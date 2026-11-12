@@ -1,0 +1,305 @@
+# Validation mode in the microVM runner
+
+Status: draft for implementation. Builds on [ADR 0009](../adr/0009-microvm-workers.md)
+and [ADR 0012](../adr/0012-microvm-validation-mode.md). The security-audit harness
+records its execution controls in
+[security-audit-harness.md](security-audit-harness.md), "Execution limits and errors".
+
+## Problem
+
+The security audit keeps a lead as `needs_validation` when it cannot run the target
+code under OS-enforced controls. The controls (security-audit-harness.md:35-37):
+
+- no external network;
+- an allowlisted empty environment;
+- writes to scratch only;
+- a read-only target and toolchain;
+- resource limits;
+- the skill's safe artifact promotion controls.
+
+"A container or microVM label alone proves none of these controls." This board has
+no sandbox that meets them, so most leads stay `needs_validation`.
+
+A normal microVM turn VM fails the controls by design:
+
+- `firecrackerConfig` always writes a `"network-interfaces"` entry (src/vmRunner.ts),
+  and `vmNet.ts` lets the VM reach the board and the internet.
+- The guest gets the request env (`guestEnv`), holds a bearer token, and clones the
+  branch from the board's git endpoint. No secret enters a turn VM, but the token
+  and the env are still more than an empty allowlist.
+- The overlay root gives the turn writes over the whole toolchain (upper on scratch).
+
+## Goal
+
+A validation mode of the Firecracker runner: one VM runs one validation job under
+the controls above. The audit can start a job and read the result and the VM's
+self-check output. The job's own evidence (blocked network, read-only target,
+read-back env and limits) proves the controls from inside the VM.
+
+## Non-goals
+
+- Automatic validation of backlog leads (OTTR-869 starts those jobs).
+- Intel hosts (`kvm_intel`).
+- Normal work turns in VMs; the classic pool and the turn mode stay as they are.
+- Changes to the `security-audit-harness` skill files (agent-data card).
+- Detached or resumable validation jobs. A validation call is synchronous; a board
+  restart cancels it and the caller re-runs it.
+
+## VM layout
+
+One VM per job, mode `validate` (`ottr.mode=validate` on the cmdline). Drives:
+
+| Drive | Content | Writable |
+| --- | --- | --- |
+| `vda` | base rootfs: the toolchain (the `vm-runner` image root) | no |
+| `vdb` | project layer: the project's packages (as a turn VM); omitted when absent | no |
+| `vdc` | scratch ext4: `/tmp`, `/home`, `/work`, and the job input `/job/job.json` | yes |
+| `vdd` | result medium: raw, 1 MiB, the guest writes the result JSON at offset 0 | guest only, root-only device node |
+| `vde` | target ext4: the target checkout, built host-side, mounted read-only at `/target` | no |
+
+- `firecrackerConfig` writes **no `"network-interfaces"` key** in validate mode, and
+  the boot args carry no `ip=`, no `ottr.board`, no `ottr.boardhost`, no token.
+  With no interface there is no route, no tap traffic, and no guest HTTP surface.
+- The overlay root mounts **lower-only** (no upper): the whole tree outside the
+  bind mounts below rejects writes with `EROFS`, for root as well.
+- Bind mounts from `vdc`: `/tmp` (mode 1777), `/home` (job's `HOME`), `/work`.
+- The job runs as `nobody` (uid 65534, ships in the Debian base). `/home` and
+  `/work` are chowned to it. `/dev/vdd` is `0600 root:root`, so the job cannot
+  forge the result. Every process in the frame that writes the result is code the
+  image ships, not code the request supplied.
+- The kernel cmdline stays `console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro
+  init=/usr/local/bin/ottr-vm-init`, plus `ottr.mode=validate`.
+
+## Job environment
+
+The job env is a fixed allowlist, never the request env:
+
+- `PATH=/usr/local/bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`
+- `HOME=/home/job`
+- `TMPDIR=/tmp`
+- `LANG=C.UTF-8`
+
+The job spec cannot add, remove, or override entries. This is the harness's
+"launch from an empty environment" rule.
+
+## Resource limits
+
+| Limit | Where enforced | Default |
+| --- | --- | --- |
+| vCPUs | Firecracker `machine-config` | `OTTR_VM_VCPUS` (clamped to the runner's own cap) |
+| memory | Firecracker `machine-config` | `OTTR_VM_MEM` (clamped) |
+| disk | the scratch disk is a fixed-size block device | `OTTR_VM_DISK` (clamped) |
+| processes | `RLIMIT_NPROC` on the job (`maxProcesses`) | 256, clamp 1..2048 |
+| core dumps | `RLIMIT_CORE` 0 on the job | fixed |
+| file size | `RLIMIT_FSIZE` on the job | 1 GiB |
+| time | the guest kills the job at `timeoutSec`; the runner kills the VM at `timeoutSec + 120 s` | `timeoutSec` clamp 1..900, default 300 |
+
+## Guest flow (`docker/ottr-vm-init`, guest agent)
+
+1. Init parses `ottr.mode=validate` (the shape checks relax: empty token, board and
+   boardhost are valid in validate mode).
+2. Init mounts `vdc` at a private mount point, `vde` read-only at `/target`,
+   builds the lower-only overlay root, and binds `/tmp`, `/home`, `/work` from
+   `vdc`. It leaves `/dev/vdd` with node `0600 root:root`.
+3. Init starts the guest agent (`src/vmGuest.ts`) with `OTTR_VM_MODE=validate`.
+   The agent does not serve HTTP in validate mode.
+4. The agent reads `/job/job.json`, runs the self-check (below), then the job
+   through one spawn path: `env` exactly the allowlist, cwd under `/target`,
+   `nobody`, the rlimits, the timeout. It captures stdout and stderr tails
+   (64 KiB each).
+5. The agent writes the result JSON to `/dev/vdd` (8-byte little-endian length,
+   then UTF-8 JSON), then exits. Init kills the tree, syncs, unmounts, powers off
+   as today.
+
+### Self-check
+
+The self-check runs before the job, as trusted image code. Each check records
+`{ name, ok, detail }`. On the first failure the agent writes the result with
+`missingControl` set to the failed control's name, does not run the job, and
+powers off. Checks:
+
+| Check | Proof | Missing-control name |
+| --- | --- | --- |
+| interfaces | `/sys/class/net` lists only `lo` | `network isolation` |
+| routes | `ip route` and `ip -6 route` are empty; a TCP connect probe to `1.1.1.1:53` fails within 2 s | `network isolation` |
+| env | the built job env keys equal the allowlist; a probe spawn through the job path prints exactly that env | `allowlisted empty environment` |
+| target read-only | a write attempt to `/target` fails, as `nobody` and as root | `read-only target` |
+| toolchain read-only | a write attempt to `/usr` fails with `EROFS` (lower-only overlay) | `read-only toolchain` |
+| scratch writable | a write to `/tmp` succeeds as `nobody`, then unlinks | `scratch-only writes` |
+| result medium guarded | a write to `/dev/vdd` fails as `nobody`; the node is `0600 root:root` | `artifact promotion guard` |
+| limits read back | a probe prints `ulimit -u` equal to `maxProcesses`, `nproc` equal to the vCPU count, `MemTotal` above 0, and the scratch size equal to the configured bytes | `resource limits` |
+
+### Artifact promotion
+
+The job spec carries `collect`: scratch-relative paths with per-file and
+cumulative byte caps. After the job's process tree is gone, the agent promotes
+each allowlisted file into the result, with the harness's promotion rules:
+
+- reject absolute, empty, `.`, `..`, or symlinked components;
+- walk every parent no-follow from the scratch root, reopen by descriptor only;
+- leaf open no-follow; `fstat` a regular file with link count 1 inside its caps;
+- inline the bytes as base64 in the result JSON, re-checking the caps while reading.
+
+Anything that fails a rule is dropped from the result and named. The result
+medium is parent-owned afterwards (`/data/<project>/validate-jobs/<id>/`), which
+mirrors the skill's retained `artifacts/` rule: the sandbox never writes it.
+
+## Runner endpoint: `POST /validate`
+
+Authorized like `/run` (`x-otwr-token`). Health gate like `/run`: a host that
+cannot boot VMs answers `503` with the reason. Slot accounting shares the
+`OTTR_VM_MAX` pool with work turns (residual: a validation can hold a work-turn
+slot; a separate cap is future work).
+
+Request:
+
+```json
+{
+  "id": "val-<hex>",
+  "project": "ottr",
+  "targetTar": "/data/ottr/validate-jobs/val-<hex>/target.tar",
+  "job": {
+    "argv": ["bun", "test", "src/parse.ts"],
+    "cwd": "/target",
+    "timeoutSec": 300,
+    "maxProcesses": 256,
+    "collect": ["scratch/poc.txt"]
+  },
+  "limits": { "vcpus": 2, "memMiB": 2048, "diskBytes": 2147483648 }
+}
+```
+
+Rules:
+
+- `project` passes `PROJECT_NAME`; `targetTar` must sit under
+  `<dataRoot>/<project>/` with no link escape (the `checkCopyPaths` rules).
+- `argv` is a non-empty string list; `cwd` is absolute, normalized, under
+  `/target`; `collect` names stay under the scratch dirs with byte caps.
+- `limits` clamp to the runner's `OTTR_VM_*` values; the response records the
+  applied values.
+
+Flow: build the target ext4 from the tar into a staging dir (safe unpack: reuse
+`readTar`; refuse names outside the staging root, links stored as links, devices
+and fifos skipped; normalize modes `a+rX`), build the scratch ext4 with
+`mkfs.ext4 -d` from a staging tree (`job.json`, `tmp/`, `home/`, `work/`), create
+the 1 MiB sparse result file, boot the VM through the launcher with the validate
+spec, wait for exit under the lifetime cap, kill at the cap, read `/dev/vdd`
+image bytes, parse the result, and answer JSON:
+
+```json
+{
+  "id": "val-<hex>",
+  "selfCheck": { "ok": true, "checks": [] },
+  "missingControl": null,
+  "job": { "exitCode": 1, "timedOut": false, "stdoutTail": "...", "stderrTail": "..." },
+  "artifacts": [],
+  "limits": { "vcpus": 2, "memMiB": 2048, "diskBytes": 2147483648, "maxProcesses": 256, "timeoutSec": 300 },
+  "bootMs": 812,
+  "totalMs": 9400,
+  "logTail": "…last serial output…",
+  "resultSource": "guest"
+}
+```
+
+`resultSource` is `"absent"` with an `error` line when the VM died before writing
+a result (killed at the cap, guest crash). The runner writes the response JSON to
+`/data/<project>/validate-jobs/<id>/result.json` (parent-owned, outside the VM)
+and removes the run dir as today. A lazy layer bake reuses the networked bake VM
+unchanged; only then does the run bring its tap and iptables rules up, and the
+validate VM itself never gets the network-interfaces entry.
+
+## Board tool: `sandbox_run` (extension/tracker.ts)
+
+One eval-kernel tool for review and scout runs. The audit calls it; it is the
+only way the harness executes target code on this board.
+
+- Args: `project`, `ref` (default `HEAD`), `argv`, `cwd` (target-relative),
+  `timeoutSec`, `maxProcesses`, `collect`.
+- Guard: the agent-host guard rules apply (project-scoped, like `propose_task`).
+  The tool runs only when `OTTR_VM_RUNNER_URL` is set and the runner answers
+  `/healthz`; otherwise it returns the health reason as the error, which the
+  audit records as the exact blocker of a `needs_validation` lead.
+- Target bytes: `git archive <ref>` from the project's main checkout on the
+  server, written to `/data/<project>/validate-jobs/<id>/target.tar`, then
+  `POST /validate`. The response JSON is returned to the agent as the tool
+  result and stays in `result.json`.
+- The tool adds no secret to the request; the runner request carries the shared
+  `OTTR_WORKER_TOKEN` on the wire only, as `/run` does today.
+
+## Skill integration (documentation here; skill files change in agent-data)
+
+`security-audit-harness` execution gating uses this mode as follows: a lead's
+validation plan names `sandbox_run` with its argv; before execution the parent
+requires `sandbox_run` to answer with `selfCheck.ok === true`; the job's output
+tails and `artifacts` are the observed result; a failed or absent self-check or a
+`missingControl` value keeps the lead `needs_validation` with that exact control
+named. The skill's own promotion procedure still applies to files the audit
+retains from `result.json`.
+
+## Acceptance checks
+
+1. Fake-launcher test: a `POST /validate` builds a VM config with **no
+   `"network-interfaces"` entry**, read-only target and toolchain drives, the
+   raw result drive, and the limits set (vCPUs, memory, scratch bytes, cmdline
+   `ottr.mode=validate`).
+2. Test: a failed self-check stops the job (no job spawn) and returns the result
+   with the missing control named.
+3. Real run on this host: a validation job that tries to reach the network, write
+   to the target, and read the environment shows each attempt blocked in its
+   result. The ready report holds the command and its output.
+4. `bun run check` and `bun test` exit 0.
+
+## Alternatives considered
+
+- **vsock** for the job/result channel: needs the vsock device in the guest
+  kernel config and a host-side listener; the raw result drive needs no new
+  kernel feature and no second protocol. Rejected for v1.
+- **Serial-console sentinel** for the result: the launcher keeps only a 4000-char
+  tail; a structured result on a drive is exact and complete. Rejected.
+- **Guest HTTP over the tap** for copy-in and the job: the tap is the external
+  network the controls forbid. Rejected.
+- **In-VM `git clone`** of the target: needs network and a token in the VM.
+  Rejected; the target crosses in as a tar from the server.
+- **Job as root**: then the job could write the result medium and every device
+  node; the `nobody` user is what makes the promotion guard OS-enforced.
+- **Writable overlay over the toolchain** (as turn VMs do): a write to `/usr`
+  would succeed through the upper; the lower-only overlay is what proves
+  "read-only toolchain" at the kernel level.
+- **A separate VM pool for validations**: a different cap per mode needs store
+  and settings work; the shared pool is enough for v1. Recorded as future work.
+
+## Risks
+
+- The KVM acceptance runs of ADR 0009 have not run yet on this host. The mode
+  shares the guest kernel features the turn mode uses (overlayfs, ext4,
+  devtmpfs), so a failed boot invalidates both modes, not this design alone.
+  Record boot time and results in ADR 0009 before or with the first real run.
+- `mkfs.ext4 -d` needs e2fsprogs with the `-d` populate option (>= 1.43); verify
+  the version in the `vm-runner` image on the host.
+- The target ext4 is built from a tar the caller controls: the safe-unpack rules
+  above are the boundary; they reuse the proven `readTar` reader.
+- A VM killed at the lifetime cap may leave no result: the answer says
+  `resultSource: "absent"` instead of a guess.
+- A board restart cancels a synchronous validation call; the audit re-runs the
+  job. No detach path in v1.
+- `nobody` cannot read target files with modes below `a+rX`; the mode
+  normalization on the host side prevents that.
+
+## Detailed Implementation Plan
+
+1. `src/vmRunner.ts`: `validateFirecrackerConfig` (or a `mode` branch in
+   `firecrackerConfig`), the `/validate` endpoint, disk builders (target ext4,
+   scratch ext4 with job input, result sparse file), result read-back, lifetime
+   cap. Reuse `readTar`, `checkCopyPaths`, slot accounting.
+2. `src/vmGuest.ts` or new `src/vmValidate.ts`: the guest validation flow —
+   job spec reader, self-check catalog, job spawn path (env allowlist, `nobody`,
+   rlimits, timeout, output tails), promotion collector, result writer.
+3. `docker/ottr-vm-init`: the `validate` mode branch (mounts above, relaxed
+   cmdline checks, `OTTR_VM_MODE=validate`).
+4. `extension/tracker.ts`: the `sandbox_run` tool with the guard, `git archive`
+   packing, runner call.
+5. `src/vmRunner.test.ts` (fake launcher tests for checks 1-2),
+   `src/vmGuest.test.ts` or `src/vmValidate.test.ts` (guest flow with injected
+   probe results).
+6. Docs: this spec, ADR 0012, `docs/WORKERS.md` microVM section, README feature
+   table line. The KVM acceptance results land in ADR 0009.
