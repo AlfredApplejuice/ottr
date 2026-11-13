@@ -133,6 +133,23 @@ elif [ "$mode" = validate ]; then
 	if [ -d "$m/layer/upper" ]; then
 		lower="$m/layer/upper:$m/base"
 	fi
+	# The final root is lower-only (the read-only toolchain control), so nothing may write
+	# on it: not even the skeleton dirs the binds need. A short-lived setup overlay (its
+	# upper on the scratch) takes the writes instead: the bind mount points and the hosts
+	# files. After it unmounts, its upper becomes the final root's lowest lower layer, so
+	# the skeleton is visible and the root itself still rejects every write.
+	r="$m/root"
+	mount -t overlay overlay -o \
+		"lowerdir=$lower,upperdir=$m/scratch/setup-upper,workdir=$m/scratch/setup-work" \
+		"$r" || die "cannot mount the setup overlay"
+	mkdir -p "$r/target" "$r/work" "$r/job" || die "cannot create the bind mount points"
+	# No board and no resolver: both are outside the controls. hosts keeps its localhost
+	# lines only; resolv.conf stays empty, so no name ever resolves.
+	printf '127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n' \
+		>"$r/etc/hosts" || die "cannot write /etc/hosts"
+	: >"$r/etc/resolv.conf" || die "cannot empty /etc/resolv.conf"
+	umount "$r" || die "cannot unmount the setup overlay"
+	lower="$m/scratch/setup-upper:$lower"
 else
 	mount -t ext4 /dev/vdb "$m/layer" || die "cannot mount the project layer (vdb)"
 	mkdir -p "$m/layer/upper" "$m/layer/work" || die "cannot prepare the project layer"
@@ -144,8 +161,9 @@ else
 	work="$m/layer/work"
 fi
 r="$m/root"
-# Validate mode mounts a lower-only overlay: no upper means every write outside the binds
-# below fails with EROFS, for root too. That is the read-only toolchain control.
+# Validate mode mounts a lower-only overlay whose lowest layer is the setup upper, so the
+# skeleton and the hosts files are visible while every write still fails with EROFS, for
+# root too. That is the read-only toolchain control.
 if [ "$mode" = validate ]; then
 	mount -t overlay overlay -o "lowerdir=$lower" "$r" || die "cannot mount the overlay root"
 else
@@ -156,7 +174,11 @@ fi
 # The kernel filesystems the agent and its tools expect, mounted fresh into the new root
 # (proc, sysfs and devtmpfs are the same kernel instances as init's own).
 mkdir -p "$r/proc" "$r/sys" "$r/dev" "$r/run" "$r/tmp" || die "cannot create the root's mount points"
-chmod 1777 "$r/tmp"
+# Validate's /tmp is a bind of the scratch dir and gets its 1777 after that bind; the
+# chmod below would touch the lower-only root and fail with EROFS.
+if [ "$mode" != validate ]; then
+	chmod 1777 "$r/tmp"
+fi
 mount -t proc proc "$r/proc" || die "cannot mount the root's /proc"
 mount -t sysfs sysfs "$r/sys" || die "cannot mount the root's /sys"
 mount -t devtmpfs devtmpfs "$r/dev" || die "cannot mount the root's /dev"
@@ -183,14 +205,10 @@ fi
 
 # Name resolution: the board by the name turns use for it (OTTR_BOARD_URL), everything else
 # through public resolvers. The VM reaches no compose DNS: vm-runner's rules drop it.
-# rm first: the rootfs may carry them as links to files outside the guest's control.
-rm -f "$r/etc/hosts" "$r/etc/resolv.conf"
-if [ "$mode" = validate ]; then
-	# No board and no resolver: both are outside the controls. hosts keeps its localhost
-	# lines only; resolv.conf stays absent, so no name ever resolves.
-	printf '127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n' \
-		>"$r/etc/hosts" || die "cannot write /etc/hosts"
-else
+# Validate mode wrote its own (localhost-only hosts, empty resolv.conf) in its setup
+# overlay above; this section's writes would hit its read-only root.
+if [ "$mode" != validate ]; then
+	rm -f "$r/etc/hosts" "$r/etc/resolv.conf"
 	printf '127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n%s\t%s\n' \
 		"$board" "$boardhost" >"$r/etc/hosts" || die "cannot write /etc/hosts"
 	printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >"$r/etc/resolv.conf" ||
