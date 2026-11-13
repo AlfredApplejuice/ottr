@@ -121,6 +121,10 @@ symlinkSync(
 	"junction",
 );
 
+// The smoke's servers inherit only the smokeEnv allowlist, so the turn env's runner
+// coordinates never reach them: the board's fail-closed rule (vmRunnerFromEnv) refuses a
+// boot whose env carries OTTR_VM_RUNNER_URL without OTTR_WORKER_TOKEN. The rule stays
+// covered by runner.test.ts; this image server never dispatches to a runner.
 const spawnServer = () =>
 	Bun.spawn(["bun", "src/server.ts"], {
 		cwd: imageDir,
