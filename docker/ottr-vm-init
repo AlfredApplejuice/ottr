@@ -128,6 +128,10 @@ elif [ "$mode" = validate ]; then
 	mount -t ext4 -o ro /dev/vde "$m/target" || die "cannot mount the target disk (vde)"
 	mkdir -p "$m/scratch/tmp" "$m/scratch/home" "$m/scratch/work" "$m/scratch/job" ||
 		die "cannot prepare the scratch disk"
+	# The setup overlay below needs its upper and work dirs on the scratch: the kernel
+	# refuses the mount when either is missing.
+	mkdir -p "$m/scratch/setup-upper" "$m/scratch/setup-work" ||
+		die "cannot prepare the setup overlay"
 	# A layer that has an upper/ still lowers over the base; otherwise vda is alone down there.
 	lower="$m/base"
 	if [ -d "$m/layer/upper" ]; then

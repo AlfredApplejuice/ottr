@@ -103,9 +103,11 @@ Fixed constants of the validation mode (no request knobs, no runner env):
 
 1. Init parses `ottr.mode=validate` (the shape checks relax: empty token, board and
    boardhost are valid in validate mode).
-2. Init mounts `vdc` at a private mount point, `vde` read-only at `/target`,
-   builds the lower-only overlay root, and binds `/tmp`, `/home`, `/work` from
-   `vdc`. It leaves `/dev/vdd` with node `0600 root:root`.
+2. Init mounts `vdc` at a private mount point, `vde` read-only at `/target`, builds a
+   short-lived setup overlay (its upper on the scratch) to create the bind mount
+   points and the hosts files, unmounts it, and mounts the final root as a
+   lower-only overlay whose lowest layer is the setup upper. It binds `/tmp`,
+   `/home`, `/work` from `vdc`. It leaves `/dev/vdd` with node `0600 root:root`.
 3. Init starts the guest agent (`src/vmGuest.ts`) with `OTTR_VM_MODE=validate`.
    The agent does not serve HTTP in validate mode.
 4. The agent reads `/job/job.json`, runs the self-check (below), then the job

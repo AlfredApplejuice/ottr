@@ -1,26 +1,26 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // ottr-vm-init is PID 1: it mounts kernel filesystems and ends with kill -TERM -1, so a
 // test never runs the whole script (OTTR-517: no test signals processes it did not
-// create). The cmdline guards sit between two stable comments and touch nothing but
-// `die` and the four parsed values, so the test sources the shipped block verbatim and
-// injects the values as argv. A restructure that removes the block fails the extraction
-// assertion below instead of passing vacuously.
+// create). Two blocks are extracted between stable comments and driven by the test:
+// the cmdline guards (pure case logic over the parsed values) and the mount section
+// (everything under the script's m= directory, with mount, umount and chmod shimmed).
 
 const init = readFileSync(join(import.meta.dir, "ottr-vm-init"), "utf8");
-const start = init.indexOf("# The values land in /etc/hosts");
-const end = init.indexOf("# The token never reaches the log.");
-const guardBlock = start >= 0 && end > start ? init.slice(start, end) : "";
 
 const root = mkdtempSync(join(tmpdir(), "ottr-vm-init-"));
-afterAll(() => {
-	rmSync(root, { recursive: true, force: true });
-	for (const stale of ["/tmp/base", "/tmp/layer", "/tmp/scratch", "/tmp/root", "/tmp/target"])
-		rmSync(stale, { recursive: true, force: true, maxRetries: 5 });
-});
+afterAll(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
+
+/* ------------------------------------------------------------------------------------ */
+/* cmdline guards                                                                        */
+/* ------------------------------------------------------------------------------------ */
+
+const guardStart = init.indexOf("# The values land in /etc/hosts");
+const guardEnd = init.indexOf("# The token never reaches the log.");
+const guardBlock = guardStart >= 0 && guardEnd > guardStart ? init.slice(guardStart, guardEnd) : "";
 
 /** Runs the shipped guard block with the given cmdline values; `die` marks and stops. */
 function runGuards(
@@ -104,98 +104,166 @@ describe("ottr-vm-init cmdline guards", () => {
 	});
 });
 
-describe("ottr-vm-init validate mount walk", () => {
-	// The mount section sits between two stable markers and only touches the filesystem
-	// under /tmp (the script's fixed m=/tmp) plus mount/umount, which the test shims:
-	// the real mounts need a kernel the test must not drive. Everything else runs for
-	// real, so the skeleton writes, the hosts files and the mount order are the shipped
-	// script's own behavior.
-	const start = init.indexOf("m=/tmp");
-	const end = init.indexOf("# The kernel's ip= autoconfig");
-	const mountBody = start >= 0 && end > start ? init.slice(start, end) : "";
+/* ------------------------------------------------------------------------------------ */
+/* mount walk                                                                            */
+/* ------------------------------------------------------------------------------------ */
 
-	function walk(mode: string, board: string, boardhost: string) {
-		// The script's m=/tmp is fixed, so a previous walk's dirs would trip its plain
-		// mkdir; the real VM starts from a fresh tmpfs.
-		for (const stale of ["base", "layer", "scratch", "root", "target"])
-			rmSync(`/tmp/${stale}`, { recursive: true, force: true, maxRetries: 5 });
-		rmSync(join(root, "mounts.log"), { force: true });
-		const shim = join(root, "shim");
-		mkdirSync(shim, { recursive: true });
-		const log = join(root, "mounts.log");
-		for (const tool of ["mount", "umount"]) {
-			const body =
-				tool === "mount"
-					? // The stub stands in for the kernel building the merged tree: the base
-						// rootfs's /etc must exist where an overlay would expose it. Only the
-						// root mounts get it (the last argument), never the fresh tmpfs.
-						'for last; do :; done\ncase "$last" in /tmp/root) mkdir -p /tmp/root/etc ;; esac\n'
-					: "";
-			writeFileSync(`${shim}/${tool}`, `#!/bin/sh\n${body}echo "${tool} $*" >> '${log}'\n`);
-			chmodSync(`${shim}/${tool}`, 0o755);
-		}
-		const harness = [
-			"power_off() { exit 1; }",
-			'die() { echo "DIE: $*" >&2; exit 1; }',
-			'mode="$1" token="" board="$2" boardhost="$3"',
-			mountBody,
-		].join("\n");
-		const r = Bun.spawnSync(["sh", "-c", harness, "sh", mode, board, boardhost], {
-			cwd: root,
-			env: { PATH: `${shim}:${process.env.PATH ?? ""}` },
-			stdin: "ignore",
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const out = `${r.stdout.toString()}${r.stderr.toString()}`;
-		const mounts = readFileSync(log, "utf8");
-		return { exitCode: r.exitCode, out, mounts };
+const walkStart = init.indexOf("m=/tmp");
+const walkEnd = init.indexOf("# The kernel's ip= autoconfig");
+const rawMountBody = walkStart >= 0 && walkEnd > walkStart ? init.slice(walkStart, walkEnd) : "";
+
+interface WalkResult {
+	exitCode: number;
+	out: string;
+	mounts: string;
+	/** The m= directory the walk ran in: the test's own temp dir. */
+	mRoot: string;
+}
+
+/**
+ * Walks the shipped mount section in the test's own temp dir. The script's `m=/tmp` is
+ * rewritten to the temp dir (the one text change; every other line ships as is), so the
+ * walk never touches shared /tmp paths. mount and umount are shimmed: the mount shim
+ * enforces what the kernel enforces on mounts it can check without a kernel module —
+ * every overlay lowerdir, upperdir and workdir must exist, a bind source must exist and
+ * a bind target must exist — and answers non-zero like the kernel's ENOENT otherwise.
+ * chmod is shimmed to log and never touch /dev, so no host device node changes.
+ */
+function walk(
+	mode: string,
+	board: string,
+	boardhost: string,
+): WalkResult {
+	const mRoot = mkdtempSync(join(root, "walk-"));
+	rmSync(join(mRoot, "mounts.log"), { force: true });
+	const shim = join(mRoot, "shim");
+	mkdirSync(shim, { recursive: true });
+	const log = join(mRoot, "mounts.log");
+	// Built without shell quoting puzzles: the temp path has no metacharacters, and the
+	// only `${` sequences below are escaped for the template literal, not for sh.
+	const mountShim = [
+		"#!/bin/sh",
+		`log='${log}'`,
+		'last=""',
+		'for a in "$@"; do last="$a"; done',
+		'if [ "$1" = "-t" ] && [ "$2" = "overlay" ]; then',
+		'\topts="$5"',
+		'\told="$IFS"; IFS=","',
+		"\tfor kv in $opts; do",
+		'\t\tkey="${kv%%=*}"; val="${kv#*=}"',
+		'\t\tcase "$key" in',
+		"\t\tlowerdir|upperdir|workdir)",
+		'\t\t\toifs="$IFS"; IFS=":"',
+		"\t\t\tfor d in $val; do",
+		'\t\t\t\tif [ -n "$d" ] && [ ! -d "$d" ]; then',
+		'\t\t\t\t\techo "mount: overlay $key dir missing: $d" >> "$log"',
+		'\t\t\t\t\tIFS="$oifs"',
+		"\t\t\t\t\texit 1",
+		"\t\t\t\tfi",
+		"\t\t\tdone",
+		'\t\t\tIFS="$oifs"',
+		"\t\t;;",
+		"\t\tesac",
+		"\tdone",
+		'\tIFS="$old"',
+		"fi",
+		'if [ "$1" = "--bind" ]; then',
+		'\tif [ ! -e "$2" ]; then echo "mount: bind source missing: $2" >> "$log"; exit 1; fi',
+		'\tif [ ! -d "$3" ]; then echo "mount: bind target missing: $3" >> "$log"; exit 1; fi',
+		"fi",
+		'case "$last" in',
+		`"${mRoot}/root")`,
+		`mkdir -p "${mRoot}/root/etc" "${mRoot}/root/tmp" "${mRoot}/root/home" "${mRoot}/root/proc" "${mRoot}/root/sys" "${mRoot}/root/dev" "${mRoot}/root/run"`,
+		";;",
+		"esac",
+		`echo "mount $*" >> '${log}'`,
+		"exit 0",
+	].join("\n");
+	const umountShim = `#!/bin/sh\necho "umount $*" >> '${log}'\nexit 0\n`;
+	// chmod never reaches a host device node: the /dev path is logged and skipped.
+	const chmodShim = `#!/bin/sh\necho "chmod $*" >> '${log}'\nif [ "$2" = "/dev/vdd" ]; then exit 0; fi\nexec /bin/chmod "$@"\n`;
+	for (const [name, body] of [
+		["mount", mountShim],
+		["umount", umountShim],
+		["chmod", chmodShim],
+	] as const) {
+		writeFileSync(join(shim, name), body);
+		chmodSync(join(shim, name), 0o755);
 	}
+	// The one rewrite: the script's fixed m=/tmp becomes the walk's own temp dir.
+	const mountBody = rawMountBody.replace("m=/tmp", `m="${mRoot}"`);
+	const harness = [
+		"power_off() { exit 1; }",
+		'die() { echo "DIE: $*" >&2; exit 1; }',
+		'mode="$1" token="" board="$2" boardhost="$3"',
+		mountBody,
+	].join("\n");
+	const r = Bun.spawnSync(["sh", "-c", harness, "sh", mode, board, boardhost], {
+		cwd: mRoot,
+		env: { PATH: `${shim}:${process.env.PATH ?? ""}` },
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const out = `${r.stdout.toString()}${r.stderr.toString()}`;
+	const mounts = existsSync(log) ? readFileSync(log, "utf8") : "";
+	return { exitCode: r.exitCode, out, mounts, mRoot };
+}
 
+describe("ottr-vm-init mount walk", () => {
 	test("the mount section is present", () => {
-		expect(mountBody).toContain("m=/tmp");
-		expect(mountBody).toContain("cannot mount the overlay root");
+		expect(rawMountBody).toContain("m=/tmp");
+		expect(rawMountBody).toContain("cannot mount the overlay root");
 	});
 
 	test("validate builds the skeleton in the setup overlay before the read-only root", () => {
 		const w = walk("validate", "", "");
 		expect(w.exitCode, w.out).toBe(0);
 		expect(w.out).not.toContain("DIE:");
-		const setup = w.mounts.indexOf("upperdir=/tmp/scratch/setup-upper");
-		const unmounted = w.mounts.indexOf("umount /tmp/root");
+		// The setup overlay mounts, unmounts, then the final root mounts with the setup
+		// upper as its lowest layer.
+		const setup = w.mounts.indexOf("upperdir=");
+		const unmounted = w.mounts.indexOf(`umount ${w.mRoot}/root`);
 		const final = w.mounts.indexOf(
-			"lowerdir=/tmp/scratch/setup-upper:/tmp/base",
+			`lowerdir=${w.mRoot}/scratch/setup-upper:${w.mRoot}/base`,
 		);
 		expect(setup).toBeGreaterThan(-1);
 		expect(unmounted).toBeGreaterThan(setup);
 		expect(final).toBeGreaterThan(unmounted);
+		// The setup overlay's own dirs exist on the scratch: the kernel refuses the mount
+		// without them, so their absence is exactly the bug this walk must catch.
+		expect(existsSync(`${w.mRoot}/scratch/setup-upper`)).toBe(true);
+		expect(existsSync(`${w.mRoot}/scratch/setup-work`)).toBe(true);
 		// The job's whole writable world is bound from the scratch; the target is bound
 		// read-only from its own disk.
 		for (const bind of [
-			"mount --bind /tmp/target /tmp/root/target",
-			"mount --bind /tmp/scratch/tmp /tmp/root/tmp",
-			"mount --bind /tmp/scratch/home /tmp/root/home",
-			"mount --bind /tmp/scratch/work /tmp/root/work",
-			"mount --bind /tmp/scratch/job /tmp/root/job",
+			`mount --bind ${w.mRoot}/target ${w.mRoot}/root/target`,
+			`mount --bind ${w.mRoot}/scratch/tmp ${w.mRoot}/root/tmp`,
+			`mount --bind ${w.mRoot}/scratch/home ${w.mRoot}/root/home`,
+			`mount --bind ${w.mRoot}/scratch/work ${w.mRoot}/root/work`,
+			`mount --bind ${w.mRoot}/scratch/job ${w.mRoot}/root/job`,
 		])
 			expect(w.mounts).toContain(bind);
 		// The skeleton writes happened for real, at the paths the binds need.
-		expect(readFileSync("/tmp/root/etc/hosts", "utf8")).toBe(
+		expect(readFileSync(`${w.mRoot}/root/etc/hosts`, "utf8")).toBe(
 			"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n",
 		);
-		expect(readFileSync("/tmp/root/etc/resolv.conf", "utf8")).toBe("");
-		for (const dir of ["/tmp/target", "/tmp/root/target", "/tmp/root/work", "/tmp/root/job"])
-			expect(() => statSync(dir)).not.toThrow();
+		expect(readFileSync(`${w.mRoot}/root/etc/resolv.conf`, "utf8")).toBe("");
+		// The walk never left its own temp dir and never touched a host device node.
+		expect(w.mounts).not.toContain("/tmp/base");
+		expect(w.mounts).not.toContain("/tmp/scratch");
+		expect(w.mounts).toContain("chmod 600 /dev/vdd");
 	});
 
 	test("run mode keeps its writable overlay and board hosts", () => {
 		const w = walk("run", "10.231.0.1", "ottr");
 		expect(w.exitCode, w.out).toBe(0);
 		expect(w.out).not.toContain("DIE:");
-		expect(w.mounts).toContain("upperdir=/tmp/scratch/upper,workdir=/tmp/scratch/work");
+		expect(w.mounts).toContain(
+			`upperdir=${w.mRoot}/scratch/upper,workdir=${w.mRoot}/scratch/work`,
+		);
 		expect(w.mounts).not.toContain("setup-upper");
-		expect(readFileSync("/tmp/root/etc/hosts", "utf8")).toContain("10.231.0.1\tottr");
-		expect(readFileSync("/tmp/root/etc/resolv.conf", "utf8")).toContain("nameserver");
+		expect(readFileSync(`${w.mRoot}/root/etc/hosts`, "utf8")).toContain("10.231.0.1\tottr");
+		expect(readFileSync(`${w.mRoot}/root/etc/resolv.conf`, "utf8")).toContain("nameserver");
 	});
 });
-
