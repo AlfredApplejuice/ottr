@@ -66,18 +66,35 @@ for arg in $(cat /proc/cmdline); do
 	esac
 done
 # The values land in /etc/hosts and the agent's env: refuse anything but their plain shapes.
+# Validate mode carries no token, board or boardhost on the cmdline, so there the empty
+# value is the correct one and only a non-empty value keeps its shape check.
 case "$mode" in
 run | bake | validate) ;;
 *) die "ottr.mode must be run, bake or validate, not '$mode'" ;;
 esac
-case "$token" in
-"" | *[!0-9a-f]*) die "ottr.token is missing or not lowercase hex" ;;
-esac
-case "$board" in
-"" | *[!0-9.]*) die "ottr.board must be an IPv4 address, not '$board'" ;;
-esac
-case "$boardhost" in
-"" | -* | *[!A-Za-z0-9.-]*) die "ottr.boardhost must be a host name, not '$boardhost'" ;;
+case "$mode" in
+validate)
+	case "$token" in
+	*[!0-9a-f]*) die "ottr.token is not lowercase hex" ;;
+	esac
+	case "$board" in
+	*[!0-9.]*) die "ottr.board must be an IPv4 address, not '$board'" ;;
+	esac
+	case "$boardhost" in
+	-* | *[!A-Za-z0-9.-]*) die "ottr.boardhost must be a host name, not '$boardhost'" ;;
+	esac
+	;;
+*)
+	case "$token" in
+	"" | *[!0-9a-f]*) die "ottr.token is missing or not lowercase hex" ;;
+	esac
+	case "$board" in
+	"" | *[!0-9.]*) die "ottr.board must be an IPv4 address, not '$board'" ;;
+	esac
+	case "$boardhost" in
+	"" | -* | *[!A-Za-z0-9.-]*) die "ottr.boardhost must be a host name, not '$boardhost'" ;;
+	esac
+	;;
 esac
 # The token never reaches the log.
 echo "ottr-vm-init: mode $mode, board $boardhost at $board"
