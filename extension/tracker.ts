@@ -2,6 +2,11 @@
 // Loaded per run via `--extension <abs path>`; the task runner reads the tool call
 // from omp's JSON event stream.
 
+// The sandbox_run tool's client: a leaf module (node builtins + the shared
+// validation contract only), so the extension keeps loading standalone.
+import { existsSync } from "node:fs";
+import { PROJECT_NAME, runSandboxJob } from "../src/sandboxRun.ts";
+
 // ponytail: minimal structural typing of omp's extension API; @oh-my-pi packages not installed
 interface ZodBuilder {
 	object(shape: Record<string, unknown>): unknown;
@@ -54,6 +59,13 @@ interface TrendingParams {
 	prompt?: unknown;
 	verdict?: unknown;
 	reason?: unknown;
+}
+interface SandboxRunParams {
+	project?: unknown;
+	ref?: unknown;
+	argv?: unknown;
+	cwd?: unknown;
+	collect?: unknown;
 }
 interface Pi {
 	zod: ZodBuilder;
@@ -1044,6 +1056,81 @@ export default function (pi: Pi) {
 				const out = await postVerdict("judge_repo", { repo, verdict, reason });
 				if (!out.ok) return textResult(out.text);
 				return textResult(`Recorded ${verdict} for ${repo}.`);
+			},
+		});
+	}
+
+	// The audit's one way to execute target code (docs/specs/microvm-validation-mode.md,
+	// "Board tool: sandbox_run"): a review or a trending-scout run gets the validation
+	// sandbox; work and retro runs never see the tool. Same run-kind env gate as
+	// propose_task. The runner coordinates are read per call, so a host without the
+	// runner returns the setting's name as the error, which the audit records as the
+	// exact blocker of a needs_validation lead.
+	if (reviewMode || process.env.OTTR_TRENDING === "1") {
+		pi.registerTool({
+			name: "sandbox_run",
+			label: "Sandbox run",
+			description:
+				"Run one command against a project's checkout in the Firecracker validation sandbox: no network interface, a three-variable env, scratch-only writes as nobody, a read-only target and toolchain, fixed limits (1 vCPU, 512 MiB, 10 minutes). " +
+				"The result JSON carries the job's output tails, promoted artifacts and the guest's self-check; treat selfCheck.ok and missingControl as the gate before you trust the job's result. " +
+				"project: the project whose server checkout (/workspace/<project>) is packed with git archive. ref: git ref to archive, default HEAD. " +
+				'argv: the command, for example ["bun", "test", "src/parse.ts"]. cwd: working directory, absolute under /target, default /target. ' +
+				"collect: scratch-relative paths (/tmp, /home, /work) to return, at most 16.",
+			parameters: z.object({
+				project: z.string().describe("Project whose checkout to pack and run"),
+				ref: z.string().optional().describe("Git ref to archive; default HEAD"),
+				argv: z
+					.array(z.string())
+					.describe(
+						'The job\'s command, for example ["bun", "test", "src/parse.ts"]',
+					),
+				cwd: z
+					.string()
+					.optional()
+					.describe(
+						"Working directory, absolute under /target; default /target",
+					),
+				collect: z
+					.array(z.string())
+					.optional()
+					.describe(
+						"Scratch-relative paths to promote into the result; at most 16",
+					),
+			}),
+			loadMode: "essential",
+			approval: "read",
+			async execute(_toolCallId: string, params: SandboxRunParams) {
+				const project = trimmed(params.project);
+				if (!PROJECT_NAME.test(project))
+					return textResult(
+						"Error: project must be a project name (letters, digits, dot, dash, underscore).",
+					);
+				// The server's main checkout per project; the worktrees live under it.
+				const checkout = `/workspace/${project}`;
+				if (!existsSync(checkout))
+					return textResult(
+						`Error: no checkout at ${checkout} for project ${project}; sandbox_run packs the server's main checkout.`,
+					);
+				const ref = trimmed(params.ref);
+				const cwd = trimmed(params.cwd);
+				const argv = Array.isArray(params.argv)
+					? params.argv.filter((x): x is string => typeof x === "string")
+					: [];
+				if (argv.length === 0)
+					return textResult("Error: argv must be a non-empty list of strings.");
+				const collect = Array.isArray(params.collect)
+					? params.collect.filter((x): x is string => typeof x === "string")
+					: [];
+				const job = await runSandboxJob({
+					project,
+					checkout,
+					argv,
+					...(ref !== "" ? { ref } : {}),
+					...(cwd !== "" ? { cwd } : {}),
+					...(collect.length > 0 ? { collect } : {}),
+				});
+				if (!job.ok) return textResult(`Error: ${job.error}`);
+				return textResult(JSON.stringify(job.result, null, 2));
 			},
 		});
 	}

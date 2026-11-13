@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	PROPOSE_TOOL_DESCRIPTION,
 	REVIEW_PROPOSE_TOOL_DESCRIPTION,
@@ -112,6 +112,8 @@ const envKeys = [
 	"OTTR_REVIEW",
 	"OTTR_TRENDING",
 	"OTTR_MODELS",
+	"OTTR_VM_RUNNER_URL",
+	"OTTR_WORKER_TOKEN",
 ] as const;
 function setEnv(v: Partial<Record<(typeof envKeys)[number], string>>) {
 	for (const k of envKeys) if (v[k] !== undefined) process.env[k] = v[k];
@@ -1545,5 +1547,179 @@ describe("board tools called through the eval kernel", () => {
 				}),
 			),
 		).toContain("only one proposal is allowed");
+	});
+});
+
+// A tiny real checkout under /workspace so sandbox_run's execute passes its
+// existsSync check and git archive packs real bytes; the caller removes it.
+function probeCheckout(name: string): string {
+	const checkout = `/workspace/${name}`;
+	rmSync(checkout, { recursive: true, force: true });
+	mkdirSync(checkout, { recursive: true });
+	writeFileSync(join(checkout, "probe.txt"), "hi\n");
+	const sh = (...args: string[]) => {
+		const r = Bun.spawnSync(["git", ...args], {
+			cwd: checkout,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (r.exitCode !== 0)
+			throw new Error(`git ${args.join(" ")} failed: ${r.stderr.toString()}`);
+	};
+	sh("init", "-q", ".");
+	sh("config", "user.email", "probe@example.com");
+	sh("config", "user.name", "probe");
+	sh("add", "-A");
+	sh("commit", "-q", "-m", "probe", "--no-gpg-sign");
+	return checkout;
+}
+
+// The run dir's parent (<dataRoot>/<project>), so a test leaves no /data junk.
+function removeRunDir(targetTar: string): void {
+	rmSync(dirname(dirname(targetTar)), { recursive: true, force: true });
+}
+
+describe("sandbox_run tool", () => {
+	const runnerUrl = "http://vm-runner:8080";
+	const runnerEnv = {
+		OTTR_VM_RUNNER_URL: runnerUrl,
+		OTTR_WORKER_TOKEN: "worker-token",
+	};
+
+	test("absent without a review or scout run kind so work runs never see it", () => {
+		// The runner env alone must not enable the tool.
+		process.env.OTTR_VM_RUNNER_URL = runnerUrl;
+		expect(fakePi().sandbox_run).toBeUndefined();
+	});
+
+	test("absent in a retro run, which propose_task serves instead", () => {
+		process.env.OTTR_RETRO = "1";
+		expect(fakePi().sandbox_run).toBeUndefined();
+	});
+
+	test("present in review runs and headless-safe like the other tools", () => {
+		process.env.OTTR_REVIEW = "1";
+		const tool = fakePi().sandbox_run;
+		expect(tool).toBeDefined();
+		expect(tool?.approval).toBe("read");
+		expect(tool?.loadMode).toBe("essential");
+	});
+
+	test("present in trending scout runs", () => {
+		process.env.OTTR_TRENDING = "1";
+		expect(fakePi().sandbox_run).toBeDefined();
+	});
+
+	test("declares exactly project, ref, argv, cwd and collect", () => {
+		process.env.OTTR_REVIEW = "1";
+		expect(Object.keys(fakePi().sandbox_run?.parameters ?? {})).toEqual([
+			"project",
+			"ref",
+			"argv",
+			"cwd",
+			"collect",
+		]);
+	});
+
+	test("rejects a bad project name and a missing checkout before any call", async () => {
+		process.env.OTTR_REVIEW = "1";
+		const tools = fakePi();
+		let called = false;
+		globalThis.fetch = (async () => {
+			called = true;
+			return new Response("{}", { status: 200 });
+		}) as unknown as typeof fetch;
+		expect(
+			text(
+				await tools.sandbox_run!.execute("t1", {
+					project: "../evil",
+					argv: ["true"],
+				}),
+			),
+		).toContain("project must be a project name");
+		expect(
+			text(
+				await tools.sandbox_run!.execute("t1", {
+					project: "ottr-no-such-project",
+					argv: ["true"],
+				}),
+			),
+		).toContain("no checkout at /workspace/ottr-no-such-project");
+		expect(called).toBe(false);
+	});
+
+	test("execute packs the checkout and returns the runner's JSON with the token on the wire only", async () => {
+		process.env.OTTR_REVIEW = "1";
+		setEnv(runnerEnv);
+		const project = "ottr-sbx-probe";
+		const checkout = probeCheckout(project);
+		try {
+			let seen: { url: string; init: RequestInit } | null = null;
+			globalThis.fetch = (async (url: string | URL, init: RequestInit) => {
+				seen = { url: String(url), init };
+				return new Response(
+					JSON.stringify({
+						id: "val-1-aabbccdd",
+						selfCheck: { ok: true, checks: [] },
+						missingControl: null,
+						job: null,
+						artifacts: [],
+						limits: {},
+						bootMs: 1,
+						totalMs: 2,
+						logTail: "",
+						resultSource: "guest",
+					}),
+					{ status: 200 },
+				);
+			}) as unknown as typeof fetch;
+			const out = await fakePi().sandbox_run!.execute("t1", {
+				project,
+				argv: ["sh", "-c", "true"],
+			});
+			const parsed = JSON.parse(text(out)) as {
+				id: string;
+				resultSource: string;
+			};
+			expect(parsed.id).toBe("val-1-aabbccdd");
+			expect(parsed.resultSource).toBe("guest");
+			expect(seen!.url).toBe(`${runnerUrl}/validate`);
+			expect(seen!.init.method).toBe("POST");
+			expect(seen!.init.headers).toMatchObject({
+				"x-otwr-token": "worker-token",
+				"content-type": "application/json",
+			});
+			const body = JSON.parse(String(seen!.init.body)) as {
+				project: string;
+				targetTar: string;
+				job: { argv: string[]; cwd: string };
+			};
+			expect(body.project).toBe(project);
+			expect(body.job).toEqual({ argv: ["sh", "-c", "true"], cwd: "/target" });
+			expect(body.targetTar).toContain(`/data/${project}/validate-jobs/val-`);
+			// The token rides the header only; the returned text never carries it.
+			expect(text(out)).not.toContain("worker-token");
+			removeRunDir(body.targetTar);
+		} finally {
+			rmSync(checkout, { recursive: true, force: true });
+		}
+	});
+
+	test("execute without OTTR_VM_RUNNER_URL returns the naming error", async () => {
+		process.env.OTTR_REVIEW = "1";
+		process.env.OTTR_WORKER_TOKEN = "worker-token";
+		const project = "ottr-sbx-probe";
+		const checkout = probeCheckout(project);
+		try {
+			const out = await fakePi().sandbox_run!.execute("t1", {
+				project,
+				argv: ["true"],
+			});
+			expect(text(out)).toStartWith("Error: ");
+			expect(text(out)).toContain("OTTR_VM_RUNNER_URL");
+			expect(text(out)).toContain("--profile vm");
+		} finally {
+			rmSync(checkout, { recursive: true, force: true });
+		}
 	});
 });
