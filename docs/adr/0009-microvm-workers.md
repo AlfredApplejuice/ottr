@@ -4,10 +4,14 @@ Date: 2026-11-07
 
 ## Status
 
-accepted — experimental: no Firecracker boot has run yet on a Linux host with `/dev/kvm`.
-The backend stays marked experimental until the KVM acceptance runs (end-to-end turn,
-network isolation, OOM kill, session resume, restart re-bind, busy queueing, layer rebuild)
-and the performance numbers are recorded in this ADR.
+accepted — experimental. The first Firecracker boots ran on 2026-11-12 on a KVM
+host (Docker Desktop WSL2, `kvm_amd`): the guest kernel and the rootfs boot, and
+the guest agent answers `/healthz`. A full turn still fails on three bugs
+tracked as OTTR-887 (a boot error masked as `stopped`, a dirty ext4 journal on
+the baked layer, the plugin-skills overlay missing from copy-in). The backend
+stays marked experimental until the KVM acceptance runs (end-to-end turn,
+network isolation, OOM kill, session resume, restart re-bind, busy queueing,
+layer rebuild) and the performance numbers are recorded here.
 
 ## Context
 

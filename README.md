@@ -96,7 +96,7 @@ The full column list, research cards, backlog drafts, the second-model check and
 
 ## How it works
 
-| Stage | What happens |
+10: @ours
 | --- | --- |
 | Work turn | Ottr creates `.worktrees/<id>` on branch `ott/<id>-<slug>` and runs `omp -p` in it; the agent finishes with the `report_outcome` tool. |
 | Merge turn | A second turn rebases, re-runs the project's checks, and integrates the work; one merge turn per project at a time. |

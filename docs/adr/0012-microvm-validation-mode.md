@@ -4,7 +4,7 @@ Date: 2026-11-12
 
 ## Status
 
-accepted as a design; implementation pending the KVM acceptance runs of
+accepted as a design; implemented by OTTR-874. Builds on
 [ADR 0009](0009-microvm-workers.md). Spec:
 [docs/specs/microvm-validation-mode.md](../specs/microvm-validation-mode.md).
 
@@ -26,8 +26,11 @@ iptables rules, receives the request env, and holds a bearer token; and its
 overlay root lets the turn write over the whole toolchain.
 
 On 2026-11-12 `/dev/kvm` worked on this host (Docker Desktop WSL2 after
-`modprobe kvm_amd`; AMD Ryzen 9 5900X). No Firecracker boot has run yet
-(ADR 0009), so this ADR records a design, not measured numbers.
+`modprobe kvm_amd`; AMD Ryzen 9 5900X). The first Firecracker boots ran on
+2026-11-12: the guest kernel and the rootfs boot, and the guest agent answers
+`/healthz`. A full turn still fails on three bugs (OTTR-887: a boot error masked
+as `stopped`, a dirty ext4 journal on the baked layer, the plugin-skills overlay
+missing from copy-in), so the acceptance numbers of ADR 0009 stay open.
 
 ## Decision
 
@@ -40,10 +43,11 @@ docs/specs/microvm-validation-mode.md. One VM runs one validation job:
   the toolchain stays the read-only base and layer drives;
 - the overlay root mounts lower-only, so every write outside the scratch bind
   mounts fails with `EROFS`, and the job runs as `nobody`;
-- the job env is a fixed four-variable allowlist, never the request env;
-- limits: vCPUs, memory and disk from the runner's `OTTR_VM_*` caps, plus
-  `RLIMIT_NPROC`, `RLIMIT_CORE`, `RLIMIT_FSIZE`, and a guest-side job timeout
-  under a runner-side VM lifetime cap;
+- the job env is a fixed allowlist of three variables (`PATH`, `HOME`, `LANG`),
+  never the request env;
+- limits are fixed constants: 1 vCPU, 512 MiB memory, 1 GiB scratch, 256
+  processes (`RLIMIT_NPROC`), no core dumps, a 1 GiB file-size rlimit, and a
+  10-minute job timeout under a runner-side VM lifetime cap;
 - the job spec and its result cross on drives only: the input on the scratch
   ext4, the result on a raw drive whose device node the job cannot write
   (`0600 root:root`). The trusted guest code runs a self-check of every control

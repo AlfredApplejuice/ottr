@@ -44,6 +44,10 @@ read-back env and limits) proves the controls from inside the VM.
 - Changes to the `security-audit-harness` skill files (agent-data card).
 - Detached or resumable validation jobs. A validation call is synchronous; a board
   restart cancels it and the caller re-runs it.
+- The three boot bugs OTTR-887 fixes (a boot error masked as `stopped`, a dirty
+  ext4 journal on the baked layer, the plugin-skills overlay missing from
+  copy-in). This card owns none of them; a validation run that trips one shows it
+  in `resultSource: "absent"` and the serial `logTail`.
 
 ## VM layout
 
@@ -72,11 +76,10 @@ One VM per job, mode `validate` (`ottr.mode=validate` on the cmdline). Drives:
 
 ## Job environment
 
-The job env is a fixed allowlist, never the request env:
+The job env is a fixed allowlist of exactly three variables, never the request env:
 
 - `PATH=/usr/local/bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`
 - `HOME=/home/job`
-- `TMPDIR=/tmp`
 - `LANG=C.UTF-8`
 
 The job spec cannot add, remove, or override entries. This is the harness's
@@ -84,15 +87,17 @@ The job spec cannot add, remove, or override entries. This is the harness's
 
 ## Resource limits
 
-| Limit | Where enforced | Default |
+Fixed constants of the validation mode (no request knobs, no runner env):
+
+| Limit | Where enforced | Value |
 | --- | --- | --- |
-| vCPUs | Firecracker `machine-config` | `OTTR_VM_VCPUS` (clamped to the runner's own cap) |
-| memory | Firecracker `machine-config` | `OTTR_VM_MEM` (clamped) |
-| disk | the scratch disk is a fixed-size block device | `OTTR_VM_DISK` (clamped) |
-| processes | `RLIMIT_NPROC` on the job (`maxProcesses`) | 256, clamp 1..2048 |
-| core dumps | `RLIMIT_CORE` 0 on the job | fixed |
+| vCPUs | Firecracker `machine-config` | 1 |
+| memory | Firecracker `machine-config` | 512 MiB |
+| disk | the scratch disk is a fixed-size block device | 1 GiB |
+| processes | `RLIMIT_NPROC` on the job | 256 |
+| core dumps | `RLIMIT_CORE` on the job | 0 |
 | file size | `RLIMIT_FSIZE` on the job | 1 GiB |
-| time | the guest kills the job at `timeoutSec`; the runner kills the VM at `timeoutSec + 120 s` | `timeoutSec` clamp 1..900, default 300 |
+| time | the guest kills the job at 600 s; the runner kills the VM at 600 s + boot slack (180 s total cap) | 10 minutes |
 
 ## Guest flow (`docker/ottr-vm-init`, guest agent)
 
@@ -161,11 +166,8 @@ Request:
   "job": {
     "argv": ["bun", "test", "src/parse.ts"],
     "cwd": "/target",
-    "timeoutSec": 300,
-    "maxProcesses": 256,
     "collect": ["scratch/poc.txt"]
-  },
-  "limits": { "vcpus": 2, "memMiB": 2048, "diskBytes": 2147483648 }
+  }
 }
 ```
 
@@ -174,9 +176,8 @@ Rules:
 - `project` passes `PROJECT_NAME`; `targetTar` must sit under
   `<dataRoot>/<project>/` with no link escape (the `checkCopyPaths` rules).
 - `argv` is a non-empty string list; `cwd` is absolute, normalized, under
-  `/target`; `collect` names stay under the scratch dirs with byte caps.
-- `limits` clamp to the runner's `OTTR_VM_*` values; the response records the
-  applied values.
+  `/target`; `collect` names stay under the job's writable dirs (`/tmp`,
+  `/home`, `/work`) with byte caps; at most 16 names.
 
 Flow: build the target ext4 from the tar into a staging dir (safe unpack: reuse
 `readTar`; refuse names outside the staging root, links stored as links, devices
@@ -193,7 +194,7 @@ image bytes, parse the result, and answer JSON:
   "missingControl": null,
   "job": { "exitCode": 1, "timedOut": false, "stdoutTail": "...", "stderrTail": "..." },
   "artifacts": [],
-  "limits": { "vcpus": 2, "memMiB": 2048, "diskBytes": 2147483648, "maxProcesses": 256, "timeoutSec": 300 },
+  "limits": { "vcpus": 1, "memMiB": 512, "diskBytes": 1073741824, "maxProcesses": 256, "timeoutSec": 600 },
   "bootMs": 812,
   "totalMs": 9400,
   "logTail": "…last serial output…",
@@ -214,7 +215,7 @@ One eval-kernel tool for review and scout runs. The audit calls it; it is the
 only way the harness executes target code on this board.
 
 - Args: `project`, `ref` (default `HEAD`), `argv`, `cwd` (target-relative),
-  `timeoutSec`, `maxProcesses`, `collect`.
+  `collect`. The limits are the mode's fixed constants; the tool takes none.
 - Guard: the agent-host guard rules apply (project-scoped, like `propose_task`).
   The tool runs only when `OTTR_VM_RUNNER_URL` is set and the runner answers
   `/healthz`; otherwise it returns the health reason as the error, which the
@@ -240,14 +241,16 @@ retains from `result.json`.
 
 1. Fake-launcher test: a `POST /validate` builds a VM config with **no
    `"network-interfaces"` entry**, read-only target and toolchain drives, the
-   raw result drive, and the limits set (vCPUs, memory, scratch bytes, cmdline
-   `ottr.mode=validate`).
+   raw result drive, and the fixed limits set (1 vCPU, 512 MiB, 1 GiB scratch,
+   `ottr.mode=validate` on the cmdline).
 2. Test: a failed self-check stops the job (no job spawn) and returns the result
    with the missing control named.
-3. Real run on this host: a validation job that tries to reach the network, write
-   to the target, and read the environment shows each attempt blocked in its
-   result. The ready report holds the command and its output.
-4. `bun run check` and `bun test` exit 0.
+3. Real run on the KVM host (not from a turn container): a validation job that
+   tries to reach the network, write to the target, and read the environment
+   shows each attempt blocked in its result. The ready report states that this
+   check needs the host and gives the exact host commands (the
+   `scripts/vm-validate-smoke.ts` run).
+4. `bun run check` and `bun test` exit 0 in the turn container.
 
 ## Alternatives considered
 
@@ -270,10 +273,13 @@ retains from `result.json`.
 
 ## Risks
 
-- The KVM acceptance runs of ADR 0009 have not run yet on this host. The mode
-  shares the guest kernel features the turn mode uses (overlayfs, ext4,
-  devtmpfs), so a failed boot invalidates both modes, not this design alone.
-  Record boot time and results in ADR 0009 before or with the first real run.
+- The KVM acceptance runs of ADR 0009 started on 2026-11-12: the kernel and the
+  rootfs boot and the guest agent answers `/healthz`; a full turn still fails on
+  the three bugs OTTR-887 owns. A layer bake inside a validate run can trip the
+  dirty-journal bug; the answer then says `resultSource: "absent"` with that
+  tail, which is the honest result, not a mode defect.
+- The fixed 512 MiB guest RAM and 1 GiB scratch have not booted on real
+  hardware yet; the host run of the smoke script is their first measurement.
 - `mkfs.ext4 -d` needs e2fsprogs with the `-d` populate option (>= 1.43); verify
   the version in the `vm-runner` image on the host.
 - The target ext4 is built from a tar the caller controls: the safe-unpack rules
@@ -287,19 +293,26 @@ retains from `result.json`.
 
 ## Detailed Implementation Plan
 
-1. `src/vmRunner.ts`: `validateFirecrackerConfig` (or a `mode` branch in
-   `firecrackerConfig`), the `/validate` endpoint, disk builders (target ext4,
-   scratch ext4 with job input, result sparse file), result read-back, lifetime
-   cap. Reuse `readTar`, `checkCopyPaths`, slot accounting.
-2. `src/vmGuest.ts` or new `src/vmValidate.ts`: the guest validation flow —
-   job spec reader, self-check catalog, job spawn path (env allowlist, `nobody`,
-   rlimits, timeout, output tails), promotion collector, result writer.
-3. `docker/ottr-vm-init`: the `validate` mode branch (mounts above, relaxed
+1. `src/vmValidateShared.ts`: the constants (`VM_VALIDATE`) and the request,
+   job-spec, self-check and result types both sides share.
+2. `src/vmRunner.ts`: the `"validate"` branch in `firecrackerConfig` (no
+   `network-interfaces`) and `bootArgs`, the `/validate` endpoint, disk builders
+   (target ext4 via `mkfs.ext4 -d`, scratch ext4 with the job input, 1 MiB
+   result sparse file), result read-back, lifetime cap. Reuse `readTar`,
+   `checkCopyPaths`, slot accounting, the bake path for a missing layer.
+3. `src/vmValidate.ts`: the guest validation flow — job spec reader, self-check
+   catalog, job spawn path (env allowlist, `nobody`, `prlimit`, timeout, output
+   tails), promotion collector, result writer. `src/vmGuest.ts` dispatches to it
+   on `OTTR_VM_MODE=validate`.
+4. `docker/ottr-vm-init`: the `validate` mode branch (mounts above, relaxed
    cmdline checks, `OTTR_VM_MODE=validate`).
-4. `extension/tracker.ts`: the `sandbox_run` tool with the guard, `git archive`
-   packing, runner call.
-5. `src/vmRunner.test.ts` (fake launcher tests for checks 1-2),
-   `src/vmGuest.test.ts` or `src/vmValidate.test.ts` (guest flow with injected
-   probe results).
-6. Docs: this spec, ADR 0012, `docs/WORKERS.md` microVM section, README feature
-   table line. The KVM acceptance results land in ADR 0009.
+5. `src/sandboxRun.ts`, `extension/tracker.ts`, `src/vmValidateSmoke.ts`: the
+   `sandbox_run` tool (guard, `git archive` packing, runner call) and the CLI
+   the host acceptance run uses (in `src/`, because the server image ships
+   `src/`, not `scripts/`).
+6. Tests: `src/vmRunner.test.ts` (fake launcher: checks 1-2, absent result),
+   `src/vmValidate.test.ts` (guest flow with injected probes), the extension
+   tool tests in the extension's test file.
+7. Docs: this spec, ADR 0012, ADR 0009 status, `docs/WORKERS.md` microVM
+   section, README feature table. The remaining KVM acceptance numbers land in
+   ADR 0009 on the host.

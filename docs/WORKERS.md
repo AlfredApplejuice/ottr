@@ -841,11 +841,13 @@ the classic workers. The decision and the comparison with Kata Containers and gV
 in [ADR 0009](adr/0009-microvm-workers.md). The classic pool stays the default, and every
 project without the setting keeps it.
 
-**Experimental.** No Firecracker boot has run yet on a Linux host with `/dev/kvm`: the
-guest kernel, the overlay root, the iptables rules, the OOM behaviour, session resume and
-the restart re-bind are covered only by unit tests with a fake launcher. Treat the mode as
-experimental until the KVM acceptance runs and the performance numbers are recorded in
-ADR 0009.
+**Experimental.** The first Firecracker boots ran on 2026-11-12 on a KVM host: the guest
+kernel and the rootfs boot, and the guest agent answers `/healthz`. A full turn still
+fails on three bugs tracked as OTTR-887 (a boot error masked as `stopped`, a dirty ext4
+journal on the baked layer, the plugin-skills overlay missing from copy-in), so the
+overlay root, the iptables rules, the OOM behaviour, session resume and the restart
+re-bind are not proven end to end yet. Treat the mode as experimental until the KVM
+acceptance runs and the performance numbers are recorded in ADR 0009.
 
 Only work turns whose cwd is the card's own worktree go to a VM. Interview, grill and
 trending turns of the same project run in the main checkout and stay on the classic pool.
@@ -996,6 +998,44 @@ killed those VMs already.
 - Board files: at the end of a turn the VM sends back `research-report.md` and the files
   under `shots/` (at most 16 MiB in all), and the board writes them into the server
   worktree before it classifies the turn; it writes no other path the VM sends.
+
+### Validation mode
+
+Beside turns, the runner runs validation jobs for the security-audit harness
+([the spec](specs/microvm-validation-mode.md), [ADR 0012](adr/0012-microvm-validation-mode.md)):
+one VM runs one job of target code under OS-enforced controls. The VM gets no
+network interface at all (no `network-interfaces` entry, no `ip=` on the
+cmdline). The job env is exactly `PATH`, `HOME`, `LANG`. The overlay root mounts
+lower-only, so a write anywhere outside the scratch bind mounts fails with
+`EROFS`, and the job runs as `nobody`. The target crosses in as a tar and lands
+on a read-only ext4 drive; the toolchain is the read-only base and layer drives.
+The limits are fixed: 1 vCPU, 512 MiB memory, 1 GiB scratch, 256 processes
+(`RLIMIT_NPROC`), no core dumps, a 1 GiB file-size rlimit, and a 10-minute
+timeout. The guest's self-check proves each control before the job runs; on a
+failed check the job never runs and the result names the missing control.
+
+The job spec crosses in on the scratch ext4; the result crosses out on a raw
+drive whose device node the job cannot write (`0600 root:root`). The runner
+reads the drive after the VM stops, so a killed VM leaves no result and the
+answer says so instead of a guess.
+
+`POST /validate` on the runner (the same `OTTR_WORKER_TOKEN`, the same health
+gate and slot pool as `/run`) takes the job and answers the result JSON. The
+board tool `sandbox_run` (review and scout runs) is the audit-facing way to call
+it: it packs the target with `git archive` from the project checkout on the
+server, sends it to the runner, and returns the result. The runner also stores
+each result under `/data/<project>/validate-jobs/<id>/result.json`. Validations
+share the `OTTR_VM_MAX` slot pool with work turns, and a validation call is
+synchronous: a board restart cancels it, and the caller re-runs it.
+
+To prove the controls on a KVM host, run the smoke job from the server container
+(it holds `OTTR_VM_RUNNER_URL`, `OTTR_WORKER_TOKEN`, `/workspace` and the
+compose network; the image must carry this card's code):
+
+    docker compose exec server bun /app/src/vmValidateSmoke.ts
+
+The job prints its env, its routes, and its write attempts against the target
+and the result drive; every attempt must come back blocked.
 
 ### vm-runner in the update roll
 
