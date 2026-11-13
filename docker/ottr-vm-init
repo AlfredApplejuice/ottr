@@ -3,14 +3,23 @@
 # guest. The vm-runner image (Dockerfile.worker, stage vm-runner) ships it, and the guest's
 # base rootfs is that image's own root. Boot contract (vm-runner <-> init):
 #   vda: base rootfs ext4, the kernel's root (root=/dev/vda ro), mounted read-only;
-#   vdb: the project layer ext4 with upper/ and work/ (read-only in run mode, written in bake);
+#   vdb: the project layer ext4 with upper/ and work/ (read-only in run and validate, written in bake);
 #   vdc: run: the scratch ext4 the turn writes to; bake: the bake-status ext4 init reports
-#     the shutdown outcome on (vm-runner reads it with debugfs);
-#   cmdline: ottr.mode=run|bake ottr.token=<hex> ottr.board=<board ip> ottr.boardhost=<name>;
-#   eth0 is already up: the kernel configures it from the cmdline's ip= (IP_PNP).
-# It builds a writable overlay root over vda (run: lower vdb's upper over vda, upper on vdc;
-# bake: lower vda, upper on vdb, so the bake's changes become the layer), chroots into it,
-# runs the guest agent (src/vmGuest.ts, port 7070) and ends the VM when the agent exits.
+#     the shutdown outcome on (vm-runner reads it with debugfs); validate: the job's
+#     scratch ext4 with the job's tmp, home, work and job dirs plus the setup overlay's
+#     upper and work;
+#   vdd (validate only): the raw result drive the guest writes at offset 0; node 0600 root;
+#   vde (validate only): the target checkout ext4, mounted read-only at /target;
+#   cmdline: ottr.mode=run|bake|validate ottr.token=<hex> ottr.board=<board ip>
+#     ottr.boardhost=<name>; the token, board and boardhost stay empty in validate mode,
+#     and validate has no ip= at all (no eth0: the VM has no network interface);
+#   eth0 is already up in run and bake: the kernel configures it from the cmdline's ip= (IP_PNP).
+# It builds an overlay root over vda (run: lower vdb's upper over vda, upper on vdc;
+# bake: lower vda, upper on vdb, so the bake's changes become the layer; validate: a setup
+# overlay first for the skeleton and the hosts files, then lower-only, every write outside
+# the scratch binds fails), chroots into it, runs the guest agent (src/vmGuest.ts, port
+# 7070; no HTTP in validate mode, the flow of src/vmValidate.ts) and ends the VM when the
+# agent exits.
 # POSIX sh (dash) with coreutils, util-linux and iproute2 only: no busybox in the image.
 # No `set -e`: every failure must still end the VM, or vm-runner waits on a VM that idles.
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -58,8 +67,8 @@ for arg in $(cat /proc/cmdline); do
 done
 # The values land in /etc/hosts and the agent's env: refuse anything but their plain shapes.
 case "$mode" in
-run | bake) ;;
-*) die "ottr.mode must be run or bake, not '$mode'" ;;
+run | bake | validate) ;;
+*) die "ottr.mode must be run, bake or validate, not '$mode'" ;;
 esac
 case "$token" in
 "" | *[!0-9a-f]*) die "ottr.token is missing or not lowercase hex" ;;
@@ -77,7 +86,7 @@ echo "ottr-vm-init: mode $mode, board $boardhost at $board"
 # root; the overlay root below has its own /tmp, so this one stays private to init.
 m=/tmp
 mount -t tmpfs -o mode=0700,size=1m ottr-vm-init "$m" || die "cannot mount the init tmpfs"
-mkdir "$m/base" "$m/layer" "$m/scratch" "$m/root" || die "cannot create the mount points"
+mkdir "$m/base" "$m/layer" "$m/scratch" "$m/root" "$m/target" || die "cannot create the mount points"
 # The overlay's lowest layer is vda's own tree. A plain (non-recursive) bind carries none
 # of the mounts above (/proc, /sys, /dev, this tmpfs), so the new root sees vda only.
 mount --bind / "$m/base" || die "cannot bind the base rootfs"
@@ -93,6 +102,20 @@ if [ "$mode" = run ]; then
 	fi
 	upper="$m/scratch/upper"
 	work="$m/scratch/work"
+elif [ "$mode" = validate ]; then
+	# The project layer is optional in validate mode: a project that never baked has none.
+	if [ -b /dev/vdb ]; then
+		mount -t ext4 -o ro /dev/vdb "$m/layer" || die "cannot mount the project layer (vdb)"
+	fi
+	mount -t ext4 /dev/vdc "$m/scratch" || die "cannot mount the scratch disk (vdc)"
+	mount -t ext4 -o ro /dev/vde "$m/target" || die "cannot mount the target disk (vde)"
+	mkdir -p "$m/scratch/tmp" "$m/scratch/home" "$m/scratch/work" "$m/scratch/job" ||
+		die "cannot prepare the scratch disk"
+	# A layer that has an upper/ still lowers over the base; otherwise vda is alone down there.
+	lower="$m/base"
+	if [ -d "$m/layer/upper" ]; then
+		lower="$m/layer/upper:$m/base"
+	fi
 else
 	mount -t ext4 /dev/vdb "$m/layer" || die "cannot mount the project layer (vdb)"
 	mkdir -p "$m/layer/upper" "$m/layer/work" || die "cannot prepare the project layer"
@@ -104,8 +127,14 @@ else
 	work="$m/layer/work"
 fi
 r="$m/root"
-mount -t overlay overlay -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$r" ||
-	die "cannot mount the overlay root"
+# Validate mode mounts a lower-only overlay: no upper means every write outside the binds
+# below fails with EROFS, for root too. That is the read-only toolchain control.
+if [ "$mode" = validate ]; then
+	mount -t overlay overlay -o "lowerdir=$lower" "$r" || die "cannot mount the overlay root"
+else
+	mount -t overlay overlay -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$r" ||
+		die "cannot mount the overlay root"
+fi
 
 # The kernel filesystems the agent and its tools expect, mounted fresh into the new root
 # (proc, sysfs and devtmpfs are the same kernel instances as init's own).
@@ -120,14 +149,36 @@ mount -t devpts -o gid=5,mode=0620,ptmxmode=0666 devpts "$r/dev/pts" || die "can
 mount -t tmpfs -o mode=1777 shm "$r/dev/shm" || die "cannot mount /dev/shm"
 mount -t tmpfs -o mode=0755 run "$r/run" || die "cannot mount /run"
 
+if [ "$mode" = validate ]; then
+	# The scratch binds are the job's whole writable world: /tmp, the job home, /work, and
+	# /job with the job spec. Everything else rejects writes (lower-only overlay), and
+	# /dev/vdd stays root-only, so the job cannot forge the result the runner reads.
+	mkdir -p "$r/target" "$r/tmp" "$r/home" "$r/work" "$r/job"
+	mount --bind "$m/target" "$r/target" || die "cannot bind the target into the root"
+	mount --bind "$m/scratch/tmp" "$r/tmp" || die "cannot bind the scratch tmp into the root"
+	chmod 1777 "$r/tmp"
+	mount --bind "$m/scratch/home" "$r/home" || die "cannot bind the scratch home into the root"
+	mount --bind "$m/scratch/work" "$r/work" || die "cannot bind the scratch work into the root"
+	mount --bind "$m/scratch/job" "$r/job" || die "cannot bind the job dir into the root"
+	chown -R 65534:65534 "$m/scratch/home" "$m/scratch/work"
+	chmod 600 /dev/vdd
+fi
+
 # Name resolution: the board by the name turns use for it (OTTR_BOARD_URL), everything else
 # through public resolvers. The VM reaches no compose DNS: vm-runner's rules drop it.
 # rm first: the rootfs may carry them as links to files outside the guest's control.
 rm -f "$r/etc/hosts" "$r/etc/resolv.conf"
-printf '127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n%s\t%s\n' \
-	"$board" "$boardhost" >"$r/etc/hosts" || die "cannot write /etc/hosts"
-printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >"$r/etc/resolv.conf" ||
-	die "cannot write /etc/resolv.conf"
+if [ "$mode" = validate ]; then
+	# No board and no resolver: both are outside the controls. hosts keeps its localhost
+	# lines only; resolv.conf stays absent, so no name ever resolves.
+	printf '127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n' \
+		>"$r/etc/hosts" || die "cannot write /etc/hosts"
+else
+	printf '127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n%s\t%s\n' \
+		"$board" "$boardhost" >"$r/etc/hosts" || die "cannot write /etc/hosts"
+	printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >"$r/etc/resolv.conf" ||
+		die "cannot write /etc/resolv.conf"
+fi
 # The kernel's ip= autoconfig brings up eth0; loopback is set up here in case it did not.
 ip link set lo up 2>/dev/null
 
@@ -141,6 +192,7 @@ chroot "$r" /usr/bin/env -i \
 	BUN_INSTALL=/usr/local/bun \
 	NODE_OPTIONS=--require=/app/src/stryker-tap.cjs \
 	LANG=C.UTF-8 \
+	OTTR_VM_MODE="$mode" \
 	OTTR_VM_GUEST_TOKEN="$token" \
 	bun /app/src/vmGuest.ts &
 agent=$!
@@ -165,4 +217,5 @@ umount "$m/layer" 2>/dev/null || mount -o remount,ro "$m/layer" 2>/dev/null || {
 	fi
 }
 umount "$m/scratch" 2>/dev/null
+umount "$m/target" 2>/dev/null
 power_off

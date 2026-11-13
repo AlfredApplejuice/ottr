@@ -6,6 +6,7 @@ import {
 	readdirSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -33,6 +34,13 @@ import {
 	type VmRunnerOptions,
 } from "./vmRunner.ts";
 import { parseSize, readVmRunnerEnv } from "./vmRunnerMain.ts";
+import {
+	type ValidateJobSpec,
+	type ValidateRequest,
+	type ValidateResponse,
+	type ValidateResult,
+	VM_VALIDATE,
+} from "./vmValidateShared.ts";
 import { type VmSpec, WORKER_DONE, type WorkerRequest } from "./workers.ts";
 
 // Nothing here needs KVM: the launcher is a fake that starts a fake guest agent (Bun.serve on
@@ -70,7 +78,14 @@ function gate(): { wait: Promise<void>; open: () => void } {
 
 /** A hand-made GNU-style tar, independent of the runner's own writer. */
 function rawTar(
-	members: { name: string; content?: string; type?: string; mtime?: number }[],
+	members: {
+		name: string;
+		content?: string;
+		type?: string;
+		mtime?: number;
+		/** Stored link target for a "2" (symlink) member. */
+		link?: string;
+	}[],
 ): Uint8Array {
 	const blocks: Uint8Array[] = [];
 	const header = (
@@ -78,6 +93,7 @@ function rawTar(
 		type: string,
 		size: number,
 		mtime: number,
+		link = "",
 	): Uint8Array => {
 		const b = new Uint8Array(512);
 		const put = (off: number, s: string): void => b.set(enc.encode(s), off);
@@ -89,6 +105,7 @@ function rawTar(
 		put(136, `${mtime.toString(8).padStart(11, "0")}\0`);
 		b.fill(0x20, 148, 156);
 		b[156] = type.charCodeAt(0);
+		put(157, link.slice(0, 100));
 		put(257, "ustar  \0");
 		let sum = 0;
 		for (const x of b) sum += x;
@@ -105,7 +122,10 @@ function rawTar(
 			blocks.push(header("././@LongLink", "L", long.length, 0), long);
 			blocks.push(pad(long.length));
 		}
-		blocks.push(header(m.name, m.type ?? "0", data.length, mtime), data);
+		blocks.push(
+			header(m.name, m.type ?? "0", data.length, mtime, m.link ?? ""),
+			data,
+		);
 		blocks.push(pad(data.length));
 	}
 	blocks.push(new Uint8Array(1024));
@@ -134,6 +154,15 @@ async function members(
 	return out;
 }
 
+/** Writes a ValidateResult to a raw drive the way the guest does: an 8-byte little-endian
+ * length, then the UTF-8 JSON. */
+function writeResultDrive(path: string, result: ValidateResult): void {
+	const payload = Buffer.from(JSON.stringify(result), "utf8");
+	const head = Buffer.alloc(8);
+	head.writeBigUInt64LE(BigInt(payload.length));
+	writeFileSync(path, Buffer.concat([head, payload]));
+}
+
 interface GuestRec {
 	spec: VmLaunchSpec;
 	token: string;
@@ -151,6 +180,8 @@ interface GuestScript {
 	shutdown?: (rec: GuestRec) => Response;
 	files?: (q: URLSearchParams) => Uint8Array;
 	healthz?: (rec: GuestRec) => Response;
+	/** A ValidateResult the fake guest writes to the vdd drive before it powers off. */
+	validateResult?: ValidateResult;
 }
 
 const DONE_OK = {
@@ -258,6 +289,22 @@ function fakeLauncher(script: GuestScript): {
 			fileQueries: [],
 			crash: () => {},
 		};
+		// Validate mode has no guest HTTP (no interface): the fake guest writes the result
+		// drive when scripted to and powers off at once.
+		if (spec.mode === "validate") {
+			const vdd = spec.drives.find((d) => d.id === "vdd");
+			if (script.validateResult && vdd)
+				writeResultDrive(vdd.path, script.validateResult);
+			recs.push(rec);
+			exit();
+			return {
+				pid: 4242,
+				guestUrl: "http://127.0.0.1:9",
+				exited,
+				kill: () => exit(),
+				logTail: () => "fake console\n",
+			};
+		}
 		const server = Bun.serve({
 			port: 0,
 			hostname: "127.0.0.1",
@@ -289,6 +336,17 @@ const fakeRootfs = {
 	layer: async () => ({ ok: true as const, path: "/state/layer.ext4" }),
 };
 
+/** What startRunner hands each test: the server URL, the fake VMs' records, the recorded
+ * exec commands, and the three temp roots. */
+interface TestRunner {
+	url: string;
+	recs: GuestRec[];
+	execs: string[][];
+	stateDir: string;
+	dataRoot: string;
+	homeRoot: string;
+}
+
 function startRunner(
 	o: {
 		script?: GuestScript;
@@ -301,8 +359,10 @@ function startRunner(
 		execHook?: (
 			argv: string[],
 		) => { code: number | null; stdout: string; stderr: string } | null;
+		/** Extra exec behavior on top of the recording: snapshot at mkfs time, etc. */
+		exec?: Exec;
 	} = {},
-) {
+): TestRunner {
 	const stateDir = mkdtempSync(join(root, "state-"));
 	const dataRoot = mkdtempSync(join(root, "data-"));
 	const homeRoot = mkdtempSync(join(root, "home-"));
@@ -310,7 +370,10 @@ function startRunner(
 	const execs: string[][] = [];
 	const exec: Exec = async (argv) => {
 		execs.push(argv);
-		return o.execHook?.(argv) ?? { code: 0, stdout: "", stderr: "" };
+		return (
+			o.execHook?.(argv) ??
+			(o.exec ? o.exec(argv) : { code: 0, stdout: "", stderr: "" })
+		);
 	};
 	const { launcher, recs } = fakeLauncher(o.script ?? {});
 	const server = serveVmRunner({
@@ -1013,6 +1076,351 @@ describe("vm-runner health and refusals", () => {
 			body: JSON.stringify(request()),
 		});
 		expect(res.status).toBe(401);
+	});
+});
+
+/* ------------------------------------------------------------------------------------ */
+/* /validate: one synchronous job in one network-less VM                                  */
+/* ------------------------------------------------------------------------------------ */
+
+const VALID_RESULT: ValidateResult = {
+	schema: 1,
+	id: "val-1",
+	selfCheck: {
+		ok: true,
+		checks: [
+			{ name: "interfaces", ok: true, detail: "/sys/class/net holds only lo" },
+		],
+	},
+	missingControl: null,
+	job: {
+		argv: ["bun", "test", "src/parse.ts"],
+		cwd: "/target",
+		exitCode: 0,
+		signal: null,
+		timedOut: false,
+		stdoutTail: "1 pass\n",
+		stderrTail: "",
+	},
+	artifacts: [],
+	endedAt: 1_700_000_000,
+};
+
+/** Seeds the target tar a /validate request names, under the project's data root. */
+function seedTarget(r: TestRunner, id: string): string {
+	const dir = join(r.dataRoot, "proj", "validate-jobs", id);
+	mkdirSync(dir, { recursive: true });
+	const tar = join(dir, "target.tar");
+	writeFileSync(
+		tar,
+		rawTar([
+			{ name: "docs", type: "5" },
+			{ name: "README.md", content: "hello" },
+			{ name: "src/parse.ts", content: "export const one = 1;\n" },
+		]),
+	);
+	return tar;
+}
+
+function validateBody(
+	targetTar: string,
+	over: Partial<ValidateRequest> = {},
+): ValidateRequest {
+	return {
+		id: "val-1",
+		project: "proj",
+		targetTar,
+		job: {
+			argv: ["bun", "test", "src/parse.ts"],
+			cwd: "/target",
+			collect: ["work/poc.txt"],
+		},
+		...over,
+	};
+}
+
+describe("vm-runner /validate", () => {
+	test("acceptance: builds a network-less VM at the fixed limits and answers the guest's result", async () => {
+		const result = { ...VALID_RESULT, id: "val-acc" };
+		const r = startRunner({ script: { validateResult: result } });
+		const res = await post(
+			r.url,
+			"/validate",
+			validateBody(seedTarget(r, "val-acc"), { id: "val-acc" }),
+		);
+		expect(res.status).toBe(200);
+		expect(res.headers.get("content-type")).toContain("application/json");
+		const body = (await res.json()) as ValidateResponse;
+		expect(body.id).toBe("val-acc");
+		expect(body.limits).toEqual(VM_VALIDATE);
+		expect(body.resultSource).toBe("guest");
+		expect(body.selfCheck).toEqual(result.selfCheck);
+		expect(body.missingControl).toBeNull();
+		expect(body.job).toEqual(result.job);
+		expect(body.artifacts).toEqual([]);
+		expect(body.bootMs).toBeNull();
+		expect(typeof body.totalMs).toBe("number");
+		// One validate boot, no bake: no tap command and no iptables rule ran.
+		expect(r.recs).toHaveLength(1);
+		const vm = r.recs[0]!;
+		expect(vm.spec.mode).toBe("validate");
+		const cfg = firecrackerConfig(vm.spec);
+		expect("network-interfaces" in cfg).toBe(false);
+		expect(cfg["machine-config"]).toEqual({
+			vcpu_count: 1,
+			mem_size_mib: 512,
+			smt: false,
+		});
+		const drives = cfg.drives as {
+			drive_id: string;
+			is_read_only: boolean;
+		}[];
+		expect(drives.map((d) => [d.drive_id, d.is_read_only])).toEqual([
+			["vda", true],
+			["vdb", true],
+			["vdc", false],
+			["vdd", false],
+			["vde", true],
+		]);
+		// No ip=, no token, no board on the cmdline: only the mode flag.
+		expect(vm.spec.bootArgs).toBe(
+			"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/usr/local/bin/ottr-vm-init ottr.mode=validate",
+		);
+		expect(r.execs.some((a) => a[0] === "iptables" || a[0] === "ip")).toBe(
+			false,
+		);
+		// The result record landed parent-owned under the project's data root, identical
+		// to the answer.
+		const record = JSON.parse(
+			readFileSync(
+				join(r.dataRoot, "proj", "validate-jobs", "val-acc", "result.json"),
+				"utf8",
+			),
+		) as ValidateResponse;
+		expect(record).toEqual(body);
+		// Teardown: the run dir is gone and the slot takes a new job again.
+		await until(
+			() =>
+				!existsSync(join(r.stateDir, "runs")) ||
+				readdirSync(join(r.stateDir, "runs")).length === 0,
+			"run dir cleanup",
+		);
+		const again = await post(
+			r.url,
+			"/validate",
+			validateBody(seedTarget(r, "val-next"), { id: "val-next" }),
+		);
+		expect(again.status).toBe(200);
+		await again.text();
+	});
+
+	test("answers absent with the serial tail when the VM wrote no result", async () => {
+		const r = startRunner();
+		const res = await post(
+			r.url,
+			"/validate",
+			validateBody(seedTarget(r, "val-absent")),
+		);
+		// The job failed, not the runner: still a 200 JSON answer.
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ValidateResponse;
+		expect(body.resultSource).toBe("absent");
+		expect(body.error).toContain("the guest wrote no result");
+		expect(body.logTail).toContain("fake console");
+		expect(body.selfCheck).toBeNull();
+		expect(body.job).toBeNull();
+		expect(body.artifacts).toEqual([]);
+	});
+
+	test("refuses malformed requests with a one-line reason and needs the token", async () => {
+		const r = startRunner();
+		const good = validateBody(seedTarget(r, "val-bad"));
+		const cases: unknown[] = [
+			{ ...good, id: "bad id!" },
+			{ ...good, id: "" },
+			{ ...good, project: "no/slashes" },
+			{ ...good, targetTar: join(r.dataRoot, "elsewhere", "target.tar") },
+			{ ...good, job: { argv: [], cwd: "/target" } },
+			{ ...good, job: { argv: ["true"], cwd: "/tmp" } },
+			{ ...good, job: { argv: ["true"], cwd: "/target/../x" } },
+			{ ...good, job: { argv: ["true"], cwd: "/target/x/" } },
+			{
+				...good,
+				job: {
+					argv: ["true"],
+					cwd: "/target",
+					collect: Array.from({ length: 17 }, (_, i) => `f${i}`),
+				},
+			},
+			{
+				...good,
+				job: { argv: ["true"], cwd: "/target", collect: ["../escape"] },
+			},
+			{ ...good, job: { argv: ["true"], cwd: "/target", collect: ["/abs"] } },
+		];
+		for (const body of cases) {
+			const res = await post(r.url, "/validate", body);
+			expect(res.status).toBe(400);
+			expect((await res.text()).length).toBeGreaterThan(0);
+		}
+		// A link that leaves the project's data root is refused like a copy-in path.
+		mkdirSync(join(r.dataRoot, "elsewhere"), { recursive: true });
+		writeFileSync(join(r.dataRoot, "elsewhere", "secret.tar"), "x");
+		symlinkSync(
+			join(r.dataRoot, "elsewhere"),
+			join(r.dataRoot, "proj", "link"),
+		);
+		const linkRes = await post(
+			r.url,
+			"/validate",
+			validateBody(join(r.dataRoot, "proj", "link", "secret.tar")),
+		);
+		expect(linkRes.status).toBe(400);
+		expect(await linkRes.text()).toContain("through a link");
+		expect(r.recs).toHaveLength(0);
+		// The endpoint shares /run's token gate.
+		const unauth = await fetch(`${r.url}/validate`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-otwr-token": "wrong",
+			},
+			body: JSON.stringify(good),
+		});
+		expect(unauth.status).toBe(401);
+	});
+
+	test("answers busy with x-ottr-busy when the shared slot pool is full", async () => {
+		const held = heldGuest();
+		const r = startRunner({ max: 1, script: { run: held.run } });
+		const body = validateBody(seedTarget(r, "val-busy"), { id: "val-busy" });
+		const first = await post(r.url, "/run", request());
+		const reader = first.body!.getReader();
+		await reader.read(); // the guest's first event: the VM holds the slot
+		const busy = await post(r.url, "/validate", body);
+		expect(busy.status).toBe(503);
+		expect(busy.headers.get("x-ottr-busy")).toBe("1");
+		held.release();
+		while (!(await reader.read()).done) {
+			// drain to the end of the first run
+		}
+		await until(async () => {
+			const again = await post(r.url, "/validate", body);
+			if (again.status === 503) return false;
+			expect(again.status).toBe(200);
+			await again.text();
+			return true;
+		}, "free slot");
+	});
+
+	test("builds both disks with mkfs.ext4 -d and stages the job input before the scratch mkfs", async () => {
+		const mkfs: {
+			argv: string[];
+			imageSize: number;
+			jobJson: string | null;
+		}[] = [];
+		const r = startRunner({
+			script: { validateResult: { ...VALID_RESULT, id: "val-mkfs" } },
+			exec: async (argv) => {
+				if (argv[0] !== "mkfs.ext4") return { code: 0, stdout: "", stderr: "" };
+				const staging = argv[argv.indexOf("-d") + 1]!;
+				const image = argv[argv.length - 1]!;
+				const jobPath = join(staging, "job", "job.json");
+				mkfs.push({
+					argv: [...argv],
+					imageSize: statSync(image).size,
+					jobJson: existsSync(jobPath) ? readFileSync(jobPath, "utf8") : null,
+				});
+				return { code: 0, stdout: "", stderr: "" };
+			},
+		});
+		const res = await post(
+			r.url,
+			"/validate",
+			validateBody(seedTarget(r, "val-mkfs"), { id: "val-mkfs" }),
+		);
+		expect(res.status).toBe(200);
+		await res.text();
+		expect(mkfs).toHaveLength(2);
+		const target = mkfs[0]!;
+		const scratch = mkfs[1]!;
+		// Both disks are populated from their own staging tree with mkfs.ext4 -d.
+		expect(target.argv.slice(0, 2)).toEqual(["mkfs.ext4", "-d"]);
+		expect(target.argv[2]).toContain("staging-target");
+		expect(target.argv.slice(3, 5)).toEqual(["-F", "-q"]);
+		expect(target.argv[5]).toContain("target.ext4");
+		expect(scratch.argv[2]).toContain("staging-scratch");
+		expect(scratch.argv[5]).toContain("scratch.ext4");
+		// The disks exist at their planned sizes: the scratch exactly the fixed 1 GiB,
+		// the target at the 64 MiB floor for this small checkout.
+		expect(scratch.imageSize).toBe(VM_VALIDATE.diskBytes);
+		expect(target.imageSize).toBe(64 * 1024 * 1024);
+		// The scratch staging held the job input when its mkfs ran; the target's held none.
+		expect(target.jobJson).toBeNull();
+		expect(scratch.jobJson).not.toBeNull();
+		const job = JSON.parse(scratch.jobJson!) as ValidateJobSpec;
+		expect(job).toEqual({
+			schema: 1,
+			id: "val-mkfs",
+			argv: ["bun", "test", "src/parse.ts"],
+			cwd: "/target",
+			collect: ["work/poc.txt"],
+		});
+	});
+
+	test("a cache miss bakes through the networked bake VM while the validate boot stays network-less", async () => {
+		const bakeRootfs = {
+			base: async () => ({ key: "base", path: "/state/base.ext4" }),
+			layer: async (
+				_p: string,
+				bake: (image: string) => Promise<BakeResult>,
+			) => {
+				const b = await bake("/state/layer.tmp");
+				return b.exitCode === 0
+					? { ok: true as const, path: "/state/layer.tmp" }
+					: { ok: false as const, stderrTail: b.stderrTail };
+			},
+		};
+		const r = startRunner({
+			rootfs: bakeRootfs,
+			script: { validateResult: { ...VALID_RESULT, id: "val-bake" } },
+		});
+		const res = await post(
+			r.url,
+			"/validate",
+			validateBody(seedTarget(r, "val-bake"), { id: "val-bake" }),
+		);
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ValidateResponse;
+		expect(body.resultSource).toBe("guest");
+		expect(body.error).toBeUndefined();
+		// Two boots: the bake VM first, then the validate VM on the baked layer.
+		expect(r.recs).toHaveLength(2);
+		const bakeVm = r.recs[0]!;
+		const validateVm = r.recs[1]!;
+		expect(bakeVm.spec.mode).toBe("bake");
+		expect("network-interfaces" in firecrackerConfig(bakeVm.spec)).toBe(true);
+		expect(bakeVm.spec.bootArgs).toContain("ottr.mode=bake");
+		expect(bakeVm.spec.bootArgs).toContain("ottr.board=172.18.0.5");
+		expect(bakeVm.spec.bootArgs).toContain("ottr.boardhost=ottr");
+		expect(bakeVm.spec.drives.map((d) => [d.id, d.readOnly])).toEqual([
+			["vda", true],
+			["vdb", false],
+		]);
+		expect(validateVm.spec.mode).toBe("validate");
+		expect("network-interfaces" in firecrackerConfig(validateVm.spec)).toBe(
+			false,
+		);
+		expect(validateVm.spec.drives.find((d) => d.id === "vdb")?.path).toBe(
+			"/state/layer.tmp",
+		);
+		// The bake brought the slot's tap and board rule up on the default port, then down.
+		const board = { ip: "172.18.0.5", port: 8080 };
+		for (const argv of slotUpCommands(slotFor(0), board))
+			expect(r.execs).toContainEqual(argv);
+		for (const argv of slotDownCommands(slotFor(0), board))
+			expect(r.execs).toContainEqual(argv);
+		await until(() => bakeVm.killed, "bake vm kill");
 	});
 });
 

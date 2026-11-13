@@ -9,6 +9,7 @@
  */
 import { randomBytes } from "node:crypto";
 import {
+	chmodSync,
 	closeSync,
 	constants,
 	existsSync,
@@ -22,6 +23,7 @@ import {
 	renameSync,
 	rmSync,
 	type Stats,
+	symlinkSync,
 	unlinkSync,
 	utimesSync,
 	writeFileSync,
@@ -46,6 +48,15 @@ import {
 	sparseFile,
 	workerListPaths,
 } from "./vmRootfs.ts";
+import {
+	cwdUnderTarget,
+	type ValidateJobSpec,
+	type ValidateRequest,
+	type ValidateResponse,
+	type ValidateResult,
+	type ValidateSelfCheck,
+	VM_VALIDATE,
+} from "./vmValidateShared.ts";
 import {
 	type DetachedRun,
 	type VmOutcome,
@@ -573,7 +584,7 @@ const BAKE_UNMOUNT_FAILED = "layer-unmount-failed";
 const SHUTDOWN_TIMEOUT_MS = 30_000;
 
 export interface VmDrive {
-	id: "vda" | "vdb" | "vdc";
+	id: "vda" | "vdb" | "vdc" | "vdd" | "vde";
 	path: string;
 	readOnly: boolean;
 }
@@ -581,7 +592,7 @@ export interface VmDrive {
 export interface VmLaunchSpec {
 	/** Per-VM scratch dir: config file, logs. */
 	runDir: string;
-	mode: "run" | "bake";
+	mode: "run" | "bake" | "validate";
 	slot: Slot;
 	vcpus: number;
 	memMiB: number;
@@ -603,13 +614,30 @@ export interface VmHandle {
 
 export type VmLauncher = (spec: VmLaunchSpec) => Promise<VmHandle>;
 
-function bootArgs(a: {
-	mode: "run" | "bake";
-	slot: Slot;
-	token: string;
-	boardIp: string;
-	boardHost: string;
-}): string {
+function bootArgs(
+	a:
+		| {
+				mode: "run" | "bake";
+				slot: Slot;
+				token: string;
+				boardIp: string;
+				boardHost: string;
+		  }
+		| { mode: "validate" },
+): string {
+	if (a.mode === "validate")
+		// No ip=, no token, no board: the validate VM has no interface to address and
+		// must hold no secret (docs/specs/microvm-validation-mode.md).
+		return [
+			"console=ttyS0",
+			"reboot=k",
+			"panic=1",
+			"pci=off",
+			"root=/dev/vda",
+			"ro",
+			"init=/usr/local/bin/ottr-vm-init",
+			"ottr.mode=validate",
+		].join(" ");
 	return [
 		"console=ttyS0",
 		"reboot=k",
@@ -628,7 +656,7 @@ function bootArgs(a: {
 
 /** Firecracker's --config-file document for one VM. */
 export function firecrackerConfig(spec: VmLaunchSpec): Record<string, unknown> {
-	return {
+	const config: Record<string, unknown> = {
 		"boot-source": {
 			kernel_image_path: spec.kernel,
 			boot_args: spec.bootArgs,
@@ -646,14 +674,18 @@ export function firecrackerConfig(spec: VmLaunchSpec): Record<string, unknown> {
 			mem_size_mib: spec.memMiB,
 			smt: false,
 		},
-		"network-interfaces": [
+	};
+	// Validate mode gets no "network-interfaces" key at all: no interface means no route,
+	// no tap traffic and no guest HTTP surface.
+	if (spec.mode !== "validate")
+		config["network-interfaces"] = [
 			{
 				iface_id: "eth0",
 				guest_mac: spec.slot.mac,
 				host_dev_name: spec.slot.tap,
 			},
-		],
-	};
+		];
+	return config;
 }
 
 /** The real launcher: one `firecracker --no-api --config-file` process per VM. */
@@ -691,7 +723,8 @@ export function firecrackerLauncher(binary: string): VmLauncher {
 /* Request checks                                                                        */
 /* ------------------------------------------------------------------------------------ */
 
-const PROJECT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+/** The project name a request may carry; exported for the validate mode's siblings. */
+export const PROJECT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 /** True when `p` is an absolute path strictly inside `root`, with no ".." component. */
 function inside(p: string, root: string): boolean {
@@ -799,6 +832,200 @@ function guestEnv(env: Record<string, string>): Record<string, string> {
 }
 
 /* ------------------------------------------------------------------------------------ */
+/* Validation jobs (docs/specs/microvm-validation-mode.md)                                */
+/* ------------------------------------------------------------------------------------ */
+
+/** The only directory tree the job may read its target from. */
+const TARGET_ROOT = "/target";
+
+/** The 400 reason the /validate body gives, null when the request is well-formed. */
+function checkValidateBody(body: unknown, dataRoot: string): string | null {
+	if (typeof body !== "object" || body === null)
+		return "the /validate body is not an object";
+	const b = body as ValidateRequest;
+	if (typeof b.id !== "string" || !/^[A-Za-z0-9._-]{1,64}$/.test(b.id))
+		return "validate.id is not 1..64 of [A-Za-z0-9._-]";
+	if (typeof b.project !== "string" || !PROJECT_NAME.test(b.project))
+		return "validate.project is not a project name";
+	const projectRoot = join(dataRoot, b.project);
+	if (typeof b.targetTar !== "string" || !inside(b.targetTar, projectRoot))
+		return `validate.targetTar must be a tar under ${projectRoot}/`;
+	if (!realParentInside(b.targetTar, projectRoot))
+		return `validate.targetTar ${b.targetTar} leaves ${projectRoot}/ through a link`;
+	if (typeof b.job !== "object" || b.job === null)
+		return "validate.job is missing";
+	const job = b.job as ValidateRequest["job"];
+	if (!isStrings(job.argv) || job.argv.length === 0)
+		return "validate.job.argv is not a non-empty string list";
+	// Strict normalization by parts: Bun's posix.normalize keeps trailing and doubled
+	// slashes, so the segment list is the rule, not a normalize round trip.
+	if (typeof job.cwd !== "string" || !cwdUnderTarget(job.cwd))
+		return `validate.job.cwd must be a normalized absolute path at or under ${TARGET_ROOT}`;
+	if (job.collect !== undefined) {
+		if (!isStrings(job.collect))
+			return "validate.job.collect is not a string list";
+		if (job.collect.length > VM_VALIDATE.collectMaxNames)
+			return `validate.job.collect holds more than ${VM_VALIDATE.collectMaxNames} names`;
+		for (const name of job.collect)
+			if (posix.isAbsolute(name) || name.split("/").includes(".."))
+				return `validate.job.collect ${name} must stay relative to the scratch`;
+	}
+	return null;
+}
+
+/** Creates `path` with `mode` exactly: a umask must not strip the guest's sticky bit. */
+const mkdirMode = (path: string, mode: number): void => {
+	mkdirSync(path, { recursive: true });
+	chmodSync(path, mode);
+};
+
+/** The scratch tree mkfs.ext4 populates the scratch disk from: the job input at
+ * /job/job.json and the writable dirs. */
+function writeJobStaging(staging: string, body: ValidateRequest): void {
+	mkdirMode(join(staging, "job"), 0o755);
+	const jobSpec: ValidateJobSpec = {
+		schema: 1,
+		id: body.id,
+		argv: body.job.argv,
+		cwd: body.job.cwd,
+		collect: body.job.collect,
+	};
+	writeFileSync(join(staging, "job", "job.json"), JSON.stringify(jobSpec), {
+		mode: 0o644,
+	});
+	mkdirMode(join(staging, "tmp"), 0o1777);
+	mkdirMode(join(staging, "home"), 0o755);
+	mkdirMode(join(staging, "work"), 0o755);
+}
+
+/**
+ * Unpacks the validation target tar into the fresh `staging` dir: regular files, dirs and
+ * symlinks (stored as links, never followed); devices, fifos and hard links are skipped.
+ * Names outside the staging root are refused and reported, not written. Returns the
+ * regular files' total byte count, which sizes the target disk.
+ */
+async function unpackTarget(
+	stream: ReadableStream<Uint8Array>,
+	staging: string,
+): Promise<{ bytes: number; refused: string[] }> {
+	const refused: string[] = [];
+	let bytes = 0;
+	await readTar(stream, async (m, data) => {
+		const abs = join(staging, m.name);
+		// join() normalizes: an absolute name or a ".." part is the only way out of
+		// staging, and "" or "." would name the staging dir itself.
+		if (
+			m.name === "" ||
+			m.name === "." ||
+			m.name.startsWith("/") ||
+			m.name.split("/").includes("..") ||
+			!abs.startsWith(`${staging}/`)
+		) {
+			refused.push(m.name);
+			return;
+		}
+		if (m.type === "5") {
+			if (realDirChain(staging, abs)) return;
+			refused.push(m.name);
+			return;
+		}
+		if (m.type === "2") {
+			if (!realDirChain(staging, dirname(abs))) refused.push(m.name);
+			else symlinkSync(m.linkname, abs);
+			return;
+		}
+		if (m.type !== "0") return; // hard links, devices, fifos: a checkout needs none
+		if (!realDirChain(staging, dirname(abs))) {
+			refused.push(m.name);
+			return;
+		}
+		const fd = openSync(
+			abs,
+			constants.O_WRONLY |
+				constants.O_CREAT |
+				constants.O_EXCL |
+				constants.O_NOFOLLOW,
+			0o600,
+		);
+		try {
+			for await (const chunk of data) {
+				let off = 0;
+				while (off < chunk.length) off += writeSync(fd, chunk, off);
+				bytes += chunk.length;
+			}
+		} finally {
+			closeSync(fd);
+		}
+	});
+	return { bytes, refused };
+}
+
+/** Adds read-for-everyone to every dir and file mode: the job's nobody must read /target. */
+function normalizeTargetModes(staging: string): void {
+	const st = lstatSync(staging);
+	chmodSync(staging, st.mode | 0o555);
+	const walk = (dir: string): void => {
+		for (const name of readdirSync(dir)) {
+			const abs = join(dir, name);
+			const s = lstatSync(abs);
+			// Symlinks carry no own meaningful mode and are never followed here.
+			if (s.isDirectory()) {
+				chmodSync(abs, s.mode | 0o555);
+				walk(abs);
+			} else if (s.isFile()) chmodSync(abs, s.mode | 0o444);
+		}
+	};
+	walk(staging);
+}
+
+/** True when `v` is the ValidateResult shape the guest writes: schema, self-check,
+ * missing control, job outcome and artifacts. The fields' contents stay the guest's
+ * word; the harness re-checks them against its own controls. */
+function isValidateResult(v: unknown): v is ValidateResult {
+	if (typeof v !== "object" || v === null) return false;
+	const r = v as Record<string, unknown>;
+	if (r.schema !== 1) return false;
+	const selfCheck = r.selfCheck as ValidateSelfCheck | null;
+	if (
+		typeof selfCheck !== "object" ||
+		selfCheck === null ||
+		!Array.isArray(selfCheck.checks)
+	)
+		return false;
+	if (r.missingControl !== null && typeof r.missingControl !== "string")
+		return false;
+	if (r.job !== null) {
+		if (typeof r.job !== "object" || r.job === null) return false;
+		const job = r.job as Record<string, unknown>;
+		for (const k of [
+			"argv",
+			"cwd",
+			"exitCode",
+			"signal",
+			"timedOut",
+			"stdoutTail",
+			"stderrTail",
+		] as const)
+			if (!(k in job)) return false;
+	}
+	return Array.isArray(r.artifacts);
+}
+
+/** The ValidateResult the guest wrote to the raw drive (an 8-byte little-endian length,
+ * then the UTF-8 JSON), null when it wrote none or one that fails the shape check. */
+function readResultDrive(path: string): ValidateResult | null {
+	try {
+		const buf = readFileSync(path);
+		const len = Number(buf.readBigUInt64LE(0));
+		if (len <= 0 || len > buf.length - 8) return null;
+		const parsed: unknown = JSON.parse(buf.toString("utf8", 8, 8 + len));
+		return isValidateResult(parsed) ? parsed : null;
+	} catch {
+		return null; // a short, missing or unreadable drive holds no result
+	}
+}
+
+/* ------------------------------------------------------------------------------------ */
 /* Server                                                                                */
 /* ------------------------------------------------------------------------------------ */
 
@@ -816,6 +1043,9 @@ export interface VmRunnerOptions {
 	firecracker: string;
 	/** OTTR_VM_BOARD_HOST: the name resolved to the board ip the VMs may reach. */
 	boardHost: string;
+	/** The board's tcp port when a validate run's bake brings its tap up; /run requests
+	 * carry theirs in vm.boardUrl. Defaults to the board's 8080. */
+	boardPort?: number;
 	/** Startup network setup failure (vmNet.netStartup), null when it succeeded. */
 	netError: string | null;
 	launcher: VmLauncher;
@@ -1492,6 +1722,280 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 		});
 	}
 
+	/**
+	 * One validation job (docs/specs/microvm-validation-mode.md): builds the target and
+	 * scratch disks host-side, boots one VM with no network interface, waits for it under
+	 * the lifetime cap, reads the raw result drive and answers one JSON response. The
+	 * caller owns no stream: a gone client stops the VM through request.signal alone.
+	 */
+	async function startValidate(
+		body: ValidateRequest,
+		request: Request,
+		index: number,
+	): Promise<Response> {
+		const slot = slotFor(index);
+		const runDir = join(
+			opts.stateDir,
+			"runs",
+			`${index}-${randomBytes(4).toString("hex")}`,
+		);
+		const stopper = new AbortController();
+		let current: VmHandle | null = null;
+		let upBoard: BoardAddr | null = null; // set once the bake's slotUp ran: finish takes it down
+		const stop = (): void => {
+			stopper.abort();
+			current?.kill();
+		};
+		request.signal.addEventListener("abort", stop);
+		if (request.signal.aborted) stop();
+		mkdirSync(runDir, { recursive: true });
+		const startedAt = now();
+
+		/** The response for `result`; `error` says why it is absent or what was refused. */
+		const answer = (
+			result: ValidateResult | null,
+			error: string | null,
+		): ValidateResponse => {
+			const response: ValidateResponse = {
+				id: body.id,
+				selfCheck: result?.selfCheck ?? null,
+				missingControl: result?.missingControl ?? null,
+				job: result?.job ?? null,
+				artifacts: result?.artifacts ?? [],
+				limits: VM_VALIDATE,
+				bootMs: null,
+				totalMs: now() - startedAt,
+				logTail: current?.logTail().trim().slice(-1500) ?? "",
+				resultSource: result ? "guest" : "absent",
+			};
+			if (error) response.error = error;
+			return response;
+		};
+
+		/** Tears the job down and answers: the tap rule, the run dir, the slot. */
+		const finish = async (response: ValidateResponse): Promise<Response> => {
+			if (upBoard) await slotDown(exec, slot, upBoard);
+			removeRunDir(runDir);
+			slots.delete(index);
+			return Response.json(response);
+		};
+
+		/** Boots one VM and hands it to the stopper; a stop that raced the launch kills it. */
+		const boot = async (spec: VmLaunchSpec): Promise<VmHandle> => {
+			const vm = await opts.launcher(spec);
+			current = vm;
+			if (stopper.signal.aborted) vm.kill();
+			return vm;
+		};
+
+		/** Aborts when the job stops or the VM dies mid-flight. */
+		const guestSignal = (vm: VmHandle): AbortSignal => {
+			const gone = new AbortController();
+			void vm.exited.then(() => gone.abort());
+			return AbortSignal.any([stopper.signal, gone.signal]);
+		};
+
+		const halt = async (vm: VmHandle): Promise<void> => {
+			vm.kill();
+			await vm.exited;
+			if (current === vm) current = null;
+		};
+
+		/** Asks the booted bake VM to install the project's packages into its layer. */
+		const bakeTurn = async (
+			vm: VmHandle,
+			token: string,
+			signal: AbortSignal,
+		): Promise<BakeResult> => {
+			const r = await guestFetch(`${vm.guestUrl}/bake`, {
+				method: "POST",
+				headers: {
+					[GUEST_TOKEN_HEADER]: token,
+					"content-type": "application/json",
+				},
+				body: JSON.stringify({ project: body.project }),
+				signal,
+			});
+			if (!r.ok || !r.body)
+				return {
+					exitCode: 1,
+					stderrTail: `the bake guest answered ${r.status}: ${(await r.text()).slice(0, 500)}\n`,
+				};
+			// No stream carries the install notes to a validate caller; only ok/not matters.
+			const done = await relayLines(r.body, () => {}).catch(() => null);
+			return (
+				done ?? {
+					exitCode: 1,
+					stderrTail: `the bake microVM died: ${vm.logTail().trim().slice(-1500)}\n`,
+				}
+			);
+		};
+
+		/** Formats `image` populated from `staging`; a one-line error when mkfs failed. */
+		const mkfsPopulate = async (
+			what: string,
+			staging: string,
+			image: string,
+		): Promise<string | null> => {
+			const r = await exec(["mkfs.ext4", "-d", staging, "-F", "-q", image]);
+			return r.code === 0
+				? null
+				: `mkfs.ext4 ${what}: ${r.stderr.trim().slice(-500)}`;
+		};
+
+		try {
+			// The target: unpack the caller's tar into a fresh staging dir, then mkfs it into
+			// the ext4 the guest mounts read-only at /target. Payload plus mkfs overhead,
+			// never under 64 MiB, rounded up to the largest mkfs.ext4 block size (4 KiB).
+			const staging = join(runDir, "staging-target");
+			mkdirSync(staging, { recursive: true });
+			const target = await unpackTarget(
+				Bun.file(body.targetTar).stream(),
+				staging,
+			);
+			normalizeTargetModes(staging);
+			const targetExt4 = join(runDir, "target.ext4");
+			const targetBytes = Math.max(
+				64 * 1024 * 1024,
+				target.bytes + target.bytes / 3 + 16 * 1024 * 1024,
+			);
+			sparseFile(targetExt4, Math.ceil(targetBytes / 4096) * 4096);
+			const targetErr = await mkfsPopulate("target", staging, targetExt4);
+			if (targetErr !== null) return finish(answer(null, targetErr));
+			// The scratch: the job input and the writable dirs; the result drive stays
+			// zeroed until the guest writes it.
+			const scratchStaging = join(runDir, "staging-scratch");
+			writeJobStaging(scratchStaging, body);
+			const scratch = join(runDir, "scratch.ext4");
+			sparseFile(scratch, VM_VALIDATE.diskBytes);
+			const scratchErr = await mkfsPopulate("scratch", scratchStaging, scratch);
+			if (scratchErr !== null) return finish(answer(null, scratchErr));
+			const resultImg = join(runDir, "result.img");
+			sparseFile(resultImg, VM_VALIDATE.resultDriveBytes);
+
+			// The project layer, with the networked bake only on a cache miss: a validate
+			// run with a cached layer touches no network and no iptables.
+			const base = await opts.rootfs.base();
+			if (stopper.signal.aborted) return finish(answer(null, "stopped"));
+			const boardUp = async (): Promise<BoardAddr> => {
+				if (upBoard) return upBoard;
+				const board: BoardAddr = {
+					ip: await resolveHost(opts.boardHost),
+					port: opts.boardPort ?? 8080,
+				};
+				await slotUp(exec, slot, board);
+				upBoard = board;
+				return board;
+			};
+			const bake =
+				(basePath: string) =>
+				async (image: string): Promise<BakeResult> => {
+					const board = await boardUp();
+					const token = randomBytes(16).toString("hex");
+					let vm: VmHandle | null = null;
+					try {
+						vm = await boot({
+							runDir: join(runDir, "bake"),
+							mode: "bake",
+							slot,
+							vcpus: opts.vcpus,
+							memMiB: opts.memMiB,
+							kernel: opts.kernel,
+							drives: [
+								{ id: "vda", path: basePath, readOnly: true },
+								{ id: "vdb", path: image, readOnly: false },
+							],
+							bootArgs: bootArgs({
+								mode: "bake",
+								slot,
+								token,
+								boardIp: board.ip,
+								boardHost: opts.boardHost,
+							}),
+						});
+						const signal = guestSignal(vm);
+						await waitGuest(vm, signal);
+						await putFiles(
+							vm,
+							token,
+							workerListPaths(homeRoot, body.project).map((path) => ({
+								path,
+							})),
+							signal,
+						);
+						return await bakeTurn(vm, token, signal);
+					} catch (err) {
+						return { exitCode: 1, stderrTail: `${errText(err)}\n` };
+					} finally {
+						if (vm) await halt(vm);
+					}
+				};
+			const layer = await opts.rootfs.layer(body.project, bake(base.path));
+			if (stopper.signal.aborted) return finish(answer(null, "stopped"));
+			if (!layer.ok) return finish(answer(null, layer.stderrTail));
+
+			// The validate VM: fixed limits, five drives, no network interface.
+			const vm = await boot({
+				runDir: join(runDir, "validate"),
+				mode: "validate",
+				slot,
+				vcpus: VM_VALIDATE.vcpus,
+				memMiB: VM_VALIDATE.memMiB,
+				kernel: opts.kernel,
+				drives: [
+					{ id: "vda", path: base.path, readOnly: true },
+					{ id: "vdb", path: layer.path, readOnly: true },
+					{ id: "vdc", path: scratch, readOnly: false },
+					{ id: "vdd", path: resultImg, readOnly: false },
+					{ id: "vde", path: targetExt4, readOnly: true },
+				],
+				bootArgs: bootArgs({ mode: "validate" }),
+			});
+			// The guest kills the job at timeoutSec; the runner kills the VM at the lifetime
+			// cap even if the boot ate the slack: no validation outlives it.
+			const cap = setTimeout(
+				() => vm.kill(),
+				(VM_VALIDATE.timeoutSec + VM_VALIDATE.lifetimeSlackSec) * 1000,
+			);
+			let result: ValidateResult | null;
+			let error: string | null;
+			try {
+				await vm.exited;
+				result = readResultDrive(resultImg);
+				error =
+					result === null
+						? `the guest wrote no result: ${vm.logTail().trim().slice(-500)}`
+						: null;
+			} finally {
+				clearTimeout(cap);
+			}
+			const response = answer(result, error);
+			if (target.refused.length > 0) {
+				const refused = `the target tar held ${target.refused.length} refused name(s): ${target.refused.slice(0, 5).join(", ")}`;
+				response.error = response.error
+					? `${response.error}; ${refused}`
+					: refused;
+			}
+			// The result record sits outside the VM (parent-owned, like the skill's
+			// retained artifacts): a failed write appends to the error, never loses it.
+			try {
+				const record = join(dataRoot, body.project, "validate-jobs", body.id);
+				mkdirSync(record, { recursive: true });
+				writeFileSync(join(record, "result.json"), JSON.stringify(response));
+			} catch (err) {
+				const failed = `the result record failed to write: ${errText(err)}`;
+				response.error = response.error
+					? `${response.error}; ${failed}`
+					: failed;
+			}
+			return finish(response);
+		} catch (err) {
+			// A setup failure (tar, disks, boot) is the runner's, not the job's: it ends
+			// the job as an absent result, like a failed install ends a turn.
+			return finish(answer(null, `vm-runner: ${errText(err)}`));
+		}
+	}
+
 	/** Releases every active run's stream: the board restart drops them, but keeps the VMs. */
 	const detachAll = (): Response => {
 		// The board restart drops every /run stream: release them all, keep the VMs.
@@ -1611,6 +2115,34 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 		return response;
 	}
 
+	/**
+	 * The POST /validate endpoint (docs/specs/microvm-validation-mode.md): one synchronous
+	 * validation job in one network-less VM, answered with its result JSON. Health gate and
+	 * slot accounting share the /run machinery; the busy answer is the same.
+	 */
+	async function validateEndpoint(request: Request): Promise<Response> {
+		let body: unknown;
+		try {
+			body = await request.json();
+		} catch {
+			return new Response("bad json", { status: 400 });
+		}
+		const refusal = checkValidateBody(body, dataRoot);
+		if (refusal !== null) return new Response(refusal, { status: 400 });
+		// Not the busy answer: a host that cannot boot VMs is down, which the board's
+		// health probe already shows.
+		const health = vmRunnerHealth(opts, exists);
+		if (health !== null) return new Response(health, { status: 503 });
+		const index = freeSlot();
+		if (index === -1)
+			return new Response(`all ${opts.max} microVMs are taken`, {
+				status: 503,
+				headers: { "x-ottr-busy": "1" },
+			});
+		slots.add(index);
+		return startValidate(body as ValidateRequest, request, index);
+	}
+
 	return Bun.serve({
 		port: opts.port ?? 8787,
 		hostname: "0.0.0.0",
@@ -1626,6 +2158,11 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 			}
 			const answered = await handleDetach(request, url);
 			if (answered !== null) return answered;
+			if (request.method === "POST" && url.pathname === "/validate") {
+				if (!authorized(request))
+					return new Response("unauthorized", { status: 401 });
+				return validateEndpoint(request);
+			}
 			// /sweep and /signins are classic-worker concerns: a VM leaves no process behind
 			// and holds no omp store.
 			if (request.method !== "POST" || url.pathname !== "/run")

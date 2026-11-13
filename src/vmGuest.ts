@@ -732,6 +732,14 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 }
 
 if (import.meta.main) {
+	// Validation mode runs the guest flow of src/vmValidate.ts: one job, no HTTP, no token.
+	// Dynamic import by contract (OTTR-874): the validate-only flow stays out of the serve
+	// path the classic turn VM boots, and the mode is only known at runtime.
+	if (process.env.OTTR_VM_MODE === "validate") {
+		const { runValidationMode } = await import("./vmValidate.ts");
+		await runValidationMode();
+		process.exit(0);
+	}
 	const token = process.env.OTTR_VM_GUEST_TOKEN;
 	if (!token) {
 		console.error("vmGuest: OTTR_VM_GUEST_TOKEN is not set");
