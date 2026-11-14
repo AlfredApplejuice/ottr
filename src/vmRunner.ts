@@ -13,6 +13,7 @@ import {
 	closeSync,
 	constants,
 	existsSync,
+	futimesSync,
 	lstatSync,
 	mkdirSync,
 	openSync,
@@ -25,12 +26,12 @@ import {
 	type Stats,
 	symlinkSync,
 	unlinkSync,
-	utimesSync,
 	writeFileSync,
 	writeSync,
 } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, isAbsolute, join, posix, relative } from "node:path";
+import { type Dir, openDir, withDir } from "./confine.ts";
 import {
 	type BoardAddr,
 	boardPort,
@@ -474,29 +475,32 @@ function copyOutTarget(
 
 /** True when the member may replace an existing file: only one this run copied in. */
 function replaceableCopyOut(
+	d: Dir,
 	abs: string,
 	copiedIn: ReadonlySet<string>,
 ): boolean {
 	try {
-		const st = lstatSync(abs);
+		const st = lstatSync(d.at(posix.basename(abs)));
 		return !st.isDirectory() && copiedIn.has(abs);
 	} catch {
 		return true; // missing: a new file
 	}
 }
 
-/** Writes one copy-out member through a temp file and rename. */
+/**
+ * Writes one copy-out member through a temp file and rename, both inside the parent `d`
+ * that the walk holds open: a parent a worker swaps for a symlink meanwhile is never
+ * followed.
+ */
 async function writeCopyOutMember(
 	m: TarMember,
+	d: Dir,
 	abs: string,
 	data: AsyncGenerator<Uint8Array>,
 	written: string[],
 ): Promise<void> {
-	const parent = dirname(abs);
-	const tmp = join(
-		parent,
-		`.${posix.basename(abs)}.ottr-copyout-${randomBytes(4).toString("hex")}`,
-	);
+	const name = posix.basename(abs);
+	const tmp = d.at(`.${name}.ottr-copyout-${randomBytes(4).toString("hex")}`);
 	const fd = openSync(
 		tmp,
 		constants.O_WRONLY |
@@ -510,14 +514,14 @@ async function writeCopyOutMember(
 			let off = 0;
 			while (off < chunk.length) off += writeSync(fd, chunk, off);
 		}
+		futimesSync(fd, m.mtime, m.mtime);
 	} catch (err) {
 		closeSync(fd);
 		unlinkSync(tmp);
 		throw err;
 	}
 	closeSync(fd);
-	utimesSync(tmp, m.mtime, m.mtime);
-	renameSync(tmp, abs);
+	renameSync(tmp, d.at(name));
 	written.push(abs);
 }
 
@@ -526,9 +530,10 @@ async function writeCopyOutMember(
  * under `root` (/data/<project>). A member outside `dir`, with a ".." component or an
  * absolute name is refused; so is one whose path on the host crosses a symlink or a
  * non-directory, and one whose target already exists unless it is a file this run copied
- * in (`copiedIn`): a VM creates new files and updates its own, never others. Files land
- * through a temp file and rename, which replaces a link at the target instead of writing
- * through it.
+ * in (`copiedIn`): a VM creates new files and updates its own, never others. The parent
+ * dir is opened one component at a time from root's parent (the volume mount) and held
+ * open (src/confine.ts), and files land through a temp file and rename inside it, which
+ * replaces a link at the target instead of writing through it.
  */
 export async function extractCopyOut(
 	stream: ReadableStream<Uint8Array>,
@@ -542,34 +547,36 @@ export async function extractCopyOut(
 	await readTar(stream, async (m, data) => {
 		if (m.type !== "0") return;
 		const abs = copyOutTarget(m, root, scope);
-		if (
-			abs === null ||
-			!realDirChain(root, dirname(abs)) ||
-			!replaceableCopyOut(abs, copiedIn)
-		) {
+		const d = abs === null ? null : openCopyOutParent(root, dirname(abs));
+		if (abs === null || d === null) {
 			refused.push(m.name);
 			return;
 		}
-		await writeCopyOutMember(m, abs, data, written);
+		try {
+			if (!replaceableCopyOut(d, abs, copiedIn)) refused.push(m.name);
+			else await writeCopyOutMember(m, d, abs, data, written);
+		} finally {
+			d.close();
+		}
 	});
 	return { written, refused };
 }
 
-/** True when every component from root to dir is a real directory (created when missing). */
-function realDirChain(root: string, dir: string): boolean {
-	let cur = root;
-	const rest = relative(root, dir);
-	for (const part of ["", ...(rest === "" ? [] : rest.split("/"))]) {
-		if (part) cur = join(cur, part);
-		try {
-			const st = lstatSync(cur);
-			if (!st.isDirectory()) return false; // a symlink or a file: never crossed
-		} catch {
-			if (cur === root) return false; // the project's data dir itself must exist
-			mkdirSync(cur, { mode: 0o755 });
-		}
+/**
+ * Opens `dir` below `root` without following a symlink at any component, root included,
+ * and makes the missing components below root. Null when a component is a symlink or a
+ * file, or when root itself is missing: the project's data dir must exist.
+ */
+function openCopyOutParent(root: string, dir: string): Dir | null {
+	const anchor = dirname(root);
+	try {
+		withDir(anchor, root, {}, () => {});
+		return openDir(anchor, dir, { create: true });
+	} catch (err) {
+		const e = err as NodeJS.ErrnoException;
+		if (e.code === "ENOENT" || e.message?.startsWith("refusing ")) return null;
+		throw err;
 	}
-	return true;
 }
 
 /* ------------------------------------------------------------------------------------ */

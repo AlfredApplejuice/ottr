@@ -1714,6 +1714,13 @@ anchor, for example at `.worktrees` or `.git/info`, stops the operation with a
 `refusing <path>` error. A git dir outside the project checkout gets no exclude entry: the
 board refuses it, because a worker can point `.git` at any dir.
 
+The VM runner (`vm-runner` service) mounts the `ottr-data` volume too. When it copies the
+new files of a turn back to `/data/<project>`, it uses the same `src/confine.ts` walk. The
+anchor is `/data`. The runner holds the parent dir of each file open, and it makes the temp
+file and the rename in that dir. A worker that changes a parent into a symlink during the
+copy cannot move the file out of `/data/<project>`. The runner refuses a member when a
+parent is a symlink or a file.
+
 Limits: omp writes its own session files in `sessions/` for turns that the board runs. This
 guard does not cover them.
 

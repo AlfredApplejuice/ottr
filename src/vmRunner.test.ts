@@ -5,6 +5,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	statSync,
 	symlinkSync,
@@ -48,6 +49,7 @@ import { type VmSpec, WORKER_DONE, type WorkerRequest } from "./workers.ts";
 
 const root = mkdtempSync(join(tmpdir(), "ottr-vmrunner-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
+const linux = process.platform === "linux";
 
 const stoppers: (() => void)[] = [];
 afterEach(() => {
@@ -1492,40 +1494,84 @@ describe("tar", () => {
 		expect(ln?.m.linkname).toBe(`/${"z".repeat(150)}`);
 	});
 
-	test("copy-out never writes through a symlinked dir under the project root", async () => {
-		const dataRoot = mkdtempSync(join(root, "co-"));
-		const proj = join(dataRoot, "proj");
-		const outside = join(dataRoot, "outside");
-		mkdirSync(proj);
-		mkdirSync(outside);
-		symlinkSync(outside, join(proj, "sessions"));
-		const out = await extractCopyOut(
-			bodyOf(
-				rawTar([
-					{ name: `${proj.slice(1)}/sessions/x.txt`, content: "x" },
-					{ name: `${proj.slice(1)}/ok/y.txt`, content: "y" },
-				]),
-			),
-			proj,
-			proj,
-			new Set(),
-		);
-		expect(existsSync(join(outside, "x.txt"))).toBe(false);
-		expect(out.refused).toEqual([`${proj.slice(1)}/sessions/x.txt`]);
-		expect(readFileSync(join(proj, "ok", "y.txt"), "utf8")).toBe("y");
-		// A link at the target itself (a file the run copied in) is replaced, not written
-		// through.
-		writeFileSync(join(outside, "target"), "keep");
-		symlinkSync(join(outside, "target"), join(proj, "ok", "z.txt"));
-		await extractCopyOut(
-			bodyOf(rawTar([{ name: `${proj.slice(1)}/ok/z.txt`, content: "new" }])),
-			proj,
-			proj,
-			new Set([join(proj, "ok", "z.txt")]),
-		);
-		expect(readFileSync(join(outside, "target"), "utf8")).toBe("keep");
-		expect(readFileSync(join(proj, "ok", "z.txt"), "utf8")).toBe("new");
-	});
+	// The symlink guard (src/confine.ts) needs /proc/self/fd: Linux only, like the VM runner.
+	test.skipIf(!linux)(
+		"copy-out never writes through a symlinked dir under the project root",
+		async () => {
+			const dataRoot = mkdtempSync(join(root, "co-"));
+			const proj = join(dataRoot, "proj");
+			const outside = join(dataRoot, "outside");
+			mkdirSync(proj);
+			mkdirSync(outside);
+			symlinkSync(outside, join(proj, "sessions"));
+			const out = await extractCopyOut(
+				bodyOf(
+					rawTar([
+						{ name: `${proj.slice(1)}/sessions/x.txt`, content: "x" },
+						{ name: `${proj.slice(1)}/ok/y.txt`, content: "y" },
+					]),
+				),
+				proj,
+				proj,
+				new Set(),
+			);
+			expect(existsSync(join(outside, "x.txt"))).toBe(false);
+			expect(out.refused).toEqual([`${proj.slice(1)}/sessions/x.txt`]);
+			expect(readFileSync(join(proj, "ok", "y.txt"), "utf8")).toBe("y");
+			// A link at the target itself (a file the run copied in) is replaced, not written
+			// through.
+			writeFileSync(join(outside, "target"), "keep");
+			symlinkSync(join(outside, "target"), join(proj, "ok", "z.txt"));
+			await extractCopyOut(
+				bodyOf(rawTar([{ name: `${proj.slice(1)}/ok/z.txt`, content: "new" }])),
+				proj,
+				proj,
+				new Set([join(proj, "ok", "z.txt")]),
+			);
+			expect(readFileSync(join(outside, "target"), "utf8")).toBe("keep");
+			expect(readFileSync(join(proj, "ok", "z.txt"), "utf8")).toBe("new");
+		},
+	);
+
+	// OTTR-954: a worker shares the data volume and can swap a parent dir for a symlink
+	// after the walk checked it. The write must stay in the dir the walk opened.
+	test.skipIf(!linux)(
+		"copy-out stays in the held parent when a worker swaps it for a symlink mid-write",
+		async () => {
+			const dataRoot = mkdtempSync(join(root, "co-swap-"));
+			const proj = join(dataRoot, "proj");
+			const outside = join(dataRoot, "outside");
+			mkdirSync(join(proj, "sub"), { recursive: true });
+			mkdirSync(outside);
+			const bytes = rawTar([
+				{ name: `${proj.slice(1)}/sub/x.txt`, content: "x" },
+			]);
+			let step = 0;
+			let atSwap: string[] = [];
+			const stream = new ReadableStream<Uint8Array>(
+				{
+					pull(c) {
+						if (step === 0) c.enqueue(bytes.slice(0, 512));
+						else if (step === 1) {
+							// The member's header is read and its temp file is open in sub.
+							atSwap = readdirSync(join(proj, "sub"));
+							renameSync(join(proj, "sub"), join(proj, "held"));
+							symlinkSync(outside, join(proj, "sub"));
+							c.enqueue(bytes.slice(512));
+						} else c.close();
+						step++;
+					},
+				},
+				{ highWaterMark: 0 },
+			);
+			const out = await extractCopyOut(stream, proj, proj, new Set());
+			expect(atSwap).toHaveLength(1);
+			expect(out.written).toEqual([join(proj, "sub", "x.txt")]);
+			expect(readdirSync(outside)).toEqual([]);
+			expect(readdirSync(join(proj, "held"))).toEqual(["x.txt"]);
+			expect(readFileSync(join(proj, "held", "x.txt"), "utf8")).toBe("x");
+		},
+	);
 
 	test("a corrupt header is an error, not a silent partial extract", async () => {
 		const bytes = rawTar([{ name: "data/p/a.txt", content: "a" }]);
