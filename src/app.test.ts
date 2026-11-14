@@ -21092,6 +21092,32 @@ describe("releaseUsageHolds (OTTR-688)", () => {
 		return t;
 	};
 
+	test("OTTR-960: a release line hold (no provider) stays across a blocked-then-free refresh", async () => {
+		const a = {
+			store: await ProjectStore.open(join(root, "quota-release-line")),
+			name: "a",
+		};
+		const gate = await held(a.store, "release line wait", {
+			holdUntil: NOW + 86_400_000,
+			holdProvider: null,
+			holdWindow: null,
+			holdSetAt: NOW - 2_000,
+		});
+		const prev = quota([window({ provider: "zai", usedPct: 100 })]);
+		prev.at = NOW - 3_000;
+		const released = await releaseUsageHolds(
+			quota([window({ provider: "zai", usedPct: 10 })]),
+			[a],
+			NOW,
+			prev,
+		);
+		expect(released).toBe(0);
+		const after = (await a.store.getTask(gate.id))!;
+		expect(after.holdUntil).toBe(NOW + 86_400_000);
+		expect(after.holdProvider).toBeNull();
+		await closeTestStore(a.store);
+	});
+
 	test("frees the held provider across projects and keeps every other hold", async () => {
 		const a = {
 			store: await ProjectStore.open(join(root, "quota-a")),

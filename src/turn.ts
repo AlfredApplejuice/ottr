@@ -244,6 +244,7 @@ import {
 	parseKeptChoices,
 	planKeptFinish,
 	type quarantineUntracked,
+	runProjectCheck,
 	type saveDoneFiles,
 	slugify,
 	targetTracksRules,
@@ -950,6 +951,10 @@ export interface TurnOps {
 	 * gates, or a still-rejected retry push is what queues the recovery steer. */
 	rebaseTargetBranch: typeof rebaseTargetBranch;
 	runMergeGates: typeof runMergeGates;
+	/** OTTR-960: the project check a Dependabot park re-runs in the card's worktree; the
+	 * release-line hold reads the release-line step's marker line from its output.
+	 * Optional: absent runs the real runProjectCheck. */
+	runProjectCheck?: typeof runProjectCheck;
 	/** OTTR-465: the credential kinds the server's git can use for a push to a URL (a card-log line, never a value); null for a non-URL pin. */
 	pushAuthKind?: (url: string) => string | null;
 	/** PR mode: pushes the card branch to the pinned origin from the main checkout (same plumbing as serverMergePush). */
@@ -7984,7 +7989,10 @@ export function createTurnLoop(
 		// The PR-mode ship step owns the card's next state: it never lands, so the done
 		// write below (pushSha pinning, worktree removal, release stamping) is skipped.
 		if (st.prNext !== null) next = st.prNext;
-		return { facts, next: await stampUsageHold(st, next) };
+		return {
+			facts,
+			next: await stampReleaseLineHold(st, await stampUsageHold(st, next)),
+		};
 	}
 
 	/** A run the provider stopped at its usage limit continues automatically (classify's
@@ -8044,6 +8052,110 @@ export function createTurnLoop(
 			holdWindow: null,
 			holdAttempts: attempts,
 			needsReason: `${QUOTA_LIMIT} - the quota report shows no exhausted window, and the error names no reset time. The board tries again at ${at} UTC. Cancel to stop it instead.`,
+		};
+	}
+
+	/** The blocked packages a check run's release-line step reported (OTTR-960): the exact
+	 * `release line blocked: ` marker line the script prints after its human failure lines.
+	 * Null when the run's failure was not that gate: no marker line, more than one, a
+	 * broken body, or no valid entry. The parse runs on the board's own check run, never
+	 * on agent text, so a quoted marker line cannot forge the hold. */
+	function releaseLineBlock(
+		output: string,
+	): { name: string; version: string; waitUntilMs: number }[] | null {
+		const lines = output
+			.split("\n")
+			.filter((line) => line.startsWith("release line blocked: "));
+		if (lines.length !== 1) return null;
+		const prefix = "release line blocked: ";
+		let body: unknown;
+		try {
+			body = JSON.parse(lines[0]!.slice(prefix.length));
+		} catch {
+			return null;
+		}
+		if (
+			typeof body !== "object" ||
+			body === null ||
+			!("blocked" in body) ||
+			!Array.isArray(body.blocked) ||
+			body.blocked.length === 0
+		)
+			return null;
+		const entries: {
+			name: string;
+			version: string;
+			waitUntilMs: number;
+		}[] = [];
+		for (const item of body.blocked) {
+			if (
+				typeof item !== "object" ||
+				item === null ||
+				!("name" in item) ||
+				!("version" in item) ||
+				!("waitUntilMs" in item)
+			)
+				return null;
+			const { name, version, waitUntilMs } = item;
+			if (
+				typeof name !== "string" ||
+				typeof version !== "string" ||
+				typeof waitUntilMs !== "number" ||
+				!Number.isFinite(waitUntilMs)
+			)
+				return null;
+			entries.push({ name, version, waitUntilMs });
+		}
+		return entries;
+	}
+
+	/** OTTR-960: a Dependabot card the release-line gate parked waits with a timer instead
+	 * of a human. On a needs_you park with no ask, the board re-runs the project check in
+	 * the card's worktree; a run that failed while carrying exactly one release-line
+	 * marker line failed at that gate (the chain is &&-ordered and the release-line step
+	 * is not last, so earlier steps passed and later steps never ran). The hold is the
+	 * latest per-package clear time; the scheduler restarts the turn when it passes. Any
+	 * other failure keeps the needs_you park. */
+	async function stampReleaseLineHold(
+		st: TurnSettle,
+		next: Next,
+	): Promise<Next> {
+		if (
+			next.state !== "needs_you" ||
+			next.asked !== undefined ||
+			st.task.sourcePrDependabot !== true ||
+			!(st.kind === "work" || st.kind === "merge") ||
+			st.idn.interview ||
+			st.idn.grill ||
+			st.idn.scout ||
+			st.idn.reviewCard ||
+			st.idn.releaseCard
+		)
+			return next;
+		const wt = join(st.store.worktreesDir, st.id);
+		if (!existsSync(wt)) return next;
+		const probe = await (ops.runProjectCheck ?? runProjectCheck)(wt).catch(
+			() => null,
+		);
+		if (probe === null || probe.ok) return next;
+		const blocked = releaseLineBlock(probe.output);
+		if (blocked === null) return next;
+		const holdUntil = Math.max(...blocked.map((b) => b.waitUntilMs));
+		if (!(holdUntil > Date.now())) return next;
+		const names = blocked.map((b) => `${b.name} ${b.version}`).join(", ");
+		const at = new Date(holdUntil).toISOString().slice(0, 16).replace("T", " ");
+		await st.log(`- release line gate: holding until ${at} UTC: ${names}`);
+		return {
+			...next,
+			state: "queued",
+			holdUntil,
+			holdProvider: null,
+			holdWindow: null,
+			holdAttempts: st.task.holdAttempts,
+			needsReason: `The release line gate blocks this card: ${names}. The board runs the card again after the lines settle at ${at} UTC. Send a message to run it now, or cancel the card.`,
+			pendingPrompt:
+				"Continue this task: the release line wait has passed. Re-run the gates (bun run check, bun test) and continue the pipeline.",
+			pendingBy: "supervisor",
 		};
 	}
 

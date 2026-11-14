@@ -2160,6 +2160,32 @@ export async function runMergeGates(
 }
 
 /**
+ * OTTR-960: the project check a settle re-runs in a card's worktree when a Dependabot
+ * card parks. `bun run check` only — `bun test` takes minutes and the release-line hold
+ * never needs it. The spawn names process.execPath (bun itself) like runMergeGates, so a
+ * planted PATH cannot substitute another binary; the env carries no hosted
+ * identity-signing key. The output comes back uncapped: the caller parses the
+ * release-line step's marker line from it. Killed after 30 minutes.
+ */
+export async function runProjectCheck(
+	dir: string,
+): Promise<{ ok: boolean; output: string }> {
+	const env = { ...process.env };
+	delete env[HOSTED_SECRET_ENV];
+	const check = Bun.spawn([process.execPath, "run", "check"], {
+		cwd: dir,
+		env,
+		stdout: "pipe",
+		stderr: "pipe",
+		timeout: 1_800_000,
+	});
+	const out = await new Response(check.stdout).text();
+	const err = await new Response(check.stderr).text();
+	const code = await check.exited;
+	return { ok: code === 0, output: `${out}${err}` };
+}
+
+/**
  * OTTR-274: whether the commits a server push would ship (refs/heads/<branch>) carry exactly the
  * approved hold's content change (base..approvedHead), plus the push-side diff for the reviewer
  * and the audited origin tip for the push's lease. A merge turn resumes the same agent session

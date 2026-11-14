@@ -145,3 +145,42 @@ export function lineCapReached(
 	const wait = lineWait(releases, version, now, ageMs, version);
 	return wait !== null && wait > capMs;
 }
+
+/**
+ * The earliest epoch ms at which the gate passes for `version` (OTTR-960): the earlier of
+ * its line's settle time (the newest young counted release above it turns `ageMs` old)
+ * and its line's cap time (the oldest aged counted release at or above it plus `capMs`).
+ * Null when `version` is not blocked now: the board holds a card only for a future time.
+ */
+export function releaseLineWaitUntil(
+	releases: RegistryRelease[],
+	version: string,
+	now: number,
+	ageMs: number,
+	capMs: number,
+): number | null {
+	if (unsettledBlocker(releases, version, now, ageMs) === null) return null;
+	if (lineCapReached(releases, version, now, ageMs, capMs)) return null;
+	const line = lineKey(version);
+	const youngAbove = releases.filter(
+		(r) =>
+			counts(r) &&
+			lineKey(r.version) === line &&
+			compareVersions(r.version, version) > 0 &&
+			!isAged(r, now, ageMs),
+	);
+	// unsettledBlocker is non-null, so at least one young release sits above.
+	const settleAt = Math.max(...youngAbove.map((r) => r.publishedAt + ageMs));
+	const floor = releases.filter(
+		(r) =>
+			counts(r) &&
+			lineKey(r.version) === line &&
+			compareVersions(r.version, version) >= 0 &&
+			isAged(r, now, ageMs),
+	);
+	const capAt =
+		floor.length === 0
+			? Number.POSITIVE_INFINITY
+			: Math.min(...floor.map((r) => r.publishedAt)) + capMs;
+	return Math.min(settleAt, capAt);
+}

@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 import {
 	lineCapReached,
 	type RegistryRelease,
+	releaseLineWaitUntil,
 	unsettledBlocker,
 } from "../src/releaseLine.ts";
 
@@ -233,6 +234,11 @@ async function fetchReleases(name: string): Promise<RegistryRelease[]> {
 async function scan(): Promise<number> {
 	const now = Date.now();
 	const failures: string[] = [];
+	const blocked: {
+		name: string;
+		version: string;
+		waitUntilMs: number;
+	}[] = [];
 	for (const pkg of changedPackages()) {
 		let releases: RegistryRelease[];
 		try {
@@ -250,10 +256,23 @@ async function scan(): Promise<number> {
 		if (lineCapReached(releases, pkg.version, now, AGE_MS, CAP_MS)) continue;
 		const days = Math.floor((now - blocker.publishedAt) / DAY_MS);
 		const line = `release line not settled: ${pkg.name} ${pkg.version}, ${blocker.version} is ${days} days old`;
-		if (pkg.direct) failures.push(line);
-		else console.error(`warning: ${line} (transitive)`);
+		if (pkg.direct) {
+			failures.push(line);
+			// OTTR-960: the machine-readable clear time the board's hold reads.
+			const waitUntilMs = releaseLineWaitUntil(
+				releases,
+				pkg.version,
+				now,
+				AGE_MS,
+				CAP_MS,
+			);
+			if (waitUntilMs !== null)
+				blocked.push({ name: pkg.name, version: pkg.version, waitUntilMs });
+		} else console.error(`warning: ${line} (transitive)`);
 	}
 	for (const line of failures) console.error(line);
+	if (blocked.length > 0)
+		console.log(`release line blocked: ${JSON.stringify({ blocked })}`);
 	return failures.length > 0 ? 1 : 0;
 }
 

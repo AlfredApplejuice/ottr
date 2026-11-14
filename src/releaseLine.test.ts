@@ -4,6 +4,7 @@ import {
 	lineCapReached,
 	type RegistryRelease,
 	releaseLineAccepts,
+	releaseLineWaitUntil,
 	settledLineTarget,
 	unsettledBlocker,
 } from "./releaseLine.ts";
@@ -159,6 +160,69 @@ describe("releaseLineAccepts", () => {
 		const young = [rel("1.0.1", 12), rel("1.0.2", 9), rel("1.0.3", 2)];
 		expect(releaseLineAccepts(young, "1.0.1", NOW, AGE, CAP)).toBe(false);
 		expect(releaseLineAccepts(young, "1.0.2", NOW, AGE, CAP)).toBe(false);
+	});
+});
+
+describe("releaseLineWaitUntil", () => {
+	test("the settle time is the young release above turning old", () => {
+		// 1.2.5 aged 2 days blocks 1.2.0: the gate passes when 1.2.5 turns 7.
+		expect(
+			releaseLineWaitUntil(
+				[rel("1.2.0", 8), rel("1.2.5", 2)],
+				"1.2.0",
+				NOW,
+				AGE,
+				CAP,
+			),
+		).toBe(NOW + 5 * DAY);
+	});
+
+	test("two young releases above settle at the earliest cap when it lifts first", () => {
+		// The line's wait started with 1.2.0 aged 10 days: the cap ends it in 4 days,
+		// before 1.2.6 (the youngest, aged 1) turns 7.
+		const releases = [rel("1.2.0", 10), rel("1.2.5", 2), rel("1.2.6", 1)];
+		expect(releaseLineWaitUntil(releases, "1.2.0", NOW, AGE, CAP)).toBe(
+			NOW + 4 * DAY,
+		);
+	});
+
+	test("two young releases above settle at the last age-out when no cap interferes", () => {
+		// 1.2.0 aged 8 days: the cap is 6 days out, the settle 6 days out; a
+		// still-older line start keeps both above the last age-out.
+		const releases = [rel("1.2.0", 8), rel("1.2.5", 2), rel("1.2.6", 1)];
+		expect(releaseLineWaitUntil(releases, "1.2.0", NOW, AGE, CAP)).toBe(
+			NOW + 6 * DAY,
+		);
+	});
+
+	test("a settled version is not blocked", () => {
+		expect(
+			releaseLineWaitUntil([rel("1.2.0", 8)], "1.2.0", NOW, AGE, CAP),
+		).toBeNull();
+	});
+
+	test("a cap-lifted version is not blocked", () => {
+		expect(
+			releaseLineWaitUntil(
+				[rel("1.2.0", 20), rel("1.2.5", 2)],
+				"1.2.0",
+				NOW,
+				AGE,
+				CAP,
+			),
+		).toBeNull();
+	});
+
+	test("a young release in another line never counts", () => {
+		expect(
+			releaseLineWaitUntil(
+				[rel("1.2.0", 8), rel("1.3.0", 1)],
+				"1.2.0",
+				NOW,
+				AGE,
+				CAP,
+			),
+		).toBeNull();
 	});
 });
 

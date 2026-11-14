@@ -254,6 +254,77 @@ local registry listener, fixture lock derived from the real `bun.lock`):
     open fail card, v1.3.1 aged 2 days: the target is null (line 1.2 waited 8 days; the
     cap on line 1.3 is above the walk and cannot bless v1.2.0).
 
+## Board auto-hold for Dependabot cards (OTTR-960)
+
+A Dependabot card whose gates fail only on this check parks needs_you and waits for a
+person to re-run its turn after the wait. The board now waits with a timer and starts the
+turn again by itself when the line settles.
+
+### Marker: the script's machine-readable report
+
+`scan()` collects, for every failed direct package, one entry
+`{ name, version, waitUntilMs }`. After the human failure lines it prints exactly one
+line to stdout:
+
+```
+release line blocked: {"blocked":[{"name":"@biomejs/biome","version":"2.6.7","waitUntilMs":1763485440000}]}
+```
+
+Transitive warnings never enter: they never fail the check. `waitUntilMs` is the earliest
+epoch ms at which the gate passes for that package: the earlier of
+
+- **settle**: the newest young counted release above the installed version turns `ageMs`
+  old (`max(publishedAt of young counted releases above) + ageMs`), and
+- **cap**: the oldest aged counted release at or above the installed version plus
+  `capMs`.
+
+New pure function `releaseLineWaitUntil(releases, version, now, ageMs, capMs)` in
+`src/releaseLine.ts`; null when `version` is not blocked now.
+
+### The board's hold (`src/turn.ts`)
+
+At a settle whose classified outcome is needs_you with no ask, on a card with
+`sourcePrDependabot true`, turn kind work or merge, and no interview, grill, scout,
+review, or release identity, the board re-runs the project check itself in the card's
+worktree (`worktreesDir/<id>`; a missing worktree keeps the park). The run goes through a
+new optional ops seam `runProjectCheck`, whose default (`src/worktree.ts`) spawns
+`bun run check` like `runMergeGates` does (same env rule, 30-minute kill) and returns the
+uncapped combined output.
+
+**Attribution.** The check chain is `&&`-ordered and the release-line step is not its
+last step, so a run that exits non-zero and carries exactly one
+`release line blocked: ` marker line failed at that gate: every earlier step passed and
+the steps after it never ran. Any other failure — no marker line, more than one, a
+broken body, or a latest clear time already past — keeps today's needs_you park. The
+parse reads the board's own run output, never agent text.
+
+**Arm.** The park becomes `state queued` at the unchanged stage with:
+
+- `holdUntil` = the latest `waitUntilMs` (it must be in the future),
+- `holdProvider` null: the quota refresh never releases the hold, because
+  `releaseUsageHolds` skips null-provider holds,
+- `holdAttempts` unchanged (not a usage hold), `holdSetAt` = the settle time,
+- `needsReason` naming the packages and the UTC time,
+- `pendingPrompt` = the resume line, authored by the supervisor.
+
+At `holdUntil` the scheduler picks the card and its turn runs again. A user message
+still runs the card now: the existing reply and requeue paths write `holdUntil null`.
+
+### Acceptance checks
+
+21. `releaseLineWaitUntil`: blocked by one young release above → its publish time plus
+    `ageMs`; with the cap earlier → the cap time; not blocked → null; two young releases
+    above → the newest one's publish time plus `ageMs`.
+22. Script: the unsettled direct dependency fixture exits 1 with the human line and the
+    exact marker line naming the package, version, and the computed `waitUntilMs`.
+23. Fake clock: a Dependabot card whose check run fails with marker times T1 < T2 parks
+    `state queued` with `holdUntil T2`; `pickRunnable` at `now = T2` picks the card, at
+    `T2 - 1` it does not. Each fails before the change.
+24. The same card with a check run that fails on another step (no marker line) keeps
+    today's needs_you park.
+25. `releaseUsageHolds` leaves the armed hold (null provider) armed across a quota
+    refresh that saw the provider blocked and then free.
+
 Gates: `bun run check` and `bun test` exit 0.
 
 ## Non-goals
@@ -261,6 +332,8 @@ Gates: `bun run check` and `bun test` exit 0.
 - G21 and the other projects (later, after this works).
 - GitHub Actions, Docker base image, Dependabot behavior, the 7-day age.
 - No new dependency; no ADR.
+- The gate's rule, the Dependabot config, and non-Dependabot cards stay unchanged
+  (OTTR-960). `bun test` takes no part in the attribution.
 
 ## Alternatives considered
 
@@ -269,6 +342,11 @@ Gates: `bun run check` and `bun test` exit 0.
 - Teaching Bun or Dependabot the rule: rejected; their configs cannot express it
   (decision 6 records the cooldown stays).
 - A per-package threshold configuration: rejected; one rule with fixed 7 and 14 days.
+- Parsing the agent's park reason for the wait: rejected; agent text can quote any
+  marker, so the board reads only its own check run's output.
+- Probing only the release-line script without the check chain: rejected; the marker
+  alone proves the gate red, not that the run failed at the gate, so another red gate
+  would also arm the timer.
 
 ## Risks
 
@@ -279,3 +357,8 @@ Gates: `bun run check` and `bun test` exit 0.
   shape and the spec names the revisit trigger.
 - The cap can take an unsettled-line version after 14 days of waiting; that is the
   decided tradeoff against waiting forever.
+- A red `bun test` beside the gate still arms the timer (the probe runs the check chain
+  only): the resumed turn fails its gates again and parks needs_you with the gate green,
+  so the park then sticks. One wasted turn, then the human decides.
+- The probe runs the full check chain (about a minute, plus registry calls) inside the
+  settle; it runs only for Dependabot needs_you parks with no ask.

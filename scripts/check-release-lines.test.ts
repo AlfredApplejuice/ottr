@@ -212,7 +212,8 @@ async function runScript(
 }
 
 describe("check-release-lines (live spawns)", () => {
-	test("unsettled direct dependency: exact failure line, exact GET", async () => {
+	test("unsettled direct dependency: exact failure line, exact GET, exact marker", async () => {
+		const published = Date.now();
 		const repo = fixture(
 			{ mermaid: "12.1.0", babel: "8.0.6" },
 			{ mermaid: "12.2.0", babel: "8.0.6" },
@@ -224,7 +225,7 @@ describe("check-release-lines (live spawns)", () => {
 			]),
 		});
 		try {
-			const { stderr, code } = await runScript(repo, reg.base);
+			const { stdout, stderr, code } = await runScript(repo, reg.base);
 			expect(code).toBe(1);
 			const lines = stderr.split("\n").filter((line) => line !== "");
 			expect(lines).toContain(
@@ -234,6 +235,31 @@ describe("check-release-lines (live spawns)", () => {
 			expect(reg.requests).toEqual([
 				{ method: "GET", url: `${reg.base}/mermaid` },
 			]);
+			// spec check 22: one machine-readable marker line on stdout. 12.2.1 was
+			// published `published - 2d - 1h` (settle at +5d - 1h), but the installed
+			// 12.2.0 is 10d 1h old, so its line's 14-day cap ends earlier, at
+			// `published - 10d - 1h + 14d` — that is the clear time (5s covers the ms
+			// between the two Date.now calls).
+			const markers = stdout
+				.split("\n")
+				.filter((line) => line.startsWith("release line blocked: "));
+			expect(markers).toHaveLength(1);
+			const body = JSON.parse(
+				markers[0]!.slice("release line blocked: ".length),
+			) as {
+				blocked: { name: string; version: string; waitUntilMs: number }[];
+			};
+			expect(body.blocked).toEqual([
+				{
+					name: "mermaid",
+					version: "12.2.0",
+					waitUntilMs: expect.any(Number),
+				},
+			]);
+			const expected = published - 10 * DAY_MS - HOUR_MS + 14 * DAY_MS;
+			expect(Math.abs(body.blocked[0]!.waitUntilMs - expected)).toBeLessThan(
+				5_000,
+			);
 		} finally {
 			reg.stop();
 			rmSync(repo, { recursive: true, force: true });
@@ -252,7 +278,7 @@ describe("check-release-lines (live spawns)", () => {
 			]),
 		});
 		try {
-			const { stderr, code } = await runScript(repo, reg.base);
+			const { stdout, stderr, code } = await runScript(repo, reg.base);
 			expect(code).toBe(0);
 			const lines = stderr.split("\n").filter((line) => line !== "");
 			expect(lines).toContain(
@@ -261,6 +287,8 @@ describe("check-release-lines (live spawns)", () => {
 			expect(
 				lines.some((line) => line.startsWith("release line not settled:")),
 			).toBe(false);
+			// A transitive warning never blocks, so it never prints the marker.
+			expect(stdout.includes("release line blocked:")).toBe(false);
 		} finally {
 			reg.stop();
 			rmSync(repo, { recursive: true, force: true });

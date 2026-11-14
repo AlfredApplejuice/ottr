@@ -14736,6 +14736,182 @@ describe("work card check", () => {
 	});
 });
 
+// Release-line gate auto-hold (OTTR-960): a Dependabot card the gate parks waits with a
+// timer and restarts by itself when the line settles; any other failure keeps the park.
+describe("turn release line hold (dependabot gate park)", () => {
+	const DAY = 86_400_000;
+	const T1 = Date.now() + DAY;
+	const T2 = T1 + DAY;
+	const PARK_QUESTION =
+		"Re-run this card's integration turn after the release line settles.";
+	const marker = (
+		entries: Array<[name: string, version: string, waitUntilMs: number]>,
+	): string =>
+		`release line blocked: ${JSON.stringify({
+			blocked: entries.map(([name, version, waitUntilMs]) => ({
+				name,
+				version,
+				waitUntilMs,
+			})),
+		})}\n`;
+
+	/** startRun override whose run reports the OTTR-938-style needs_you park, and a
+	 * runProjectCheck stub that answers the probe the stamp makes. */
+	function gateRun(
+		record: Recorded,
+		probeOutput: () => { ok: boolean; output: string },
+	): Partial<TurnOps> {
+		return {
+			commitsAhead: async () => 0,
+			runProjectCheck: async () => probeOutput(),
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				await o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "needs_you",
+								summary: "gates red",
+								question: PARK_QUESTION,
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {
+						record.killed = true;
+					},
+				};
+			},
+		};
+	}
+
+	async function gateCase(
+		probeOutput: () => {
+			ok: boolean;
+			output: string;
+		},
+	) {
+		const store = await freshStore();
+		const record = baseRecord();
+		const projects = new Map([[store.name, fakeProject(store)]]);
+		const loop = holdFollowUps(
+			projects,
+			fakeOps(record, gateRun(record, probeOutput)),
+		);
+		return { store, loop };
+	}
+
+	async function dependabotTask(store: ProjectStore) {
+		const task = await store.createTask("take the dependabot bump");
+		await store.updateTask(task.id, { sourcePrDependabot: true });
+		mkdirSync(join(store.worktreesDir, task.id), { recursive: true });
+		return task;
+	}
+
+	test("a gate-blocked dependabot card arms the hold at the latest clear time", async () => {
+		const { store, loop } = await gateCase(() => ({
+			ok: false,
+			output: `other steps pass\n${marker([
+				["@biomejs/biome", "2.6.7", T1],
+				["knip", "6.44.1", T2],
+			])}`,
+		}));
+		const task = await dependabotTask(store);
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("queued");
+		expect(after.stage).toBe("in_progress");
+		expect(after.holdUntil).toBe(T2);
+		expect(after.holdProvider).toBeNull();
+		expect(after.needsReason).toContain("@biomejs/biome 2.6.7");
+		expect(after.needsReason).toContain("knip 6.44.1");
+		expect(after.pendingPrompt).not.toBeNull();
+		// At T2 the scheduler picks the card; a tick earlier it waits.
+		const live = await store.listTasks();
+		expect(
+			pickRunnable(live, { maxParallel: 2, hasRules: true, now: T2 }).map(
+				(t) => t.id,
+			),
+		).toContain(task.id);
+		expect(
+			pickRunnable(live, { maxParallel: 2, hasRules: true, now: T2 - 1 }).map(
+				(t) => t.id,
+			),
+		).not.toContain(task.id);
+	});
+
+	test("a merge-kind dependabot card requeues at merging with the same hold", async () => {
+		const { store, loop } = await gateCase(() => ({
+			ok: false,
+			output: `${marker([["@biomejs/biome", "2.6.7", T1]])}`,
+		}));
+		const task = await dependabotTask(store);
+		await store.updateTask(task.id, { stage: "merging" });
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("queued");
+		expect(after.stage).toBe("merging");
+		expect(after.holdUntil).toBe(T1);
+		const live = await store.listTasks();
+		expect(
+			pickRunnable(live, { maxParallel: 2, hasRules: true, now: T1 }).map(
+				(t) => t.id,
+			),
+		).toContain(task.id);
+	});
+
+	test("a check run that fails on another step keeps the needs_you park", async () => {
+		const { store, loop } = await gateCase(() => ({
+			ok: false,
+			output: "error TS2321: cannot find name 'x'\n",
+		}));
+		const task = await dependabotTask(store);
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.stage).toBe("in_progress");
+		expect(after.needsReason).toBe(PARK_QUESTION);
+		expect(after.holdUntil).toBeNull();
+		expect(after.pendingPrompt).toBeNull();
+	});
+
+	test("a passing probe keeps the park, and a non-dependabot card never probes", async () => {
+		const { store, loop } = await gateCase(() => ({
+			ok: false,
+			output: `${marker([["@biomejs/biome", "2.6.7", T1]])}`,
+		}));
+		const task = await dependabotTask(store);
+		await store.updateTask(task.id, { sourcePrDependabot: false });
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.holdUntil).toBeNull();
+	});
+
+	test("a marker whose clear time already passed keeps the park", async () => {
+		const { store, loop } = await gateCase(() => ({
+			ok: false,
+			output: `${marker([["@biomejs/biome", "2.6.7", Date.now() - 1]])}`,
+		}));
+		const task = await dependabotTask(store);
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.holdUntil).toBeNull();
+	});
+});
+
 // Dep-held turns (OTTR-34): a needs_you report_outcome with dependsOn requeues the card in
 // its current stage with DEP_HELD_PROMPT parked; the dispatcher swaps the marker for
 // depResumePrompt at restart.
