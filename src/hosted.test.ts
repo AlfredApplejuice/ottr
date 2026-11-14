@@ -153,6 +153,54 @@ describe("controlPlaneHooks", () => {
 			fake(() => Response.json({ token: "" })).hooks.gitToken("app", "r"),
 		).rejects.toThrow("token");
 	});
+
+	test("no hook follows a redirect: the identity never reaches another origin", async () => {
+		const captured: string[] = [];
+		using capture = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(req) {
+				captured.push(`${req.method} ${new URL(req.url).pathname}`);
+				return Response.json({ ok: true, token: "t", expiresAt: "2030-01-01" });
+			},
+		});
+		for (const status of [307, 308]) {
+			using control = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch: (req) =>
+					new Response(null, {
+						status,
+						headers: {
+							location: `http://localhost:${capture.port}${new URL(req.url).pathname}`,
+						},
+					}),
+			});
+			const real = readHostedConfig({
+				...BASE,
+				OTTR_HOSTED_CONTROL_URL: `http://127.0.0.1:${control.port}`,
+			}) as HostedConfig;
+			const logged = Promise.withResolvers<string>();
+			// The default transport (real fetch), not a stub: the redirect policy lives there.
+			const hooks = controlPlaneHooks(real, { log: logged.resolve });
+			await expect(hooks.creditOk()).rejects.toThrow(String(status));
+			await expect(hooks.gitToken("app", "r")).rejects.toThrow(String(status));
+			hooks.reportUsage({
+				tenant: "t-1",
+				project: "app",
+				taskId: "APP-1",
+				turnId: 1,
+				kind: "work",
+				role: "default",
+				model: "a/b",
+				run: 1,
+				final: true,
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 },
+			});
+			expect(await logged.promise).toContain(String(status));
+		}
+		expect(captured).toEqual([]);
+	});
 });
 
 describe("takeHostedConfig", () => {

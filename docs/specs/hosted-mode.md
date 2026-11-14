@@ -83,6 +83,8 @@ When the flag is off, the `/api/boot` payload has no `hosted` key.
 
 Each call carries `X-Ottr-Identity` with role `tenant`. The base path is
 `<OTTR_HOSTED_CONTROL_URL>/v1/tenants/<tenant>`. Client: `controlPlaneHooks` in `src/hosted.ts`.
+The client never follows a redirect. A 3xx answer is a failed call, like any other non-2xx
+status. Thus the signed header and the body go to the configured origin only.
 
 | Call | Body | Answer | Use |
 |---|---|---|---|

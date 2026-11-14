@@ -232,6 +232,10 @@ export function controlPlaneHooks(
 			method,
 			headers,
 			body: body === undefined ? undefined : JSON.stringify(body),
+			// redirect: "manual": fetch keeps custom headers on a cross-origin 307/308, so a
+			// followed redirect would relay the signed identity (and the body) off the control
+			// plane. A 3xx answer fails each hook like any other non-2xx status.
+			redirect: "manual",
 			signal: AbortSignal.timeout(10_000),
 		});
 	};
