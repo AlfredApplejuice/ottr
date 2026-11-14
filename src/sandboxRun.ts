@@ -153,11 +153,16 @@ export async function runSandboxJob(
 	const targetTar = join(runDir, "target.tar");
 
 	const spawn = o.spawnImpl ?? defaultSpawn;
+	// `--` ends git's option parsing: a caller-supplied ref is a tree-ish, never a
+	// flag. Without it, a value like --output=/path would truncate a host file or
+	// --remote=<host> would dial out from this process before git failed on the
+	// missing tree-ish.
 	const archive = await spawn([
 		"git",
 		"-C",
 		o.checkout ?? join("/workspace", project),
 		"archive",
+		"--",
 		o.ref ?? "HEAD",
 	]);
 	if (archive.code !== 0 || archive.stdout.length === 0) {

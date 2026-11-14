@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type GitSpawn, newJobId, runSandboxJob } from "./sandboxRun.ts";
@@ -93,7 +93,7 @@ describe("runSandboxJob", () => {
 		});
 		expect(res.ok).toBe(true);
 		expect(spawned).toEqual([
-			["git", "-C", "/workspace/ottr", "archive", "main"],
+			["git", "-C", "/workspace/ottr", "archive", "--", "main"],
 		]);
 		expect(seen.length).toBe(1);
 		const call = seen[0]!;
@@ -356,4 +356,40 @@ describe("runSandboxJob", () => {
 		expect(res.error).toContain("PROJECT_NAME");
 		expect(spawned).toBe(0);
 	});
+});
+
+test("a dashed ref cannot reach git as an option: the spawn puts -- before it", async () => {
+	const root = mkdtempSync(join(tmpdir(), "ottr-sbx-dashref-"));
+	try {
+		const { fetchImpl } = fakeFetch(200, JSON.stringify(guestResponse));
+		const spawned: string[][] = [];
+		const res = await runSandboxJob({
+			project: "ottr",
+			ref: "--output=/data/stats.db",
+			argv: ["true"],
+			checkout: "/workspace/ottr",
+			fetchImpl,
+			spawnImpl: async (argv) => {
+				spawned.push(argv);
+				return { code: 0, stdout: TAR, stderr: "" };
+			},
+			env: jobEnv(),
+			dataRoot: root,
+			idFactory: () => "val-1763000000-dashref",
+		});
+		// The separator keeps git from reading the caller's value as a flag: even a
+		// value crafted for --output or --remote travels only as a tree-ish name.
+		expect(res.ok).toBe(true);
+		expect(spawned[0]).toEqual([
+			"git",
+			"-C",
+			"/workspace/ottr",
+			"archive",
+			"--",
+			"--output=/data/stats.db",
+		]);
+		expect(existsSync(join(root, "ottr", "validate-jobs"))).toBe(true);
+	} finally {
+		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+	}
 });
