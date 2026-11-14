@@ -1768,8 +1768,9 @@ function findingHead(f: RecordedFinding): string {
  * (docs/specs/review-findings-persistence.md §4; the value is the record's
  * fingerprint from the security-audit-harness audit output). Strict: the exact
  * prefix at line start, no case or spacing variants. Null: the lead carries no
- * line and files as today. */
-function leadFingerprint(prompt: string): string | null {
+ * line and files as today. Exported so the audit-leads tests hit the real
+ * reader, not a copy of its regex. */
+export function leadFingerprint(prompt: string): string | null {
 	const m = /^Fingerprint: (.+)$/m.exec(prompt);
 	if (m === null) return null;
 	const value = m[1]?.trim() ?? "";
@@ -6386,7 +6387,7 @@ export function createTurnLoop(
 		if (cancelled) return true;
 		st.plannedNext = planned;
 		await fileRetroProposal(st, planned);
-		if (await runReviewCheck(st)) return true;
+		if (await runReviewCheck(st, planned)) return true;
 		if (await runWorkCheck(st, planned)) return true;
 		await writePostCheckState(st, planned);
 		await stampDoneCard(st, planned);
@@ -9297,12 +9298,27 @@ export function createTurnLoop(
 	/** A review's recorded findings: Ottr caps them, checks the selection with a second model
 	 * (a fresh session — never --resume, never the review's own — memory off, read/grep/glob
 	 * only), and files the kept ones as queued cards linked to the review, the flow
-	 * create_task's per-finding calls did inline before. An approved review holds at merging
-	 * (FINDINGS_HOLD) and a needs_you review keeps its park: either way the card stays
+	 * create_task's per-finding calls did inline before. A landing review with no recorded
+	 * proposals still files the audit run's needs_validation records (OTTR-959). An
+	 * approved review holds at merging (FINDINGS_HOLD) and a needs_you review keeps its
+	 * park: either way the card stays
 	 * in_progress/running until the deferred write below stores the final state.
 	 * True: the turn stopped (a credit stop or a taken-over check). */
-	async function runReviewCheck(st: TurnSettle): Promise<boolean> {
-		if (st.reviewFindings.length === 0) return false;
+	async function runReviewCheck(st: TurnSettle, next: Next): Promise<boolean> {
+		// OTTR-959: the lead source engages even when the agent recorded no
+		// proposals — an agent that leaves out its leads is the case the audit
+		// run's findings.json exists for. The landing is a review card settling
+		// to its final state with no check stamp: done (parkReviewDone held
+		// nothing), merging (the findings hold), or needs_you. Non-landing
+		// reviews keep today's fast exit, and so does a landing whose run
+		// directory holds nothing to file.
+		const landing =
+			st.idn.reviewCard &&
+			st.task.findingsCheckedAt === null &&
+			(next.stage === "done" ||
+				next.stage === "merging" ||
+				next.state === "needs_you");
+		if (st.reviewFindings.length === 0 && !landing) return false;
 		const checkOn = (await ops.reviewCheck?.()) ?? true;
 		// Leads (the prompt's "Needs validation" tag) never enter the selection or the cap:
 		// they file as unverified backlog cards without a second-model opinion.
@@ -9337,6 +9353,25 @@ export function createTurnLoop(
 			await st.log(
 				`- no audit run directory was created during this turn under ${auditRoot}/${st.name}; leads come from the agent's proposals`,
 			);
+		}
+		if (st.reviewFindings.length === 0) {
+			// The pass holds no recorded proposals: file the audit run's
+			// needs_validation records only. No confirmed selection exists, so the
+			// second-model check has no input and does not run.
+			if (audit.state !== "used" || audit.leads.length === 0) return false;
+			await fileKeptFindings(st, {
+				kept: [],
+				dropped: [],
+				belowCap: [],
+				leads: audit.leads,
+				droppedAgentLeads: [],
+				checkOn: false,
+				checkMs: 0,
+				checkFailed: null,
+				checkModel: null,
+				checkWarn: null,
+			});
+			return false;
 		}
 		const selected = selectFindings(confirmed);
 		const selectedSet = new Set(selected);

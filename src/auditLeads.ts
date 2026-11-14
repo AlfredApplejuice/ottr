@@ -149,14 +149,16 @@ export function readAuditLeads(
 /** One lead prompt per audit record: the board's own lines first (the lead tag
  * line 1 and the `Fingerprint:` line 2 — the strict fingerprint reader takes the
  * first match, so the untrusted record body cannot forge it), then the record
- * fields. Structured fields render as one JSON line each, so their content
- * cannot add board-format lines at line start. */
+ * fields. The title collapses to one line, so no untrusted field renders before
+ * the board's own lines. Structured fields render as one JSON line each, so
+ * their content cannot add board-format lines at line start. */
 export function auditLeadPrompt(rec: AuditRecord): string {
 	const text = (value: unknown): string =>
 		typeof value === "string" ? value : (JSON.stringify(value) ?? "");
 	const json = (value: unknown): string => JSON.stringify(value) ?? "null";
+	const title = text(rec.title).replace(/\s+/g, " ").trim();
 	return [
-		`Needs validation: ${text(rec.title)}`,
+		`Needs validation: ${title}`,
 		`Fingerprint: ${String(rec.fingerprint).trim()}`,
 		"",
 		text(rec.description),

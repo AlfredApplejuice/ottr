@@ -25457,6 +25457,64 @@ describe("stored review findings", () => {
 		);
 	});
 
+	test("a landing review with no recorded proposals files the run's leads (OTTR-959)", async () => {
+		const root = mkdtempSync(join(tmpdir(), "turn-audit-noprop-"));
+		dirs.push(root);
+		const records = [
+			auditRecord("fp-a"),
+			auditRecord("fp-b"),
+			auditRecord("fp-x", "confirmed"),
+		];
+		const { store, loop, checkRuns } = await auditReviewSetup(
+			root,
+			() => records,
+			// The agent recorded no propose_task findings at all.
+			[],
+			runResult({ outcome: { status: "answered", summary: "review done" } }),
+			[], // nothing to check, so no check run exists
+		);
+		const review = await reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+
+		// The run's needs_validation records filed as fingerprinted backlog leads
+		// even though the pass recorded nothing.
+		const kids = await kidsOf(store, review.id);
+		expect(kids).toHaveLength(2);
+		for (const k of kids) {
+			expect(k.stage).toBe("backlog");
+			expect(k.prompt.split("\n")[1]).toMatch(/^Fingerprint: fp-[ab]$/);
+			expect(k.details).toContain("Waits for a validation sandbox");
+		}
+		const log = await readFileSync(await store.logPath(review.id), "utf8");
+		expect(log).toContain("leads come from the audit run's findings.json");
+		expect(log).toContain("run-1");
+		expect(checkRuns).toHaveLength(0);
+		// Leads never hold Done: the review settles through with the leads open.
+		const after = (await store.getTask(review.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.findingsCheckedAt).not.toBeNull();
+	});
+
+	test("a landing review with no proposals and no run files nothing (OTTR-959)", async () => {
+		const root = mkdtempSync(join(tmpdir(), "turn-audit-norun-"));
+		dirs.push(root);
+		const { store, loop } = await auditReviewSetup(
+			root,
+			() => undefined,
+			[],
+			runResult({ outcome: { status: "answered", summary: "review done" } }),
+			[],
+		);
+		const review = await reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+
+		expect(await kidsOf(store, review.id)).toHaveLength(0);
+		const log = await readFileSync(await store.logPath(review.id), "utf8");
+		expect(log).toContain(
+			"no audit run directory was created during this turn",
+		);
+	});
+
 	test("findings persist through a never-settling run and a later answered turn checks and files them", async () => {
 		const record = baseRecord();
 		const { store, loop, checkRuns } = await storedReviewSetup(

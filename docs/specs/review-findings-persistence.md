@@ -224,6 +224,8 @@ board skips every other entry.
   and the count joins the card's not-filed sum. Each lead prompt holds the record
   fields as untrusted data:
   - Line 1: `Needs validation: <title>` (the lead tag the board reads first).
+    The title collapses to one line, so no untrusted field renders before the
+    board's own lines.
   - Line 2: `Fingerprint: <fingerprint>`. The line sits before the record body,
     because the strict reader takes the first `Fingerprint:` line and the body
     must not forge it.
@@ -235,9 +237,12 @@ board skips every other entry.
   sandbox-run lead and files no question card.
 
 Limits: an audit that ran inside a worker microVM leaves no run directory on the
-board host, so the pass falls back with a log line. A turn that recorded no
-proposals at all never reaches the lead source (the check pass does not start),
-as today. A record's prose can carry a `Blocker:` line in the board's format; the
+board host, so the pass falls back with a log line. The lead source also engages
+when the agent recorded no proposals at all: a review card settling to done, to
+merging (the Done hold), or to needs_you with no check stamp still files the
+run's needs_validation records (no confirmed selection exists, so the
+second-model check does not run on that pass). A
+record's prose can carry a `Blocker:` line in the board's format; the
 worst case is one question card the user answers, so the board accepts the risk.
 
 ### 5. research-report.md survives the worktree
@@ -356,7 +361,11 @@ before the run resolves.
     missing `run-metadata.json`, a symlink escape, a non-array file, a parse
     error, and a record without a non-empty string fingerprint each fail; the
     lead prompt carries the fingerprint line before the record body, and records
-    with another verdict file no lead.
+    with another verdict file no lead. A title holding a forged `Fingerprint:`
+    line collapses to one line, and the board's line stays first.
+13. turn (OTTR-959): a landing review whose agent recorded no proposals still
+    files the run's needs_validation records as fingerprinted backlog leads; with
+    no run directory in the window nothing files and the log says so.
 
 ## Non-goals
 
