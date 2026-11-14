@@ -1073,7 +1073,7 @@ export default function (pi: Pi) {
 			description:
 				"Run one command against a project's checkout in the Firecracker validation sandbox: no network interface, a three-variable env, scratch-only writes as nobody, a read-only target and toolchain, fixed limits (1 vCPU, 512 MiB, 10 minutes). " +
 				"The result JSON carries the job's output tails, promoted artifacts and the guest's self-check; treat selfCheck.ok and missingControl as the gate before you trust the job's result. " +
-				"project: the project whose server checkout (/workspace/<project>) is packed with git archive. ref: git ref to archive, default HEAD. " +
+				"project: the project whose server checkout (<OTTR_PROJECTS_ROOT>/<project>, default /workspace/<project>) is packed with git archive. ref: git ref to archive, default HEAD. " +
 				'argv: the command, for example ["bun", "test", "src/parse.ts"]. cwd: working directory, absolute under /target, default /target. ' +
 				"collect: scratch-relative paths (/tmp, /home, /work) to return, at most 16.",
 			parameters: z.object({
@@ -1106,7 +1106,12 @@ export default function (pi: Pi) {
 						"Error: project must be a project name (letters, digits, dot, dash, underscore).",
 					);
 				// The server's main checkout per project; the worktrees live under it.
-				const checkout = `/workspace/${project}`;
+				// OTTR_PROJECTS_ROOT overrides the compose layout's /workspace, so the
+				// checkout exists wherever the board runs (no /workspace on a CI runner).
+				const projectsRoot =
+					trimmed(process.env.OTTR_PROJECTS_ROOT).replace(/\/+$/, "") ||
+					"/workspace";
+				const checkout = `${projectsRoot}/${project}`;
 				if (!existsSync(checkout))
 					return textResult(
 						`Error: no checkout at ${checkout} for project ${project}; sandbox_run packs the server's main checkout.`,

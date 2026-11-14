@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -1550,10 +1550,11 @@ describe("board tools called through the eval kernel", () => {
 	});
 });
 
-// A tiny real checkout under /workspace so sandbox_run's execute passes its
-// existsSync check and git archive packs real bytes; the caller removes it.
-function probeCheckout(name: string): string {
-	const checkout = `/workspace/${name}`;
+// A tiny real git checkout under the caller's projects root, so sandbox_run's execute
+// passes its existsSync check wherever the test runs — the tool derives the checkout
+// from env OTTR_PROJECTS_ROOT (default /workspace), which no CI runner has.
+function probeCheckout(projectsRoot: string, name: string): string {
+	const checkout = join(projectsRoot, name);
 	rmSync(checkout, { recursive: true, force: true });
 	mkdirSync(checkout, { recursive: true });
 	writeFileSync(join(checkout, "probe.txt"), "hi\n");
@@ -1585,6 +1586,12 @@ describe("sandbox_run tool", () => {
 		OTTR_VM_RUNNER_URL: runnerUrl,
 		OTTR_WORKER_TOKEN: "worker-token",
 	};
+	// The checkout root the tool reads from env: the tests’ own temp dir, so the
+	// describe passes on machines without a /workspace (the GitHub runner).
+	const projectsRoot = mkdtempSync(join(tmpdir(), "ottr-sbx-projects-"));
+	afterAll(() =>
+		rmSync(projectsRoot, { recursive: true, force: true, maxRetries: 5 }),
+	);
 
 	test("absent without a review or scout run kind so work runs never see it", () => {
 		// The runner env alone must not enable the tool.
@@ -1623,6 +1630,7 @@ describe("sandbox_run tool", () => {
 
 	test("rejects a bad project name and a missing checkout before any call", async () => {
 		process.env.OTTR_REVIEW = "1";
+		process.env.OTTR_PROJECTS_ROOT = projectsRoot;
 		const tools = fakePi();
 		let called = false;
 		globalThis.fetch = (async () => {
@@ -1637,14 +1645,18 @@ describe("sandbox_run tool", () => {
 				}),
 			),
 		).toContain("project must be a project name");
-		expect(
-			text(
-				await tools.sandbox_run!.execute("t1", {
-					project: "ottr-no-such-project",
-					argv: ["true"],
-				}),
-			),
-		).toContain("no checkout at /workspace/ottr-no-such-project");
+		const out = text(
+			await tools.sandbox_run!.execute("t1", {
+				project: "ottr-no-such-project",
+				argv: ["true"],
+			}),
+		);
+		expect(out).toContain(
+			`no checkout at ${projectsRoot}/ottr-no-such-project`,
+		);
+		// The checkout comes from OTTR_PROJECTS_ROOT, not a hardcoded /workspace: the
+		// test’s own temp root proves the env drives the path, on any machine.
+		expect(out).not.toContain("/workspace/");
 		expect(called).toBe(false);
 	});
 
@@ -1652,7 +1664,7 @@ describe("sandbox_run tool", () => {
 		process.env.OTTR_REVIEW = "1";
 		setEnv(runnerEnv);
 		const project = "ottr-sbx-probe";
-		const checkout = probeCheckout(project);
+		const checkout = probeCheckout(projectsRoot, project);
 		try {
 			let seen: { url: string; init: RequestInit } | null = null;
 			globalThis.fetch = (async (url: string | URL, init: RequestInit) => {
@@ -1709,7 +1721,7 @@ describe("sandbox_run tool", () => {
 		process.env.OTTR_REVIEW = "1";
 		process.env.OTTR_WORKER_TOKEN = "worker-token";
 		const project = "ottr-sbx-probe";
-		const checkout = probeCheckout(project);
+		const checkout = probeCheckout(projectsRoot, project);
 		try {
 			const out = await fakePi().sandbox_run!.execute("t1", {
 				project,
