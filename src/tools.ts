@@ -11,6 +11,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	readlinkSync,
 	realpathSync,
 	renameSync,
 	rmSync,
@@ -308,8 +309,9 @@ let queue: Promise<unknown> = Promise.resolve();
 
 /**
  * Installs the listed tools this machine lacks (the "_all" list first, then the project's own),
- * before a turn runs here. Returns lines for the turn log (none when nothing was missing);
- * throws on the first failure, so the turn stops.
+ * before a turn runs here, and checks every archive tool it already has against its pin.
+ * Returns lines for the turn log (none when nothing was missing); throws on the first
+ * failure, so the turn stops.
  */
 export async function ensureProjectTools(
 	project: string,
@@ -338,12 +340,22 @@ function readTools(project: string, home: string): ToolEntry[] {
 	return parseToolsJson(readFileSync(file, "utf8"));
 }
 
+function sha256Hex(data: string | Uint8Array): string {
+	return new Bun.CryptoHasher("sha256").update(data).digest("hex");
+}
+
 async function install(entries: ToolEntry[], home: string): Promise<string[]> {
+	const root = join(home, ".ottr", "tools");
 	const lines: string[] = [];
 	for (const e of entries) {
-		const target = join(home, ".ottr", "tools", e.sha256);
-		if (existsSync(target)) continue;
-		await unpackInto(e, target, home);
+		const target = join(root, e.sha256);
+		if (existsSync(target)) {
+			// The home is shared: a turn can rewrite an installed tree (OTTR-953). A plain
+			// binary is checked at link time (verifyPinnedBinary); an archive's tree here.
+			if (e.unpack !== "none") await verifyUnpacked(e, target, root);
+			continue;
+		}
+		await unpackInto(e, target, root);
 		lines.push(`tools: installed ${e.name} (${e.sha256.slice(0, 12)})`);
 	}
 	return lines;
@@ -352,42 +364,13 @@ async function install(entries: ToolEntry[], home: string): Promise<string[]> {
 async function unpackInto(
 	e: ToolEntry,
 	target: string,
-	home: string,
+	root: string,
 ): Promise<void> {
-	const root = join(home, ".ottr", "tools");
 	mkdirSync(root, { recursive: true });
 	// Same filesystem as the target, so the final move is one rename.
 	const tmp = mkdtempSync(join(root, "install-"));
 	try {
-		// A download that hangs must not hold the install queue (and every later turn) forever.
-		const res = await fetch(e.url, { signal: AbortSignal.timeout(600_000) });
-		if (!res.ok)
-			throw new Error(`tools: ${e.name}: download failed (${res.status})`);
-		const bytes = Buffer.from(await res.arrayBuffer());
-		const hash = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
-		if (hash !== e.sha256)
-			throw new Error(
-				`tools: ${e.name}: sha256 mismatch (${hash.slice(0, 12)})`,
-			);
-		const dir = join(tmp, "unpack");
-		mkdirSync(dir);
-		if (e.unpack === "none") {
-			writeFileSync(join(dir, e.name), bytes);
-		} else {
-			const archive = join(
-				tmp,
-				`download.${e.unpack === "zip" ? "zip" : "tar.gz"}`,
-			);
-			writeFileSync(archive, bytes);
-			await exec(
-				e.unpack === "zip"
-					? ["unzip", "-q", archive, "-d", dir]
-					: ["tar", "-xzf", archive, "-C", dir],
-			);
-		}
-		guardPaths(e.name, dir);
-		const bin = join(dir, e.bin ?? e.name);
-		chmodSync(bin, 0o755);
+		const dir = await unpack(e, await pinnedBytes(e, root, tmp), tmp);
 		try {
 			renameSync(dir, target);
 		} catch (err) {
@@ -398,6 +381,115 @@ async function unpackInto(
 	} finally {
 		rmSync(tmp, { recursive: true, force: true });
 	}
+}
+
+/** Refuses an installed archive tree that differs from a fresh unpack of the pinned archive. */
+async function verifyUnpacked(
+	e: ToolEntry,
+	target: string,
+	root: string,
+): Promise<void> {
+	const tmp = mkdtempSync(join(root, "verify-"));
+	try {
+		const fresh = await unpack(e, await pinnedBytes(e, root, tmp), tmp);
+		const diff = treeDiff(fresh, target);
+		if (diff !== null)
+			throw new Error(
+				`tools: ${e.name}: installed files do not match its sha256 (${diff || "."} differs); remove ${target} to reinstall`,
+			);
+	} finally {
+		rmSync(tmp, { recursive: true, force: true });
+	}
+}
+
+/**
+ * The pinned download's bytes. An archive keeps a copy at <root>/<sha256>.<unpack>, so a later
+ * check unpacks it without a download; a copy that fails the hash is downloaded again.
+ */
+async function pinnedBytes(
+	e: ToolEntry,
+	root: string,
+	tmp: string,
+): Promise<Buffer> {
+	const kept = join(root, `${e.sha256}.${e.unpack}`);
+	// lstat: a planted FIFO or link is never read; it is replaced like a failed copy.
+	if (
+		e.unpack !== "none" &&
+		lstatSync(kept, { throwIfNoEntry: false })?.isFile()
+	) {
+		const bytes = readFileSync(kept);
+		if (sha256Hex(bytes) === e.sha256) return bytes;
+	}
+	// A download that hangs must not hold the install queue (and every later turn) forever.
+	const res = await fetch(e.url, { signal: AbortSignal.timeout(600_000) });
+	if (!res.ok)
+		throw new Error(`tools: ${e.name}: download failed (${res.status})`);
+	const bytes = Buffer.from(await res.arrayBuffer());
+	const hash = sha256Hex(bytes);
+	if (hash !== e.sha256)
+		throw new Error(`tools: ${e.name}: sha256 mismatch (${hash.slice(0, 12)})`);
+	if (e.unpack !== "none") {
+		// One rename: a reader never sees a half-written copy, and a planted link is replaced.
+		writeFileSync(join(tmp, "kept"), bytes);
+		renameSync(join(tmp, "kept"), kept);
+	}
+	return bytes;
+}
+
+/** Unpacks verified bytes into <tmp>/unpack, executable bin included; returns that dir. */
+async function unpack(
+	e: ToolEntry,
+	bytes: Buffer,
+	tmp: string,
+): Promise<string> {
+	const dir = join(tmp, "unpack");
+	mkdirSync(dir);
+	if (e.unpack === "none") {
+		writeFileSync(join(dir, e.name), bytes);
+	} else {
+		const archive = join(
+			tmp,
+			`download.${e.unpack === "zip" ? "zip" : "tar.gz"}`,
+		);
+		writeFileSync(archive, bytes);
+		await exec(
+			e.unpack === "zip"
+				? ["unzip", "-q", archive, "-d", dir]
+				: ["tar", "-xzf", archive, "-C", dir],
+		);
+	}
+	guardPaths(e.name, dir);
+	chmodSync(join(dir, e.bin ?? e.name), 0o755);
+	return dir;
+}
+
+/**
+ * The first relative path ("" = the root) where `actual` differs from `expected`: entry type,
+ * a file's bytes, a symlink's target, or a dir's entry names. Null when the trees match.
+ * lstat only, so no link is followed and no special file is read.
+ */
+function treeDiff(expected: string, actual: string): string | null {
+	const stack: string[] = [""];
+	for (let rel = stack.pop(); rel !== undefined; rel = stack.pop()) {
+		const a = join(expected, rel);
+		const b = join(actual, rel);
+		const sa = lstatSync(a);
+		const sb = lstatSync(b, { throwIfNoEntry: false });
+		if (sb === undefined || (sa.mode & 0o170000) !== (sb.mode & 0o170000))
+			return rel;
+		if (sa.isSymbolicLink()) {
+			if (readlinkSync(a) !== readlinkSync(b)) return rel;
+		} else if (sa.isDirectory()) {
+			const names = readdirSync(a).sort();
+			if (names.join("\0") !== readdirSync(b).sort().join("\0")) return rel;
+			for (const n of names) stack.push(rel ? `${rel}/${n}` : n);
+		} else if (
+			sa.isFile() &&
+			(sa.size !== sb.size || !readFileSync(a).equals(readFileSync(b)))
+		)
+			return rel;
+	}
+	return null;
 }
 
 /**
@@ -453,9 +545,7 @@ function verifyPinnedBinary(
 	sha256: string,
 	target: string,
 ): void {
-	const hash = new Bun.CryptoHasher("sha256")
-		.update(readFileSync(target))
-		.digest("hex");
+	const hash = sha256Hex(readFileSync(target));
 	if (hash !== sha256)
 		throw new Error(
 			`tools: ${name}: installed binary does not match its sha256 (${hash.slice(0, 12)})`,
@@ -477,8 +567,7 @@ function linkTargets(
 				`tools: ${e.name}: ${e.sha256.slice(0, 12)} missing from ${root}`,
 			);
 		// A plain binary must still be the pinned download: a dir someone else wrote under this
-		// sha256 is refused. ponytail: an archive's unpacked files carry no pin to check against;
-		// the server-only root (prepareTurn) is what keeps those trusted.
+		// sha256 is refused. An archive's tree is checked by install (verifyUnpacked).
 		if (e.unpack === "none") verifyPinnedBinary(e.name, e.sha256, target);
 		links.set(e.name, {
 			target,
@@ -491,32 +580,63 @@ function linkTargets(
 /** One symlink/wrapper plan for a tool name. */
 type ToolLink = { target: string; wrapper: string | null };
 
-/** Materialises the links dir atomically; a concurrent winner's dir is reused. */
+/**
+ * Materialises the links dir atomically; a concurrent winner's dir is reused. Each call
+ * checks the dir, a reused one too: it is shared home state a turn can write (OTTR-953).
+ */
 function writeLinksDir(
 	root: string,
 	key: string,
 	links: Map<string, ToolLink>,
 ): string {
 	const dir = join(root, `path-${key}`);
-	if (existsSync(dir)) return dir;
-	// Built aside and moved in with one rename, so a reused dir is never half-built.
-	const tmp = mkdtempSync(join(root, "path-build-"));
-	try {
-		for (const [name, { target, wrapper }] of links) {
-			if (wrapper !== null)
-				writeFileSync(join(tmp, name), wrapper, { mode: 0o755 });
-			else symlinkSync(target, join(tmp, name));
-		}
+	if (!existsSync(dir)) {
+		// Built aside and moved in with one rename, so a reused dir is never half-built.
+		const tmp = mkdtempSync(join(root, "path-build-"));
 		try {
-			renameSync(tmp, dir);
-		} catch (err) {
-			// Two turns build the same set at once: the winner's dir is complete; reuse it.
-			if (!existsSync(dir)) throw err;
+			for (const [name, { target, wrapper }] of links) {
+				if (wrapper !== null)
+					writeFileSync(join(tmp, name), wrapper, { mode: 0o755 });
+				else symlinkSync(target, join(tmp, name));
+			}
+			try {
+				renameSync(tmp, dir);
+			} catch (err) {
+				// Two turns build the same set at once: the winner's dir is complete; reuse it.
+				if (!existsSync(dir)) throw err;
+			}
+		} finally {
+			rmSync(tmp, { recursive: true, force: true });
 		}
-	} finally {
-		rmSync(tmp, { recursive: true, force: true });
 	}
+	const bad = linksDirDiff(dir, links);
+	if (bad !== null)
+		throw new Error(
+			`tools: link dir does not match the tool set (${bad} differs); remove ${dir} to rebuild`,
+		);
 	return dir;
+}
+
+/** The first name ("." = the dir itself) where the links dir differs from the plan, or null. */
+function linksDirDiff(
+	dir: string,
+	links: Map<string, ToolLink>,
+): string | null {
+	if (!lstatSync(dir).isDirectory()) return ".";
+	if (
+		readdirSync(dir).sort().join("\0") !== [...links.keys()].sort().join("\0")
+	)
+		return ".";
+	for (const [name, { target, wrapper }] of links) {
+		const path = join(dir, name);
+		const s = lstatSync(path);
+		const same =
+			wrapper === null
+				? s.isSymbolicLink() && readlinkSync(path) === target
+				: s.isFile() && readFileSync(path, "utf8") === wrapper;
+		if (!same) return name;
+	}
+	return null;
 }
 
 export function buildToolsPath(project: string, home = homedir()): string {
@@ -524,9 +644,7 @@ export function buildToolsPath(project: string, home = homedir()): string {
 	const links = linkTargets(project, home, root);
 	// "" = nothing to prepend: the callers skip the PATH prefix for an empty turn.
 	if (links.size === 0) return "";
-	const key = new Bun.CryptoHasher("sha256")
-		.update(JSON.stringify([...links]))
-		.digest("hex");
+	const key = sha256Hex(JSON.stringify([...links]));
 	return writeLinksDir(root, key, links);
 }
 

@@ -390,6 +390,80 @@ describe("ensureProjectTools", () => {
 		);
 	});
 
+	// OTTR-953: the home is shared with turns, so an installed archive tree is not trusted.
+	test("a tampered archive entry fails provisioning instead of linking", async () => {
+		const h = mkdtempSync(join(home, "tamper-"));
+		const body = tarGz("bin/hello.sh", "#!/bin/sh\necho real\n");
+		const url = serveFile(body);
+		provision(
+			"victim",
+			[
+				{
+					name: "hello",
+					url,
+					sha256: sha256(body),
+					unpack: "tar.gz",
+					bin: "bin/hello.sh",
+				},
+			],
+			[],
+			h,
+		);
+		await ensureProjectTools("victim", h);
+		const dir = join(h, ".ottr", "tools", sha256(body));
+		// An intact tree passes, checked against the kept archive: no second download.
+		expect(await ensureProjectTools("victim", h)).toEqual([]);
+		expect(hits[new URL(url).pathname]).toBe(1);
+		writeFileSync(join(dir, "bin", "hello.sh"), "#!/bin/sh\necho MARKER\n");
+		await expect(ensureProjectTools("victim", h)).rejects.toThrow(
+			"hello: installed files do not match its sha256 (bin/hello.sh differs)",
+		);
+		writeFileSync(join(dir, "bin", "hello.sh"), "#!/bin/sh\necho real\n");
+		expect(await ensureProjectTools("victim", h)).toEqual([]);
+		// An added name beside the bin is a change too.
+		writeFileSync(join(dir, "bin", "git"), "#!/bin/sh\necho MARKER\n");
+		await expect(ensureProjectTools("victim", h)).rejects.toThrow(
+			"(bin differs)",
+		);
+	});
+
+	test("a missing or tampered kept archive is downloaded again and still checks the tree", async () => {
+		const h = mkdtempSync(join(home, "kept-"));
+		const body = zip("run/tool", "#!/bin/sh\necho zip\n");
+		const url = serveFile(body);
+		provision(
+			"keeper",
+			[
+				{
+					name: "tool",
+					url,
+					sha256: sha256(body),
+					unpack: "zip",
+					bin: "run/tool",
+				},
+			],
+			[],
+			h,
+		);
+		await ensureProjectTools("keeper", h);
+		const kept = join(h, ".ottr", "tools", `${sha256(body)}.zip`);
+		expect(readFileSync(kept)).toEqual(Buffer.from(body));
+		// An install from before the kept copy existed.
+		rmSync(kept);
+		expect(await ensureProjectTools("keeper", h)).toEqual([]);
+		expect(hits[new URL(url).pathname]).toBe(2);
+		writeFileSync(kept, "not the archive");
+		expect(await ensureProjectTools("keeper", h)).toEqual([]);
+		expect(hits[new URL(url).pathname]).toBe(3);
+		expect(readFileSync(kept)).toEqual(Buffer.from(body));
+		// A planted kept archive cannot vouch for a planted tree: its hash fails the pin.
+		writeFileSync(join(h, ".ottr", "tools", sha256(body), "run", "tool"), "x");
+		writeFileSync(kept, zip("run/tool", "x"));
+		await expect(ensureProjectTools("keeper", h)).rejects.toThrow(
+			"(run/tool differs)",
+		);
+	});
+
 	test("installs the _all list first, then the project's own", async () => {
 		const all = new TextEncoder().encode("all\n");
 		const own = new TextEncoder().encode("own\n");
@@ -664,6 +738,30 @@ describe("buildToolsPath", () => {
 		expect(() => buildToolsPath("victim", h)).toThrow(
 			"installed binary does not match its sha256",
 		);
+	});
+
+	test("a reused link dir with a planted name or a swapped link is refused", () => {
+		const h = mkdtempSync(join(home, "linkdir-"));
+		const body = new TextEncoder().encode("real\n");
+		const sha = sha256(body);
+		mkdirSync(join(h, ".ottr", "tools", sha), { recursive: true });
+		writeFileSync(join(h, ".ottr", "tools", sha, "tool"), body);
+		provision(
+			"linker",
+			[{ name: "tool", url: "https://x/t", sha256: sha, unpack: "none" }],
+			[],
+			h,
+		);
+		const dir = buildToolsPath("linker", h);
+		writeFileSync(join(dir, "git"), "#!/bin/sh\necho MARKER\n");
+		expect(() => buildToolsPath("linker", h)).toThrow(
+			"link dir does not match the tool set (. differs)",
+		);
+		rmSync(join(dir, "git"));
+		expect(buildToolsPath("linker", h)).toBe(dir);
+		rmSync(join(dir, "tool"));
+		writeFileSync(join(dir, "tool"), "#!/bin/sh\necho MARKER\n");
+		expect(() => buildToolsPath("linker", h)).toThrow("(tool differs)");
 	});
 });
 

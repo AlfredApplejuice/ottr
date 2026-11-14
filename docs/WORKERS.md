@@ -542,6 +542,14 @@ link: without `DISPLAY` or `WAYLAND_DISPLAY` it adds `--headless`, because Godot
 exits with "Can't load Xlib" when it finds no display.
 Before a turn links a `none` tool, it checks the installed binary against
 `sha256` again. A changed binary stops the turn.
+An archive tool keeps its verified download at `~/.ottr/tools/<sha256>.<unpack>`.
+When a turn finds the tool already installed, it unpacks that copy into a temporary
+folder and compares the two trees. A changed, added or removed file stops the turn,
+and the error names the folder to remove. A kept copy that fails the hash is
+downloaded again, so an install from before this check costs one download.
+A reused link folder must hold exactly the turn's links. A planted or changed
+entry stops the turn too. The reason: a turn can write the shared home, so an
+installed tool must never run from a planted file (OTTR-953).
 
 A turn that runs in the server (a merge turn, or a work turn with no worker) does
 not use the shared home volume for tools. The server reads `tools.json` and
