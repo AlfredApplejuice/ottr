@@ -1,11 +1,13 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import {
+	ALATE_PROJECTS_ROOT,
 	alateApi,
 	alateHealth,
 	alateRotateKey,
 	alateUrlError,
 	CONFIG_YML,
 	commitConfigYml,
+	ensureAlateProjectsRoot,
 	ghApi,
 	loadConfigYml,
 	noRedirectFetch,
@@ -621,6 +623,100 @@ describe("readOnlyMountError", () => {
 		).toBe(false);
 		expect(readOnlyMountError("NEROFS: not a real code")).toBe(false);
 		expect(readOnlyMountError("alate returned 500")).toBe(false);
+	});
+});
+
+describe("ensureAlateProjectsRoot", () => {
+	test("the constant names the compose mount point", () => {
+		expect(ALATE_PROJECTS_ROOT).toBe("/workspace");
+	});
+	// Alate's GET /config shape (alate server.ts): the source fields, tokenSet, and
+	// projectsRoot (absent only on an alate older than projectsRoot support).
+	const config = (over: Record<string, unknown>) =>
+		Response.json({
+			repo: "o/data",
+			path: null,
+			tokenSet: true,
+			projectsRoot: null,
+			...over,
+		});
+	test("null projectsRoot with a repo source POSTs /config with /workspace", async () => {
+		serve((req) =>
+			req.method === "GET"
+				? config({})
+				: Response.json({ repo: "o/data", path: null, tokenSet: true }),
+		);
+		expect(await ensureAlateProjectsRoot(alate)).toBeNull();
+		expect(hits).toEqual([
+			{
+				method: "GET",
+				path: "/config",
+				auth: "Bearer k1",
+				type: null,
+				body: "",
+			},
+			{
+				method: "POST",
+				path: "/config",
+				auth: "Bearer k1",
+				type: "application/json",
+				body: '{"projectsRoot":"/workspace"}',
+			},
+		]);
+	});
+	test("the compose value or an operator root already set posts nothing", async () => {
+		for (const root of ["/workspace", "/home/user/projects"]) {
+			serve(() => config({ projectsRoot: root }));
+			expect(await ensureAlateProjectsRoot(alate)).toBeNull();
+			expect(hits).toEqual([
+				{
+					method: "GET",
+					path: "/config",
+					auth: "Bearer k1",
+					type: null,
+					body: "",
+				},
+			]);
+		}
+	});
+	test("an alate without the projectsRoot field posts nothing", async () => {
+		serve(() => Response.json({ repo: "o/data", path: null, tokenSet: true }));
+		expect(await ensureAlateProjectsRoot(alate)).toBeNull();
+		expect(hits.length).toBe(1);
+	});
+	test("a path source keeps alate's own parent-directory fallback", async () => {
+		serve(() =>
+			config({ repo: null, path: "/home/user/agent-data", projectsRoot: null }),
+		);
+		expect(await ensureAlateProjectsRoot(alate)).toBeNull();
+		expect(hits.length).toBe(1);
+	});
+	test("a refused root surfaces alate's error text", async () => {
+		// The workspace mount is missing: alate answers 400 invalid projectsRoot.
+		serve((req) =>
+			req.method === "GET"
+				? config({})
+				: Response.json({ error: "invalid projectsRoot" }, { status: 400 }),
+		);
+		expect(await ensureAlateProjectsRoot(alate)).toBe("invalid projectsRoot");
+		expect(hits.length).toBe(2);
+	});
+	test("a failed config read surfaces the request name and posts nothing", async () => {
+		serve(() => Response.json({}, { status: 503 }));
+		expect(await ensureAlateProjectsRoot(alate)).toBe(
+			"the alate config read failed (unavailable): check that the alate server is up, then try again",
+		);
+		expect(hits.length).toBe(1);
+	});
+	test("no url or key refuses before any fetch", async () => {
+		serve(() => config({}));
+		expect(await ensureAlateProjectsRoot({ url: null, key: "k" })).toBe(
+			"alate server url is not configured",
+		);
+		expect(await ensureAlateProjectsRoot({ url: alate.url, key: null })).toBe(
+			"alate api key is not configured",
+		);
+		expect(hits.length).toBe(0);
 	});
 });
 

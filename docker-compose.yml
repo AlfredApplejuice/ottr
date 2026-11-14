@@ -569,6 +569,12 @@ services:
       - ./docker/no-proxy.sh:/no-proxy.sh:ro
       - home:/root # alate provisions the workers' shared agent layer here
       - alate-state:/state
+      # install-projects.mjs writes the files that agent-data projects/projects.json
+      # lists into the project checkouts. Without this mount /workspace does not
+      # exist in the container, alate refuses a projectsRoot of /workspace as not a
+      # directory, and the step prints "install-projects: no --root; project files
+      # not provisioned". Same volume as the workers', so the checkouts are shared.
+      - workspace:/workspace
     environment:
       # The key alate itself requires on every request.
       ALATE_API_KEY: ${ALATE_API_KEY:-}

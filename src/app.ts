@@ -35,6 +35,7 @@ import {
 	alateRotateKey,
 	alateUrlError,
 	commitConfigYml,
+	ensureAlateProjectsRoot,
 	loadConfigYml,
 	noRedirectFetch,
 	readOnlyMountError,
@@ -3364,6 +3365,13 @@ export async function createApp(deps: AppDeps) {
 			return { ok: false, status: 409, error: "provisioning already running" };
 		provisioning = true;
 		try {
+			// install-projects.mjs writes the projects.json files only with --root, and
+			// alate passes --root only when its config carries projectsRoot. Best-effort
+			// before every attempt; a failure (an alate without the workspace mount, or
+			// down) never blocks the provision that follows.
+			const rootError = await ensureAlateProjectsRoot(alate);
+			if (rootError !== null)
+				console.warn(`alate: projectsRoot not ensured: ${rootError}`);
 			return await provisionRequest();
 		} finally {
 			provisioning = false;

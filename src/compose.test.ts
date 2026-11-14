@@ -17,6 +17,7 @@ const buildkit = svc("buildkit");
 const buildkitCerts = svc("buildkit-certs");
 const server = svc("server");
 const postgresTest = svc("postgres-test");
+const alate = svc("alate");
 const postgresTestImage =
 	"docker.io/library/postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636";
 const ci = Bun.YAML.parse(
@@ -256,5 +257,21 @@ describe("the PostgreSQL test infrastructure shape", () => {
 			expect(step.env?.OTTR_TEST_PG_URL).toBeUndefined();
 			expect(step.env?.OTTR_REQUIRE_PG_TESTS).toBeUndefined();
 		}
+	});
+});
+
+describe("the bundled alate service shape", () => {
+	test("the alate service mounts the workspace volume at /workspace", () => {
+		// The same named volume the board and the workers mount: install-projects.mjs
+		// writes the projects.json files into the shared project checkouts there.
+		// Without the mount /workspace does not exist in the container, alate refuses
+		// a projectsRoot of /workspace, and the provision prints
+		// "install-projects: no --root; project files not provisioned".
+		expect(alate.volumes).toContain("workspace:/workspace");
+	});
+
+	test("docs/WORKERS.md documents the alate workspace mount and projectsRoot", () => {
+		expect(workersDoc).toContain("workspace:/workspace");
+		expect(workersDoc).toContain("projectsRoot");
 	});
 });

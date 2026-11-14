@@ -3948,20 +3948,40 @@ describe("alate routes", () => {
 		ok: true,
 		results: [{ script: "sync.mjs", code: 0, output: "out", truncated: false }],
 	};
+	// GET /config's answer. projectsRoot defaults to the compose value the board
+	// accepts as already set, so the older tests see the same request flow.
+	let alateConfig: Record<string, unknown> = {
+		repo: "o/data",
+		path: null,
+		tokenSet: true,
+		projectsRoot: "/workspace",
+	};
+	// When set, POST /config answers with this body at 400 (alate's invalid
+	// projectsRoot refusal), while GET /config and /provision stay successful.
+	let alateConfigPost: unknown = null;
 	const fakeAlate = Bun.serve({
 		port: 0,
 		fetch: async (req) => {
 			if (alateDelay > 0) await Bun.sleep(alateDelay);
 			if (alateRedirect !== null) return Response.redirect(alateRedirect, 302);
-			const reqBody = await req.json().catch(() => undefined);
+			const pathname = new URL(req.url).pathname;
+			const reqBody =
+				pathname === "/config"
+					? await req.json().catch(() => undefined)
+					: undefined;
 			const entry: AlateReq = {
 				method: req.method,
-				url: new URL(req.url).pathname,
+				url: pathname,
 				auth: req.headers.get("authorization"),
 				...(reqBody === undefined ? {} : { body: reqBody }),
 			};
 			lastAlateReq = entry;
 			alateReqs.push(entry);
+			if (pathname === "/config") {
+				if (req.method === "POST" && alateConfigPost !== null)
+					return Response.json(alateConfigPost, { status: 400 });
+				return Response.json(alateConfig, { status: alateStatus });
+			}
 			return Response.json(alateBody, { status: alateStatus });
 		},
 	});
@@ -4027,6 +4047,75 @@ describe("alate routes", () => {
 				{ script: "sync.mjs", code: 0, output: "out", truncated: false },
 			],
 		});
+	});
+
+	test("provision reads /config and posts nothing when projectsRoot is set", async () => {
+		alateReqs = [];
+		const res = await post("/api/alate/provision", {});
+		expect(res.status).toBe(200);
+		expect(alateReqs.map((r) => `${r.method} ${r.url}`)).toEqual([
+			"GET /config",
+			"POST /provision",
+		]);
+	});
+
+	test("provision sets a null projectsRoot to /workspace before POST /provision", async () => {
+		alateConfig = {
+			repo: "o/data",
+			path: null,
+			tokenSet: true,
+			projectsRoot: null,
+		};
+		alateReqs = [];
+		const res = await post("/api/alate/provision", {});
+		expect(res.status).toBe(200);
+		expect(alateReqs).toEqual([
+			{ method: "GET", url: "/config", auth: "Bearer alate_secret" },
+			{
+				method: "POST",
+				url: "/config",
+				auth: "Bearer alate_secret",
+				body: { projectsRoot: "/workspace" },
+			},
+			{ method: "POST", url: "/provision", auth: "Bearer alate_secret" },
+		]);
+		alateConfig = { ...alateConfig, projectsRoot: "/workspace" };
+	});
+
+	test("a refused projectsRoot never blocks the provision", async () => {
+		// An alate without the workspace mount answers 400 invalid projectsRoot:
+		// the attempt logs, and the provision still runs.
+		alateConfig = {
+			repo: "o/data",
+			path: null,
+			tokenSet: true,
+			projectsRoot: null,
+		};
+		alateConfigPost = { error: "invalid projectsRoot" };
+		alateReqs = [];
+		const warnings: string[] = [];
+		const originalWarn = console.warn;
+		console.warn = (msg?: unknown): void => {
+			warnings.push(String(msg));
+		};
+		try {
+			const res = await post("/api/alate/provision", {});
+			expect(res.status).toBe(200);
+			expect(alateReqs.map((r) => `${r.method} ${r.url}`)).toEqual([
+				"GET /config",
+				"POST /config",
+				"POST /provision",
+			]);
+			expect(
+				warnings.some((w) =>
+					w.includes("alate: projectsRoot not ensured: invalid projectsRoot"),
+				),
+			).toBe(true);
+		} finally {
+			console.warn = originalWarn;
+			alateConfig = { ...alateConfig, projectsRoot: "/workspace" };
+			alateConfigPost = null;
+		}
 	});
 
 	test("provision without url or key is 400", async () => {

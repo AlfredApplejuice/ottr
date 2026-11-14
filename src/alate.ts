@@ -313,6 +313,45 @@ export async function alateRotateKey(
 export function readOnlyMountError(error: string): boolean {
 	return /\b(?:EROFS|EACCES)\b/.test(error);
 }
+/** The projects workspace inside the bundled alate container (docker-compose.yml mounts
+ *  the `workspace` volume there, the same volume the board and the workers use). Alate
+ *  passes --root to install-projects.mjs only when its server config carries
+ *  projectsRoot, and a repo source has no fallback, so without it the step prints
+ *  "install-projects: no --root; project files not provisioned". */
+export const ALATE_PROJECTS_ROOT = "/workspace";
+/** Ensures alate's server config carries projectsRoot so a provision writes the
+ *  projects.json files into the checkouts. Reads GET /config first: null sets it with
+ *  POST /config { projectsRoot }, the compose value is already set, a root an operator
+ *  saved in alate's own dashboard stays, and an alate older than projectsRoot support
+ *  omits the field. A path source keeps alate's own fallback (the source's parent
+ *  directory). Returns the failure text, or null when nothing was wrong; the caller
+ *  must not block the provision on it (an alate without the workspace mount refuses
+ *  the set and keeps today's no---root behavior). */
+export async function ensureAlateProjectsRoot(
+	alate: Alate,
+): Promise<string | null> {
+	const cfg = await alateApi(
+		alate,
+		"/config",
+		10_000,
+		null,
+		"the alate config read",
+	);
+	if (!cfg.ok) return cfg.error;
+	if (cfg.body.projectsRoot !== null) return null;
+	if (typeof cfg.body.repo !== "string" || cfg.body.repo === "") return null;
+	const set = await alateApi(
+		alate,
+		"/config",
+		10_000,
+		{
+			method: "POST",
+			body: { projectsRoot: ALATE_PROJECTS_ROOT },
+		},
+		"the alate projectsRoot set",
+	);
+	return set.ok ? null : set.error;
+}
 export const CONFIG_YML = "user/omp/agent/config.yml";
 // Alate's source fields reach gh api paths: only plain names, hex commits and safe branches.
 // GitHub owners hold no dots, and a repo is never "." or "..": no segment can climb the path.

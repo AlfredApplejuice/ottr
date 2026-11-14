@@ -813,6 +813,20 @@ real podman.
   never logs the key, and the runner strips it from every turn's env, since
   no turn calls alate. A user whose Alate server already runs on another host
   omits the profile and saves the URL and key under **Settings -> Alate**.
+  The service also mounts the stack's `workspace` volume at `/workspace`
+  (`workspace:/workspace` in `docker-compose.yml`), the same volume the board
+  and the workers use. Alate's install-projects step writes the files that the
+  data repo's `projects/projects.json` lists into the project checkouts there,
+  but only when alate's server config carries `projectsRoot`. The board sets
+  it before every provision attempt: it reads `GET /config`, and when alate's
+  source is the data repo and `projectsRoot` is unset, it sends `POST /config`
+  with `projectsRoot: /workspace`. A root saved in alate's own dashboard stays,
+  and a folder-source alate keeps its parent-directory fallback. A stack that
+  ran the profile before this mount needs one
+  `docker compose --profile alate up -d --force-recreate alate`, so the
+  container gets `/workspace`; without it, alate refuses the set and the
+  provision prints `install-projects: no --root; project files not
+  provisioned`.
 - Server: `OTTR_OMP_STATS_PORT` is the port of the omp stats dashboard proxy
   (**Settings → omp usage → Launch omp stats dashboard**). The default is
   `3848`. The value `0` or `off` disables the proxy. Compose publishes the
