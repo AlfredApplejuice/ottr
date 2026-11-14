@@ -2010,6 +2010,57 @@ describe("createPrWatcher", () => {
 		expect(s.prompts).toHaveLength(1);
 	});
 
+	test("the watcher never reviews a Dependabot PR a card already owns", async () => {
+		const s = await setup();
+		const card = await s.store.createTask("Dependabot card");
+		await s.store.updateTask(card.id, {
+			sourcePrNumber: 11,
+			sourcePrDependabot: true,
+		});
+		s.setOpen([
+			pr(11, sha("a"), false, "Dependabot PR"),
+			pr(12, sha("b"), false, "Person PR"),
+		]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		await s.watcher.tick();
+		expect((await s.cards()).length).toBe(1);
+		expect((await s.cards())[0]!.title).toContain("#12");
+		expect(
+			(await s.cards()).some((c) => c.title.includes("PR review: #11")),
+		).toBe(false);
+		expect(s.prompts).toHaveLength(1);
+	});
+
+	test("a cancelled Dependabot card no longer keeps the watch off its PR", async () => {
+		const s = await setup();
+		const card = await s.store.createTask("Dependabot card");
+		await s.store.updateTask(card.id, {
+			sourcePrNumber: 11,
+			sourcePrDependabot: true,
+			cancelledAt: 1,
+		});
+		s.setOpen([pr(11, sha("a"), false, "Dependabot PR")]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect((await s.cards()).length).toBe(1);
+		expect((await s.cards())[0]!.title).toContain("#11");
+		expect(s.prompts).toHaveLength(1);
+	});
+
+	test("a Dependabot PR with no owning card still gets a review", async () => {
+		const s = await setup();
+		s.setOpen([pr(11, sha("a"), false, "Dependabot PR")]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect((await s.cards()).length).toBe(1);
+		expect((await s.cards())[0]!.title).toContain("#11");
+		expect(s.prompts).toHaveLength(1);
+	});
+
 	test("reviewNow skips the project's own PR", async () => {
 		const s = await setup();
 		const card = await s.store.createTask("parent");

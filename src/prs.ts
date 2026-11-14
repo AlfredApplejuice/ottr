@@ -1038,18 +1038,29 @@ async function closeGonePulls(
 }
 
 /** The PR numbers and branch names of the project's cards: pull requests the board opened
- * itself. The watcher never files a review card for one. */
+ * itself. The watcher never files a review card for one. sourcePrNumbers holds the external
+ * PRs an uncancelled card already owns (a Dependabot PR the Dependabot flow integrates);
+ * the watcher never files a review card for one either. */
 async function ownPulls(store: ForkProject["store"]): Promise<{
 	numbers: Set<number>;
 	branches: Set<string>;
+	sourcePrNumbers: Set<number>;
 }> {
 	const numbers = new Set<number>();
 	const branches = new Set<string>();
+	const sourcePrNumbers = new Set<number>();
 	for (const c of await store.listTasks()) {
 		if (c.prNumber !== null) numbers.add(c.prNumber);
 		if (c.branch !== null) branches.add(c.branch);
+		// A cancelled card released its source PR back to the watch.
+		if (
+			c.sourcePrDependabot === true &&
+			c.sourcePrNumber !== null &&
+			c.cancelledAt == null
+		)
+			sourcePrNumbers.add(c.sourcePrNumber);
 	}
-	return { numbers, branches };
+	return { numbers, branches, sourcePrNumbers };
 }
 
 /** Open, non-draft rows whose head the project has not reviewed yet and whose quiet period is over. */
@@ -1075,6 +1086,7 @@ async function dueReviewRows(
 		const info = byNumber.get(row.number);
 		if (
 			own.numbers.has(row.number) ||
+			own.sourcePrNumbers.has(row.number) ||
 			(info?.headRef != null && own.branches.has(info.headRef))
 		)
 			continue;
