@@ -8,11 +8,20 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	renameSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
+	basename,
+	dirname,
+	isAbsolute,
+	join,
+	relative,
+	resolve,
+	sep,
+} from "node:path";
 
 import { closeLocked, openLocked, StoreLockedError } from "./dblock.ts";
 import type { SQLiteDatabase } from "./sqliteDriver.ts";
@@ -102,27 +111,69 @@ function isAtOrBelow(dir: string, root: string): boolean {
 	return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
+/** The real path of `p`; a missing path gets the real path of its nearest existing parent. */
+function realOrNearest(p: string): string {
+	const abs = resolve(p);
+	try {
+		return realpathSync(abs);
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException).code;
+		const parent = dirname(abs);
+		if ((code !== "ENOENT" && code !== "ENOTDIR") || parent === abs) throw err;
+		return join(realOrNearest(parent), basename(abs));
+	}
+}
+
+/** The first root that one of `dirs` is equal to or below, by the given and the real root path. */
+function rootBelow(
+	dirs: readonly string[],
+	roots: readonly string[],
+): string | undefined {
+	return roots.find((root) => {
+		const forms = [resolve(root), realOrNearest(root)];
+		return dirs.some((d) => forms.some((r) => isAtOrBelow(d, r)));
+	});
+}
+
 /**
  * The backup dir and the retention count from the env. `keep: 0` means no backups. Only a
  * dir from OTTR_BACKUP_DIR can be refused: the default dir is next to tracker.db, so a
- * snapshot there is exactly as exposed as tracker.db itself.
+ * snapshot there is exactly as exposed as tracker.db itself. The check uses the given and
+ * the real paths; `refuseBelow` holds the roots that each run checks again.
  */
 export function resolveBackup(
 	env: Record<string, string | undefined>,
 	stateDir: string,
 	workerRoots: readonly string[],
-): { dir: string; keep: number; errors: string[] } {
+): { dir: string; keep: number; errors: string[]; refuseBelow: string[] } {
 	const errors: string[] = [];
 	const keep = parseKeep(env.OTTR_BACKUP_KEEP, errors);
 	if (!env.OTTR_BACKUP_DIR)
-		return { dir: join(resolve(stateDir), ".tasks", "backups"), keep, errors };
+		return {
+			dir: join(resolve(stateDir), ".tasks", "backups"),
+			keep,
+			errors,
+			refuseBelow: [],
+		};
 	const dir = resolve(env.OTTR_BACKUP_DIR);
-	const root = workerRoots.find((r) => isAtOrBelow(dir, r));
-	if (root === undefined) return { dir, keep, errors };
+	const refuseBelow = [...workerRoots];
+	let real: string;
+	let root: string | undefined;
+	try {
+		real = realOrNearest(dir);
+		root = rootBelow([dir, real], workerRoots);
+	} catch (err) {
+		errors.push(
+			`OTTR_BACKUP_DIR ${dir} cannot be checked against the worker-mounted roots (${errorText(err)}), so the board makes no backups`,
+		);
+		return { dir, keep: 0, errors, refuseBelow };
+	}
+	if (root === undefined) return { dir, keep, errors, refuseBelow };
+	const via = real === dir ? "" : ` (real path ${real})`;
 	errors.push(
-		`OTTR_BACKUP_DIR ${dir} is equal to or below the worker-mounted root ${resolve(root)}: a worker could read the snapshots, so the board makes no backups`,
+		`OTTR_BACKUP_DIR ${dir}${via} is equal to or below the worker-mounted root ${resolve(root)}: a worker could read the snapshots, so the board makes no backups`,
 	);
-	return { dir, keep: 0, errors };
+	return { dir, keep: 0, errors, refuseBelow };
 }
 
 const projectFile = (name: string): string =>
@@ -250,20 +301,29 @@ function prune(dir: string, keep: number): string[] {
 /**
  * Writes one snapshot `<dir>/<stamp>/` through `<stamp>.partial/`, then applies retention when
  * all sources passed. Throws when a snapshot with the same stamp exists already.
+ * Throws before it writes when the real path of `dir` is equal to or below a root of `refuseBelow`.
  */
 export async function runBackup(o: {
 	dir: string;
 	keep: number;
 	now: Date;
 	sources: BackupSource[];
+	refuseBelow: readonly string[];
 }): Promise<BackupResult> {
 	mkdirSync(o.dir, { recursive: true });
-	removeStalePartials(o.dir);
+	// The real path, checked after mkdir: a link can point into a root after the boot check.
+	const dir = realpathSync(o.dir);
+	const root = rootBelow([dir], o.refuseBelow);
+	if (root !== undefined)
+		throw new Error(
+			`the backup dir ${o.dir} (real path ${dir}) is equal to or below the worker-mounted root ${resolve(root)}: no snapshot is written`,
+		);
+	removeStalePartials(dir);
 	const stamp = formatStamp(o.now);
-	const final = join(o.dir, stamp);
+	const final = join(dir, stamp);
 	if (present(final))
-		throw new Error(`the snapshot ${stamp} exists already in ${o.dir}`);
-	const partial = join(o.dir, `${stamp}${PARTIAL}`);
+		throw new Error(`the snapshot ${stamp} exists already in ${dir}`);
+	const partial = join(dir, `${stamp}${PARTIAL}`);
 	mkdirSync(partial);
 	const copied: string[] = [];
 	const failed: Failure[] = [];
@@ -286,7 +346,7 @@ export async function runBackup(o: {
 		`${JSON.stringify(manifest, null, "\t")}\n`,
 	);
 	renameSync(partial, final);
-	const pruned = failed.length === 0 ? prune(o.dir, o.keep) : [];
+	const pruned = failed.length === 0 ? prune(dir, o.keep) : [];
 	return { stamp, copied, failed, pruned };
 }
 
@@ -295,6 +355,7 @@ export async function backupTick(o: {
 	dir: string;
 	keep: number;
 	now: Date;
+	refuseBelow: readonly string[];
 	sources: () => BackupSource[];
 	log: (line: string) => void;
 }): Promise<void> {
@@ -305,6 +366,7 @@ export async function backupTick(o: {
 			dir: o.dir,
 			keep: o.keep,
 			now: o.now,
+			refuseBelow: o.refuseBelow,
 			sources: o.sources(),
 		});
 		o.log(

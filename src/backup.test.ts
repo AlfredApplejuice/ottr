@@ -46,6 +46,16 @@ const tmp = (label: string): string => {
 	return dir;
 };
 
+/** A new dir with the worker root `data` and the link `backup` to `target`, a path below the new dir; `target` is not made. */
+const linked = (label: string, target: string) => {
+	const base = tmp(label);
+	const workers = join(base, "data");
+	mkdirSync(workers);
+	const link = join(base, "backup");
+	symlinkSync(join(base, target), link);
+	return { workers, link, target: join(base, target) };
+};
+
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 const T0 = new Date("2026-11-10T03:15:00Z");
@@ -220,6 +230,7 @@ describe("resolveBackup", () => {
 			dir: join(resolve("/srv/ottr"), ".tasks", "backups"),
 			keep: 7,
 			errors: [],
+			refuseBelow: [],
 		});
 		expect(resolveBackup({ OTTR_BACKUP_DIR: "" }, "state", []).dir).toBe(
 			join(resolve("state"), ".tasks", "backups"),
@@ -232,6 +243,7 @@ describe("resolveBackup", () => {
 			dir: resolve("/mnt/disk2/ottr"),
 			keep: 7,
 			errors: [],
+			refuseBelow: [],
 		});
 		expect(resolveBackup({ OTTR_BACKUP_DIR: "rel" }, "/srv", []).dir).toBe(
 			resolve("rel"),
@@ -283,6 +295,7 @@ describe("resolveBackup", () => {
 				dir: resolve(dir),
 				keep: 3,
 				errors: [],
+				refuseBelow: composeRoots,
 			});
 		}
 	});
@@ -292,6 +305,7 @@ describe("resolveBackup", () => {
 			dir: join(resolve("/workspace/ottr"), ".tasks", "backups"),
 			keep: 7,
 			errors: [],
+			refuseBelow: [],
 		});
 	});
 
@@ -301,6 +315,99 @@ describe("resolveBackup", () => {
 		expect(result.keep).toBe(0);
 		expect(result.errors.length).toBe(2);
 	});
+
+	test.skipIf(process.platform === "win32")(
+		"a link outside every root to a dir below a root makes no backups",
+		() => {
+			const { workers, link, target } = linked("link-in", "data/loot");
+			mkdirSync(target);
+			const result = resolveBackup({ OTTR_BACKUP_DIR: link }, "/app", [
+				workers,
+			]);
+			expect(result.dir).toBe(resolve(link));
+			expect(result.keep).toBe(0);
+			expect(result.errors.length).toBe(1);
+			expect(result.errors[0]).toContain(resolve(link));
+			expect(result.errors[0]).toContain(resolve(workers));
+			expect(result.refuseBelow).toEqual([workers]);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"a missing dir below such a link makes no backups",
+		() => {
+			const { workers, link, target } = linked("link-sub", "data/loot");
+			mkdirSync(target);
+			const dir = join(link, "sub");
+			const result = resolveBackup({ OTTR_BACKUP_DIR: dir }, "/app", [workers]);
+			expect(result.keep).toBe(0);
+			expect(result.errors.length).toBe(1);
+			expect(result.errors[0]).toContain(resolve(dir));
+			expect(result.errors[0]).toContain(resolve(workers));
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"a dir below the real target of a linked root makes no backups",
+		() => {
+			const base = tmp("root-link");
+			const real = join(base, "real-data");
+			mkdirSync(real);
+			const workers = join(base, "data");
+			symlinkSync(real, workers);
+			const dir = join(real, "backups");
+			const result = resolveBackup({ OTTR_BACKUP_DIR: dir }, "/app", [workers]);
+			expect(result.keep).toBe(0);
+			expect(result.errors.length).toBe(1);
+			expect(result.errors[0]).toContain(resolve(dir));
+			expect(result.errors[0]).toContain(resolve(workers));
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"a link to a dir outside every root is accepted",
+		() => {
+			const { workers, link, target } = linked("link-out", "elsewhere");
+			mkdirSync(target);
+			expect(
+				resolveBackup({ OTTR_BACKUP_DIR: link }, "/app", [workers]),
+			).toEqual({
+				dir: resolve(link),
+				keep: 7,
+				errors: [],
+				refuseBelow: [workers],
+			});
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"property: each dir below a link into a root makes no backups",
+		() => {
+			const { workers, link, target } = linked("link-prop", "data/loot");
+			mkdirSync(target);
+			const segmentArb = fc
+				.array(fc.constantFrom(..."abcxyz019".split("")), {
+					minLength: 1,
+					maxLength: 8,
+				})
+				.map((chars) => chars.join(""));
+			fc.assert(
+				fc.property(
+					fc.array(segmentArb, { minLength: 1, maxLength: 3 }),
+					fc.boolean(),
+					(segments, made) => {
+						const dir = join(link, ...segments);
+						if (made) mkdirSync(dir, { recursive: true });
+						const result = resolveBackup({ OTTR_BACKUP_DIR: dir }, "/app", [
+							workers,
+						]);
+						expect(result.keep).toBe(0);
+						expect(result.errors.length).toBe(1);
+					},
+				),
+			);
+		},
+	);
 });
 
 describe("backupSources", () => {
@@ -354,6 +461,7 @@ describe("backupSources", () => {
 					dir,
 					keep: 1,
 					now: T0,
+					refuseBelow: [],
 					sources: backupSources(gstore, [store]),
 				});
 				expect(first.failed).toEqual([]);
@@ -375,6 +483,7 @@ describe("backupSources", () => {
 				dir,
 				keep: 1,
 				now: after(DAY),
+				refuseBelow: [],
 				sources: backupSources(
 					gstore,
 					[],
@@ -420,6 +529,7 @@ describe("backupDue and backupTick", () => {
 				dir,
 				keep,
 				now,
+				refuseBelow: [],
 				sources: () => {
 					asked++;
 					return sources();
@@ -545,7 +655,7 @@ describe("runBackup", () => {
 		now: Date,
 		keep: number,
 		sources: BackupSource[] = [good("tracker.db")],
-	) => await runBackup({ dir, keep, now, sources });
+	) => await runBackup({ dir, keep, now, sources, refuseBelow: [] });
 
 	test("a delayed real snapshot precedes manifest, rename, retention, and log output", async () => {
 		const dir = tmp("delayed-copy");
@@ -562,6 +672,7 @@ describe("runBackup", () => {
 				dir,
 				keep: 1,
 				now: after(DAY),
+				refuseBelow: [],
 				sources: () => [
 					{
 						file: "tracker.db",
@@ -909,6 +1020,81 @@ describe("runBackup", () => {
 			),
 		);
 	});
+
+	test.skipIf(process.platform === "win32")(
+		"a link to a dir below a refused root throws and writes nothing",
+		async () => {
+			const { workers, link, target } = linked("run-link-in", "data/loot");
+			mkdirSync(target);
+			await expect(
+				runBackup({
+					dir: link,
+					keep: 7,
+					now: T0,
+					sources: [good("tracker.db")],
+					refuseBelow: [workers],
+				}),
+			).rejects.toThrow(link);
+			expect(readdirSync(target)).toEqual([]);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"a link that points into a root only after boot throws in the run",
+		async () => {
+			const { workers, link, target } = linked("run-link-late", "data/loot");
+			const boot = resolveBackup({ OTTR_BACKUP_DIR: link }, "/app", [workers]);
+			expect(boot.keep).toBe(7);
+			mkdirSync(target);
+			await expect(
+				runBackup({
+					dir: boot.dir,
+					keep: boot.keep,
+					now: T0,
+					sources: [good("tracker.db")],
+					refuseBelow: boot.refuseBelow,
+				}),
+			).rejects.toThrow();
+			expect(readdirSync(target)).toEqual([]);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"a tick with a link into a root logs the failure and makes no snapshot",
+		async () => {
+			const { workers, link, target } = linked("tick-link-in", "data/loot");
+			mkdirSync(target);
+			const lines: string[] = [];
+			await backupTick({
+				dir: link,
+				keep: 7,
+				now: T0,
+				refuseBelow: [workers],
+				sources: () => [good("tracker.db")],
+				log: (line) => lines.push(line),
+			});
+			expect(lines.length).toBe(1);
+			expect(lines[0]).toStartWith("backup: failed:");
+			expect(readdirSync(target)).toEqual([]);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"a link to a dir outside every root gets the snapshot in its target",
+		async () => {
+			const { workers, link, target } = linked("run-link-out", "elsewhere");
+			mkdirSync(target);
+			const result = await runBackup({
+				dir: link,
+				keep: 7,
+				now: T0,
+				sources: [good("tracker.db")],
+				refuseBelow: [workers],
+			});
+			expect(result.stamp).toBe(S0);
+			expect(existsSync(join(target, S0, "tracker.db"))).toBe(true);
+		},
+	);
 });
 
 describe("readManifest", () => {

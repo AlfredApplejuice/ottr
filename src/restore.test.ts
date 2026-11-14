@@ -79,7 +79,13 @@ const snapshot = async (
 		backupTo: async (dest: string) => await gstore.backupTo(dest),
 	}));
 	const sources = backupSources(gstore, stores);
-	const result = await runBackup({ dir, keep: 7, now, sources });
+	const result = await runBackup({
+		dir,
+		keep: 7,
+		now,
+		sources,
+		refuseBelow: [],
+	});
 	await gstore.close();
 	expect(result.failed).toEqual([]);
 };
@@ -138,6 +144,7 @@ describe("runRestore", () => {
 				dir: backups,
 				keep: 7,
 				now: T0,
+				refuseBelow: [],
 				sources: backupSources(gstore, [store]),
 			});
 			expect(result).toEqual({
@@ -396,6 +403,7 @@ describe("runRestore", () => {
 			dir: d.dir,
 			keep: 7,
 			now: T1,
+			refuseBelow: [],
 			sources: backupSources(gstore, [failing]),
 		});
 		await gstore.close();

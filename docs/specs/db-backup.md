@@ -63,8 +63,13 @@ history and settings (OTTR-736, topics 83 and 84).
 3. A snapshot holds the same tokens and keys as `tracker.db`. With a worker boundary
    (`OTTR_DATA_DIR` set), the board refuses an `OTTR_BACKUP_DIR` that is equal to or below
    a worker-mounted root (the project roots, `OTTR_DATA_DIR`, the home dir). It logs one
-   error at boot and makes no backups. The default dir is next to `tracker.db` and is as
-   open as that file, so the board never refuses it.
+   error at boot and makes no backups. The check compares the given paths and also their
+   real paths, with each symlink resolved: a symlink outside the roots whose target is
+   below a root is refused too. A dir that does not exist yet uses the real path of its
+   nearest existing parent. Each run checks again after it creates the dir and writes
+   through the real path, so a link that points into a root later stops the run before it
+   writes a file. The default dir is next to `tracker.db` and is as open as that file, so
+   the board never refuses it.
 4. `childEnv` (src/runner.ts) removes `OTTR_BACKUP_DIR` from each turn env. A turn that
    starts a scratch board (ottr's own test suite, the boot smoke) must not write into the
    live backup dir or remove live snapshots.
@@ -131,7 +136,8 @@ call it on the store's own connection. Each caller awaits the snapshot before it
     parseStamp(name: string): Date | null        // null unless `name` is a canonical stamp
     listSnapshots(dir: string): string[]         // finished snapshots, newest first
     resolveBackup(env, stateDir: string, workerRoots: readonly string[]):
-      { dir: string; keep: number; errors: string[] }
+      { dir: string; keep: number; errors: string[]; refuseBelow: string[] }
+      // refuseBelow: the roots that each run checks again; [] for the default dir
     type BackupSource = { file: string; backupTo: (dest: string) => Promise<void> }
     backupSources(tracker: { backupTo(dest: string): Promise<void> },
       projects: Iterable<{ name: string; backupTo(dest: string): Promise<void> }>,
@@ -144,10 +150,12 @@ call it on the store's own connection. Each caller awaits the snapshot before it
       // null when the file is missing or not valid (a file name that is not a relative
       // path inside the snapshot makes the whole manifest not valid)
     backupDue(dir: string, now: Date): boolean
-    runBackup(o: { dir: string; keep: number; now: Date; sources: BackupSource[] }):
+    runBackup(o: { dir: string; keep: number; now: Date; sources: BackupSource[];
+      refuseBelow: readonly string[] }):
       Promise<{ stamp: string | null; copied: string[];
         failed: { file: string; error: string }[]; pruned: string[] }>
-    backupTick(o: { dir: string; keep: number; now: Date;
+      // throws before it writes when the real path of `dir` is equal to or below a root
+    backupTick(o: { dir: string; keep: number; now: Date; refuseBelow: readonly string[];
       sources: () => BackupSource[]; log: (line: string) => void }): Promise<void>
     restoreSnapshot(o: { dir: string; stamp: string; now: Date; trackerDb: string;
       projectDbFor: (name: string) => string | null; adoptedMarker: string | null }):
@@ -203,9 +211,11 @@ err: string[] }>` and the `import.meta.main` entry that awaits the result before
   manifest, each give a failure of the restore.
 - The restore tool stops with no change while a store holds a target. It renames an
   existing target and never deletes it.
-- `resolveBackup` refuses an `OTTR_BACKUP_DIR` below a worker root, accepts the compose
-  layout (`/backup` with roots `/workspace`, `/data`, `/root`), and never refuses the
-  default dir.
+- `resolveBackup` refuses an `OTTR_BACKUP_DIR` below a worker root, also through a
+  symlink whose target is below a root, accepts the compose layout (`/backup` with roots
+  `/workspace`, `/data`, `/root`), and never refuses the default dir.
+- `runBackup` with a dir whose symlink target is below a root in `refuseBelow` throws
+  and writes no file below the root, also when the link was dangling at boot.
 - `childEnv` removes `OTTR_BACKUP_DIR`.
 - Property tests: `parseStamp(formatStamp(t))` gives `t` in whole seconds, each name
   that `parseStamp` accepts formats to itself, retention keeps each entry that is

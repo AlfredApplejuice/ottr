@@ -1610,7 +1610,9 @@ Location:
   or corrupt state volume. It does not protect against a lost host or disk. For that, copy
   the backup dir off the host.
 - The board refuses an `OTTR_BACKUP_DIR` that is equal to or below a worker-mounted root
-  (`/workspace`, `/data`, `/root`). It logs one error at boot and makes no backups.
+  (`/workspace`, `/data`, `/root`). It logs one error at boot and makes no backups. The check
+  also resolves symlinks: a link whose target is below a root is refused too. Each daily run
+  checks the real path again, and it writes no snapshot when the target moved into a root.
 - A snapshot holds the sealed fields of `tracker.db`. Protect the backup dir, and also the
   sealing key: a restored snapshot is usable only with its sealing key. Back up
   `.tasks/secret.key` or set `OTTR_SECRET_KEY`.

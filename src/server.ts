@@ -1032,6 +1032,7 @@ if (backup.keep !== 0) {
 			dir: backup.dir,
 			keep: backup.keep,
 			now: new Date(),
+			refuseBelow: backup.refuseBelow,
 			// A project that opened later (added again from the board) is a live source, not a failure.
 			sources: () =>
 				backupSources(
