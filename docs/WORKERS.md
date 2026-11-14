@@ -1002,7 +1002,7 @@ killed those VMs already.
 ### Validation mode
 
 Beside turns, the runner runs validation jobs for the security-audit harness
-([the spec](specs/microvm-validation-mode.md), [ADR 0012](adr/0012-microvm-validation-mode.md)):
+([the spec](specs/microvm-validation-mode.md), [ADR 0015](adr/0015-microvm-validation-mode.md)):
 one VM runs one job of target code under OS-enforced controls. The VM gets no
 network interface at all (no `network-interfaces` entry, no `ip=` on the
 cmdline). The job env is exactly `PATH`, `HOME`, `LANG`. The overlay root mounts

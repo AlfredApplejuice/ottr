@@ -1,7 +1,7 @@
 # Validation mode in the microVM runner
 
 Status: draft for implementation. Builds on [ADR 0009](../adr/0009-microvm-workers.md)
-and [ADR 0012](../adr/0012-microvm-validation-mode.md). The security-audit harness
+and [ADR 0015](0015-microvm-validation-mode.md). The security-audit harness
 records its execution controls in
 [security-audit-harness.md](security-audit-harness.md), "Execution limits and errors".
 
@@ -315,6 +315,6 @@ retains from `result.json`.
 6. Tests: `src/vmRunner.test.ts` (fake launcher: checks 1-2, absent result),
    `src/vmValidate.test.ts` (guest flow with injected probes), the extension
    tool tests in the extension's test file.
-7. Docs: this spec, ADR 0012, ADR 0009 status, `docs/WORKERS.md` microVM
+7. Docs: this spec, ADR 0015, ADR 0009 status, `docs/WORKERS.md` microVM
    section, README feature table. The remaining KVM acceptance numbers land in
    ADR 0009 on the host.
