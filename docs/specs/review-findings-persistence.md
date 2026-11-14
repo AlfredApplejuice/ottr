@@ -189,6 +189,57 @@ open lead card already holds (OTTR-929).
 - A card filed for a lead joins the title index for the rest of the same pass,
   so two leads with one title file once.
 
+#### Leads come from the audit run's findings.json (OTTR-959)
+
+The agent writes the lead prompts. The prompts carry no `Fingerprint:` line and no
+stable titles, so the two dedupe rules above never matched: 0 of 70 lead cards
+carried the line. The stable fingerprints live in the audit run's output. The board
+therefore takes each lead from the run's `findings.json`, and the dedupe then works.
+
+The board looks for the run directory when the settle pass files leads. The
+directory lives on the board host at `<auditRunsRoot>/<project>/run-N`.
+`<auditRunsRoot>` is `/root/security-audit-skill` (`TurnOps.auditRunsRoot` overrides
+it; tests point it at a temp directory). `<project>` is the board project's name.
+The one rule: among the `run-N` directories whose `run-metadata.json` mtime falls
+inside the turn window (the run's `runStartedAt` to the settle time), the newest
+mtime wins; equal mtimes break on the higher N. The comparison allows a skew of
+five seconds on each side, because filesystem mtimes can sit a few milliseconds
+off the board's clock. A directory name must match
+`run-N` with digits only, and it must hold a readable `run-metadata.json`; the
+board skips every other entry.
+
+- No run directory in the window: today's path stays. The agent's own lead
+  proposals file, and the review log says that no run directory was created during
+  the turn.
+- A run directory found: the board reads its `findings.json` and validates the
+  file before use. The file's real path (realpath) must stay inside
+  `<auditRunsRoot>/<project>` (a symlinked `findings.json` or `run-N` directory
+  cannot escape the root). The JSON must parse to an array. Every element must be
+  an object with a non-empty string `fingerprint`. One failed check fails the
+  whole file: the review log names the reason, and the lead source falls back to
+  the agent's proposals.
+- A valid file: the pass's leads are one per record with `verdict` equal to
+  `needs_validation`, in file order. `model`, `rank`, and `security` stay null.
+  The agent's own lead proposals of the pass are dropped; the log says how many,
+  and the count joins the card's not-filed sum. Each lead prompt holds the record
+  fields as untrusted data:
+  - Line 1: `Needs validation: <title>` (the lead tag the board reads first).
+  - Line 2: `Fingerprint: <fingerprint>`. The line sits before the record body,
+    because the strict reader takes the first `Fingerprint:` line and the body
+    must not forge it.
+  - Then the description, the claimed root cause, and the trace, evidence,
+    blockers, and validation plan as one JSON line each, plus one line that marks
+    the record as untrusted audit data.
+- The fingerprint dedupe, the title dedupe, the blocker sorting, and the backlog
+  filing run unchanged. A file lead carries no `Blocker:` line, so it sorts as a
+  sandbox-run lead and files no question card.
+
+Limits: an audit that ran inside a worker microVM leaves no run directory on the
+board host, so the pass falls back with a log line. A turn that recorded no
+proposals at all never reaches the lead source (the check pass does not start),
+as today. A record's prose can carry a `Blocker:` line in the board's format; the
+worst case is one question card the user answers, so the board accepts the risk.
+
 ### 5. research-report.md survives the worktree
 
 The report harvest (`readReportFile` -> `archiveReport` -> `task.report`) runs
@@ -293,6 +344,19 @@ before the run resolves.
    cancel and never loses its run to the bare patch.
 9. turn: a review with only sandbox-run leads (one without the blocker line)
    files no question card.
+10. turn (OTTR-959): the turn-window audit run's two `needs_validation` records
+    file two leads, each with its `Fingerprint:` line; the agent's own proposals
+    drop, and the log names the count. A second review over the same records plus
+    one new record files only the new lead, logs `lead already open as card <id>`
+    for the open one, and files nothing for the cancelled one.
+11. turn (OTTR-959): a malformed `findings.json` in the window and a turn with no
+    run directory each fall back to the agent's proposals, with the reason in the
+    log.
+12. auditLeads (unit): the newest in-window run wins; a bad directory name, a
+    missing `run-metadata.json`, a symlink escape, a non-array file, a parse
+    error, and a record without a non-empty string fingerprint each fail; the
+    lead prompt carries the fingerprint line before the record body, and records
+    with another verdict file no lead.
 
 ## Non-goals
 
@@ -313,3 +377,5 @@ before the run resolves.
 - No dedupe of confirmed findings and no repair of the duplicate lead cards
   filed before OTTR-870; the fixed line dedupes leads only, from its first
   appearance in a lead prompt onward.
+- No back-fill of fingerprints into the lead cards filed before OTTR-959; those
+  cards keep the title fallback only.

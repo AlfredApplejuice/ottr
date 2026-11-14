@@ -7,6 +7,12 @@ import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import type { ensureProjectPackages } from "./apt.ts";
 import {
+	AUDIT_RUNS_ROOT,
+	type AuditRun,
+	findAuditRunDir,
+	readAuditLeads,
+} from "./auditLeads.ts";
+import {
 	copyBelow,
 	readBelow,
 	readRegular,
@@ -847,6 +853,9 @@ export interface TurnOps {
 	maxTotalRuns(): number | null;
 	/** The board's review-check switch (POST /api/settings); absent counts as on, so test fakes need nothing. */
 	reviewCheck?: () => boolean | Promise<boolean>;
+	/** OTTR-959: the audit runs root the review lead source reads on this host
+	 * (`/root/security-audit-skill` when absent); tests point it at a temp dir. */
+	auditRunsRoot?: () => string;
 	/** The board's work-check switch (POST /api/settings); absent counts as on, so test fakes need nothing. */
 	workCheck?: () => boolean | Promise<boolean>;
 	/** Role → selector map the check run's model resolves from; overridable for tests. */
@@ -9260,6 +9269,31 @@ export function createTurnLoop(
 		);
 	}
 
+	/** OTTR-959: the pass's lead source. `used`: the settling turn's audit run — the
+	 * newest run-N directory whose run-metadata.json mtime sits inside the turn window
+	 * — carried a valid findings.json, and its needs_validation records replace the
+	 * agent's own lead proposals. `no-run` and `invalid`: the agent's proposals file,
+	 * and the reason rides the review log (docs/specs/review-findings-persistence.md
+	 * §4, "Leads come from the audit run's findings.json"). */
+	function auditRunLeads(
+		root: string,
+		st: TurnSettle,
+	):
+		| { state: "used"; run: string; leads: RecordedFinding[] }
+		| { state: "no-run" }
+		| { state: "invalid"; reason: string } {
+		const run: AuditRun | null = findAuditRunDir(
+			root,
+			st.name,
+			st.dispatch.runStartedAt,
+			st.now,
+		);
+		if (run === null) return { state: "no-run" };
+		const read = readAuditLeads(root, st.name, run);
+		if (!read.ok) return { state: "invalid", reason: read.error };
+		return { state: "used", run: `${st.name}/${run.name}`, leads: read.leads };
+	}
+
 	/** A review's recorded findings: Ottr caps them, checks the selection with a second model
 	 * (a fresh session — never --resume, never the review's own — memory off, read/grep/glob
 	 * only), and files the kept ones as queued cards linked to the review, the flow
@@ -9275,9 +9309,35 @@ export function createTurnLoop(
 		const confirmed = st.reviewFindings.filter(
 			(f) => !f.prompt.startsWith("Needs validation"),
 		);
-		const leads = st.reviewFindings.filter((f) =>
+		const agentLeads = st.reviewFindings.filter((f) =>
 			f.prompt.startsWith("Needs validation"),
 		);
+		// OTTR-959: when the settling turn ran the security audit on this host (a run-N
+		// directory created inside the turn window), the pass's leads come from that
+		// run's findings.json — the stable fingerprints — and the agent's own lead
+		// proposals drop. No valid run in the window: the agent's proposals file, and
+		// the log says why.
+		const auditRoot = ops.auditRunsRoot?.() ?? AUDIT_RUNS_ROOT;
+		const audit = auditRunLeads(auditRoot, st);
+		let leads = agentLeads;
+		let droppedAgentLeads: RecordedFinding[] = [];
+		if (audit.state === "used") {
+			leads = audit.leads;
+			droppedAgentLeads = agentLeads;
+			const n = audit.leads.length;
+			const d = droppedAgentLeads.length;
+			await st.log(
+				`- leads come from the audit run's findings.json (${audit.run}, ${n} needs-validation record${n === 1 ? "" : "s"}; ${d} agent lead proposal${d === 1 ? "" : "s"} dropped)`,
+			);
+		} else if (audit.state === "invalid") {
+			await st.log(
+				`- the audit run's findings.json is invalid (${audit.reason}); leads come from the agent's proposals`,
+			);
+		} else {
+			await st.log(
+				`- no audit run directory was created during this turn under ${auditRoot}/${st.name}; leads come from the agent's proposals`,
+			);
+		}
 		const selected = selectFindings(confirmed);
 		const selectedSet = new Set(selected);
 		const belowCap = confirmed.filter((f) => !selectedSet.has(f));
@@ -9316,6 +9376,7 @@ export function createTurnLoop(
 			dropped,
 			belowCap,
 			leads,
+			droppedAgentLeads,
 			checkOn,
 			checkMs,
 			checkFailed,
@@ -9672,6 +9733,10 @@ export function createTurnLoop(
 			dropped: { id: number; finding: RecordedFinding; reason: string }[];
 			belowCap: RecordedFinding[];
 			leads: RecordedFinding[];
+			/** OTTR-959: the agent's own lead proposals this pass dropped because the
+			 * leads came from the audit run's findings.json (empty otherwise). Their
+			 * count joins the not-filed sum; the log names it. */
+			droppedAgentLeads: RecordedFinding[];
 			checkOn: boolean;
 			checkMs: number;
 			checkFailed: string | null;
@@ -9865,7 +9930,10 @@ export function createTurnLoop(
 				}
 				await st.log(
 					`- review findings: ${st.reviewFindings.length} recorded, ${filed.length} filed, ${
-						args.belowCap.length + args.dropped.length + leadNotFiled.length
+						args.belowCap.length +
+						args.dropped.length +
+						leadNotFiled.length +
+						args.droppedAgentLeads.length
 					} not filed${args.checkOn ? `, check ${(args.checkMs / 1000).toFixed(0)}s` : ", check off"}`,
 				);
 				// The counts and every unfiled finding with its reason live on the review card: the
