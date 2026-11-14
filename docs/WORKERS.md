@@ -1034,8 +1034,19 @@ compose network; the image must carry this card's code):
 
     docker compose exec server bun /app/src/vmValidateSmoke.ts
 
-The job prints its env, its routes, and its write attempts against the target
-and the result drive; every attempt must come back blocked.
+The acceptance run works the same way from a host shell, against the vm-runner
+image built from the branch under test: the job is `scripts/vm-validate-smoke.ts`,
+which prints each attempt with its blocked-or-allowed verdict and exits non-zero
+when one attempt is not blocked. The one-off container needs the compose network,
+a read-only checkout for the tar and the data volume for the job input:
+
+    NET=$(docker inspect "$(docker compose --profile vm ps -q vm-runner)" \
+      --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+    docker run --rm --network "$NET" -v /workspace:/workspace:ro -v ottr_ottr-data:/data \
+      -e OTTR_VM_RUNNER_URL=http://vm-runner:8787 -e OTTR_WORKER_TOKEN="$OTTR_WORKER_TOKEN" \
+      ottr-vm-runner:local bun /workspace/ottr/scripts/vm-validate-smoke.ts
+
+Either way, every attempt must come back blocked and the exit code must be 0.
 
 ### vm-runner in the update roll
 
