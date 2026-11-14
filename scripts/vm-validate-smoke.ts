@@ -18,19 +18,50 @@ import { join } from "node:path";
 import { runSandboxJob } from "../src/sandboxRun.ts";
 import { type ValidateResponse, VM_VALIDATE } from "../src/vmValidateShared.ts";
 
+export interface ProbeOptions {
+	/** The connect target; the real run uses the public resolver. */
+	connectHost?: string;
+	connectPort?: number;
+	/** The path the target-write attempt touches. */
+	targetPath?: string;
+}
+
+const CONNECT_HOST = /^[A-Za-z0-9.-]+$/;
+
 /** The job that attempts the three harness controls and reports each one. */
-export function probeArgv(): string[] {
-	return [
-		"sh",
-		"-c",
-		[
-			"if bun -e 'Bun.connect({hostname:\"1.1.1.1\",port:53,socket:{}}).then(()=>process.exit(0),()=>process.exit(1))' >/dev/null 2>&1; then v=allowed; else v=blocked; fi",
-			'echo "ATTEMPT network $v tcp/1.1.1.1:53 routes=$(ip route show | head -1)"',
-			"if touch /target/.ottr-smoke 2>/dev/null; then v=allowed; else v=blocked; fi",
-			'echo "ATTEMPT target-write $v /target/.ottr-smoke"',
-			"echo \"ATTEMPT env $(env | sort | sed 's/=.*//' | tr '\\n' ' ' | sed 's/ $//')\"",
-		].join("; "),
-	];
+export function probeArgv(opts: ProbeOptions = {}): string[] {
+	const host = opts.connectHost ?? "1.1.1.1";
+	const port = opts.connectPort ?? 53;
+	const target = opts.targetPath ?? "/target/.ottr-smoke";
+	if (!CONNECT_HOST.test(host)) throw new Error(`bad probe host: ${host}`);
+	// The connect attempt distinguishes the verdicts the kernel can prove: connected,
+	// refused (with the errno), and everything else is inconclusive — a missing
+	// interpreter or a crash must read as probe-failed, never as a false "blocked".
+	// The env names drop the variables the shell itself adds (PWD, OLDPWD, _), so the
+	// line reports the spawn env, which is what the allowlist controls.
+	const script = [
+		`v=$(bun -e 'const net=require("node:net");const s=net.connect({host:"${host}",port:${port}},()=>{console.log("allowed");process.exit(0)});s.on("error",(e)=>{console.log("blocked:"+(e.code||e.name||"unknown"));process.exit(2)});' 2>/dev/null)`,
+		'case "$v" in',
+		'allowed) echo "ATTEMPT network allowed tcp/' + host + ":" + port + '";;',
+		'blocked:*) echo "ATTEMPT network blocked tcp/' +
+			host +
+			":" +
+			port +
+			' reason=${v#blocked:}";;',
+		'*) echo "ATTEMPT network probe-failed tcp/' +
+			host +
+			":" +
+			port +
+			' out=$v";;',
+		"esac",
+		`if touch ${target} 2>/dev/null; then`,
+		`echo "ATTEMPT target-write allowed ${target}";`,
+		"else",
+		`echo "ATTEMPT target-write blocked ${target}";`,
+		"fi",
+		"echo \"ATTEMPT env $(env | sort | sed 's/=.*//' | grep -v -x -e PWD -e OLDPWD -e _ | tr '\\n' ' ' | sed 's/ $//')\"",
+	].join("\n");
+	return ["sh", "-c", script];
 }
 
 export interface Attempt {
@@ -92,6 +123,8 @@ export function acceptanceViolations(result: ValidateResponse): string[] {
 	for (const name of ["network", "target-write"] as const) {
 		const a = byName.get(name);
 		if (!a) bad.push(`the ${name} attempt never ran`);
+		else if (a.verdict === "probe-failed")
+			bad.push(`the ${name} probe failed: inconclusive (${a.detail})`);
 		else if (a.verdict !== "blocked")
 			bad.push(
 				`the ${name} attempt was ${a.verdict}, not blocked (${a.detail})`,

@@ -6,6 +6,7 @@ import {
 	readFileSync,
 	writeSync,
 } from "node:fs";
+import { connect as netConnect } from "node:net";
 import { isAbsolute, join } from "node:path";
 import { platform } from "./platform/index.ts";
 import {
@@ -858,9 +859,24 @@ const realDeps = (): ValidateDeps => ({
 	spawn: realSpawn,
 	exec: realExec,
 	connectProbe: async (host, port) => {
-		// `socket: {}` satisfies bun-types' required handler bag; the probe needs no events.
-		const socket = await Bun.connect({ hostname: host, port, socket: {} });
-		socket.end();
+		// node:net reports the kernel's errno on the error event; Bun.connect's typed
+		// shape rejects before it connects in this runtime.
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		const timer = setTimeout(() => {
+			s.destroy();
+			reject(new Error("connect timed out"));
+		}, 2000);
+		const s = netConnect({ host, port }, () => {
+			clearTimeout(timer);
+			s.destroy();
+			resolve(); // a connect succeeded: the isolation is broken
+		});
+		s.on("error", (err: Error) => {
+			clearTimeout(timer);
+			s.destroy();
+			reject(err);
+		});
+		await promise;
 	},
 	sleep: (ms) => {
 		const { promise, resolve } = Promise.withResolvers<void>();

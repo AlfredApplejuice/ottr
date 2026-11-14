@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { SandboxJobOptions } from "../src/sandboxRun.ts";
 import { type ValidateResponse, VM_VALIDATE } from "../src/vmValidateShared.ts";
 import {
@@ -10,7 +13,9 @@ import {
 	type SmokeDeps,
 } from "./vm-validate-smoke.ts";
 
-const envLine = `ATTEMPT env ${expectedEnvNames}`;
+// A fixed sample line, not derived from the expected value: if the allowlist ever
+// changes, the real-probe tests below catch the drift, not this fixture.
+const envLine = "ATTEMPT env HOME LANG PATH";
 
 const heldResult = (
 	over: Partial<ValidateResponse> = {},
@@ -51,7 +56,7 @@ describe("probeArgv", () => {
 		expect(script).toContain("ATTEMPT network");
 		expect(script).toContain("ATTEMPT target-write");
 		expect(script).toContain("ATTEMPT env");
-		expect(script).toContain('hostname:"1.1.1.1",port:53');
+		expect(script).toContain('net.connect({host:"1.1.1.1",port:53}');
 		expect(script).toContain("touch /target/.ottr-smoke");
 	});
 });
@@ -214,5 +219,108 @@ describe("main", () => {
 			checkout: "/workspace/demo",
 			env: { OTTR_VM_RUNNER_URL: "http://r:1", OTTR_WORKER_TOKEN: "tok" },
 		});
+	});
+});
+
+describe("the real probe process", () => {
+	// The probe runs for real, under exactly the job env the guest would get: no
+	// fixture stands in for its output.
+	const jobEnv = {
+		PATH: process.env.PATH ?? "",
+		HOME: "/tmp",
+		LANG: "C.UTF-8",
+	};
+
+	function runProbe(over?: {
+		connectHost?: string;
+		connectPort?: number;
+		targetPath?: string;
+	}): ReturnType<typeof parseAttempts> {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-probe-"));
+		try {
+			const r = Bun.spawnSync(probeArgv(over), {
+				cwd: dir,
+				env: jobEnv,
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			return parseAttempts(r.stdout.toString());
+		} finally {
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}
+
+	test("the env attempt names exactly the allowlist: PWD and shell additions are filtered", () => {
+		const env = runProbe().find((a) => a.name === "env");
+		expect(env).toBeDefined();
+		expect(env?.verdict).toBe(expectedEnvNames);
+		expect(env?.verdict).not.toContain("PWD");
+	});
+
+	test("a refused connect reports blocked with the kernel reason", () => {
+		// Bind a port, then close it: the next connect is refused, deterministically.
+		const srv = Bun.serve({ port: 0, fetch: () => new Response("x") });
+		const port = srv.port;
+		srv.stop(true);
+		const net = runProbe({ connectHost: "127.0.0.1", connectPort: port }).find(
+			(a) => a.name === "network",
+		);
+		expect(net?.verdict).toBe("blocked");
+		expect(net?.detail).toContain("ECONNREFUSED");
+	});
+
+	test("a missing interpreter is inconclusive, not blocked", () => {
+		// bun lives only under /usr/local on this image: a worker-style PATH without it
+		// must make the network attempt probe-failed, which the acceptance counts as a
+		// violation, instead of a false "blocked".
+		const dir = mkdtempSync(join(tmpdir(), "ottr-probe-nobun-"));
+		try {
+			const r = Bun.spawnSync(
+				probeArgv({ connectHost: "127.0.0.1", connectPort: 1 }),
+				{
+					cwd: dir,
+					env: { PATH: "/usr/bin:/bin", HOME: "/tmp", LANG: "C.UTF-8" },
+					stdin: "ignore",
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
+			const attempts = parseAttempts(r.stdout.toString());
+			const net = attempts.find((a) => a.name === "network");
+			expect(net?.verdict).toBe("probe-failed");
+			const violations = acceptanceViolations({
+				id: "x",
+				selfCheck: { ok: true, checks: [] },
+				missingControl: null,
+				job: {
+					argv: [],
+					cwd: "/target",
+					exitCode: 0,
+					signal: null,
+					timedOut: false,
+					stdoutTail: r.stdout.toString(),
+					stderrTail: "",
+				},
+				artifacts: [],
+				limits: VM_VALIDATE,
+				bootMs: null,
+				totalMs: 1,
+				logTail: "",
+				resultSource: "guest",
+			});
+			expect(violations.join("\n")).toContain("probe failed: inconclusive");
+		} finally {
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+
+	test("a target write into a missing directory is blocked", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-probe-t-"));
+		const net = runProbe({
+			targetPath: join(dir, "no-such-dir", "smoke"),
+		}).find((a) => a.name === "target-write");
+		expect(net?.verdict).toBe("blocked");
+		rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
 	});
 });
