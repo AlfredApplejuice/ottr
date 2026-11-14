@@ -579,6 +579,27 @@ function openCopyOutParent(root: string, dir: string): Dir | null {
 	}
 }
 
+/**
+ * True when every component from root to dir is a real directory (created when missing).
+ * A check-then-use walk: fit only for a dir no other process writes, such as the runner's
+ * own staging dir. The shared data volume uses openCopyOutParent.
+ */
+function realDirChain(root: string, dir: string): boolean {
+	let cur = root;
+	const rest = relative(root, dir);
+	for (const part of ["", ...(rest === "" ? [] : rest.split("/"))]) {
+		if (part) cur = join(cur, part);
+		try {
+			const st = lstatSync(cur);
+			if (!st.isDirectory()) return false; // a symlink or a file: never crossed
+		} catch {
+			if (cur === root) return false; // the root itself must exist
+			mkdirSync(cur, { mode: 0o755 });
+		}
+	}
+	return true;
+}
+
 /* ------------------------------------------------------------------------------------ */
 /* VM launch                                                                             */
 /* ------------------------------------------------------------------------------------ */
