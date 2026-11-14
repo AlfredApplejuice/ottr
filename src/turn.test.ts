@@ -1985,6 +1985,9 @@ describe("turn quarantine", () => {
 			// finally; the cap keeps the card at the settle instant these tests assert.
 			holdFollowUps: true,
 			commitsAhead: async () => 1,
+			// The head is not on the target: this test pins the merge-queue path, not the
+			// already-integrated settle.
+			isIntegrated: async () => false,
 			quarantineUntracked: async (worktreePath, quarantineDir) => {
 				record.quarantine.push({ worktreePath, quarantineDir });
 				return { moved: [".smoke-1.png", ".smoke-2.png"], refused: [] };
@@ -2012,6 +2015,7 @@ describe("turn quarantine", () => {
 		const { store, loop } = await setup({
 			holdFollowUps: true, // hold the chained merge turn; assert the settle instant
 			commitsAhead: async () => 1,
+			isIntegrated: async () => false, // the merge-queue path, not the integrated settle
 			quarantineUntracked: async () => {
 				throw new Error("git boom");
 			},
@@ -2135,6 +2139,7 @@ describe("merge-turn diff capture", () => {
 		const { store, record, loop } = await setup({
 			// The merge turn owns the snapshot. Hold the automatic merge at the work-settle boundary.
 			holdFollowUps: true,
+			isIntegrated: async () => false, // the merge-queue path, not the integrated settle
 			diffStat,
 			diffText,
 		});
@@ -3048,6 +3053,7 @@ describe("turn sessions, steering and images", () => {
 		const { store, loop } = await setup({
 			changedFiles: async () => ["src/ui/app.tsx"],
 			isClean: async () => false,
+			isIntegrated: async () => false, // the refusal park, not the integrated settle
 		});
 		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
@@ -8564,6 +8570,7 @@ describe("turn ownership, cap and settle regressions", () => {
 			// Assert the settle instant: the requeued merge turn is real but must not
 			// start inside this await and flip the card to preparing.
 			holdFollowUps: true,
+			isIntegrated: async () => false, // the merge-queue path, not the integrated settle
 		});
 		const task = await store.createTask("work please");
 		// An earlier turn on this card attached a shot; changedFiles is the cumulative diff.
@@ -16582,6 +16589,9 @@ describe("turn survivor round 5 — run setup", () => {
 			},
 			// Only a turn start may claim the retry in this test; the timer must not fire first.
 			titleRetryDelayMs: 3_600_000,
+			// The retry rides the chained merge turn's prepare: keep the head off the target
+			// so the answered settle still queues that merge turn.
+			isIntegrated: async () => false,
 		});
 		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
@@ -17219,6 +17229,7 @@ describe("turn survivor round 5 — run result and merge push", () => {
 		const record = baseRecord();
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
+			isIntegrated: async () => false, // the research park, not the integrated settle
 			createWorktree: withReport(record),
 			startRun: finishing(record, {
 				outcome: { status: "ready", summary: "researched" },
@@ -17234,9 +17245,11 @@ describe("turn survivor round 5 — run result and merge push", () => {
 	});
 
 	test("a research card without its report keeps its mark on an answered report with commits", async () => {
-		const { store, loop } = await withRun({
-			outcome: { status: "answered", summary: "researched" },
-		});
+		const { store, loop } = await withRun(
+			{ outcome: { status: "answered", summary: "researched" } },
+			// The head is off the target: the research park, not the integrated settle.
+			{ isIntegrated: async () => false },
+		);
 		const task = await researchCard(store);
 		await loop.runTurn(store.name, task.id);
 		const after = (await store.getTask(task.id))!;
@@ -17244,6 +17257,47 @@ describe("turn survivor round 5 — run result and merge push", () => {
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("1 commit(s)");
+	});
+
+	test("an answered work card whose branch is already on the target settles done", async () => {
+		// The default run answers with one commit ahead; the integrated head makes every
+		// branch commit already merged, so done — not a merge turn, not a park.
+		const { store, loop } = await withRun(
+			{ outcome: { status: "answered", summary: "did it" } },
+			{ isIntegrated: async () => true },
+		);
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect([after.stage, after.state, after.needsReason]).toEqual([
+			"done",
+			"idle",
+			null,
+		]);
+	});
+
+	test("an answered research card whose branch is on the target settles done (VELVET-124)", async () => {
+		// The card moved its branch to the target: the report is the deliverable and the
+		// commits need no merge, so done instead of the never-integrated park.
+		const record = baseRecord();
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			isIntegrated: async () => true,
+			createWorktree: withReport(record),
+			startRun: finishing(record, {
+				outcome: { status: "answered", summary: "researched" },
+			}),
+		});
+		const task = await researchCard(store);
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect([after.stage, after.state, after.needsReason]).toEqual([
+			"done",
+			"idle",
+			null,
+		]);
+		expect(after.research).toBe(true);
+		expect(after.report).toContain("# findings");
 	});
 
 	test("a research card's ready report without commits stays research and asks for the report", async () => {
@@ -19894,6 +19948,7 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 	test("a run whose session was never announced still settles to merging/queued", async () => {
 		const { store, record, loop } = await setup({
 			holdFollowUps: true, // keep the finally's schedule() from starting the merge turn
+			isIntegrated: async () => false, // the merge-queue path, not the integrated settle
 			// No onSession call: the card never left preparing while the run went on.
 			startRun: async (o: StartArgs) => {
 				record.runs.push(o);
@@ -19912,7 +19967,10 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 
 	test("a work card settling to merging/queued gets a fresh queue time", async () => {
 		// Cap 0 keeps the finally's schedule() from starting the merge turn.
-		const { store, loop } = await setup({ holdFollowUps: true });
+		const { store, loop } = await setup({
+			holdFollowUps: true,
+			isIntegrated: async () => false, // the merge-queue path, not the integrated settle
+		});
 		const task = await store.createTask("work please");
 		await store.updateTask(task.id, { queuedAt: 1 });
 		const before = Date.now();
@@ -20031,6 +20089,7 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 	test("a run whose done rejects frees its slot: the requeued card runs again", async () => {
 		let calls = 0;
 		const { store, record, loop } = await setup({
+			isIntegrated: async () => false, // the requeued run settles to merging
 			startRun: async (o: StartArgs) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");

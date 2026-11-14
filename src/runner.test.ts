@@ -1830,6 +1830,42 @@ describe("classify", () => {
 		});
 	});
 
+	test("6d. work answered with an integrated head settles done (the tip is on the target)", () => {
+		const answered = result({ outcome: outcome({ status: "answered" }) });
+		// VELVET-124: a research card moved its branch to the target; all 47 commits
+		// ahead are merged, so answered settles done instead of parking.
+		expect(
+			classify({
+				kind: "work",
+				result: answered,
+				git: git({ commitsAhead: 47, integrated: true }),
+				target: "origin/main",
+				previousError: null,
+				research: true,
+			}),
+		).toEqual({ stage: "done", state: "idle", needsReason: null });
+		// The same settle holds without the research flag: nothing is left to integrate.
+		expect(
+			run("work", answered, git({ commitsAhead: 47, integrated: true })),
+		).toEqual({ stage: "done", state: "idle", needsReason: null });
+		// Without an integrated head the refusal keeps today's reason.
+		expect(
+			classify({
+				kind: "work",
+				result: answered,
+				git: git({ commitsAhead: 2, integrated: false }),
+				target: "origin/main",
+				previousError: null,
+				research: true,
+			}),
+		).toEqual({
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason:
+				"Reported answered, but the branch has 2 commit(s) that were never integrated.",
+		});
+	});
+
 	test("7. a work turn that reports integrated is rejected", () => {
 		// Merging is the merge turn's job (rebase, gates, server push): a work turn's
 		// integrated report is rejected regardless of what git shows (AGEN-33). A head

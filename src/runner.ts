@@ -839,12 +839,18 @@ function workReadyNext(
 	);
 }
 
-/** A work turn's answered report: no commits settle done, an integrable branch still merges (never research), the rest is a refusal. */
+/** A work turn's answered report: an integrated head settles done (the tip is on the target),
+ * no commits settle done, an integrable branch still merges (never research), the rest is a
+ * refusal. */
 function workAnsweredNext(
 	o: ClassifyInput,
 	stage: Next["stage"],
 	git: GitFacts,
 ): Next {
+	// Every branch commit is already on the target (VELVET-124: a research card moved its
+	// branch to main, 47 commits ahead were all merged): nothing is left to integrate.
+	if (git.integrated)
+		return { stage: "done", state: "idle", needsReason: null };
 	if (git.commitsAhead === 0)
 		return { stage: "done", state: "idle", needsReason: null };
 	// The agent misfiled answered while landable commits sit on the branch; git proves work to
