@@ -9,6 +9,7 @@
 import { readFileSync } from "node:fs";
 import {
 	lineCapReached,
+	RELEASE_LINE_MARKER,
 	type RegistryRelease,
 	releaseLineWaitUntil,
 	unsettledBlocker,
@@ -272,7 +273,7 @@ async function scan(): Promise<number> {
 	}
 	for (const line of failures) console.error(line);
 	if (blocked.length > 0)
-		console.log(`release line blocked: ${JSON.stringify({ blocked })}`);
+		console.log(`${RELEASE_LINE_MARKER}${JSON.stringify({ blocked })}`);
 	return failures.length > 0 ? 1 : 0;
 }
 

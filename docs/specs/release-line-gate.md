@@ -120,6 +120,21 @@ export function lineCapReached(
 	ageMs: number,
 	capMs: number,
 ): boolean;
+
+/** The earliest epoch ms at which the gate passes for `version`, or null when it is not
+ * blocked now: the earlier of the line's settle time and its cap time (OTTR-960). */
+export function releaseLineWaitUntil(
+	releases: RegistryRelease[],
+	version: string,
+	now: number,
+	ageMs: number,
+	capMs: number,
+): number | null;
+
+/** The stdout marker line the bun.lock check prints when a direct package is blocked
+ * (OTTR-960); the board's gate probe triggers the test gate on it and the hold parses
+ * the blocked packages from it. */
+export const RELEASE_LINE_MARKER: string;
 ```
 
 `src/releaseLine.ts` imports nothing from `src/ompWatch.ts` (the script must not pull the
@@ -285,20 +300,30 @@ New pure function `releaseLineWaitUntil(releases, version, now, ageMs, capMs)` i
 
 At a settle whose classified outcome is needs_you with no ask, on a card with
 `sourcePrDependabot true`, turn kind work or merge, and no interview, grill, scout,
-review, or release identity, the board re-runs the project check itself in the card's
+review, or release identity, the board re-runs the card's gates itself in the card's
 worktree (`worktreesDir/<id>`; a missing worktree keeps the park). The run goes through a
-new optional ops seam `runProjectCheck`, whose default (`src/worktree.ts`) spawns
-`bun run check` like `runMergeGates` does (same env rule, 30-minute kill) and returns the
-uncapped combined output.
+new optional ops seam `runProjectGates`, whose default (`src/worktree.ts`) spawns
+`bun run check` and then `bun run test` like `runMergeGates` does (same env rule,
+30-minute kill per gate) and returns the check's uncapped combined output.
 
-**Attribution.** The check chain is `&&`-ordered and the release-line step is not its
-last step, so a run that exits non-zero and carries exactly one
-`release line blocked: ` marker line failed at that gate: every earlier step passed and
-the steps after it never ran. Any other failure — no marker line, more than one, a
-broken body, or a latest clear time already past — keeps today's needs_you park. The
-parse reads the board's own run output, never agent text.
+**Attribution.** The arm needs proof that the card's gates fail only at the release
+line, and the board reads only its own run, never agent text:
 
-**Arm.** The park becomes `state queued` at the unchanged stage with:
+- The check chain is `&&`-ordered and the release-line step is not its last step, so a
+  check run that exits non-zero and carries exactly one `release line blocked: ` marker
+  line failed at that gate: every earlier step passed and the steps after it never ran.
+- The probe runs `bun run test` exactly when the check's output carries that marker
+  line, so a card whose test gate is red keeps the park; the test's verdict proves the
+  gate is the check's only failing step across both merge gates.
+
+A park the board can attribute to another cause keeps the park without a probe: the
+project's push state is broken (`mainUnpushed`, the AGENTS.md step-1 failure). An
+ask-tool question keeps the park. The agent's own park reason stays on the card, appended
+after the hold text, so a park whose cause the board cannot verify is never lost — a
+reply runs the card at once.
+
+**Arm.** When the check failed at the marker step and the test passed, the park becomes
+`state queued` at the unchanged stage with:
 
 - `holdUntil` = the latest `waitUntilMs` (it must be in the future),
 - `holdProvider` null: the quota refresh never releases the hold, because
@@ -317,13 +342,20 @@ still runs the card now: the existing reply and requeue paths write `holdUntil n
     above → the newest one's publish time plus `ageMs`.
 22. Script: the unsettled direct dependency fixture exits 1 with the human line and the
     exact marker line naming the package, version, and the computed `waitUntilMs`.
-23. Fake clock: a Dependabot card whose check run fails with marker times T1 < T2 parks
-    `state queued` with `holdUntil T2`; `pickRunnable` at `now = T2` picks the card, at
-    `T2 - 1` it does not. Each fails before the change.
-24. The same card with a check run that fails on another step (no marker line) keeps
-    today's needs_you park.
+23. Fake clock: a Dependabot card whose check run fails with marker times T1 < T2 and a
+    passing test gate parks `state queued` with `holdUntil T2`; `pickRunnable` at
+    `now = T2` picks the card, at `T2 - 1` it does not. The card's reason names the
+    packages, the time, and the park reason it replaces. Each fails before the change.
+24. The same card with a failing test gate (the probe ran it: check failed at the marker
+    step, test failed) keeps today's needs_you park; so does a check that fails on
+    another step (no marker line, the probe skips the test gate), a passing probe, a
+    marker whose clear time already passed, a card with a broken push state
+    (`mainUnpushed`), and a non-Dependabot card.
 25. `releaseUsageHolds` leaves the armed hold (null provider) armed across a quota
     refresh that saw the provider blocked and then free.
+26. Live spawn (`runProjectGates`): a check that fails at a marker-printing step runs
+    the test gate and reports its verdict; a check that fails without the marker or
+    passes skips the test gate.
 
 Gates: `bun run check` and `bun test` exit 0.
 
@@ -347,6 +379,9 @@ Gates: `bun run check` and `bun test` exit 0.
 - Probing only the release-line script without the check chain: rejected; the marker
   alone proves the gate red, not that the run failed at the gate, so another red gate
   would also arm the timer.
+- Running the test gate on every probe: rejected; its verdict matters only when the
+  marker proves the check failed at the gate step, so the minutes stay unspent on every
+  other park.
 
 ## Risks
 
@@ -357,8 +392,7 @@ Gates: `bun run check` and `bun test` exit 0.
   shape and the spec names the revisit trigger.
 - The cap can take an unsettled-line version after 14 days of waiting; that is the
   decided tradeoff against waiting forever.
-- A red `bun test` beside the gate still arms the timer (the probe runs the check chain
-  only): the resumed turn fails its gates again and parks needs_you with the gate green,
-  so the park then sticks. One wasted turn, then the human decides.
-- The probe runs the full check chain (about a minute, plus registry calls) inside the
-  settle; it runs only for Dependabot needs_you parks with no ask.
+- The probe runs the full check chain, and the test gate too when the check failed at
+  the marker step (about a minute, plus registry calls, plus a test run) inside the
+  settle; it runs only for Dependabot needs_you parks with no ask. A flaky test fails
+  the probe and keeps the park (fail closed).

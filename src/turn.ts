@@ -102,6 +102,7 @@ import type {
 	runReleaseCommand,
 } from "./release.ts";
 import { hostedGh, ownerRepo } from "./release.ts";
+import { RELEASE_LINE_MARKER } from "./releaseLine.ts";
 import type { startRun, WorkerTarget } from "./runner.ts";
 import {
 	classify,
@@ -244,7 +245,7 @@ import {
 	parseKeptChoices,
 	planKeptFinish,
 	type quarantineUntracked,
-	runProjectCheck,
+	runProjectGates,
 	type saveDoneFiles,
 	slugify,
 	targetTracksRules,
@@ -951,10 +952,11 @@ export interface TurnOps {
 	 * gates, or a still-rejected retry push is what queues the recovery steer. */
 	rebaseTargetBranch: typeof rebaseTargetBranch;
 	runMergeGates: typeof runMergeGates;
-	/** OTTR-960: the project check a Dependabot park re-runs in the card's worktree; the
-	 * release-line hold reads the release-line step's marker line from its output.
-	 * Optional: absent runs the real runProjectCheck. */
-	runProjectCheck?: typeof runProjectCheck;
+	/** OTTR-960: the gates a Dependabot park re-runs in the card's worktree; the
+	 * release-line hold reads the release-line step's marker line from the check's output
+	 * and needs the test gate's verdict to prove the gates fail only at that line.
+	 * Optional: absent runs the real runProjectGates. */
+	runProjectGates?: typeof runProjectGates;
 	/** OTTR-465: the credential kinds the server's git can use for a push to a URL (a card-log line, never a value); null for a non-URL pin. */
 	pushAuthKind?: (url: string) => string | null;
 	/** PR mode: pushes the card branch to the pinned origin from the main checkout (same plumbing as serverMergePush). */
@@ -8065,12 +8067,11 @@ export function createTurnLoop(
 	): { name: string; version: string; waitUntilMs: number }[] | null {
 		const lines = output
 			.split("\n")
-			.filter((line) => line.startsWith("release line blocked: "));
+			.filter((line) => line.startsWith(RELEASE_LINE_MARKER));
 		if (lines.length !== 1) return null;
-		const prefix = "release line blocked: ";
 		let body: unknown;
 		try {
-			body = JSON.parse(lines[0]!.slice(prefix.length));
+			body = JSON.parse(lines[0]!.slice(RELEASE_LINE_MARKER.length));
 		} catch {
 			return null;
 		}
@@ -8110,12 +8111,16 @@ export function createTurnLoop(
 	}
 
 	/** OTTR-960: a Dependabot card the release-line gate parked waits with a timer instead
-	 * of a human. On a needs_you park with no ask, the board re-runs the project check in
-	 * the card's worktree; a run that failed while carrying exactly one release-line
-	 * marker line failed at that gate (the chain is &&-ordered and the release-line step
-	 * is not last, so earlier steps passed and later steps never ran). The hold is the
-	 * latest per-package clear time; the scheduler restarts the turn when it passes. Any
-	 * other failure keeps the needs_you park. */
+	 * of a human — but only a park the board can attribute to that gate. The probe runs
+	 * the card's gates in the worktree: the check must have failed carrying exactly one
+	 * release-line marker line (the &&-ordered chain proves every earlier step passed and
+	 * the steps after the release-line one never ran), and the test gate — which the
+	 * probe runs exactly when that marker is present — must have passed. A park the
+	 * board can attribute to another cause (the project's push state is broken,
+	 * mainUnpushed) and an ask-tool question keep the park. The agent's own park reason
+	 * stays on the card behind the hold text, so a park whose cause the board cannot
+	 * verify is never lost; a reply runs the card at once. The hold is the latest
+	 * per-package clear time; the scheduler restarts the turn when it passes. */
 	async function stampReleaseLineHold(
 		st: TurnSettle,
 		next: Next,
@@ -8129,21 +8134,34 @@ export function createTurnLoop(
 			st.idn.grill ||
 			st.idn.scout ||
 			st.idn.reviewCard ||
-			st.idn.releaseCard
+			st.idn.releaseCard ||
+			// The board-visible non-gate cause: the target branch has commits origin
+			// lacks (the merge turn's AGENTS.md step-1 failure). The next park arms
+			// once the push state clears.
+			st.e.mainUnpushed === true
 		)
 			return next;
 		const wt = join(st.store.worktreesDir, st.id);
 		if (!existsSync(wt)) return next;
-		const probe = await (ops.runProjectCheck ?? runProjectCheck)(wt).catch(
+		const probe = await (ops.runProjectGates ?? runProjectGates)(wt).catch(
 			() => null,
 		);
-		if (probe === null || probe.ok) return next;
-		const blocked = releaseLineBlock(probe.output);
+		if (
+			probe === null ||
+			probe.check.ok ||
+			// The test gate's verdict exists only when the check failed; the hold
+			// arms only when it ran and passed.
+			!probe.test.ran ||
+			!probe.test.ok
+		)
+			return next;
+		const blocked = releaseLineBlock(probe.check.output);
 		if (blocked === null) return next;
 		const holdUntil = Math.max(...blocked.map((b) => b.waitUntilMs));
 		if (!(holdUntil > Date.now())) return next;
 		const names = blocked.map((b) => `${b.name} ${b.version}`).join(", ");
 		const at = new Date(holdUntil).toISOString().slice(0, 16).replace("T", " ");
+		const park = next.needsReason;
 		await st.log(`- release line gate: holding until ${at} UTC: ${names}`);
 		return {
 			...next,
@@ -8152,7 +8170,9 @@ export function createTurnLoop(
 			holdProvider: null,
 			holdWindow: null,
 			holdAttempts: st.task.holdAttempts,
-			needsReason: `The release line gate blocks this card: ${names}. The board runs the card again after the lines settle at ${at} UTC. Send a message to run it now, or cancel the card.`,
+			needsReason: `The release line gate blocks this card: ${names}. The board runs the card again after the lines settle at ${at} UTC. Send a message to run it now, or cancel the card.${
+				park ? ` The turn parked with: ${park}` : ""
+			}`,
 			pendingPrompt:
 				"Continue this task: the release line wait has passed. Re-run the gates (bun run check, bun test) and continue the pipeline.",
 			pendingBy: "supervisor",

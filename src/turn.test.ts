@@ -14737,7 +14737,9 @@ describe("work card check", () => {
 });
 
 // Release-line gate auto-hold (OTTR-960): a Dependabot card the gate parks waits with a
-// timer and restarts by itself when the line settles; any other failure keeps the park.
+// timer and restarts by itself when the line settles — but only when the board's own
+// gate probe proves the card's gates fail only at that line, and a park the board can
+// pin on another cause keeps the needs_you park.
 describe("turn release line hold (dependabot gate park)", () => {
 	const DAY = 86_400_000;
 	const T1 = Date.now() + DAY;
@@ -14755,15 +14757,25 @@ describe("turn release line hold (dependabot gate park)", () => {
 			})),
 		})}\n`;
 
+	type GateProbe = {
+		check: { ok: boolean; output: string };
+		test: { ran: boolean; ok: boolean };
+	};
+	/** The probe result of a card whose gates fail only at the release line. */
+	const gateRed = (output: string): GateProbe => ({
+		check: { ok: false, output },
+		test: { ran: true, ok: true },
+	});
+
 	/** startRun override whose run reports the OTTR-938-style needs_you park, and a
-	 * runProjectCheck stub that answers the probe the stamp makes. */
+	 * runProjectGates stub that answers the probe the stamp makes. */
 	function gateRun(
 		record: Recorded,
-		probeOutput: () => { ok: boolean; output: string },
+		probeOutput: () => GateProbe,
 	): Partial<TurnOps> {
 		return {
 			commitsAhead: async () => 0,
-			runProjectCheck: async () => probeOutput(),
+			runProjectGates: async () => probeOutput(),
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -14786,12 +14798,7 @@ describe("turn release line hold (dependabot gate park)", () => {
 		};
 	}
 
-	async function gateCase(
-		probeOutput: () => {
-			ok: boolean;
-			output: string;
-		},
-	) {
+	async function gateCase(probeOutput: () => GateProbe) {
 		const store = await freshStore();
 		const record = baseRecord();
 		const projects = new Map([[store.name, fakeProject(store)]]);
@@ -14799,7 +14806,7 @@ describe("turn release line hold (dependabot gate park)", () => {
 			projects,
 			fakeOps(record, gateRun(record, probeOutput)),
 		);
-		return { store, loop };
+		return { store, loop, projects };
 	}
 
 	async function dependabotTask(store: ProjectStore) {
@@ -14810,13 +14817,14 @@ describe("turn release line hold (dependabot gate park)", () => {
 	}
 
 	test("a gate-blocked dependabot card arms the hold at the latest clear time", async () => {
-		const { store, loop } = await gateCase(() => ({
-			ok: false,
-			output: `other steps pass\n${marker([
-				["@biomejs/biome", "2.6.7", T1],
-				["knip", "6.44.1", T2],
-			])}`,
-		}));
+		const { store, loop } = await gateCase(() =>
+			gateRed(
+				`other steps pass\n${marker([
+					["@biomejs/biome", "2.6.7", T1],
+					["knip", "6.44.1", T2],
+				])}`,
+			),
+		);
 		const task = await dependabotTask(store);
 
 		await loop.runTurn(store.name, task.id);
@@ -14828,6 +14836,10 @@ describe("turn release line hold (dependabot gate park)", () => {
 		expect(after.holdProvider).toBeNull();
 		expect(after.needsReason).toContain("@biomejs/biome 2.6.7");
 		expect(after.needsReason).toContain("knip 6.44.1");
+		// The park's own reason stays on the card behind the hold text.
+		expect(after.needsReason).toContain(
+			`The turn parked with: ${PARK_QUESTION}`,
+		);
 		expect(after.pendingPrompt).not.toBeNull();
 		// At T2 the scheduler picks the card; a tick earlier it waits.
 		const live = await store.listTasks();
@@ -14844,10 +14856,9 @@ describe("turn release line hold (dependabot gate park)", () => {
 	});
 
 	test("a merge-kind dependabot card requeues at merging with the same hold", async () => {
-		const { store, loop } = await gateCase(() => ({
-			ok: false,
-			output: `${marker([["@biomejs/biome", "2.6.7", T1]])}`,
-		}));
+		const { store, loop } = await gateCase(() =>
+			gateRed(`${marker([["@biomejs/biome", "2.6.7", T1]])}`),
+		);
 		const task = await dependabotTask(store);
 		await store.updateTask(task.id, { stage: "merging" });
 
@@ -14865,10 +14876,15 @@ describe("turn release line hold (dependabot gate park)", () => {
 		).toContain(task.id);
 	});
 
-	test("a check run that fails on another step keeps the needs_you park", async () => {
+	test("a red test gate beside the red release line keeps the needs_you park", async () => {
+		// The check failed at the marker step (the probe ran the test gate), but the
+		// test gate is red too: the card does not fail only on the release line.
 		const { store, loop } = await gateCase(() => ({
-			ok: false,
-			output: "error TS2321: cannot find name 'x'\n",
+			check: {
+				ok: false,
+				output: `${marker([["@biomejs/biome", "2.6.7", T1]])}`,
+			},
+			test: { ran: true, ok: false },
 		}));
 		const task = await dependabotTask(store);
 
@@ -14882,10 +14898,45 @@ describe("turn release line hold (dependabot gate park)", () => {
 		expect(after.pendingPrompt).toBeNull();
 	});
 
+	test("a check run that fails on another step keeps the needs_you park", async () => {
+		// No marker line: the probe skips the test gate (its verdict cannot matter).
+		const { store, loop } = await gateCase(() => ({
+			check: { ok: false, output: "error TS2321: cannot find name 'x'\n" },
+			test: { ran: false, ok: false },
+		}));
+		const task = await dependabotTask(store);
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.stage).toBe("in_progress");
+		expect(after.needsReason).toBe(PARK_QUESTION);
+		expect(after.holdUntil).toBeNull();
+		expect(after.pendingPrompt).toBeNull();
+	});
+
+	test("a card with a broken push state keeps the park even with a red gate", async () => {
+		// The board can pin the park on the AGENTS.md step-1 failure (mainUnpushed):
+		// the hold never replaces a park the board knows is not the gate's.
+		const { store, loop, projects } = await gateCase(() =>
+			gateRed(`${marker([["@biomejs/biome", "2.6.7", T1]])}`),
+		);
+		projects.get(store.name)!.mainUnpushed = true;
+		const task = await dependabotTask(store);
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(PARK_QUESTION);
+		expect(after.holdUntil).toBeNull();
+	});
+
 	test("a passing probe keeps the park, and a non-dependabot card never probes", async () => {
 		const { store, loop } = await gateCase(() => ({
-			ok: false,
-			output: `${marker([["@biomejs/biome", "2.6.7", T1]])}`,
+			check: { ok: true, output: "" },
+			test: { ran: false, ok: false },
 		}));
 		const task = await dependabotTask(store);
 		await store.updateTask(task.id, { sourcePrDependabot: false });
@@ -14898,10 +14949,9 @@ describe("turn release line hold (dependabot gate park)", () => {
 	});
 
 	test("a marker whose clear time already passed keeps the park", async () => {
-		const { store, loop } = await gateCase(() => ({
-			ok: false,
-			output: `${marker([["@biomejs/biome", "2.6.7", Date.now() - 1]])}`,
-		}));
+		const { store, loop } = await gateCase(() =>
+			gateRed(`${marker([["@biomejs/biome", "2.6.7", Date.now() - 1]])}`),
+		);
 		const task = await dependabotTask(store);
 
 		await loop.runTurn(store.name, task.id);

@@ -67,6 +67,7 @@ import {
 	resetBranchTo,
 	resolveTarget,
 	runMergeGates,
+	runProjectGates,
 	saveDoneFiles,
 	serverMergePush,
 	setGitSecrets,
@@ -610,6 +611,95 @@ describe("serverMergePush", () => {
 			const r = await runMergeGates(dir);
 			expect(r.ok).toBe(false);
 			expect(r.output).toContain("bun test exited");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	// OTTR-960: the probe a release-line hold makes. `bun run test` runs only when the
+	// check failed, so the fixture's check prints the marker line the hold parses and
+	// the test verdict decides the arm.
+	test("runProjectGates runs the test gate when the check fails at the marker step", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-gates-"));
+		try {
+			writeFileSync(
+				join(dir, "check.js"),
+				'console.log(\'release line blocked: {"blocked":[{"name":"mermaid","version":"12.2.0","waitUntilMs":1763485440000}]}\');\nprocess.exit(1);\n',
+			);
+			writeFileSync(
+				join(dir, "package.json"),
+				JSON.stringify({
+					name: "gates-fixture",
+					type: "module",
+					scripts: { check: "bun ./check.js", test: "exit 0" },
+				}),
+			);
+			const r = await runProjectGates(dir);
+			expect(r.check.ok).toBe(false);
+			expect(r.check.output).toContain("release line blocked:");
+			expect(r.test).toEqual({ ran: true, ok: true });
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("runProjectGates skips the test gate when the check fails without the marker", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-gates-"));
+		try {
+			writeFileSync(
+				join(dir, "package.json"),
+				JSON.stringify({
+					name: "gates-fixture",
+					type: "module",
+					scripts: { check: "exit 2", test: "exit 0" },
+				}),
+			);
+			const r = await runProjectGates(dir);
+			expect(r.check.ok).toBe(false);
+			expect(r.check.output).not.toContain("release line blocked:");
+			expect(r.test).toEqual({ ran: false, ok: false });
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("runProjectGates skips the test gate when the check passes", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-gates-"));
+		try {
+			writeFileSync(
+				join(dir, "package.json"),
+				JSON.stringify({
+					name: "gates-fixture",
+					type: "module",
+					scripts: { check: "exit 0", test: "exit 1" },
+				}),
+			);
+			const r = await runProjectGates(dir);
+			expect(r.check.ok).toBe(true);
+			expect(r.test).toEqual({ ran: false, ok: false });
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("runProjectGates reports a failing test gate", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-gates-"));
+		try {
+			writeFileSync(
+				join(dir, "check.js"),
+				"console.log('release line blocked: {\"blocked\":[]}');\nprocess.exit(1);\n",
+			);
+			writeFileSync(
+				join(dir, "package.json"),
+				JSON.stringify({
+					name: "gates-fixture",
+					type: "module",
+					scripts: { check: "bun ./check.js", test: "exit 3" },
+				}),
+			);
+			const r = await runProjectGates(dir);
+			expect(r.check.ok).toBe(false);
+			expect(r.test).toEqual({ ran: true, ok: false });
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}

@@ -29,6 +29,7 @@ import { githubHost, hostMatcher } from "./githubHost.ts";
 import { type CommitIdentity, identityArgs } from "./gitIdentity.ts";
 import { HOSTED_SECRET_ENV } from "./hosted.ts";
 import { platform } from "./platform/index.ts";
+import { RELEASE_LINE_MARKER } from "./releaseLine.ts";
 import type { DiffFileStat, KeptChoice } from "./types.ts";
 
 export interface GitResult {
@@ -2160,16 +2161,22 @@ export async function runMergeGates(
 }
 
 /**
- * OTTR-960: the project check a settle re-runs in a card's worktree when a Dependabot
- * card parks. `bun run check` only — `bun test` takes minutes and the release-line hold
- * never needs it. The spawn names process.execPath (bun itself) like runMergeGates, so a
- * planted PATH cannot substitute another binary; the env carries no hosted
- * identity-signing key. The output comes back uncapped: the caller parses the
- * release-line step's marker line from it. Killed after 30 minutes.
+ * OTTR-960: the gates a settle re-runs in a card's worktree when a Dependabot card
+ * parks, so the hold can prove the card's gates fail only at the release line.
+ * `bun run check` always runs first; `bun run test` runs only when the check's output
+ * carries the release-line marker — the hold needs the test verdict exactly then,
+ * when the check's failure may be the release-line step's, to prove the test gate
+ * green. A check that passes or fails before the release-line step can never arm the
+ * hold, so its test verdict is not needed and the minutes stay unspent. The spawns
+ * name process.execPath (bun itself) like runMergeGates, so a planted PATH cannot
+ * substitute another binary; the env carries no hosted identity-signing key. The
+ * check's output comes back uncapped: the caller parses the release-line step's
+ * marker line from it. Each gate is killed after 30 minutes.
  */
-export async function runProjectCheck(
-	dir: string,
-): Promise<{ ok: boolean; output: string }> {
+export async function runProjectGates(dir: string): Promise<{
+	check: { ok: boolean; output: string };
+	test: { ran: boolean; ok: boolean };
+}> {
 	const env = { ...process.env };
 	delete env[HOSTED_SECRET_ENV];
 	const check = Bun.spawn([process.execPath, "run", "check"], {
@@ -2182,7 +2189,26 @@ export async function runProjectCheck(
 	const out = await new Response(check.stdout).text();
 	const err = await new Response(check.stderr).text();
 	const code = await check.exited;
-	return { ok: code === 0, output: `${out}${err}` };
+	const result = { ok: code === 0, output: `${out}${err}` };
+	const marker =
+		!result.ok &&
+		result.output
+			.split("\n")
+			.some((line) => line.startsWith(RELEASE_LINE_MARKER));
+	if (!marker) return { check: result, test: { ran: false, ok: false } };
+	const test = Bun.spawn([process.execPath, "run", "test"], {
+		cwd: dir,
+		env,
+		stdout: "pipe",
+		stderr: "pipe",
+		timeout: 1_800_000,
+	});
+	// The pipes must drain before the exit await (a full pipe deadlocks the child);
+	// the caller needs only the verdict, so the texts go unread.
+	await new Response(test.stdout).text();
+	await new Response(test.stderr).text();
+	const testCode = await test.exited;
+	return { check: result, test: { ran: true, ok: testCode === 0 } };
 }
 
 /**

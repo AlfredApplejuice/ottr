@@ -10,6 +10,12 @@ export type RegistryRelease = {
 	deprecated?: boolean;
 };
 
+/** The machine-readable report the bun.lock check prints when a direct package is
+ * blocked (OTTR-960): one stdout line `RELEASE_LINE_MARKER + {json}`, after the human
+ * failure lines. The board's gate probe triggers the test gate on it, and the hold
+ * parses the blocked packages and their clear times from it. */
+export const RELEASE_LINE_MARKER = "release line blocked: ";
+
 const STABLE_RE = /^\d+\.\d+\.\d+$/;
 
 /** Numeric x.y.z order; both sides must be stable x.y.z. Moved here from src/ompWatch.ts. */
