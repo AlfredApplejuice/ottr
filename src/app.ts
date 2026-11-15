@@ -375,8 +375,10 @@ import {
 	type AskQuestion,
 	answeredCard,
 	askAnswerLine,
+	DONE_PAGE,
 	doneReadKey,
 	type ListedTask,
+	newestLanded,
 	type OrphanProcess,
 	type PerfRange,
 	PRIORITIES,
@@ -2265,10 +2267,12 @@ export async function createApp(deps: AppDeps) {
 		}
 	}
 
-	/** The event diff's view of the frame's cards. */
+	/** The event diff's view of the frame's cards. Summary left TaskCard (OTTR-965), so
+	 * the caller passes the frame's per-row summary bridge keyed by card id. */
 	async function alertInputs(
 		tasks: readonly TaskCard[],
 		prev: readonly AlertCardInput[] | null,
+		summaries: ReadonlyMap<string, string | null>,
 	): Promise<AlertCardInput[]> {
 		const before = new Map((prev ?? []).map((p) => [p.id, p]));
 		return await Promise.all(
@@ -2285,7 +2289,7 @@ export async function createApp(deps: AppDeps) {
 					asked: t.asked,
 					answered: t.answered,
 					needsReason: t.needsReason,
-					summary: t.summary,
+					summary: summaries.get(t.id) ?? null,
 					errorTurn: err.errorTurn,
 					errorText: err.errorText,
 					prDraft: t.prOccurrence?.draft ?? null,
@@ -5071,6 +5075,11 @@ export async function createApp(deps: AppDeps) {
 			? statSync(file, { throwIfNoEntry: false })?.mtimeMs
 			: undefined;
 		const settings = await e.store.getSettings();
+		// OTTR-965: the Done lane's first "Show more" needs the settled count before any
+		// fetch. One list read counting rows, no card build.
+		const doneTotal = (await e.store.listTasks()).filter(
+			(t) => t.stage === "done" || t.cancelledAt !== null,
+		).length;
 		return {
 			name: e.store.name,
 			icon: icon ?? null,
@@ -5097,6 +5106,7 @@ export async function createApp(deps: AppDeps) {
 			openPrs: e.openPrs ?? null,
 			settings,
 			taskPrefix: settings.taskIdPrefix ?? derivedTaskPrefix(e.name),
+			doneTotal,
 		};
 	}
 
@@ -5317,8 +5327,19 @@ export async function createApp(deps: AppDeps) {
 			progress?.at,
 		);
 		const tf = ctx.facts.turns.get(t.id);
+		// OTTR-965: the nine wide fields stay in the store — the card ships lane facts
+		// only, and the drawer fetches the wide text per task. The rest pattern keeps
+		// every small field, present and future, riding automatically.
+		const {
+			prompt: _prompt,
+			summary: _summary,
+			workCheckLog: _workCheckLog,
+			workCheckReport: _workCheckReport,
+			gate: _gate,
+			...row
+		} = t;
 		return {
-			...t,
+			...row,
 			steps: viewSteps(t),
 			sessionTitle: await e.store.frozenTitleFrom(
 				t,
@@ -5386,13 +5407,52 @@ export async function createApp(deps: AppDeps) {
 		return promise;
 	};
 
-	/** Every project's cards, newest first, plus the kept-worktree counts and the
-	 * per-card JSON text: the card slice of the state build, shared with the /system
-	 * holds so both count the same cards. Chunked (OTTR-866): yields to the loop
-	 * between projects and every 100 cards, so no single block exceeds ~50 ms. */
+	/** Every project's open cards plus its Done window (OTTR-965), newest first, plus the
+	 * kept-worktree counts and the per-card JSON text: the card slice of the state build,
+	 * shared with the /system holds so both count the same cards. Chunked (OTTR-866):
+	 * yields to the loop between projects and every 100 cards, so no single block
+	 * exceeds ~50 ms. */
+
+	/** One project's shared card context: the batched turn facts, medians, trending
+	 * repos and settings. The state build and the done pages (OTTR-965) both read it,
+	 * so the two paths never duplicate the queries. */
+	async function projectCardCtx(e: Entry) {
+		const settings = await e.store.getSettings();
+		return {
+			settings,
+			facts: await e.store.boardCardFacts(),
+			medians: turnMedians(await e.store.turnDurations()),
+			trendingRepos: await trendingReposOf(e),
+		};
+	}
+
+	/** The server's mirror of the client's unread rule (ui/queue.ts isUnread): a settled
+	 * card with something to read whose read mark is absent. The Done window keeps such
+	 * cards behind the cut, so an unread answer never hides from the board. */
+	function settledUnread(c: TaskCard, seen: ReadonlySet<string>): boolean {
+		if (c.cancelledAt !== null) return false;
+		if (
+			!(
+				c.answered ||
+				c.kind === "pr_review" ||
+				(c.research && c.stage === "done" && c.steps !== "unknown")
+			)
+		)
+			return false;
+		if (c.stage === "done" && c.kind !== "retro") {
+			// A done work card keys the mark per completion (OTTR-566); a card done at
+			// or before the baseline counts as read, so history lights nothing.
+			if (c.doneAt === null || c.doneAt <= seenDoneSince) return false;
+			return !seen.has(doneReadKey({ id: c.id, doneAt: c.doneAt }));
+		}
+		return !seen.has(c.id);
+	}
 
 	async function boardCards(now: number): Promise<{
 		tasks: TaskCard[];
+		/** OTTR-965: summary left TaskCard, so the alert diff reads it here — one entry
+		 * per row the card loop touches, keyed by id (ids are board-unique). */
+		summaries: Map<string, string | null>;
 		keptHeld: number;
 		keptStale: number;
 		keptCards: string[];
@@ -5401,16 +5461,16 @@ export async function createApp(deps: AppDeps) {
 		tasksBufs: Buffer[];
 	}> {
 		const tasks: TaskCard[] = [];
+		const summaries = new Map<string, string | null>();
 		let keptHeld = 0;
 		let keptStale = 0;
 		const keptCards: string[] = [];
+		// One read per build: each project's Done window checks these marks below.
+		const seen = new Set(await loadSeen());
 		for (const e of deps.projects.values()) {
 			try {
-				const settings = await e.store.getSettings();
-				const days = settings.keptWorktreeDays;
-				const facts = await e.store.boardCardFacts();
-				const medians = turnMedians(await e.store.turnDurations());
-				const trendingRepos = await trendingReposOf(e);
+				const ctx = await projectCardCtx(e);
+				const days = ctx.settings.keptWorktreeDays;
 				const cards: TaskCard[] = [];
 
 				let built = 0;
@@ -5420,23 +5480,37 @@ export async function createApp(deps: AppDeps) {
 					keptStale += kept.stale;
 					// One kept card is one held worktree (keptCounts), so its id names the advisory's link.
 					if (kept.held === 1) keptCards.push(t.id);
+					summaries.set(t.id, t.summary);
 					// Cancelled cards ride in the list too: the done lane shows them with a
 					// "Cancelled" chip. Every counter (slots, alarms, holds, coverage) either
 					// filters cancelledAt or reads state/stage facts a cancelled card no longer has.
-					cards.push(
-						await taskCardOf(
-							e,
-							t,
-							{ facts, medians, trendingRepos, settings },
-							now,
-						),
-					);
+					cards.push(await taskCardOf(e, t, ctx, now));
 					if (++built % 100 === 0) await yieldLoop();
 				}
 				stampReleaseHolds(cards);
 				await stampPushHolds(e, cards);
 				await stampVmHolds(e, cards);
-				tasks.push(...cards);
+				// The Done window (OTTR-965): open cards always ride; done and cancelled
+				// cards ride when they land in the newest DONE_PAGE or stay pinned — an
+				// unread answer or a starred card never hides behind the cut.
+				const open: TaskCard[] = [];
+				const settled: TaskCard[] = [];
+				for (const c of cards)
+					(c.stage === "done" || c.cancelledAt !== null ? settled : open).push(
+						c,
+					);
+				settled.sort((a, b) => newestLanded(a, b));
+				const visible: TaskCard[] = [];
+				for (let i = 0; i < settled.length; i++) {
+					const c = settled[i]!;
+					if (
+						i < DONE_PAGE ||
+						settledUnread(c, seen) ||
+						(c.starred && c.cancelledAt === null)
+					)
+						visible.push(c);
+				}
+				tasks.push(...open, ...visible);
 			} catch (err) {
 				// A sick store skips its own cards; the rest of the board still renders.
 				logStoreError(e.store.name, err);
@@ -5459,7 +5533,31 @@ export async function createApp(deps: AppDeps) {
 			if (i + 100 < tasks.length) tasksBufs.push(COMMA_BUF);
 			await yieldLoop();
 		}
-		return { tasks, keptHeld, keptStale, keptCards, tasksBufs };
+		return { tasks, keptHeld, keptStale, keptCards, tasksBufs, summaries };
+	}
+
+	/** One page of the project's done and cancelled cards, newest landed first (OTTR-965):
+	 * the same slim cards and landed order the state's Done window ships. `total` is the
+	 * project's whole settled count, so the board's "Show more" knows what stays hidden.
+	 * A page past the end answers an empty list. */
+	async function donePage(
+		e: Entry,
+		page: number,
+	): Promise<{ tasks: TaskCard[]; total: number }> {
+		const settled = (await e.store.listTasks()).filter(
+			(t) => t.stage === "done" || t.cancelledAt !== null,
+		);
+		const total = settled.length;
+		settled.sort((a, b) => newestLanded(a, b));
+		const slice = settled.slice((page - 1) * DONE_PAGE, page * DONE_PAGE);
+		const ctx = await projectCardCtx(e);
+		const tasks: TaskCard[] = [];
+		let built = 0;
+		for (const t of slice) {
+			tasks.push(await taskCardOf(e, t, ctx, Date.now()));
+			if (++built % 100 === 0) await yieldLoop();
+		}
+		return { tasks, total };
 	}
 
 	/** The /system holds: the cached state frame's cards, so /api/system counts the
@@ -5488,10 +5586,12 @@ export async function createApp(deps: AppDeps) {
 	async function stateResponse(): Promise<{
 		state: StateResponse;
 		tasksBufs: Buffer[];
+		/** OTTR-965: per-row summaries for the alert diff (summary left TaskCard). */
+		summaries: Map<string, string | null>;
 	}> {
 		const now = Date.now();
 		const cycle = await updateCycleView(now);
-		const { tasks, keptHeld, keptStale, keptCards, tasksBufs } =
+		const { tasks, keptHeld, keptStale, keptCards, tasksBufs, summaries } =
 			await boardCards(now);
 		const scan = await currentOrphanScan();
 
@@ -5578,7 +5678,7 @@ export async function createApp(deps: AppDeps) {
 			seedFailed: seedFailedView(),
 			updateCycle: cycle,
 		};
-		return { state, tasksBufs };
+		return { state, tasksBufs, summaries };
 	}
 
 	/** Applies a user card edit guarded by the revision the client loaded. */
@@ -6858,7 +6958,11 @@ export async function createApp(deps: AppDeps) {
 		// comes back with the same key must light the bell again, also on a board polled over
 		// /api/state with no socket and no push device (NODE_ENV=production disables /api/ws).
 		// The inputs come first: the seen prune reads them, and this frame must carry the pruned list.
-		const inputs = await alertInputs(state.tasks, lastAlertInputs);
+		const inputs = await alertInputs(
+			state.tasks,
+			lastAlertInputs,
+			entry.summaries,
+		);
 		const seenBefore = state.inboxSeen;
 		await pruneSeen(state, inputs);
 		// The prune can be the frame's only change (a key stops mapping to an alert
@@ -6962,6 +7066,8 @@ export async function createApp(deps: AppDeps) {
 		version: number;
 		builtAt: number;
 		state: StateResponse;
+		/** OTTR-965: per-row summaries the alert diff reads (summary left TaskCard). */
+		summaries: ReadonlyMap<string, string | null>;
 		/** The frame's exact bytes (OTTR-884): gzip and the buffer compare consume
 		 * these directly; big boards never hold the text form until asked. */
 		stateBuf: Buffer;
@@ -7015,7 +7121,7 @@ export async function createApp(deps: AppDeps) {
 			// Test seam: park every build at its start, so a test keeps it in flight
 			// across a guaranteed window (production never sets it).
 			if (deps.stateBuildGate !== undefined) await deps.stateBuildGate();
-			const { state, tasksBufs } = await stateResponse();
+			const { state, tasksBufs, summaries } = await stateResponse();
 			// Byte-identity by construction: every property except tasks is one
 			// JSON.stringify; only the tasks array is spliced with the chunk bytes the
 			// card loop serialized — the same bytes JSON.stringify produces for plain
@@ -7049,6 +7155,7 @@ export async function createApp(deps: AppDeps) {
 				version,
 				builtAt: Date.now(),
 				state,
+				summaries,
 				stateBuf,
 				// Big boards keep the 30 MB text out of memory until a consumer asks
 				// for it; the threshold matches the gz one, so a board with a cached
@@ -8288,6 +8395,23 @@ export async function createApp(deps: AppDeps) {
 			return json({ error: "order does not match the current queue" }, 409);
 		await deps.schedule();
 		return json({ ok: true });
+	}
+
+	/** OTTR-965: the Done lane's "Show more" pages — page N (DONE_PAGE cards per page,
+	 * page 1 first) of the project's done and cancelled cards, newest landed first. */
+	async function handleGETProjectsDoneByProject(
+		req: BunRequest<"/api/projects/:project/done">,
+	): Promise<Response> {
+		const e = deps.projects.get(req.params.project);
+		if (!e) return json({ error: "unknown project" }, 404);
+		if (e.gitless) return json({ error: "init a git repository first" }, 409);
+		const raw = new URL(req.url).searchParams.get("page");
+		if (raw !== null && !/^\d+$/.test(raw))
+			return json({ error: "page must be a positive integer" }, 400);
+		const page = raw === null ? 1 : Number(raw);
+		if (page < 1)
+			return json({ error: "page must be a positive integer" }, 400);
+		return json(await donePage(e, page));
 	}
 
 	async function handlePOSTProjectsReleaseSummaryByProject(
@@ -13518,6 +13642,12 @@ export async function createApp(deps: AppDeps) {
 						costly: true,
 					},
 				),
+		},
+		// OTTR-965: the Done lane's "Show more" pages, newest landed first, in the state's
+		// slim card shape.
+		"/api/projects/:project/done": {
+			GET: async (req) =>
+				await api(req, async () => await handleGETProjectsDoneByProject(req)),
 		},
 		// The composer's opt-in Deepen: a model rewrites the draft; the user accepts before anything runs.
 		"/api/projects/:project/deepen": {

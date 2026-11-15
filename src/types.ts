@@ -1000,6 +1000,9 @@ export interface ProjectView {
 	settings: ProjectSettings;
 	/** Effective task id handle: the taskIdPrefix override or the folder-derived default. */
 	taskPrefix: string;
+	/** OTTR-965: the project's done and cancelled card count. The Done lane's first
+	 * "Show more" derives the hidden count from it before any page fetch. */
+	doneTotal: number;
 }
 
 export interface TaskView extends Omit<Task, "diffText"> {
@@ -1065,10 +1068,21 @@ export interface LateCommit {
 /** A turn as shipped over the API: everything but the prompt text. */
 export type TurnView = Omit<Turn, "prompt">;
 
-/** A task as shipped in /api/state: card facts without the full report text (the drawer fetches it per task). */
+/** A task as shipped in /api/state: the lane facts only (OTTR-965). The wide text fields —
+ * prompt, summary, work check log and report, gate, details, report, diff text and files —
+ * stay in the store; the drawer fetches them per task from /api/projects/<p>/tasks/<id>.
+ * needsReason and asked stay: the lanes and the ask drafts read them. */
 export type TaskCard = Omit<
 	Task,
-	"details" | "report" | "diffFiles" | "diffText"
+	| "prompt"
+	| "summary"
+	| "details"
+	| "report"
+	| "diffFiles"
+	| "diffText"
+	| "workCheckLog"
+	| "workCheckReport"
+	| "gate"
 > & {
 	/** Card title: the first session title, else the short prompt line — frozenTitle never returns null. */
 	sessionTitle: string;
@@ -1105,6 +1119,24 @@ export type TaskCard = Omit<
 
 /** OTTR-488: harvested at settle — 'yes' when the report carries a `## Recommended steps` heading, 'no' when a harvested report carries none, 'unknown' when no report was harvested (legacy rows). Views resolve 'unknown' against the stored report at read time (app.ts viewSteps, ui/queue.ts researchSteps). */
 export type ResearchSteps = "yes" | "no" | "unknown";
+
+/** Done lane page size (OTTR-965): the cards the state's Done window keeps before "Show
+ * more" fetches the next page, and the step each click adds. One number for the server's
+ * done window (app.ts) and the UI's fetch step (ui/app.tsx). */
+export const DONE_PAGE = 20;
+
+/** Done order: latest landing first. doneAt stamps each entry into Done (the done clock);
+ * a cancelled card orders by its cancel time. Shared by the server's Done window and the
+ * UI's Done lane sort. */
+export function newestLanded(
+	a: { cancelledAt: number | null; doneAt: number | null; updatedAt: number },
+	b: { cancelledAt: number | null; doneAt: number | null; updatedAt: number },
+): number {
+	return (
+		(b.cancelledAt ?? b.doneAt ?? b.updatedAt) -
+		(a.cancelledAt ?? a.doneAt ?? a.updatedAt)
+	);
+}
 
 /** A done card is question-only when the last work turn reported `answered` (a later follow-up replaces it). */
 export function answeredCard(
@@ -1233,7 +1265,9 @@ export interface OrphanProcess {
 
 export interface StateResponse {
 	projects: ProjectView[];
-	/** Non-cancelled tasks of all projects, newest first. */
+	/** Every project's open cards plus its Done window (OTTR-965): the newest DONE_PAGE
+	 * done and cancelled cards and every pinned one, all projects newest first. Older
+	 * settled cards leave the frame; GET /api/projects/<p>/done?page=N serves them. */
 	tasks: TaskCard[];
 	/** Global cap of concurrently running omp processes; null = no cap. */
 	maxTotal: number | null;

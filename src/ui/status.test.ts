@@ -1,5 +1,4 @@
 import { expect, test } from "bun:test";
-import { ARCH_REVIEW_MARKER } from "../prompts.ts";
 import { type DepIndex, type DepProject, findDep } from "../scheduler.ts";
 import type { TaskCard } from "../types.ts";
 import {
@@ -217,7 +216,6 @@ const review = (over: Partial<TaskCard> = {}): TaskCard =>
 	card({
 		id: "r1",
 		kind: "review",
-		prompt: `${ARCH_REVIEW_MARKER} review`,
 		...over,
 	});
 

@@ -8,8 +8,6 @@ type LaneTask = Pick<
 	| "id"
 	| "sessionTitle"
 	| "title"
-	| "prompt"
-	| "summary"
 	| "stage"
 	| "state"
 	| "cancelledAt"
@@ -178,6 +176,19 @@ export function onBoard(
 	);
 }
 
+/** The board search's contains match: the card's id and the name it shows. Prompt and
+ * summary text no longer ride the state (OTTR-965), so the search cannot read them. */
+export function matchesQuery(
+	t: Pick<TaskCard, "id" | "sessionTitle" | "title">,
+	query: string,
+): boolean {
+	const q = query.trim().toLowerCase();
+	return (
+		q === "" ||
+		`${t.id}\n${t.sessionTitle || t.title}`.toLowerCase().includes(q)
+	);
+}
+
 /** The board's search filter plus per-stage counts: the shown list for the lanes, counts for tab strip and lane heads.
  * Cards off the board (see onBoard) are in neither the shown list nor any count. */
 export function laneCounts<T extends LaneTask>(
@@ -188,16 +199,7 @@ export function laneCounts<T extends LaneTask>(
 	since: number = 0,
 ): { shown: T[]; counts: Record<Stage, LaneCount> } {
 	const board = tasks.filter(onBoard);
-	const q = query.trim().toLowerCase();
-	// Contains match on the id, what the card shows, plus the full prompt and latest summary.
-	const shown =
-		q === ""
-			? board
-			: board.filter((t) =>
-					`${t.id}\n${t.sessionTitle || t.title}\n${t.prompt}\n${t.summary ?? ""}`
-						.toLowerCase()
-						.includes(q),
-				);
+	const shown = board.filter((t) => matchesQuery(t, query));
 	const counts = {} as Record<Stage, LaneCount>;
 	for (const stage of STAGES) {
 		const visible = shown.filter((t) => laneStage(t) === stage);
@@ -221,22 +223,6 @@ export function laneCounts<T extends LaneTask>(
 		};
 	}
 	return { shown, counts };
-}
-
-/** The done lane's visible page: the newest `limit` cards, grown to cover every pinned card (unread
- * answers and starred cards) so a pinned card never sits behind the cut. Returns the slice and how
- * many cards stay hidden behind the "Show more" button (0 renders no button). */
-export function donePage<T>(
-	tasks: readonly T[],
-	pinned: (t: T) => boolean,
-	limit: number,
-): { shown: T[]; hidden: number } {
-	const lastFresh = tasks.reduce((last, t, i) => (pinned(t) ? i : last), -1);
-	const cut = Math.max(limit, lastFresh + 1);
-	const hidden = Math.max(0, tasks.length - cut);
-	// The caller treats the returned array as read-only, so the uncropped branch hands back
-	// the input array itself instead of copying it.
-	return { shown: hidden > 0 ? tasks.slice(0, cut) : (tasks as T[]), hidden };
 }
 
 /** Card facts the queue reorder reads. */

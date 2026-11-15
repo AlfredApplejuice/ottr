@@ -94,8 +94,6 @@ const card = (over: Partial<TaskCard>): TaskCard =>
 		id: "t1",
 		title: "Task one",
 		sessionTitle: "Task one",
-		prompt: "work",
-		summary: null,
 		project: "alpha",
 		state: "queued",
 		stage: "todo",
@@ -210,13 +208,19 @@ const fetchMock = (async (input: RequestInfo | URL) => {
 			},
 		};
 	else {
-		// The drawer's detail fetch: a TaskView built from the board card.
+		// The drawer's detail fetch: a TaskView built from the board card. The slim
+		// state row carries no wide fields (OTTR-965), so the mock supplies them
+		// the way the server's detail route does.
 		const detail = /\/api\/projects\/[^/]+\/tasks\/[^/?]+$/.exec(url);
 		const id = detail === null ? null : detail[0].split("/").pop();
 		const row = id === null ? undefined : state.tasks.find((t) => t.id === id);
 		if (row !== undefined)
 			body = {
 				...row,
+				prompt: "work",
+				summary: null,
+				gate: null,
+				workCheckReport: null,
 				turns: [],
 				details: null,
 				report: null,

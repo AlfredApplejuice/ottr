@@ -114,8 +114,10 @@ import type { QuotaLimit, QuotaState, TaskCard } from "./types.ts";
 import {
 	type AddProjectResponse,
 	askAnswerLine,
+	DONE_PAGE,
 	doneReadKey,
 	type ListedTask,
+	newestLanded,
 	type PrReviewRow,
 	REVIEW_BODY_MAX,
 	REVIEW_FOOTER,
@@ -12396,6 +12398,35 @@ describe("web push (R1-1, R2-3)", () => {
 		});
 	});
 
+	// OTTR-965: the slim frame no longer carries summary, so the Complete push must
+	// read it from the server's store bridge, not from the card.
+	test("an answered card's Complete push still carries the summary text", async () => {
+		const b = await alertBoard("alert-summary");
+		await b.subscribe("https://push.example/sum");
+
+		const t = await b.s.createTask("answer me");
+		await publishNow(b.m.app); // baseline: prev = null is silent
+		const from = pushSends.length;
+		const turn = await b.s.startTurn(t.id, "work", ".", null);
+		await b.s.finishTurn(turn.id, {
+			outcome: "answered",
+			endedAt: Date.now(),
+			exitCode: 0,
+		});
+		await b.s.updateTask(t.id, { summary: "Known answer summary text" });
+		await b.s.updateTask(t.id, { stage: "done", state: "idle" });
+		expect(await publishNow(b.m.app)).toBe(true);
+
+		const sent = b.sentSince(from);
+		expect(sent.length).toBe(1);
+		expect(sent[0]!.payload).toMatchObject({
+			type: "alert",
+			tag: "complete",
+			keys: [`done:${t.id}`],
+			body: "Known answer summary text",
+		});
+	});
+
 	test("an error turn pushes an Error alert keyed by the turn", async () => {
 		const b = await alertBoard("alert-error");
 		await b.subscribe("https://push.example/err");
@@ -13453,6 +13484,200 @@ describe("turn ETA facts on /api/state (OTTR-587)", () => {
 		const card = (await state()).tasks.find((c) => c.id === t.id)!;
 		expect(card.runStartedAt).toBe(live.startedAt);
 		expect(card.etaMs).toBeUndefined();
+	});
+});
+
+/** OTTR-965: slim state cards, the Done window and its pages. Every test runs on a
+ * private one-project store, so the shared p1 board keeps its suite-wide build wall. */
+describe("slim state and done pages (OTTR-965)", () => {
+	/** A private one-project board with its own store, like the OTTR-866 bigBoard. */
+	const slimBoard = async (dirName: string) => {
+		const dir = join(root, dirName);
+		mkdirSync(dir, { recursive: true });
+		const st = await ProjectStore.open(dir);
+		testStores.add(st);
+		const entry: Entry = {
+			path: dir,
+			name: dirName,
+			store: st,
+			target: null,
+			gitless: false,
+			github: null,
+			protectedTarget: false,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		};
+		return { st, projects: new Map([[dirName, entry]]) };
+	};
+	/** One done card with its own landing stamp, so landed order has no ties. */
+	const seedDone = async (
+		st: ProjectStore,
+		prompt: string,
+		doneAt: number,
+		over: Partial<Parameters<ProjectStore["updateTask"]>[1]> = {},
+	) => {
+		const t = await st.createTask(prompt);
+		// doneAt is store-stamped, not patchable: pin the clock for the write.
+		setSystemTime(new Date(doneAt));
+		try {
+			await st.updateTask(t.id, { stage: "done", state: "idle", ...over });
+		} finally {
+			setSystemTime();
+		}
+		return t.id;
+	};
+	/** One question-only card: one work turn answered, then Done. */
+	const seedAnswered = async (st: ProjectStore, doneAt: number) => {
+		const t = await st.createTask("answered behind the cut");
+		const turn = await st.startTurn(t.id, "work", ".", null);
+		await st.finishTurn(turn.id, {
+			outcome: "answered",
+			endedAt: doneAt,
+			exitCode: 0,
+		});
+		setSystemTime(new Date(doneAt));
+		try {
+			await st.updateTask(t.id, { stage: "done", state: "idle" });
+		} finally {
+			setSystemTime();
+		}
+		return t.id;
+	};
+
+	test("3000 done cards with 10 KB prompts stay under 1 MB of state JSON", async () => {
+		const { st, projects } = await slimBoard("slim-size");
+		// Seeded before the mount, so every doneAt sits behind the seen baseline and
+		// nothing counts as unread: the window alone decides what rides.
+		const wide = "x".repeat(10_240);
+		const base = Date.now();
+		for (let i = 0; i < 3000; i++)
+			await seedDone(st, `done ${i} ${wide}`, base + i);
+		for (let i = 0; i < 3; i++) await st.createTask(`open ${i}`);
+		const m = await mount({ projects });
+		const res = await m.call("/api/state");
+		expect(res.status).toBe(200);
+		const text = await res.text();
+		// The old frame carried all 3000 wide prompts (about 30 MB); the slim one must not.
+		expect(text.length).toBeLessThan(1_000_000);
+		const b = JSON.parse(text) as {
+			tasks: Array<{ id: string; stage: string; prompt?: string }>;
+		};
+		expect(b.tasks.length).toBe(3 + DONE_PAGE);
+		expect(b.tasks.filter((t) => t.stage === "done").length).toBe(DONE_PAGE);
+		// The newest 20 by landed time ride.
+		const expectDone = (await st.listTasks())
+			.filter((t) => t.stage === "done")
+			.sort((a, b) => newestLanded(a, b))
+			.slice(0, DONE_PAGE)
+			.map((t) => t.id);
+		const ids = new Set(b.tasks.map((t) => t.id));
+		for (const id of expectDone) expect(ids.has(id)).toBe(true);
+		// The wide prompt text no longer rides.
+		expect(b.tasks.every((t) => t.prompt === undefined)).toBe(true);
+	});
+
+	test("the Done window keeps the cut plus pinned cards and drops the rest", async () => {
+		const { st, projects } = await slimBoard("slim-window");
+		const m = await mount({ projects });
+		// Past the boot baseline, so the answered card's unread rule applies (the seen
+		// set is empty on a fresh board).
+		const base = Date.now() + 10_000;
+		const plain: string[] = [];
+		for (let i = 0; i < 25; i++)
+			plain.push(await seedDone(st, `plain ${i}`, base + i));
+		// Both pinned cards land behind the cut: the starred one and the answered one
+		// no mark has read.
+		const starred = await seedDone(st, "starred behind the cut", base - 2_000, {
+			starred: true,
+		});
+		const answered = await seedAnswered(st, base - 3_000);
+		const cancelled = await st.createTask("cancelled, newest of all");
+		await st.updateTask(cancelled.id, {
+			cancelledAt: base + 60_000,
+			state: "idle",
+		});
+		for (let i = 0; i < 3; i++) await st.createTask(`open ${i}`);
+
+		const b = (await (await m.call("/api/state")).json()) as {
+			tasks: Array<{ id: string; stage: string; cancelledAt: number | null }>;
+		};
+		const settled = b.tasks.filter(
+			(t) => t.stage === "done" || t.cancelledAt !== null,
+		);
+		const ids = new Set(settled.map((t) => t.id));
+		// The cancelled card is the newest settled card: it takes one window slot.
+		expect(ids.has(cancelled.id)).toBe(true);
+		// The 19 newest plain done cards fill the rest of the window.
+		const windowPlain = plain.slice(plain.length - (DONE_PAGE - 1));
+		for (const id of windowPlain) expect(ids.has(id)).toBe(true);
+		// The pinned pair rides behind the cut.
+		expect(ids.has(starred)).toBe(true);
+		expect(ids.has(answered)).toBe(true);
+		// The window holds exactly the cut plus the two pinned cards.
+		expect(settled.length).toBe(DONE_PAGE + 2);
+		// The plain cards behind the cut are gone from the frame.
+		const dropped = plain.filter((id) => !windowPlain.includes(id));
+		expect(dropped.length).toBe(plain.length - (DONE_PAGE - 1));
+		for (const id of dropped) expect(ids.has(id)).toBe(false);
+	});
+
+	test("the done endpoint serves pages in landed order with the settled total", async () => {
+		const { st, projects } = await slimBoard("slim-done");
+		const m = await mount({ projects });
+		const base = Date.now();
+		for (let i = 0; i < 45; i++) await seedDone(st, `done ${i}`, base + i);
+		const landed = (await st.listTasks())
+			.sort((a, b) => newestLanded(a, b))
+			.map((t) => t.id);
+
+		const page1 = (await (
+			await m.call("/api/projects/slim-done/done")
+		).json()) as { tasks: Array<{ id: string }>; total: number };
+		expect(page1.total).toBe(45);
+		expect(page1.tasks.map((t) => t.id)).toEqual(landed.slice(0, DONE_PAGE));
+
+		const page2 = (await (
+			await m.call("/api/projects/slim-done/done?page=2")
+		).json()) as { tasks: Array<{ id: string }>; total: number };
+		expect(page2.total).toBe(45);
+		expect(page2.tasks.map((t) => t.id)).toEqual(
+			landed.slice(DONE_PAGE, 2 * DONE_PAGE),
+		);
+
+		// A page past the end answers an empty list, so "Show more" stops cleanly.
+		const far = await m.call("/api/projects/slim-done/done?page=99");
+		expect(far.status).toBe(200);
+		expect(await far.json()).toEqual({ tasks: [], total: 45 });
+	});
+
+	test("the done endpoint rejects bad pages and unknown projects", async () => {
+		const { st, projects } = await slimBoard("slim-errors");
+		const m = await mount({ projects });
+		await seedDone(st, "one done card", Date.now());
+		for (const page of ["0", "-1", "abc", "1.5"])
+			expect(
+				(await m.call(`/api/projects/slim-errors/done?page=${page}`)).status,
+			).toBe(400);
+		expect((await m.call("/api/projects/nope/done?page=1")).status).toBe(404);
+	});
+
+	test("the project view carries doneTotal, the settled count", async () => {
+		const { st, projects } = await slimBoard("slim-total");
+		const base = Date.now();
+		for (let i = 0; i < 2; i++) await seedDone(st, `done ${i}`, base + i);
+		const gone = await st.createTask("cancelled");
+		await st.updateTask(gone.id, { cancelledAt: base + 5_000, state: "idle" });
+		await st.createTask("still open");
+		const m = await mount({ projects });
+		const b = (await (await m.call("/api/state")).json()) as {
+			projects: Array<{ name: string; doneTotal: number }>;
+		};
+		expect(b.projects.find((p) => p.name === "slim-total")?.doneTotal).toBe(3);
 	});
 });
 

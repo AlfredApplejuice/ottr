@@ -22,6 +22,7 @@ import type {
 import {
 	FORK_HOLD_REASON,
 	MERGE_HOLD_MISMATCH_REASON,
+	newestLanded,
 	PR_REVIEW_WAITING,
 	UPDATE_HOLD_REASON,
 } from "../types.ts";
@@ -29,8 +30,6 @@ import {
 import { resetCatalogCache } from "./models.ts";
 // Static: notify.ts reads localStorage only when called, never at load.
 import { loadAskDrafts, saveAskDraft } from "./notify.ts";
-// Static: queue.ts is pure lane math over types.ts and scheduler.ts, no browser global.
-import { donePage } from "./queue.ts";
 
 // app.tsx reads sessionStorage at module load; bun test has no browser storage.
 globalThis.sessionStorage = {
@@ -456,14 +455,19 @@ describe("UpdateRowLine", () => {
 
 const cardFixture = (
 	over: Partial<TaskCard> &
-		Partial<Pick<Task, "details" | "report">> & { prReview?: PrReviewView },
+		Partial<
+			Pick<
+				Task,
+				"details" | "gate" | "prompt" | "report" | "summary" | "workCheckLog"
+			>
+		> & {
+			prReview?: PrReviewView;
+		},
 ): TaskCard =>
 	({
 		id: "t1",
 		title: "Task one",
 		sessionTitle: "Task one",
-		prompt: "work",
-		summary: null,
 		project: "proj",
 		state: "queued",
 		stage: "todo",
@@ -471,6 +475,13 @@ const cardFixture = (
 		createdAt: 0,
 		doneAt: null,
 		dependsOn: [],
+		// The Drawer body iterates these card arrays before the detail fetch
+		// lands; every TaskCard carries them on the wire (OTTR-965), so the
+		// fixture does too.
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
 		releaseVersion: null,
 		followUpOf: null,
 		followUpOfProject: null,
@@ -2679,7 +2690,7 @@ describe("Drawer cross-project lineage", () => {
 	});
 });
 
-describe("Drawer prompt markdown", () => {
+describe("Drawer prompt loading", () => {
 	// ponytail: render test reads only these fields; the cast keeps the fixture short.
 	const project = {
 		name: "proj",
@@ -2721,61 +2732,34 @@ describe("Drawer prompt markdown", () => {
 		maxTotal: null,
 	};
 
-	test("the prompt section renders markdown instead of raw text", () => {
-		const task = cardFixture({
-			...drawerFields,
-			stage: "done",
-			state: "idle",
-			prompt: "# Rules\n\nfix the `align` flow, **then** commit",
-		});
-		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
-		expect(html).toContain('class="prompt-text"');
-		expect(html).toContain("<h1>Rules</h1>");
-		expect(html).toContain("<code>align</code>");
-		expect(html).toContain("<strong>then</strong>");
-	});
-
-	test("the editable prompt of an unstarted card renders markdown", () => {
-		const task = cardFixture({
+	test("the read-only prompt section holds a loading line until the detail fetch lands", () => {
+		// The state row carries no prompt text (OTTR-965): the drawer fetches it from
+		// the task route. The static render never resolves the fetch, so it sees the
+		// loading state; the loaded text renders in the mounted tests further down.
+		const done = cardFixture({ ...drawerFields, stage: "done", state: "idle" });
+		const html = renderToStaticMarkup(<Drawer {...base} task={done} />);
+		expect(html).toContain('aria-label="Loading the prompt"');
+		expect(html).not.toContain('class="prompt-text"');
+		const preparing = cardFixture({
 			...drawerFields,
 			stage: "todo",
-			state: "queued",
-			prompt: "fix the `align` flow",
+			state: "preparing",
 		});
-		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
-		expect(html).toContain('class="task-prompt"');
-		expect(html).toContain("<code>align</code>");
+		const preparingHtml = renderToStaticMarkup(
+			<Drawer {...base} task={preparing} />,
+		);
+		expect(preparingHtml).toContain('aria-label="Loading the prompt"');
+		expect(preparingHtml).not.toContain("Edit task");
 	});
 
-	test("a parked backlog card shows the Edit task button; other stages do not", () => {
+	test("the editable card hides its Edit task button until the prompt lands", () => {
 		const parked = cardFixture({
 			...drawerFields,
 			stage: "backlog",
 			state: "idle",
-			prompt: "parked idea",
 		});
 		const html = renderToStaticMarkup(<Drawer {...base} task={parked} />);
-		expect(html).toContain('class="task-prompt"');
-		expect(html).toContain("Edit task");
-		const done = cardFixture({
-			...drawerFields,
-			stage: "done",
-			state: "idle",
-		});
-		const merged = renderToStaticMarkup(<Drawer {...base} task={done} />);
-		expect(merged).toContain('class="prompt-text"');
-		expect(merged).not.toContain("Edit task");
-	});
-
-	test("a preparing card shows the prompt read-only without an edit button", () => {
-		const task = cardFixture({
-			...drawerFields,
-			stage: "todo",
-			state: "preparing",
-			prompt: "fix the `align` flow",
-		});
-		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
-		expect(html).toContain('class="prompt-text"');
+		expect(html).toContain('aria-label="Loading the prompt"');
 		expect(html).not.toContain('class="task-prompt"');
 		expect(html).not.toContain("Edit task");
 	});
@@ -3513,10 +3497,19 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 		freeTitle: string,
 	): Promise<void> => {
 		const realFetch = globalThis.fetch;
-		// The drawer's effects fetch the task detail and degrade to the row on a
-		// failed response, so the fixture's fields (editable, proposal) stay authoritative.
-		globalThis.fetch = (async () =>
-			new Response("{}", { status: 404 })) as unknown as typeof fetch;
+		// The detail fetch fills the prompt (OTTR-965): serve the row back as the
+		// loaded task, so the Edit task button renders and the fixture's fields stay
+		// authoritative for the guard checks.
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.endsWith(`/tasks/${task.id}`)) {
+				return new Response(JSON.stringify({ ...task, turns: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
 		const container = window.document.createElement(
 			"div",
 		) as unknown as HTMLDivElement;
@@ -3538,6 +3531,8 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			await act(async () => {
 				root.render(<Drawer {...base} task={task} />);
 			});
+			// One more act lets the detail fetch land, so the Edit task button renders.
+			await act(async () => {});
 			const action = button(container, label);
 			expect(action.disabled).toBe(false);
 			expect(action.title).toBe(freeTitle);
@@ -3655,6 +3650,13 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 					{ status: 409 },
 				);
 			}
+			// The detail fetch fills the prompt (OTTR-965): serve the row back loaded.
+			if (url.endsWith("/tasks/t1")) {
+				return new Response(JSON.stringify({ ...card, turns: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
 			return new Response("{}", { status: 404 });
 		}) as unknown as typeof fetch;
 		const container = window.document.createElement(
@@ -3673,6 +3675,8 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			await act(async () => {
 				root.render(<Drawer {...base} act={runAct} task={card} />);
 			});
+			// One more act lets the detail fetch land, so the Edit task button renders.
+			await act(async () => {});
 			await act(async () => {
 				onClickOf(button(container, "Edit task"))({});
 			});
@@ -3716,6 +3720,13 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 				saves.push(body);
 				return new Response("{}", { status: 200 });
 			}
+			// The detail fetch fills the prompt (OTTR-965): serve the row back loaded.
+			if (url.endsWith("/tasks/t1")) {
+				return new Response(JSON.stringify({ ...card, turns: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
 			return new Response("{}", { status: 404 });
 		}) as unknown as typeof fetch;
 		const container = window.document.createElement(
@@ -3734,6 +3745,8 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			await act(async () => {
 				root.render(<Drawer {...base} act={runAct} task={card} />);
 			});
+			// One more act lets the detail fetch land, so the Edit task button renders.
+			await act(async () => {});
 			await act(async () => {
 				onClickOf(button(container, "Edit task"))({});
 			});
@@ -3773,6 +3786,13 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 				saves.push(JSON.parse(String(init.body)));
 				return new Response("{}", { status: 200 });
 			}
+			// The detail fetch fills the prompt (OTTR-965): serve the row back loaded.
+			if (url.endsWith("/tasks/t1")) {
+				return new Response(JSON.stringify({ ...card, turns: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
 			return new Response("{}", { status: 404 });
 		}) as unknown as typeof fetch;
 		const container = window.document.createElement(
@@ -3791,6 +3811,8 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			await act(async () => {
 				root.render(<Drawer {...base} act={runAct} task={card} />);
 			});
+			// One more act lets the detail fetch land, so the Edit task button renders.
+			await act(async () => {});
 			await act(async () => {
 				onClickOf(button(container, "Edit task"))({});
 			});
@@ -3833,6 +3855,13 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 				saves.push(body);
 				return new Response("{}", { status: 200 });
 			}
+			// The detail fetch fills the prompt (OTTR-965): serve the row back loaded.
+			if (url.endsWith("/tasks/t1")) {
+				return new Response(JSON.stringify({ ...card, turns: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
 			return new Response("{}", { status: 404 });
 		}) as unknown as typeof fetch;
 		const container = window.document.createElement(
@@ -3851,6 +3880,8 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			await act(async () => {
 				root.render(<Drawer {...base} act={runAct} task={card} />);
 			});
+			// One more act lets the detail fetch land, so the Edit task button renders.
+			await act(async () => {});
 			await act(async () => {
 				onClickOf(button(container, "Edit task"))({});
 			});
@@ -4070,12 +4101,19 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 
 	test("the open editor holds the card server-side and releases it on close", async () => {
 		const realFetch = globalThis.fetch;
-		// Record the hold calls; every other request degrades to null detail as above.
+		// Record the hold calls; the detail GET serves the row back loaded (OTTR-965),
+		// so the Edit task button renders; everything else degrades to null detail.
 		const holds: string[] = [];
 		globalThis.fetch = (async (input: RequestInfo | URL) => {
 			const url = String(input);
 			if (url.endsWith("/edit/start") || url.endsWith("/edit/stop"))
 				holds.push(url.endsWith("start") ? "start" : "stop");
+			if (url.endsWith("/tasks/t1")) {
+				return new Response(JSON.stringify({ ...task, turns: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
 			return new Response("{}", { status: 404 });
 		}) as unknown as typeof fetch;
 		const container = window.document.createElement(
@@ -4095,6 +4133,8 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			await act(async () => {
 				root.render(<Drawer {...base} task={task} />);
 			});
+			// One more act lets the detail fetch land, so the Edit task button renders.
+			await act(async () => {});
 			expect(holds).toEqual([]);
 			await act(async () => {
 				onClickOf(button(container, "Edit task"))({});
@@ -4704,8 +4744,10 @@ describe("Drawer research report button", () => {
 	].join("\n");
 	// The full task the detail fetch returns; the card fixture's fields plus what
 	// the done view reads beyond the row (turns, check log, hold head, report).
+	// The prompt rides only here (OTTR-965): the state row carries none.
 	const detailBody = {
 		...cardFixture({ id: "R-1", stage: "done", state: "idle", research: true }),
+		prompt: "Loaded from the task route",
 		turns: [],
 		workCheckLog: [],
 		details: null,
@@ -4723,6 +4765,43 @@ describe("Drawer research report button", () => {
 		pendingImages: [],
 		shots: [],
 		keptFiles: [],
+	} as unknown as TaskView;
+	const drawerExtras = {
+		turns: [],
+		workCheckLog: [],
+		details: null,
+		report: null,
+		diffFiles: null,
+		holdHead: null,
+		mergeHead: null,
+		branch: null,
+		base: null,
+		worktree: null,
+		sessionId: null,
+		model: null,
+		commits: [],
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+	};
+	// The editable card's loaded task: the Edit task button renders from it.
+	const parkedDetail = {
+		...cardFixture({ id: "P-1", stage: "backlog", state: "idle" }),
+		prompt: "parked idea",
+		...drawerExtras,
+	} as unknown as TaskView;
+	// The proposal's loaded task: the decision panel's prompt slots fill from it.
+	const proposalDetail = {
+		...cardFixture({
+			id: "PR-1",
+			stage: "todo",
+			state: "needs_you",
+			needsReason:
+				"Retro proposal from t3. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+		}),
+		prompt: "Loaded from the task route",
+		...drawerExtras,
 	} as unknown as TaskView;
 	const browserGlobals: Record<string, unknown> = {
 		window,
@@ -4742,7 +4821,15 @@ describe("Drawer research report button", () => {
 				? detailBody
 				: u.endsWith("/tasks/R-1/context")
 					? { context: null }
-					: null;
+					: u.endsWith("/tasks/P-1")
+						? parkedDetail
+						: u.endsWith("/tasks/P-1/context")
+							? { context: null }
+							: u.endsWith("/tasks/PR-1")
+								? proposalDetail
+								: u.endsWith("/tasks/PR-1/context")
+									? { context: null }
+									: null;
 			return Promise.resolve(
 				body === null
 					? new Response("{}", { status: 404 })
@@ -4833,6 +4920,117 @@ describe("Drawer research report button", () => {
 			},
 		};
 	};
+
+	test("the drawer renders the prompt from the task route, not the row", async () => {
+		// The row carries no prompt (OTTR-965): the first paint holds the section's
+		// loading line without crashing, then the fetched prompt text renders.
+		// The detail fetch waits on a deferred promise. The test releases the body
+		// after the first paint, so the loading line stays observable.
+		const { promise: detailLanding, resolve: resolveDetail } =
+			Promise.withResolvers<TaskView>();
+		// This body matches the shape that the other mocks in this describe serve
+		// for a read-only card.
+		const deferredDetail = {
+			...cardFixture({
+				id: "R-1",
+				stage: "done",
+				state: "idle",
+				research: true,
+			}),
+			prompt: "Loaded from the task route",
+			...drawerExtras,
+		} as unknown as TaskView;
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const u = String(input);
+			if (u.endsWith("/tasks/R-1")) {
+				const body = await detailLanding;
+				return new Response(JSON.stringify(body), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return realFetch(input, init);
+		}) as unknown as typeof fetch;
+		const container = document.createElement("div");
+		document.body.append(container);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<Drawer
+						{...base}
+						task={cardFixture({
+							id: "R-1",
+							stage: "done",
+							state: "idle",
+							research: true,
+						})}
+					/>,
+				);
+			});
+			expect(
+				container.querySelector('[aria-label="Loading the prompt"]'),
+			).not.toBeNull();
+			expect(container.textContent).not.toContain("Loaded from the task route");
+			await act(async () => {
+				resolveDetail(deferredDetail);
+			});
+			await act(async () => {});
+			expect(container.textContent).toContain("Loaded from the task route");
+			expect(
+				container.querySelector('[aria-label="Loading the prompt"]'),
+			).toBeNull();
+			// The read-only card renders the loaded text without an Edit button.
+			expect(container.querySelector(".prompt-text")).not.toBeNull();
+			expect(container.textContent).not.toContain("Edit task");
+		} finally {
+			globalThis.fetch = realFetch;
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+		}
+	});
+
+	test("an editable card offers Edit task once the prompt lands", async () => {
+		const { container, unmount } = await mountDrawer(
+			cardFixture({ id: "P-1", stage: "backlog", state: "idle" }),
+		);
+		try {
+			expect(container.querySelector(".task-prompt")).not.toBeNull();
+			expect(container.textContent).toContain("parked idea");
+			expect(container.textContent).toContain("Edit task");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a proposal's prompt slots fill in when the detail lands", async () => {
+		const { container, unmount } = await mountDrawer(
+			cardFixture({
+				id: "PR-1",
+				stage: "todo",
+				state: "needs_you",
+				needsReason:
+					"Retro proposal from t3. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+			}),
+		);
+		try {
+			// Without a stored summary the loaded prompt's first paragraph becomes
+			// the decision facts, and the full prompt sits collapsed under it.
+			expect(container.querySelector(".decide-fallback")).not.toBeNull();
+			expect(container.textContent).toContain("Loaded from the task route");
+			expect(container.innerHTML).toMatch(
+				/<summary><svg class="chev"[\s\S]*?<\/svg>Full prompt<\/summary>/,
+			);
+		} finally {
+			await unmount();
+		}
+	});
 
 	test("a live turn's chip ticks elapsed instead of reading running", async () => {
 		// The Work steps chip shows the shared duration for a finished turn; the live
@@ -5207,11 +5405,12 @@ describe("Drawer of a cancelled card opens read-only", () => {
 			stage: "done",
 			state: "idle",
 			cancelledAt: 1760000000000,
-			prompt: "the original ask, kept readable",
 		});
 		const html = renderToStaticMarkup(<Drawer {...base} task={dead} />);
-		// Read-only does not mean blind: prompt, cancel stamp, summary and log stay.
-		expect(html).toContain("the original ask, kept readable");
+		// Read-only does not mean blind: the cancel stamp and the log stay; the prompt
+		// and the summary land with the detail fetch (OTTR-965), so the section holds
+		// its loading line here.
+		expect(html).toContain('aria-label="Loading the prompt"');
 		expect(html).toContain("cancelled");
 		expect(html).toContain('class="turns"');
 		// No action button survives: follow-up, cancel/delete, unread flip.
@@ -5367,6 +5566,11 @@ describe("Drawer of a cancelled card opens read-only", () => {
 			details: draft,
 			report: null,
 			diffFiles: null,
+			prompt: "review the draft",
+			summary: null,
+			gate: null,
+			workCheckLog: [],
+			workCheckReport: null,
 		};
 		return renderToStaticMarkup(
 			<PrReviewSection
@@ -5996,6 +6200,7 @@ test("OTTR-827: the rail dot counts exactly the cards whose face shows New", () 
 			settings: { maxParallel: 1 },
 			latestImage: null,
 			archReview: null,
+			doneTotal: 1,
 			dirty: false,
 			mainBranch: null,
 			latestRelease: null,
@@ -6147,6 +6352,7 @@ describe("ProjectBoard search delay", () => {
 			archReview: null,
 			latestRelease: null,
 			latestImage: null,
+			doneTotal: 0,
 			settings: { setupChecklist: false },
 			sessionsDir: "/tmp/s",
 		} as unknown as ProjectView;
@@ -6249,6 +6455,9 @@ describe("ProjectBoard done lane time view", () => {
 		navigator: window.navigator,
 		HTMLElement: window.HTMLElement,
 		HTMLInputElement: window.HTMLInputElement,
+		// The lane's Show more handler reads Node.DOCUMENT_POSITION_PRECEDING;
+		// happy-dom exposes it on its own Window only.
+		Node: window.Node,
 		requestAnimationFrame: window.requestAnimationFrame,
 		cancelAnimationFrame: window.cancelAnimationFrame,
 	};
@@ -6270,15 +6479,15 @@ describe("ProjectBoard done lane time view", () => {
 		}
 	});
 
-	test("the done lane stays on the time view: no toggle, one paged flat list", async () => {
-		// 25 landed cards, none answered or starred: no pinned card may bend the cut.
-		const doneCards = Array.from({ length: 25 }, (_, j) =>
-			cardFixture({
-				id: `d${j}`,
-				stage: "done",
-				state: "idle",
-				doneAt: j + 1,
-			}),
+	test("the done lane shows the state window and Show more fetches the server pages", async () => {
+		// The state holds only the newest window (OTTR-965): 20 held cards here, five
+		// older ones on the server. "Show more" fetches page 2; the head count and the
+		// button label read doneTotal, the project's true done+cancelled size.
+		const held = Array.from({ length: 20 }, (_, j) =>
+			cardFixture({ id: `d${j}`, stage: "done", state: "idle", doneAt: j + 1 }),
+		);
+		const olderPage = Array.from({ length: 5 }, (_, j) =>
+			cardFixture({ id: `o${j}`, stage: "done", state: "idle", doneAt: j - 5 }),
 		);
 		const container = window.document.createElement(
 			"div",
@@ -6294,15 +6503,29 @@ describe("ProjectBoard done lane time view", () => {
 			archReview: null,
 			latestRelease: null,
 			latestImage: null,
+			doneTotal: held.length + olderPage.length,
 			settings: { setupChecklist: false },
 			sessionsDir: "/tmp/s",
 		} as unknown as ProjectView;
+		const realFetch = globalThis.fetch;
+		const fetches: string[] = [];
+		globalThis.fetch = (async (url: RequestInfo | URL) => {
+			const u = String(url);
+			if (u === "/api/projects/proj/done?page=2") {
+				fetches.push(u);
+				return new Response(JSON.stringify({ tasks: olderPage, total: 25 }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
 		try {
 			await act(async () => {
 				root.render(
 					<ProjectBoard
 						project={project}
-						tasks={doneCards}
+						tasks={held}
 						deltas={new Map()}
 						open={() => {}}
 						seenAnswers={new Set()}
@@ -6315,42 +6538,40 @@ describe("ProjectBoard done lane time view", () => {
 					/>,
 				);
 			});
+			const lane = container.querySelector('[data-stage="done"]');
+			expect(lane).not.toBeNull();
 			// The switch is gone for good: no view-toggle element anywhere, and the
-			// words "By topic" / "By time" appear nowhere on the board.
+			// done stage head renders no tools but the lane-wide "Show more" button.
 			expect(container.querySelector(".view-toggle")).toBeNull();
 			expect(container.textContent).not.toContain("By topic");
 			expect(container.textContent).not.toContain("By time");
-			expect(container.innerHTML).not.toContain("By topic");
-			expect(container.innerHTML).not.toContain("By time");
-			// The done stage head renders no tools at all: not even one button.
-			const head = container.querySelector("#stage-done");
-			expect(head?.querySelectorAll("button")).toHaveLength(0);
-			// The flat list pages by time: donePage's cut decides the first page.
-			// The lane sorts newest landed first, then donePage cuts at the page size
-			// (app.tsx's unexported DONE_PAGE is 20), so no number here is guessed.
-			const { shown, hidden } = donePage(
-				[...doneCards].sort((a, b) => (b.doneAt ?? 0) - (a.doneAt ?? 0)),
-				() => false,
-				20,
-			);
-			expect(hidden).toBeGreaterThan(0);
-			const lane = container.querySelector('[data-stage="done"]');
-			expect(lane).not.toBeNull();
-			const visibleIds = [...lane!.querySelectorAll("[data-task-id]")].map(
-				(el) => el.getAttribute("data-task-id"),
-			);
-			expect(visibleIds).toEqual(shown.map((t) => t.id));
+			const ids = (): string[] =>
+				[...lane!.querySelectorAll("[data-task-id]")].map(
+					(el) => el.getAttribute("data-task-id") ?? "",
+				);
+			// The window renders newest landed first; the head count reads the true total.
+			expect(ids()).toEqual([...held].sort(newestLanded).map((t) => t.id));
+			expect(lane!.querySelector(".count")?.textContent).toBe("25");
 			// One lane-wide "Show more" carries the hidden count in its label.
-			const more = lane!.querySelector("button.lane-more");
-			expect(more?.textContent).toContain("Show more");
-			expect(more?.getAttribute("aria-label")).toBe(
-				`Show more, ${hidden} older cards`,
+			const more = lane!.querySelector<HTMLButtonElement>("button.lane-more");
+			expect(more?.getAttribute("aria-label")).toBe("Show more, 5 older cards");
+			await act(async () => {
+				more!.click();
+			});
+			await act(async () => {});
+			// The fetched page appends below the window, still newest landed first.
+			expect(fetches).toEqual(["/api/projects/proj/done?page=2"]);
+			expect(ids()).toEqual(
+				[...held, ...olderPage].sort(newestLanded).map((t) => t.id),
 			);
+			// Every card the server holds is on the board now: the button is gone.
+			expect(lane!.querySelector("button.lane-more")).toBeNull();
 		} finally {
 			await act(async () => {
 				root.unmount();
 			});
 			container.remove();
+			globalThis.fetch = realFetch;
 		}
 	});
 
@@ -6380,6 +6601,7 @@ describe("ProjectBoard done lane time view", () => {
 			archReview: null,
 			latestRelease: null,
 			latestImage: null,
+			doneTotal: 3,
 			settings: { setupChecklist: false },
 			sessionsDir: "/tmp/s",
 		} as unknown as ProjectView;
@@ -6512,6 +6734,7 @@ describe("ProjectBoard settings shortcut", () => {
 			archReview: null,
 			latestRelease: null,
 			latestImage: null,
+			doneTotal: 0,
 			settings: { setupChecklist: false },
 			sessionsDir: "/tmp/s",
 		} as unknown as ProjectView;
@@ -6695,6 +6918,7 @@ describe("ProjectBoard skill-gap markers", () => {
 		latestImage: null,
 		target: "origin/main",
 		settings: { setupChecklist: false },
+		doneTotal: 0,
 		sessionsDir: "/tmp/s",
 	} as unknown as ProjectView;
 
@@ -7112,8 +7336,9 @@ describe("Drawer prompt gate Start anyway", () => {
 	test("a gate park renders the reason and Start anyway; its click replies with the exact marker", async () => {
 		const realFetch = globalThis.fetch;
 		const posts: { url: string; body: unknown }[] = [];
-		// The drawer's detail, session and catalog fetches degrade to null on a 404;
-		// only the reply POST is captured.
+		// The drawer's session and catalog fetches degrade to null on a 404; the
+		// detail GET serves the fixture back loaded, so its gate stamp reaches the
+		// banner (OTTR-965); only the reply POST is captured.
 		globalThis.fetch = (async (
 			input: RequestInfo | URL,
 			init?: RequestInit,
@@ -7122,6 +7347,24 @@ describe("Drawer prompt gate Start anyway", () => {
 			if (url.endsWith("/tasks/t1/reply")) {
 				posts.push({ url, body: String(init?.body ?? "") });
 				return new Response(JSON.stringify({ ok: true }), { status: 200 });
+			}
+			if (url.endsWith("/tasks/t1")) {
+				return new Response(
+					JSON.stringify({
+						...gateTask({
+							hash: null,
+							seen: null,
+							fails: 1,
+							sig: "Which environment deploys this?",
+							parked: true,
+						}),
+						// The slim row carries no prompt (OTTR-965); the loaded task
+						// does, and the prompt panel renders it once the detail lands.
+						prompt: "gate park prompt",
+						turns: [],
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
 			}
 			return new Response("{}", { status: 404 });
 		}) as unknown as typeof fetch;
@@ -7145,6 +7388,8 @@ describe("Drawer prompt gate Start anyway", () => {
 					/>,
 				);
 			});
+			// One more act lets the detail fetch land, so the gate banner renders.
+			await act(async () => {});
 			const reason = container.querySelectorAll(".gate-start .needs-reason");
 			expect(reason).toHaveLength(1);
 			expect(reason[0]!.textContent).toContain(
@@ -7789,7 +8034,6 @@ describe("Drawer proposal decision panel", () => {
 			stage: "todo",
 			state: "needs_you",
 			needsReason: reason,
-			prompt: "Rework the wording\n\nsecond paragraph",
 			proposalSummary: summary,
 		});
 		const html = renderToStaticMarkup(
@@ -7811,25 +8055,24 @@ describe("Drawer proposal decision panel", () => {
 		expect(html).toContain("ZZZ-9 never existed");
 	});
 
-	test("a proposal without a summary shows the prompt's first paragraph, no five labels", () => {
+	test("a proposal without a summary holds a loading line, no five labels", () => {
+		// The prompt rides the detail fetch (OTTR-965): while it is in flight, the
+		// fallback paragraph holds its space with the loading line.
 		const task = cardFixture({
 			...drawerFields,
 			stage: "todo",
 			state: "needs_you",
 			needsReason: reason,
-			prompt: "First paragraph only\n\nSecond paragraph",
 		});
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
 		expect(html).toContain('id="drawer-decide"');
-		expect(html).toContain("First paragraph only");
-		expect(html).toContain('class="decide-fallback"');
+		expect(html).toContain('aria-label="Loading the prompt"');
+		expect(html).not.toContain('class="decide-fallback"');
 		expect(html).not.toContain("<dt>What changes</dt>");
 		expect(html).not.toContain("<dt>Why</dt>");
 		expect(html).not.toContain("<dt>Gain</dt>");
 		expect(html).not.toContain("<dt>Risk</dt>");
 		expect(html).not.toContain("<dt>Check</dt>");
-		// The full prompt stays available under the collapsed section.
-		expect(html).toContain("Second paragraph");
 	});
 
 	test("the panel carries Accept and Edit beside it, and the collapsed full prompt", () => {
@@ -7838,7 +8081,6 @@ describe("Drawer proposal decision panel", () => {
 			stage: "todo",
 			state: "needs_you",
 			needsReason: reason,
-			prompt: "Rework the wording",
 			proposalSummary: summary,
 		});
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
@@ -7848,16 +8090,16 @@ describe("Drawer proposal decision panel", () => {
 		expect(html).toContain('title="Start the proposed task"');
 		expect(html).toContain('title="Edit the task text"');
 		expect(html).not.toContain("Decline this proposal");
-		// The full prompt sits collapsed under a visible summary.
-		expect(html).toMatch(
-			/<summary><svg class="chev"[\s\S]*?<\/svg>Full prompt<\/summary>/,
-		);
-		// One decision card: the body (reason, summary, full prompt) first, then the footer
-		// with Accept and Edit, so the buttons close the decision instead of splitting it.
+		// The prompt slot holds its loading line until the detail fetch lands
+		// (OTTR-965); the loaded prompt renders in the mounted tests further down.
+		expect(html).toContain('aria-label="Loading the prompt"');
+		// One decision card: the body (reason, summary, loading prompt) first, then the
+		// footer with Accept and Edit, so the buttons close the decision instead of
+		// splitting it.
 		const card = html.slice(html.indexOf('class="decide-card"'));
 		expect(card.indexOf('class="decide-body"')).toBeGreaterThan(-1);
 		expect(card.indexOf('class="decide-actions"')).toBeGreaterThan(
-			card.indexOf("Full prompt</summary>"),
+			card.indexOf('class="decide-body"'),
 		);
 		// The panel replaces the standalone prompt section and the needs-reason box.
 		expect(html).not.toContain('id="drawer-prompt"');
@@ -7925,7 +8167,6 @@ describe("Drawer proposal decision panel", () => {
 			stage: "todo",
 			state: "needs_you",
 			needsReason: reason,
-			prompt: "Rework the wording",
 			proposalSummary: summary,
 		});
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
@@ -7959,7 +8200,6 @@ describe("Drawer proposal decision panel", () => {
 			stage: "todo",
 			state: "needs_you",
 			needsReason: reason,
-			prompt: "Rework the wording",
 			cancelledAt: 1760000000000,
 		});
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
@@ -8082,8 +8322,6 @@ describe("Drawer proposal panel editing (client)", () => {
 
 	test("the panel's Edit opens exactly one prompt editor for the proposal", async () => {
 		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async () =>
-			new Response("{}", { status: 404 })) as unknown as typeof fetch;
 		const container = window.document.createElement(
 			"div",
 		) as unknown as HTMLDivElement;
@@ -8109,8 +8347,19 @@ describe("Drawer proposal panel editing (client)", () => {
 			stage: "todo",
 			state: "needs_you",
 			needsReason: reason,
-			prompt: "Rework the wording",
 		} as unknown as Partial<TaskCard> & Partial<Pick<Task, "report">>);
+		// The detail fetch fills the prompt (OTTR-965): the row carries none, so the
+		// loaded task carries the text the editor must prefill.
+		const detail = { ...task, prompt: "Rework the wording", turns: [] };
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			if (String(input).endsWith("/tasks/t1")) {
+				return new Response(JSON.stringify(detail), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
 		const panelEdit = (): Element => {
 			const node = [...container.querySelectorAll("button")].find(
 				(b) => b.textContent?.trim() === "Edit",
@@ -8143,6 +8392,8 @@ describe("Drawer proposal panel editing (client)", () => {
 			await act(async () => {
 				root.render(<Drawer {...base} task={task} />);
 			});
+			// One more act lets the detail fetch land: the editor prefills from it.
+			await act(async () => {});
 			await act(async () => {
 				onClickOf(panelEdit())({});
 			});
@@ -8177,6 +8428,7 @@ describe("ProjectBoard sync-commit advisories", () => {
 			archReview: null,
 			latestRelease: null,
 			latestImage: null,
+			doneTotal: 0,
 			settings: { setupChecklist: false },
 			sessionsDir: "/tmp/s",
 			...over,
@@ -8277,6 +8529,7 @@ describe("ProjectBoard repo link", () => {
 			archReview: null,
 			latestRelease: null,
 			latestImage: null,
+			doneTotal: 0,
 			settings: { setupChecklist: false },
 			sessionsDir: "/tmp/s",
 			...over,
@@ -8332,6 +8585,7 @@ describe("ProjectBoard rules interview action", () => {
 		latestRelease: null,
 		latestImage: null,
 		settings: { setupChecklist: false },
+		doneTotal: 0,
 		sessionsDir: "/tmp/s",
 	} as unknown as ProjectView;
 
@@ -8470,6 +8724,7 @@ describe("ProjectBoard PR-mode suggestion action", () => {
 								archReview: null,
 								latestRelease: null,
 								latestImage: null,
+								doneTotal: 0,
 								settings: { setupChecklist: false },
 								sessionsDir: "/tmp/s",
 							} as unknown as ProjectView
@@ -10041,6 +10296,14 @@ describe("Drawer re-run failed jobs action", () => {
 					status: rerun.status,
 				});
 			}
+			// The detail fetch fills the prompt (OTTR-965): serve the row back loaded,
+			// so the CI-link scan sees the fixture's prompt text.
+			if (u.endsWith(`/tasks/${card.id}`)) {
+				return new Response(JSON.stringify({ ...card, turns: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
 			return new Response("{}", { status: 404 });
 		}) as unknown as typeof fetch;
 		const container = window.document.createElement(
@@ -10052,6 +10315,8 @@ describe("Drawer re-run failed jobs action", () => {
 			await act(async () => {
 				root.render(<Drawer {...base} task={card} />);
 			});
+			// One more act lets the detail fetch land before the run callback queries.
+			await act(async () => {});
 			await run({ posts, container, root });
 		} finally {
 			await act(async () => {
@@ -10975,6 +11240,7 @@ describe("Release card re-release confirm names its target", () => {
 				archReview: null,
 				latestRelease: null,
 				latestImage: null,
+				doneTotal: 0,
 				settings: { setupChecklist: false },
 				sessionsDir: "/tmp/s",
 			} as unknown as ProjectView;

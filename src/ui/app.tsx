@@ -48,10 +48,12 @@ import {
 	APPROVE_REPLY,
 	type AskQuestion,
 	askAnswerLine,
+	DONE_PAGE,
 	doneReadKey,
 	type GhStatus,
 	type KeptChoice,
 	MERGE_HOLD_MISMATCH_REASON,
+	newestLanded,
 	type OrphanProcess,
 	PERF_RANGES,
 	type PerfMetrics,
@@ -182,13 +184,13 @@ import { fmtNum } from "./numbers.ts";
 import {
 	autoMarkOnOpen,
 	canMarkUnread,
-	donePage,
 	doneReadable,
 	dropBeforeId,
 	isUnread,
 	laneCounts,
 	laneOrder,
 	laneStage,
+	matchesQuery,
 	onBoard,
 	railTop,
 	reorderIds,
@@ -3769,50 +3771,36 @@ function ArchReviewDialog({
 const EXPLAIN_PROJECT =
 	"Explain how this project works: load the explain-project skill and follow it. Write docs/how-it-works.md with Mermaid diagrams (architecture, the main use case, and the life cycle if the project has one). Map every node to its source path. If docs/how-it-works.md already exists, update it to match the code. If this runner lacks the skill, report needs_you: Alate provisioning installs it. Commit the file.";
 
-/** Done lane page size: the cards shown before "Show more", and the step each click adds. */
-const DONE_PAGE = 20;
-
 /** Search apply delay: the lanes re-filter this long after the last keystroke, so swift
  * typing on a big board re-renders once, not per keypress. */
 export const SEARCH_APPLY_MS = 150;
 
-/** Done order: latest landing first. doneAt stamps each entry into Done (the done clock);
- * a cancelled card orders by its cancel time. */
-const newestLanded = (a: TaskCard, b: TaskCard): number =>
-	(b.cancelledAt ?? b.doneAt ?? b.updatedAt) -
-	(a.cancelledAt ?? a.doneAt ?? a.updatedAt);
+/** One server Done page: the fetched older cards plus the project's done+cancelled total. */
+type DonePageResponse = { tasks: TaskCard[]; total: number };
 
-/** Per-column card list plus the done lane's paging state, computed once per column. */
+/** Per-column card list, computed once per column. Done merges the fetched older pages
+ * into the state window (a card both hold keeps the state's copy) and sorts newest
+ * landing first; the other lanes order by laneOrder. */
 function laneColumnData(
 	key: Stage,
 	shown: readonly TaskCard[],
 	q: string,
-	doneLimit: number,
-	seenAnswers: ReadonlySet<string>,
-	since: number,
+	older: readonly TaskCard[],
 ) {
-	const unread = (t: TaskCard): boolean => isUnread(t, seenAnswers, since);
 	// A kicked backlog card (grill session started) renders as a normal card in the todo lane.
-	const filtered = shown.filter((t) => laneStage(t) === key);
-	// Done: latest landing on top. doneAt stamps each entry into Done (the done clock), so it orders by landing time.
-	if (key === "done") filtered.sort(newestLanded);
-	// Other columns: running/needs_you first, queued cards in queue priority (draggable order).
-	let col = key === "done" ? filtered : laneOrder(filtered);
-	// Done lazy-loads: the newest page renders and "Show more" appends the next page;
-	// a search shows every match. Unread answers always stay above the cut.
-	// ponytail: the state payload still carries every card; paginate /api/state
-	// instead if boards grow into the thousands of done cards.
-	let doneHidden = 0;
-	if (key === "done" && q === "") {
-		const page = donePage(
-			col,
-			(t) => unread(t) || (t.starred && t.cancelledAt === null),
-			doneLimit,
-		);
-		col = page.shown;
-		doneHidden = page.hidden;
+	let filtered = shown.filter((t) => laneStage(t) === key);
+	if (key === "done") {
+		const held = new Set(filtered.map((t) => t.id));
+		filtered = [
+			...filtered,
+			...older.filter((t) => !held.has(t.id) && matchesQuery(t, q)),
+		];
+		// doneAt stamps each entry into Done (the done clock), so it orders by landing time.
+		filtered.sort(newestLanded);
 	}
-	return { col, doneHidden };
+	// Other columns: running/needs_you first, queued cards in queue priority (draggable order).
+	const col = key === "done" ? filtered : laneOrder(filtered);
+	return { col };
 }
 
 /** The project head's overflow menu: review, release, diagrams and settings, plus the popover trigger. */
@@ -4285,8 +4273,11 @@ export function ProjectBoard({
 		);
 		setStage(STAGE_KEYS[next] ?? stage);
 	};
-	// Done lane lazy load: how many read cards render before "Show more" appends a page.
-	const [doneLimit, setDoneLimit] = useState(DONE_PAGE);
+	// Done history the state does not carry (OTTR-965): the fetched older pages, one
+	// "Show more" click per server page. ProjectBoard remounts per project, so the
+	// pages reset when the board switches project.
+	const [older, setOlder] = useState<TaskCard[]>([]);
+	const [olderBusy, setOlderBusy] = useState(false);
 	// The flat view's pinned Starred section: one collapse toggle, default expanded.
 	const [starredCollapsed, setStarredCollapsed] = useState(false);
 	// The setup wizard, opened from the checklist's Open setup button.
@@ -4332,8 +4323,41 @@ export function ProjectBoard({
 		seenAnswers,
 		seenDoneSince,
 	);
-	// The search count matches the lanes: a retro off the board is no task to count.
-	const boardTotal = tasks.filter(onBoard).length;
+	// The done-lane cards the state holds (the window and the pinned ones) and the
+	// fetched older pages, so the hidden count stays true when a page lands.
+	const heldDoneCount = tasks.filter((t) => laneStage(t) === "done").length;
+	const heldIds = new Set(tasks.map((t) => t.id));
+	const olderCount = older.filter((t) => !heldIds.has(t.id)).length;
+	const doneHidden = Math.max(
+		0,
+		project.doneTotal - heldDoneCount - olderCount,
+	);
+	// The search count matches the lanes: a retro off the board is no task to count,
+	// and the done cards behind the state window still belong to the project's size.
+	const boardTotal =
+		tasks.filter(onBoard).length +
+		Math.max(0, project.doneTotal - heldDoneCount);
+	/** One older-Done-page fetch: page 1 is the state window, so the first click reads
+	 * page 2. A failure keeps the previous list and re-arms the button, with no notice. */
+	const fetchOlderDone = (): void => {
+		if (olderBusy) return;
+		setOlderBusy(true);
+		const page = 2 + Math.floor(older.length / DONE_PAGE);
+		fetch(`/api/projects/${encodeURIComponent(project.name)}/done?page=${page}`)
+			.then(async (res) =>
+				res.ok ? ((await res.json()) as DonePageResponse) : null,
+			)
+			.then((next) => {
+				if (next === null) return;
+				const known = new Set([
+					...tasks.map((t) => t.id),
+					...older.map((t) => t.id),
+				]);
+				setOlder([...older, ...next.tasks.filter((t) => !known.has(t.id))]);
+			})
+			.catch(() => undefined)
+			.finally(() => setOlderBusy(false));
+	};
 	return (
 		<section className="project" aria-labelledby="project-title">
 			<header className="project-head">
@@ -4464,7 +4488,7 @@ export function ProjectBoard({
 			)}
 			{/* Mobile stage tabs appear only in the single-column tier (container ≤440px).
 			    Equal-width tabs keep labels, counts and alarm marks whole. The outer strip
-			    scrolls, never the page. Done has no count because it shows landed history. */}
+			    scrolls, never the page. Done reads the project's done total (OTTR-965). */}
 			<div className="stage-tabs" role="tablist" aria-label="Board stages">
 				<div>
 					{COLUMNS.map((c) => {
@@ -4484,7 +4508,11 @@ export function ProjectBoard({
 								onKeyDown={(e) => switchTab(e, STAGE_KEYS, setStage)}
 							>
 								{c.label}
-								{c.key !== "done" && (
+								{c.key === "done" ? (
+									<span className="tabs-digits">
+										{fmtNum(project.doneTotal)}
+									</span>
+								) : (
 									<>
 										<span className="tabs-digits">
 											{q === ""
@@ -4537,14 +4565,7 @@ export function ProjectBoard({
 				}}
 			>
 				{COLUMNS.map((c) => {
-					const { col, doneHidden } = laneColumnData(
-						c.key,
-						shown,
-						q,
-						doneLimit,
-						seenAnswers,
-						seenDoneSince,
-					);
+					const { col } = laneColumnData(c.key, shown, q, older);
 					const count = counts[c.key];
 					const unread = (t: TaskCard): boolean =>
 						isUnread(t, seenAnswers, seenDoneSince);
@@ -4579,16 +4600,23 @@ export function ProjectBoard({
 									</span>
 								)}
 								<span className={q === "" ? "count" : "count filtered"}>
-									{q === "" && doneHidden === 0
-										? fmtNum(col.length)
-										: `${fmtNum(col.length)}/${fmtNum(count.total)}`}
+									{c.key === "done"
+										? // The state holds only the Done window (OTTR-965): the head and
+											// the search variant read the project's true done+cancelled total.
+											q === ""
+											? fmtNum(project.doneTotal)
+											: `${fmtNum(col.length)}/${fmtNum(project.doneTotal)}`
+										: q === ""
+											? fmtNum(col.length)
+											: `${fmtNum(col.length)}/${fmtNum(count.total)}`}
 								</span>
 							</h2>
 							<LaneCol
 								stage={c.key}
 								tasks={col}
 								more={c.key === "done" ? doneHidden : 0}
-								onMore={() => setDoneLimit((n) => n + DONE_PAGE)}
+								onMore={fetchOlderDone}
+								moreBusy={olderBusy}
 								starredCollapsed={starredCollapsed}
 								onStarredToggle={() => setStarredCollapsed((c) => !c)}
 								// Idle backlog cards park under the todo lane, below a divider; started ones
@@ -5783,6 +5811,8 @@ function LaneCards(p: {
 	view: TaskCard[];
 	more: number;
 	onMore: (() => void) | undefined;
+	/** True while the older-pages fetch runs; the button disables until it settles. */
+	moreBusy?: boolean;
 	/** LaneCol's useId value: names the Starred body for aria-controls. */
 	uid: string;
 	starredCollapsed: boolean;
@@ -5799,6 +5829,7 @@ function LaneCards(p: {
 		view,
 		more,
 		onMore,
+		moreBusy = false,
 		showMore,
 		card,
 	} = p;
@@ -5862,6 +5893,7 @@ function LaneCards(p: {
 					onClick={(e) => showMore(e, onMore)}
 					title="Show older done cards"
 					aria-label={`Show more, ${more} older cards`}
+					disabled={moreBusy}
 				>
 					Show more
 					<span className="topic-count">{more}</span>
@@ -5972,6 +6004,7 @@ export function LaneCol({
 	onAddDraft,
 	more = 0,
 	onMore,
+	moreBusy = false,
 	starredCollapsed = false,
 	onStarredToggle,
 	onRerelease,
@@ -5988,6 +6021,8 @@ export function LaneCol({
 	/** Done lane only: cards hidden behind the "Show more" button; 0 renders no button. */
 	more?: number;
 	onMore?: () => void;
+	/** Done lane only: an older-pages fetch is in flight; the button disables until it settles. */
+	moreBusy?: boolean;
 	/** Done lane only: the pinned Starred section starts collapsed when true. */
 	starredCollapsed?: boolean;
 	/** Done lane only: flips the Starred section's collapse state. */
@@ -6277,6 +6312,7 @@ export function LaneCol({
 				view={view}
 				more={more}
 				onMore={onMore}
+				moreBusy={moreBusy}
 				uid={uid}
 				starredCollapsed={starredCollapsed}
 				onStarredToggle={onStarredToggle}
@@ -9248,6 +9284,7 @@ function PromptEditForm({
  * Prompt section, which stay hidden on proposal cards. */
 function ProposalPanel({
 	task,
+	loading,
 	selfProject,
 	tasks,
 	onOpenTask,
@@ -9265,6 +9302,8 @@ function ProposalPanel({
 	onCancel,
 }: {
 	task: TaskView;
+	/** True while the detail fetch runs: the prompt slots hold a loading line. */
+	loading: boolean;
 	selfProject: string;
 	tasks: TaskCard[];
 	onOpenTask: (id: string) => void;
@@ -9328,6 +9367,9 @@ function ProposalPanel({
 					<dd>{s.check}</dd>
 				</div>
 			</dl>
+		) : loading ? (
+			// The prompt rides the detail fetch (OTTR-965): hold the slot until it lands.
+			<DrawerLoading label="Loading the prompt" />
 		) : (
 			// First paragraph of the prompt, one line per row: the prompt's single-newline
 			// sections (Why:, Change:, …) keep their run-in labels readable.
@@ -9374,6 +9416,8 @@ function ProposalPanel({
 				onSave={onSaveEdit}
 				conflict={editConflict}
 			/>
+		) : loading ? (
+			<DrawerLoading label="Loading the prompt" />
 		) : (
 			<details className="decide-prompt">
 				<summary>
@@ -10169,6 +10213,8 @@ function DrawerNotes(p: {
 function DrawerPrompts(p: {
 	editable: boolean;
 	proposal: boolean;
+	/** True while the detail fetch runs: the prompt section holds a loading line. */
+	loading: boolean;
 	task: TaskView;
 	edit: string | null;
 	setEdit: (v: string | null) => void;
@@ -10209,20 +10255,30 @@ function DrawerPrompts(p: {
 			{" "}
 			{!editable && !proposal && (
 				<DrawerSec id="drawer-prompt" label="Prompt">
-					<div className="prompt-text">
-						<Markdown text={task.prompt} />
-					</div>
+					{p.loading ? (
+						// The row carries no prompt text (OTTR-965): hold the section's space
+						// until the detail fetch lands, then render the loaded text.
+						<DrawerLoading label="Loading the prompt" />
+					) : (
+						<div className="prompt-text">
+							<Markdown text={task.prompt} />
+						</div>
+					)}
 				</DrawerSec>
 			)}
 			{!proposal && editable && edit === null && (
 				<DrawerSec id="drawer-prompt" label="Prompt">
-					<div className="task-prompt">
-						<Markdown text={task.prompt} />
-						<button type="button" onClick={openEdit}>
-							<Icon name="edit" />
-							Edit task
-						</button>
-					</div>
+					{p.loading ? (
+						<DrawerLoading label="Loading the prompt" />
+					) : (
+						<div className="task-prompt">
+							<Markdown text={task.prompt} />
+							<button type="button" onClick={openEdit}>
+								<Icon name="edit" />
+								Edit task
+							</button>
+						</div>
+					)}
 				</DrawerSec>
 			)}
 			{!proposal && editable && edit !== null && (
@@ -12961,12 +13017,19 @@ export function Drawer({
 			clearTimeout(retry);
 		};
 	}, [row.project, row.id, rowKey]);
+	// The state row omits the wide fields (OTTR-965): the fallback renders empty until
+	// the detail fetch lands; the prompt section holds its space with a loading line.
 	const task: TaskView = detail ?? {
 		...row,
+		prompt: "",
+		summary: null,
 		turns: [],
 		details: null,
 		report: null,
 		diffFiles: null,
+		workCheckLog: [],
+		workCheckReport: null,
+		gate: null,
 	};
 	// Work steps rail: this card's turns, its work check runs, its retro's turns and its
 	// review's finding turns by start time.
@@ -13203,7 +13266,8 @@ export function Drawer({
 		armEditRevision(task.revision);
 		setEditHoldPending(true);
 		setEditConflict(null);
-		setEdit(task.prompt);
+		// The row carries no prompt (OTTR-965): prefill from the fetched detail.
+		setEdit(detail?.prompt ?? "");
 	};
 	const editSaveArmed = editRevision !== null && !editHoldPending;
 	const editSubmit = (): void => {
@@ -13557,6 +13621,7 @@ export function Drawer({
 						<section id="drawer-decide" className="dsec" aria-label="Decide">
 							<ProposalPanel
 								task={task}
+								loading={detail === null}
 								selfProject={row.project}
 								tasks={tasks}
 								onOpenTask={onOpenTask}
@@ -13630,6 +13695,7 @@ export function Drawer({
 					<DrawerPrompts
 						editable={editable}
 						proposal={proposal}
+						loading={detail === null}
 						task={task}
 						edit={edit}
 						setEdit={setEdit}

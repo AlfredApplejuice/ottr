@@ -4,7 +4,6 @@ import { doneReadKey } from "../types.ts";
 import {
 	autoMarkOnOpen,
 	canMarkUnread,
-	donePage,
 	doneReadable,
 	dropBeforeId,
 	isUnread,
@@ -37,8 +36,6 @@ const card = (
 			TaskCard,
 			| "title"
 			| "sessionTitle"
-			| "prompt"
-			| "summary"
 			| "cancelledAt"
 			| "asked"
 			| "answered"
@@ -55,8 +52,6 @@ const card = (
 	cancelledAt: over.cancelledAt ?? null,
 	title: over.title ?? `Task ${id}`,
 	sessionTitle: over.sessionTitle ?? "",
-	prompt: over.prompt ?? "",
-	summary: over.summary ?? null,
 	asked: over.asked ?? null,
 	answered: over.answered ?? false,
 	kind: over.kind ?? "work",
@@ -429,10 +424,10 @@ test("drag slot edges: an unknown card, the first card, and the exact midpoint",
 	expect(dropBeforeId(cards, "b", 30)).toBeUndefined();
 });
 
-test("laneCounts filters by query across id, titles, prompt and summary", () => {
+test("laneCounts filters by query across id, title and sessionTitle only", () => {
 	const tasks = [
-		card("t1", "todo", "queued", { title: "Extract logic", prompt: "move it" }),
-		card("t2", "in_progress", "running", { summary: "parser done" }),
+		card("t1", "todo", "queued", { title: "Extract logic" }),
+		card("t2", "in_progress", "running", { sessionTitle: "parser done" }),
 	];
 	expect(laneCounts(tasks, "", new Set()).shown).toHaveLength(2);
 	const { shown } = laneCounts(tasks, "LOGI", new Set());
@@ -441,6 +436,10 @@ test("laneCounts filters by query across id, titles, prompt and summary", () => 
 		["t2"],
 	);
 	expect(laneCounts(tasks, "  parse  ", new Set()).shown).toHaveLength(1);
+	// Prompt and summary text no longer ride the state (OTTR-965): the search
+	// cannot read them, so their wording matches nothing.
+	expect(laneCounts(tasks, "move it", new Set()).shown).toHaveLength(0);
+	expect(laneCounts(tasks, "parser summary", new Set()).shown).toHaveLength(0);
 	expect(laneCounts(tasks, "nomatch", new Set()).shown).toHaveLength(0);
 });
 
@@ -545,47 +544,6 @@ test("reorderIds splices a within-column drop into the global queue order", () =
 	]);
 	// A running card is not in the queue, so there is nothing to reorder.
 	expect(reorderIds(tasks, "in_progress", "t2", "t1")).toBeNull();
-});
-
-describe("donePage", () => {
-	const n = (count: number): string[] =>
-		Array.from({ length: count }, (_, i) => `t${i}`);
-	const noUnread = (): boolean => false;
-
-	test("a short lane stays whole with nothing hidden", () => {
-		const tasks = n(20);
-		expect(donePage(tasks, noUnread, 20)).toEqual({
-			shown: tasks,
-			hidden: 0,
-		});
-	});
-
-	test("a long lane keeps the newest page and counts the rest", () => {
-		const page = donePage(n(45), noUnread, 20);
-		expect(page.shown).toEqual(n(20));
-		expect(page.hidden).toBe(25);
-	});
-
-	test("the cut grows to cover the last unread answer", () => {
-		const tasks = n(45);
-		const page = donePage(tasks, (t) => t === "t30", 20);
-		expect(page.shown).toEqual(n(31));
-		expect(page.hidden).toBe(14);
-	});
-
-	test("an unread answer inside the page changes nothing", () => {
-		const page = donePage(n(45), (t) => t === "t5", 20);
-		expect(page.shown).toEqual(n(20));
-		expect(page.hidden).toBe(25);
-	});
-
-	test("a starred card older than the limit grows the cut to include it", () => {
-		const tasks = n(45);
-		// A starred card among the old ones pins like an unread answer: the cut covers it.
-		const page = donePage(tasks, (t) => t === "t5" || t === "t30", 20);
-		expect(page.shown).toEqual(n(31));
-		expect(page.hidden).toBe(14);
-	});
 });
 
 describe("railTop", () => {
