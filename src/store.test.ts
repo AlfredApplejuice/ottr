@@ -18,6 +18,7 @@ import {
 	RETRO_MARKER,
 	RULES_INTERVIEW_MARKER,
 } from "./prompts.ts";
+import { FINDINGS_HOLD, mergeHold } from "./scheduler.ts";
 import { SQLiteDatabase } from "./sqliteDriver.ts";
 import {
 	adoptSharedProjectData,
@@ -5837,6 +5838,158 @@ describe("review findings storage", () => {
 				.get()?.n,
 		).toBe(1);
 		raw.close();
+	});
+
+	test("open backfills leadAtDone from the stage history of reviews that finished before the column existed (OTTR-963)", async () => {
+		const dir = join(root, "lead-flag-migration");
+		// First open creates the current schema and runs the backfill over an empty
+		// database; the raw rows below simulate a board from before the column existed.
+		await (await open(dir)).close();
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		const card = (
+			id: string,
+			o: {
+				kind: string;
+				doneAt?: number;
+				followUpOf?: string;
+				stage?: string;
+				createdAt?: number;
+			},
+		) =>
+			raw
+				.prepare(
+					"INSERT INTO tasks (id, title, stage, state, kind, created_at, updated_at, done_at, follow_up_of) VALUES (?, ?, ?, 'idle', ?, ?, ?, ?, ?)",
+				)
+				.run(
+					id,
+					`card ${id}`,
+					o.stage ?? "merging",
+					o.kind,
+					o.createdAt ?? 100,
+					100,
+					o.doneAt ?? null,
+					o.followUpOf ?? null,
+				);
+		const stageEvent = (id: string, at: number, to: string) =>
+			raw
+				.prepare(
+					"INSERT INTO events (at, task_id, kind, from_value, to_value) VALUES (?, ?, 'stage', 'todo', ?)",
+				)
+				.run(at, id, to);
+		// The release finished at 1000. f1 was a parked lead then (backlog at 600,
+		// promoted at 2000); f2 was already past backlog at 700; f3 filed after the
+		// release; f4 still sits in backlog; f5 carries no stage history.
+		card("r1", { kind: "review", doneAt: 1000, stage: "done" });
+		card("f1", {
+			kind: "work",
+			followUpOf: "r1",
+			createdAt: 500,
+			stage: "todo",
+		});
+		stageEvent("f1", 600, "backlog");
+		stageEvent("f1", 2000, "todo");
+		card("f2", {
+			kind: "work",
+			followUpOf: "r1",
+			createdAt: 600,
+			stage: "merging",
+		});
+		stageEvent("f2", 700, "merging");
+		card("f3", {
+			kind: "work",
+			followUpOf: "r1",
+			createdAt: 1500,
+			stage: "backlog",
+		});
+		stageEvent("f3", 1600, "backlog");
+		card("f4", {
+			kind: "work",
+			followUpOf: "r1",
+			createdAt: 700,
+			stage: "backlog",
+		});
+		stageEvent("f4", 750, "backlog");
+		card("f5", {
+			kind: "work",
+			followUpOf: "r1",
+			createdAt: 800,
+			stage: "merging",
+		});
+		// A done work card is no review: its backlog child never gets the flag.
+		card("w1", { kind: "work", doneAt: 1000, stage: "done" });
+		card("c1", {
+			kind: "work",
+			followUpOf: "w1",
+			createdAt: 700,
+			stage: "backlog",
+		});
+		stageEvent("c1", 750, "backlog");
+		raw.close();
+
+		// Reopening runs the idempotent backfill over the raw rows.
+		const store = await open(dir);
+		const flag = async (id: string) => (await store.getTask(id))?.leadAtDone;
+		expect(await flag("f1")).toBe(true);
+		expect(await flag("f2")).toBe(false);
+		expect(await flag("f3")).toBe(false);
+		expect(await flag("f4")).toBe(true);
+		expect(await flag("f5")).toBe(false);
+		expect(await flag("c1")).toBe(false);
+	});
+
+	test("a review landing done stamps its backlog findings, and the stamp survives re-queues (OTTR-963)", async () => {
+		const dir = join(root, "lead-flag-forward");
+		const store = await open(dir);
+		const review = await store.createTask("release review", null, "review");
+		const lead = await store.createTask(
+			"Needs validation: unknown deploy target",
+		);
+		await store.updateTask(lead.id, {
+			followUpOf: review.id,
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+		});
+		const committed = await store.createTask(
+			"Confirmed: unbounded workpool queue",
+		);
+		await store.updateTask(committed.id, { followUpOf: review.id });
+		const other = await store.createTask("unrelated merge");
+		await store.updateTask(other.id, { stage: "merging" });
+
+		await store.updateTask(review.id, { stage: "done", state: "idle" });
+		expect((await store.getTask(lead.id))?.leadAtDone).toBe(true);
+		expect((await store.getTask(committed.id))?.leadAtDone).toBe(false);
+
+		// The user promotes the lead after the release finished: it stops holding the
+		// project's merges, and a re-queue that rewrites its queuedAt changes nothing.
+		await store.updateTask(lead.id, {
+			stage: "todo",
+			state: "queued",
+			queuedAt: Date.now(),
+		});
+		// A reply re-opens the commitment: it still holds (the stamp is not a
+		// queuedAt-derived guess).
+		await store.updateTask(committed.id, {
+			stage: "todo",
+			state: "queued",
+			queuedAt: Date.now(),
+		});
+		const rows = await store.listTasks();
+		const reviewRow = rows.find((t) => t.id === review.id)!;
+		const leadRow = rows.find((t) => t.id === lead.id)!;
+		const committedRow = rows.find((t) => t.id === committed.id)!;
+		const otherRow = rows.find((t) => t.id === other.id)!;
+		expect(leadRow.leadAtDone).toBe(true);
+		expect(committedRow.leadAtDone).toBe(false);
+		expect(mergeHold([reviewRow, leadRow, otherRow], otherRow)).toBeNull();
+		expect(mergeHold([reviewRow, committedRow, otherRow], otherRow)).toBe(
+			FINDINGS_HOLD,
+		);
+		// And the finding itself still merges while it holds the others.
+		expect(
+			mergeHold([reviewRow, committedRow, otherRow], committedRow),
+		).toBeNull();
 	});
 
 	test("appendReviewFinding stores findings and listReviewFindings returns them in arrival order", async () => {

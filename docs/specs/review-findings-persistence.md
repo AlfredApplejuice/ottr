@@ -145,26 +145,39 @@ every non-finding merge of the project behind optional work. Incident 2026-11-15
 seven alate and two velvarr merges waited up to 8 hours behind leads of releases
 that had shipped days earlier.
 
-The rule in `reviewHoldFor` (`src/scheduler.ts`): for a review at `stage: "done"`,
-an open finding holds other merges only when it was a commitment when the review
-finished — `queuedAt` set and `queuedAt <= doneAt`. Every other open finding of a
-done review never holds, also after it leaves the backlog. The facts are stored
-card fields, no title text:
+The rule reads the recorded stage at doneAt, not a derivable one. The store
+column `lead_at_done` (mapped as `Task.leadAtDone`) is 1 when the finding sat in
+stage `backlog` when its review finished:
 
-- Leads file with `queuedAt: null` (`fileKeptFindings`) and set `queuedAt` only
-  when they leave the backlog: the user's answer, or a manual queue. So
-  `queuedAt > doneAt` (or still `null`) proves the card sat in the backlog at
-  `doneAt`, where the review's Done ignored it.
-- Kept findings queue at filing time, before the review settles done
-  (`createTask` stamps `queued_at = now`), so `queuedAt <= doneAt` proves the
-  finding was a commitment then, and it keeps holding.
+- The forward write sits in `runTaskUpdate` (`src/store.ts`), the one task
+  UPDATE funnel: when a review card lands done (`isReview` only: the review kind
+  or a release version), the same transaction stamps
+  `lead_at_done = 1` on each open direct backlog child created no later than the
+  fresh `done_at`. The stamp never changes afterwards: no patch path exists (the
+  field is outside `TaskPatch`), and the write only ever sets 1. A re-queue
+  rewrites `queuedAt` — the stamp of the last entry into state `queued` — but
+  never this flag, so the scheduler can trust it.
+- The scheduler (`reviewHoldFor`, `src/scheduler.ts`): for a review at
+  `stage: "done"`, an open finding holds other merges only when it carries no
+  stamp. A stamped finding never holds, also after it leaves the backlog. A
+  finding without the stamp was a commitment when the review finished and keeps
+  holding, even when a reply re-opens it.
+- The migration (`ProjectStore.open`) adds the column additively and backfills
+  reviews that finished before it existed, from the stage history (`events`,
+  kind `stage`): a finding whose last stage change at or before the review's
+  `done_at` left it in `backlog` was a parked lead then. The backfill runs only
+  when the tasks table carries every column it reads — tables old enough to miss
+  one predate review findings entirely — and fills only NULL rows, so it is
+  idempotent. A finding without stage history keeps NULL and keeps today's hold.
+- Direct follow-ups only: leads file as direct children
+  (`fileKeptFindings`), and a deeper closure card that misses the stamp keeps
+  today's hold.
 
-A done card without a `doneAt` stamp keeps today's hold. The review's own Done
-guard is unchanged: a lead promoted while the review still runs parks the review
-at `merging` until the lead reaches done or cancelled, as today. `reviewBlocked`
-is unchanged too: a promoted lead still delays the project's next review until it
-finishes. All other holds stay: an open release hold, a running review hold, and
-the findings hold of a review that is not done.
+The review's own Done guard is unchanged: a lead promoted while the review still
+runs parks the review at `merging` until the lead reaches done or cancelled, as
+today. `reviewBlocked` is unchanged too: a promoted lead still delays the
+project's next review until it finishes. All other holds stay: an open release
+hold, a running review hold, and the findings hold of a review that is not done.
 
 #### Lead fingerprint dedupe
 
@@ -316,6 +329,16 @@ ALTER TABLE tasks ADD COLUMN findings_checked_at INTEGER
 
 `Task` gains `findingsCheckedAt: number | null` (mapped like the other
 camelCase fields). The stamp is the review-check entry the Done guards read.
+
+OTTR-963 adds one more tasks column the same way:
+
+```sql
+ALTER TABLE tasks ADD COLUMN lead_at_done INTEGER
+```
+
+`Task` gains `leadAtDone: boolean` (mapped from the 0/1 column; NULL reads as
+false). The field stays outside `TaskPatch`: the raw write in `runTaskUpdate`
+sets it when a review lands done, and nothing clears it.
 
 ## Store API contract
 

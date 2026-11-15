@@ -197,6 +197,7 @@ function task(p: Partial<Task> = {}): Task {
 		details: null,
 		report: null,
 		findingsCheckedAt: null,
+		leadAtDone: false,
 		research: false,
 		steps: "unknown",
 		starred: false,
@@ -740,7 +741,7 @@ describe("pickRunnable", () => {
 		const finding = task({
 			followUpOf: review.id,
 			createdAt: 300,
-			queuedAt: 400,
+			queuedAt: 700,
 		});
 		const byHand = task({ createdAt: 300, stage: "merging", queuedAt: 600 });
 		expect(mergeHold([review, finding, byHand], byHand)).toBe(
@@ -846,7 +847,10 @@ describe("pickRunnable", () => {
 	test("a done release's promoted lead never holds another merge (OTTR-963)", () => {
 		// ALAT and velvarr 2026-11-15: the lead sat in the backlog when the release
 		// finished (OTTR-889's exemption), the user promoted it, and findingOpen then
-		// counted it again — every other merge of the project parked for hours.
+		// counted it again — every other merge of the project parked for hours. The
+		// store stamped leadAtDone when the release settled (store.test.ts runs the
+		// real write); the flag is the recorded stage at doneAt and survives the
+		// promotion and any later re-queue.
 		const review = task({
 			kind: "review",
 			releaseVersion: "v0.4.0",
@@ -856,23 +860,24 @@ describe("pickRunnable", () => {
 			createdAt: 100,
 			doneAt: 500,
 		});
-		// The lead files into the backlog at 310 and leaves it at 700: queuedAt is
-		// set only when it leaves, after the release's doneAt (500).
 		const lead = task({
 			followUpOf: review.id,
 			createdAt: 310,
 			stage: "in_progress",
 			state: "running",
 			queuedAt: 700,
+			leadAtDone: true,
 		});
 		const other = task({ stage: "merging", queuedAt: 100 });
 		expect(mergeHold([review, lead, other], other)).toBeNull();
 		expect(pickRunnable([review, lead, other], opts)).toEqual([other]);
-		// The same lead waiting to merge holds nothing either.
+		// The same lead waiting to merge holds nothing either, and a re-queue that
+		// rewrote its queuedAt after doneAt changes nothing.
 		const ready = {
 			...lead,
 			stage: "merging" as const,
 			state: "queued" as const,
+			queuedAt: 900,
 		};
 		expect(mergeHold([review, ready, other], other)).toBeNull();
 	});
@@ -887,12 +892,13 @@ describe("pickRunnable", () => {
 			createdAt: 100,
 			doneAt: 500,
 		});
-		// A commitment when the review finished: it queued at 400, before doneAt.
+		// A commitment when the review finished: no lead flag, and it holds even when
+		// a reply re-queued it after doneAt (queuedAt 700 is after doneAt 500).
 		const finding = task({
 			followUpOf: review.id,
 			createdAt: 300,
 			stage: "merging",
-			queuedAt: 400,
+			queuedAt: 700,
 		});
 		const other = task({ stage: "merging", queuedAt: 100 });
 		expect(mergeHold([review, finding, other], other)).toBe(FINDINGS_HOLD);
@@ -916,7 +922,7 @@ describe("pickRunnable", () => {
 			followUpOf: older.id,
 			createdAt: 300,
 			stage: "merging",
-			queuedAt: 400,
+			queuedAt: 600,
 		});
 		const newer = task({
 			kind: "review",
@@ -993,7 +999,7 @@ describe("pickRunnable", () => {
 		const finding = task({
 			followUpOf: review.id,
 			createdAt: 300,
-			queuedAt: 400,
+			queuedAt: 700,
 			dependsOn: [prereq.id],
 		});
 		const sub = task({
@@ -1596,7 +1602,6 @@ describe("arch-review changed-line coverage", () => {
 			createdAt: 500,
 			followUpOf: review.id,
 			stage: "in_progress",
-			queuedAt: 500,
 		});
 		expect(mergeHold([review, merge, edge], merge)).toBe(
 			"waiting for the review's findings to be implemented",

@@ -98,7 +98,7 @@ export type ReviewTask = Pick<
 	| "stage"
 	| "createdAt"
 	| "doneAt"
-	| "queuedAt"
+	| "leadAtDone"
 	| "dependsOn"
 	| "followUpOf"
 >;
@@ -242,33 +242,23 @@ function reviewHoldFor(
 		return "waiting for the review to finish";
 	// Parked at merging until its findings are done (findingsHold); a done review reaches
 	// this with open findings only through a finding that was a commitment when it
-	// finished. A finding that was still a parked backlog lead at doneAt never takes the
-	// hold (OTTR-963), also after it leaves the backlog: leads are optional work (their
-	// backlog stage already exempted them, OTTR-889), so a lead the user promotes later
-	// must not park every merge the review's done had freed. A finding of another review
-	// never takes this hold (OTTR-940): it is the only hold edge that can close a wait
-	// cycle through a finding — a release's own completion waits only on its findings,
-	// which are exempt from their own review above — so this exemption breaks every
-	// cycle. The release and review-running holds stay: an open release can gate a
-	// finding, and it settles once its own findings merge.
+	// finished. A finding the store flagged as a parked backlog lead at doneAt never
+	// takes the hold (OTTR-963), also after it leaves the backlog: leads are optional
+	// work (their backlog stage already exempted them, OTTR-889), so a lead the user
+	// promotes later must not park every merge the review's done had freed. The flag is
+	// the store's record of the stage at doneAt (runTaskUpdate stamps it when the review
+	// lands done; the migration backfills it from the stage history), so a re-queue
+	// cannot blur it the way the queuedAt stamp would. A finding of another review never
+	// takes this hold (OTTR-940): it is the only hold edge that can close a wait cycle
+	// through a finding — a release's own completion waits only on its findings, which
+	// are exempt from their own review above — so this exemption breaks every cycle. The
+	// release and review-running holds stay: an open release can gate a finding, and it
+	// settles once its own findings merge.
 	if (
 		!mergeIsFinding &&
 		(r.stage === "merging" ||
 			findings.some(
-				(f) =>
-					findingOpen(f) &&
-					// OTTR-963, the stored-fact test for "was a parked lead at doneAt":
-					// leads file with queuedAt null and set queuedAt only when they
-					// leave the backlog (the user's answer or a manual queue), while a
-					// kept finding queues at filing time, before the review settles
-					// done (createTask stamps queued_at = now). So a finding that still
-					// holds was a commitment at doneAt: queued set at or before doneAt.
-					// queuedAt after doneAt — or still null — proves the finding sat in
-					// the backlog at doneAt, where findingOpen ignored it (OTTR-889),
-					// and never holds. A done card without a stamp keeps today's hold.
-					(r.stage !== "done" ||
-						r.doneAt === null ||
-						(f.queuedAt !== null && f.queuedAt <= r.doneAt)),
+				(f) => findingOpen(f) && (r.stage !== "done" || !f.leadAtDone),
 			))
 	)
 		return "waiting for the review's findings to be implemented";

@@ -560,6 +560,12 @@ export interface Task {
 	/** The review-check stamp over the card's stored review findings (findingsCheckedAt in the
 	 * store): set when a check pass completes over them, cleared when a new finding arrives. */
 	findingsCheckedAt: number | null;
+	/** OTTR-963: the card sat in stage `backlog` when its review finished. The store stamps
+	 * it when a review card lands done and never changes it afterwards, so it is the
+	 * recorded stage at doneAt, not a derivable one. The scheduler exempts flagged findings
+	 * of a done review from the findings hold, also after the lead leaves the backlog.
+	 * Store column lead_at_done; never caller-settable. */
+	leadAtDone: boolean;
 }
 
 /** A task from a list read (ProjectStore.listTasks): every field but diffText, details,

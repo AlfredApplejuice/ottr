@@ -33,7 +33,7 @@ type TaskRow = {
 	state: RunState;
 	title: string;
 	created_at: number;
-	queued_at: number | null;
+	lead_at_done: number | null;
 	done_at: number | null;
 	cancelled_at: number | null;
 	needs_reason: string | null;
@@ -111,7 +111,7 @@ const toReview = (t: TaskRow) => ({
 	pushRetries: t.push_retries,
 	pendingBy: t.pending_by,
 	createdAt: t.created_at,
-	queuedAt: t.queued_at,
+	leadAtDone: t.lead_at_done === 1,
 	doneAt: t.done_at,
 	dependsOn: JSON.parse(t.depends_on) as string[],
 	followUpOf: t.follow_up_of,

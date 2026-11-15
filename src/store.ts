@@ -32,7 +32,7 @@ import {
 	shortTitle,
 } from "./prompts.ts";
 import { sumUsageIn, type UsageSum } from "./retro.ts";
-import { queueOrder } from "./scheduler.ts";
+import { isReview, queueOrder } from "./scheduler.ts";
 import {
 	cleanTitle,
 	firstSessionTitle,
@@ -375,6 +375,7 @@ interface TaskRow {
 	hold_set_at: number | null;
 	proposal_summary: string | null;
 	findings_checked_at: number | null;
+	lead_at_done: number | null;
 	kind: string;
 }
 
@@ -601,6 +602,7 @@ function toListedTask(
 		holdSetAt: r.hold_set_at,
 		proposalSummary: parseProposalSummary(r.proposal_summary),
 		findingsCheckedAt: r.findings_checked_at,
+		leadAtDone: r.lead_at_done === 1,
 	};
 }
 
@@ -877,6 +879,7 @@ export type TaskPatch = Partial<
 		| "createdAt"
 		| "updatedAt"
 		| "doneAt"
+		| "leadAtDone"
 		| "kind"
 		| "revision"
 	>
@@ -973,6 +976,9 @@ const TASK_LIST_COLUMNS = [
 	"created_at",
 	"updated_at",
 	"done_at",
+	// lead_at_done is never caller-settable (not in TASK_COLUMNS), but the scheduler's
+	// merge hold reads it from list rows (OTTR-963).
+	"lead_at_done",
 	"kind",
 	// revision is not in TASK_COLUMNS (never caller-settable), so the board still gets it
 	// on list rows and can send it back with guarded edits.
@@ -2295,6 +2301,52 @@ export class ProjectStore {
 					"findings_checked_at",
 					"ALTER TABLE tasks ADD COLUMN findings_checked_at INTEGER",
 				);
+				// OTTR-963: the recorded stage at doneAt — 1 when the finding sat in backlog
+				// when its review finished. ALTER-only like the columns above; the raw write
+				// in runTaskUpdate sets it forward, so no patch column exists.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"lead_at_done",
+					"ALTER TABLE tasks ADD COLUMN lead_at_done INTEGER",
+				);
+				// OTTR-963: reviews that finished before the column existed get their stamps
+				// from the stage history (events, kind 'stage'): a finding whose last stage
+				// change at or before the review's done_at left it in 'backlog' was a parked
+				// lead then. Only review cards count (isReview: the review kind, or a
+				// release version), matching the forward write in runTaskUpdate. A finding
+				// without stage history, or one already past backlog at doneAt, keeps NULL
+				// and keeps today's hold. Idempotent: only NULL rows are filled.
+				// Only run when the tasks table carries every column the backfill reads:
+				// tables old enough to miss one (cancelled_at never converges additively —
+				// it lands via TASKS_DDL or a rebuild) predate review findings entirely, so
+				// their rows keep NULL and keep today's hold.
+				const leadBackfillCols = [
+					"lead_at_done",
+					"stage",
+					"cancelled_at",
+					"follow_up_of",
+					"created_at",
+					"done_at",
+					"kind",
+					"release_version",
+				];
+				if (leadBackfillCols.every((c) => cols.includes(c)))
+					await db.exec(`
+					UPDATE tasks SET lead_at_done = 1
+					WHERE lead_at_done IS NULL AND stage != 'done' AND cancelled_at IS NULL
+						AND follow_up_of IS NOT NULL AND EXISTS (
+							SELECT 1 FROM tasks r
+							WHERE r.id = tasks.follow_up_of
+								AND r.stage = 'done' AND r.cancelled_at IS NULL
+								AND (r.kind = 'review' OR r.release_version IS NOT NULL)
+								AND r.done_at IS NOT NULL AND tasks.created_at <= r.done_at
+								AND (SELECT e.to_value FROM events e
+									WHERE e.task_id = tasks.id AND e.kind = 'stage'
+										AND e.at <= r.done_at
+									ORDER BY e.at DESC, e.id DESC LIMIT 1) = 'backlog'
+						)
+				`);
 				await ProjectStore.convergeProposalReasons(db, store.queue);
 				// posted_url landed after the first pr_review release: CREATE TABLE IF NOT EXISTS never
 				// updates a live table, so converge additively like the tasks columns above.
@@ -3904,13 +3956,14 @@ export class ProjectStore {
 		return this.queue.transaction<RevisionResult>(async () => {
 			const before = await this.getTask(id);
 			if (before === null) throw new Error(`unknown task: ${id}`);
+			const now = Date.now();
 			const sets: string[] = ["updated_at = ?"];
 			if (bumpRevision) sets.push("revision = revision + 1");
-			const values: (string | number | null)[] = [Date.now()];
+			const values: (string | number | null)[] = [now];
 			// Entering Done stamps done_at; it overwrites, so a release card that bounced to needs_you re-lands with a fresh time.
 			if (patch.stage === "done") {
 				sets.push("done_at = ?");
-				values.push(Date.now());
+				values.push(now);
 			}
 			for (const key of Object.keys(TASK_COLUMNS) as (keyof TaskPatch)[]) {
 				const value = patch[key];
@@ -3939,6 +3992,23 @@ export class ProjectStore {
 				await this.recordEvent("stage", id, before.stage, patch.stage, null);
 			if (patch.state !== undefined && patch.state !== before.state)
 				await this.recordEvent("state", id, before.state, patch.state, null);
+			// OTTR-963: a review landing done freezes which findings were parked backlog
+			// leads then. The stamp is the recorded stage at doneAt and nothing changes it
+			// afterwards — a later re-queue rewrites queuedAt but never this flag, so the
+			// scheduler can trust it (a flagged finding of a done review never holds other
+			// merges, also after the lead leaves the backlog). Direct follow-ups only:
+			// leads file as direct children (fileKeptFindings), and a deeper closure card
+			// that misses the stamp keeps today's hold. The write re-runs when a bounced
+			// release re-lands done; it only ever sets 1.
+			if (
+				patch.stage === "done" &&
+				patch.stage !== before.stage &&
+				isReview(task)
+			)
+				await this.db.run(
+					"UPDATE tasks SET lead_at_done = 1 WHERE follow_up_of = ? AND created_at <= ? AND stage = 'backlog' AND cancelled_at IS NULL",
+					[id, now],
+				);
 			return { ok: true, task };
 		});
 	}
