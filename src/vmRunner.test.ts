@@ -22,7 +22,7 @@ import {
 	slotUpCommands,
 	startupCommands,
 } from "./vmNet.ts";
-import { type BakeResult, layerKey, VmRootfs } from "./vmRootfs.ts";
+import { type BakeResult, layerKey, listFiles, VmRootfs } from "./vmRootfs.ts";
 import {
 	extractCopyOut,
 	firecrackerConfig,
@@ -42,7 +42,12 @@ import {
 	type ValidateResult,
 	VM_VALIDATE,
 } from "./vmValidateShared.ts";
-import { type VmSpec, WORKER_DONE, type WorkerRequest } from "./workers.ts";
+import {
+	type ProvisionLists,
+	type VmSpec,
+	WORKER_DONE,
+	type WorkerRequest,
+} from "./workers.ts";
 
 // Nothing here needs KVM: the launcher is a fake that starts a fake guest agent (Bun.serve on
 // port 0) per "VM", and ip/iptables/mkfs go through a recording exec.
@@ -171,6 +176,8 @@ interface GuestRec {
 	killed: boolean;
 	puts: Uint8Array[];
 	runBody: Record<string, unknown> | null;
+	/** The POST /bake body, when the bake reached the guest. */
+	bakeBody: Record<string, unknown> | null;
 	fileQueries: URLSearchParams[];
 	/** The VM process dies on its own: the guest vanishes, no sentinel. */
 	crash: () => void;
@@ -264,11 +271,13 @@ async function guestRoute(
 		return fakeGuestFiles(script, rec, u);
 	if (req.method === "POST" && u.pathname === "/run")
 		return fakeGuestRun(script, rec, req);
-	if (req.method === "POST" && u.pathname === "/bake")
+	if (req.method === "POST" && u.pathname === "/bake") {
+		rec.bakeBody = (await req.json()) as Record<string, unknown>;
 		return (
 			script.bake?.(rec) ??
 			ndjson(JSON.stringify({ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } }))
 		);
+	}
 	if (req.method === "POST" && u.pathname === "/shutdown")
 		return script.shutdown?.(rec) ?? new Response("ok");
 	return new Response("not found", { status: 404 });
@@ -288,6 +297,7 @@ function fakeLauncher(script: GuestScript): {
 			killed: false,
 			puts: [],
 			runBody: null,
+			bakeBody: null,
 			fileQueries: [],
 			crash: () => {},
 		};
@@ -592,6 +602,16 @@ describe("vm-runner /run", () => {
 		expect(r.recs).toHaveLength(0);
 	});
 
+	test("refuses a vm.lists that is not an object of strings", async () => {
+		const r = startRunner();
+		for (const lists of ["tools.json", 5, { tools: 7 }, { apt: null }]) {
+			const res = await post(r.url, "/run", request({ lists: lists as never }));
+			expect(res.status).toBe(400);
+			expect(await res.text()).toContain("vm.lists");
+			expect(r.recs).toHaveLength(0);
+		}
+	});
+
 	test("refuses copyIn paths outside /data/<project>, also through a link", async () => {
 		const r = startRunner();
 		const other = join(r.dataRoot, "other");
@@ -778,6 +798,7 @@ describe("vm-runner /run", () => {
 			base: async () => ({ key: "base", path: "/state/base.ext4" }),
 			layer: async (
 				_p: string,
+				_lists: ProvisionLists,
 				bake: (image: string) => Promise<BakeResult>,
 			) => {
 				const b = await bake("/state/layer.tmp");
@@ -801,15 +822,19 @@ describe("vm-runner /run", () => {
 					),
 			},
 		});
-		const lists = join(r.homeRoot, ".ottr", "workers", "proj");
-		mkdirSync(lists, { recursive: true });
-		writeFileSync(join(lists, "apt.txt"), "nope\n");
-		const text = await (await post(r.url, "/run", request())).text();
+		// A planted shared-home list is inert on this path: only the dispatch's
+		// lists ride the copy-in.
+		const planted = join(r.homeRoot, ".ottr", "workers", "proj");
+		mkdirSync(planted, { recursive: true });
+		writeFileSync(join(planted, "apt.txt"), "planted\n");
+		const text = await (
+			await post(r.url, "/run", request({ lists: { apt: "nope\n" } }))
+		).text();
 		expect(text).toContain("apt: installing nope\n");
 		const done = sentinelOf(text);
 		expect(done?.exitCode).toBe(1);
 		expect(done?.stderrTail).toContain("Unable to locate package nope");
-		// Only the bake VM booted, with the layer writable, and it got the package list.
+		// Only the bake VM booted, with the layer writable, and it got the list.
 		expect(r.recs).toHaveLength(1);
 		const bakeVm = r.recs[0]!;
 		expect(bakeVm.spec.mode).toBe("bake");
@@ -818,8 +843,12 @@ describe("vm-runner /run", () => {
 		);
 		const sent = await members(bakeVm.puts[0]!);
 		expect(
-			sent.find((s) => s.m.name === join(lists, "apt.txt").slice(1))?.content,
+			sent.find((s) => s.m.name === "root/.ottr/workers/proj/apt.txt")?.content,
 		).toBe("nope\n");
+		expect(bakeVm.bakeBody).toEqual({
+			project: "proj",
+			lists: { apt: "nope\n" },
+		});
 		expect(bakeVm.killed).toBe(true);
 	});
 
@@ -827,7 +856,11 @@ describe("vm-runner /run", () => {
 	// publishes only on exitCode 0, like the failed-bake test above.
 	const shutdownBakeRootfs = {
 		base: async () => ({ key: "base", path: "/state/base.ext4" }),
-		layer: async (_p: string, bake: (image: string) => Promise<BakeResult>) => {
+		layer: async (
+			_p: string,
+			_lists: ProvisionLists,
+			bake: (image: string) => Promise<BakeResult>,
+		) => {
 			const b = await bake("/state/layer.tmp");
 			return b.exitCode === 0
 				? { ok: true as const, path: "/state/layer.tmp" }
@@ -852,9 +885,6 @@ describe("vm-runner /run", () => {
 			rootfs: shutdownBakeRootfs,
 			script: shutdownScript(),
 		});
-		const lists = join(r.homeRoot, ".ottr", "workers", "proj");
-		mkdirSync(lists, { recursive: true });
-		writeFileSync(join(lists, "apt.txt"), "nope\n");
 		const text = await (await post(r.url, "/run", request())).text();
 		expect(sentinelOf(text)?.exitCode).toBe(0);
 		// PID 1 reports the shutdown outcome on the bake-status disk (vdc), which
@@ -877,13 +907,105 @@ describe("vm-runner /run", () => {
 					? { code: 0, stdout: "layer-unmount-failed\n", stderr: "" }
 					: null,
 		});
-		const lists = join(r.homeRoot, ".ottr", "workers", "proj");
-		mkdirSync(lists, { recursive: true });
-		writeFileSync(join(lists, "apt.txt"), "nope\n");
 		const text = await (await post(r.url, "/run", request())).text();
 		const done = sentinelOf(text);
 		expect(done?.exitCode).toBe(1);
 		expect(done?.stderrTail).toContain("could not unmount the project layer");
+	});
+
+	test("a bake pushes only the dispatch's trusted lists, never the planted shared-home files", async () => {
+		// A local listener serves the trusted tool bytes; the trusted texts name it.
+		// The fetch itself is the guest test's proof; here the pushed tar bytes and
+		// the /bake body are.
+		const served = "trusted-tool-bytes";
+		const listener = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch: () => new Response(served),
+		});
+		stoppers.push(() => listener.stop(true));
+		const base = `http://127.0.0.1:${listener.port}`;
+		const servedSha = new Bun.CryptoHasher("sha256")
+			.update(served)
+			.digest("hex");
+		const trusted: ProvisionLists = {
+			tools: JSON.stringify([
+				{ name: "trusted-tool", url: `${base}/t.tar.gz`, sha256: servedSha },
+			]),
+			toolsAll: JSON.stringify([
+				{ name: "fleet-tool", url: `${base}/f.tar.gz`, sha256: servedSha },
+			]),
+			apt: "jq\nripgrep\n",
+			requirements: `r==1 --hash=sha256:${"a".repeat(64)}\n`,
+			requirementsAll: `q==2 --hash=sha256:${"b".repeat(64)}\n`,
+		};
+		const r = startRunner({
+			rootfs: shutdownBakeRootfs,
+			script: shutdownScript(),
+		});
+		// The victim project's lists sit planted in the shared home this runner
+		// mounts read-only; none of them may reach the bake.
+		const workers = join(r.homeRoot, ".ottr", "workers");
+		for (const [dir, file, text] of [
+			["proj", "tools.json", '[{"name":"planted-tool"}]'],
+			["proj", "apt.txt", "planted-pkg\n"],
+			[
+				"proj",
+				"requirements.txt",
+				`planted==9 --hash=sha256:${"c".repeat(64)}\n`,
+			],
+			["_all", "tools.json", '[{"name":"planted-fleet"}]'],
+			[
+				"_all",
+				"requirements.txt",
+				`planted-all==9 --hash=sha256:${"d".repeat(64)}\n`,
+			],
+		] as const) {
+			mkdirSync(join(workers, dir), { recursive: true });
+			writeFileSync(join(workers, dir, file), text);
+		}
+		const first = await (
+			await post(r.url, "/run", request({ lists: trusted }))
+		).text();
+		expect(sentinelOf(first)?.exitCode).toBe(0);
+		const bakeVm = r.recs[0]!;
+		expect(bakeVm.spec.mode).toBe("bake");
+		// The copy-in tar holds exactly the request-borne members with the trusted
+		// bytes, at the guest paths the ensure wrappers read; the planted names are
+		// absent.
+		const sent = await members(bakeVm.puts[0]!);
+		const guestRoot = "root/.ottr/workers";
+		expect(sent.map((s) => s.m.name).sort()).toEqual(
+			[
+				`${guestRoot}/proj/apt.txt`,
+				`${guestRoot}/proj/tools.json`,
+				`${guestRoot}/_all/tools.json`,
+				`${guestRoot}/proj/requirements.txt`,
+				`${guestRoot}/_all/requirements.txt`,
+			].sort(),
+		);
+		const byName = new Map(sent.map((s) => [s.m.name, s.content]));
+		expect(byName.get(`${guestRoot}/proj/tools.json`)).toBe(trusted.tools);
+		expect(byName.get(`${guestRoot}/_all/tools.json`)).toBe(trusted.toolsAll);
+		expect(byName.get(`${guestRoot}/proj/apt.txt`)).toBe(trusted.apt);
+		expect(byName.get(`${guestRoot}/proj/requirements.txt`)).toBe(
+			trusted.requirements,
+		);
+		expect(byName.get(`${guestRoot}/_all/requirements.txt`)).toBe(
+			trusted.requirementsAll,
+		);
+		for (const s of sent) expect(s.content).not.toContain("planted");
+		// The /bake body carries the trusted texts.
+		expect(bakeVm.bakeBody).toEqual({ project: "proj", lists: trusted });
+
+		// The same dispatch with no lists: no list members are pushed and the /bake
+		// body names none — no shared-home fallback.
+		const second = await (await post(r.url, "/run", request())).text();
+		expect(sentinelOf(second)?.exitCode).toBe(0);
+		const bake2 = r.recs[2]!;
+		expect(bake2.spec.mode).toBe("bake");
+		expect(bake2.puts).toHaveLength(0);
+		expect(bake2.bakeBody).toEqual({ project: "proj" });
 	});
 
 	test("a VM that dies mid-run ends the stream without a sentinel", async () => {
@@ -1259,6 +1381,8 @@ describe("vm-runner /validate", () => {
 				job: { argv: ["true"], cwd: "/target", collect: ["../escape"] },
 			},
 			{ ...good, job: { argv: ["true"], cwd: "/target", collect: ["/abs"] } },
+			{ ...good, lists: "tools.json" },
+			{ ...good, lists: { apt: 3 } },
 		];
 		for (const body of cases) {
 			const res = await post(r.url, "/validate", body);
@@ -1375,6 +1499,7 @@ describe("vm-runner /validate", () => {
 			base: async () => ({ key: "base", path: "/state/base.ext4" }),
 			layer: async (
 				_p: string,
+				_lists: ProvisionLists,
 				bake: (image: string) => Promise<BakeResult>,
 			) => {
 				const b = await bake("/state/layer.tmp");
@@ -1423,6 +1548,102 @@ describe("vm-runner /validate", () => {
 		for (const argv of slotDownCommands(slotFor(0), board))
 			expect(r.execs).toContainEqual(argv);
 		await until(() => bakeVm.killed, "bake vm kill");
+	});
+
+	test("the validate bake pushes only the dispatch's trusted lists, never the planted shared-home files", async () => {
+		const served = "trusted-tool-bytes";
+		const listener = Bun.serve({
+			port: 0,
+			hostname: "127.0.0.1",
+			fetch: () => new Response(served),
+		});
+		stoppers.push(() => listener.stop(true));
+		const base = `http://127.0.0.1:${listener.port}`;
+		const servedSha = new Bun.CryptoHasher("sha256")
+			.update(served)
+			.digest("hex");
+		const trusted: ProvisionLists = {
+			tools: JSON.stringify([
+				{ name: "trusted-tool", url: `${base}/t.tar.gz`, sha256: servedSha },
+			]),
+			apt: "jq\n",
+			requirementsAll: `q==2 --hash=sha256:${"b".repeat(64)}\n`,
+		};
+		const bakeRootfs = {
+			base: async () => ({ key: "base", path: "/state/base.ext4" }),
+			layer: async (
+				_p: string,
+				_lists: ProvisionLists,
+				bake: (image: string) => Promise<BakeResult>,
+			) => {
+				const b = await bake("/state/layer.tmp");
+				return b.exitCode === 0
+					? { ok: true as const, path: "/state/layer.tmp" }
+					: { ok: false as const, stderrTail: b.stderrTail };
+			},
+		};
+		const r = startRunner({
+			rootfs: bakeRootfs,
+			script: { validateResult: { ...VALID_RESULT, id: "val-lists" } },
+		});
+		const workers = join(r.homeRoot, ".ottr", "workers");
+		for (const [dir, file, text] of [
+			["proj", "tools.json", '[{"name":"planted-tool"}]'],
+			["proj", "apt.txt", "planted-pkg\n"],
+			["_all", "requirements.txt", "planted-all\n"],
+		] as const) {
+			mkdirSync(join(workers, dir), { recursive: true });
+			writeFileSync(join(workers, dir, file), text);
+		}
+		const res = await post(
+			r.url,
+			"/validate",
+			validateBody(seedTarget(r, "val-lists"), {
+				id: "val-lists",
+				lists: trusted,
+			}),
+		);
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as ValidateResponse;
+		expect(body.resultSource).toBe("guest");
+		// Same assertions as the run path: the copy-in tar holds exactly the
+		// request-borne members with the trusted bytes, and the /bake body carries
+		// the trusted texts.
+		const bakeVm = r.recs[0]!;
+		expect(bakeVm.spec.mode).toBe("bake");
+		const sent = await members(bakeVm.puts[0]!);
+		const guestRoot = "root/.ottr/workers";
+		expect(sent.map((s) => s.m.name).sort()).toEqual(
+			[
+				`${guestRoot}/proj/apt.txt`,
+				`${guestRoot}/proj/tools.json`,
+				`${guestRoot}/_all/requirements.txt`,
+			].sort(),
+		);
+		const byName = new Map(sent.map((s) => [s.m.name, s.content]));
+		expect(byName.get(`${guestRoot}/proj/tools.json`)).toBe(trusted.tools);
+		expect(byName.get(`${guestRoot}/proj/apt.txt`)).toBe(trusted.apt);
+		expect(byName.get(`${guestRoot}/_all/requirements.txt`)).toBe(
+			trusted.requirementsAll,
+		);
+		for (const s of sent) expect(s.content).not.toContain("planted");
+		expect(bakeVm.bakeBody).toEqual({ project: "proj", lists: trusted });
+
+		// No lists on the dispatch: no list members are pushed, the /bake body
+		// names none, and the planted files stay unread.
+		const res2 = await post(
+			r.url,
+			"/validate",
+			validateBody(seedTarget(r, "val-nolists"), { id: "val-nolists" }),
+		);
+		expect(res2.status).toBe(200);
+		expect(((await res2.json()) as ValidateResponse).resultSource).toBe(
+			"guest",
+		);
+		const bake2 = r.recs[2]!;
+		expect(bake2.spec.mode).toBe("bake");
+		expect(bake2.puts).toHaveLength(0);
+		expect(bake2.bakeBody).toEqual({ project: "proj" });
 	});
 });
 
@@ -1713,26 +1934,50 @@ describe("vmNet", () => {
 });
 
 describe("vmRootfs", () => {
-	test("the layer key changes when a package list changes, and not otherwise", () => {
-		const home = mkdtempSync(join(root, "lk-"));
-		const dir = join(home, ".ottr", "workers", "proj");
-		mkdirSync(dir, { recursive: true });
-		writeFileSync(join(dir, "apt.txt"), "jq\n");
-		const k1 = layerKey("base", home, "proj");
-		expect(layerKey("base", home, "proj")).toBe(k1);
-		// Files a bake does not install from leave the key alone.
-		writeFileSync(join(dir, "notes.md"), "whatever");
-		expect(layerKey("base", home, "proj")).toBe(k1);
-		writeFileSync(join(dir, "apt.txt"), "jq\nripgrep\n");
-		const k2 = layerKey("base", home, "proj");
-		expect(k2).not.toBe(k1);
-		const all = join(home, ".ottr", "workers", "_all");
-		mkdirSync(all, { recursive: true });
-		writeFileSync(join(all, "requirements.txt"), "requests\n");
-		expect(layerKey("base", home, "proj")).not.toBe(k2);
-		expect(layerKey("base2", home, "proj")).not.toBe(
-			layerKey("base", home, "proj"),
+	test("the layer key is a function of the base and the five list texts", () => {
+		const k1 = layerKey("base", { apt: "jq\n" });
+		expect(layerKey("base", { apt: "jq\n" })).toBe(k1);
+		// The base is an input.
+		expect(layerKey("base2", { apt: "jq\n" })).not.toBe(k1);
+		// A change in any one field moves the key.
+		const changed: ProvisionLists[] = [
+			{ apt: "jq\nripgrep\n" },
+			{ apt: "jq\n", tools: "[]" },
+			{ apt: "jq\n", toolsAll: "[]" },
+			{ apt: "jq\n", requirements: "r==1 --hash=sha256:" + "a".repeat(64) },
+			{ apt: "jq\n", requirementsAll: "q==2 --hash=sha256:" + "b".repeat(64) },
+		];
+		for (const lists of changed) expect(layerKey("base", lists)).not.toBe(k1);
+		// A field gained or lost moves the key: absent is not "".
+		expect(layerKey("base", { apt: "jq\n", tools: "" })).not.toBe(k1);
+		expect(layerKey("base", {})).not.toBe(k1);
+		// The key order the caller uses is fixed, so the object's own order is not one.
+		expect(layerKey("base", { tools: "[]", apt: "jq\n" })).toBe(
+			layerKey("base", { apt: "jq\n", tools: "[]" }),
 		);
+	});
+
+	test("listFiles emits one entry per present field, at the guest paths the wrappers read", () => {
+		expect(listFiles("proj", {})).toEqual([]);
+		expect(
+			listFiles("proj", {
+				apt: "jq\n",
+				tools: "t",
+				toolsAll: "ta",
+				requirements: "r\n",
+				requirementsAll: "ra\n",
+			}),
+		).toEqual([
+			{ path: "/root/.ottr/workers/proj/apt.txt", text: "jq\n" },
+			{ path: "/root/.ottr/workers/proj/tools.json", text: "t" },
+			{ path: "/root/.ottr/workers/_all/tools.json", text: "ta" },
+			{ path: "/root/.ottr/workers/proj/requirements.txt", text: "r\n" },
+			{ path: "/root/.ottr/workers/_all/requirements.txt", text: "ra\n" },
+		]);
+		// A partial lists omits exactly its absent fields.
+		expect(listFiles("proj", { toolsAll: "ta" })).toEqual([
+			{ path: "/root/.ottr/workers/_all/tools.json", text: "ta" },
+		]);
 	});
 
 	function rootfs(
@@ -1778,9 +2023,6 @@ describe("vmRootfs", () => {
 
 	test("two turns of one project bake once; a changed list re-bakes and drops the old layer", async () => {
 		const home = mkdtempSync(join(root, "rh-"));
-		const lists = join(home, ".ottr", "workers", "proj");
-		mkdirSync(lists, { recursive: true });
-		writeFileSync(join(lists, "apt.txt"), "jq\n");
 		const { fs, stateDir } = rootfs(home);
 		let bakes = 0;
 		const bake = async (): Promise<BakeResult> => {
@@ -1788,14 +2030,13 @@ describe("vmRootfs", () => {
 			return { exitCode: 0, stderrTail: "" };
 		};
 		const [a, b] = await Promise.all([
-			fs.layer("proj", bake),
-			fs.layer("proj", bake),
+			fs.layer("proj", { apt: "jq\n" }, bake),
+			fs.layer("proj", { apt: "jq\n" }, bake),
 		]);
 		expect(bakes).toBe(1);
 		expect(a).toEqual(b);
 		expect(a.ok && existsSync(a.path)).toBe(true);
-		writeFileSync(join(lists, "apt.txt"), "jq\nripgrep\n");
-		const c = await fs.layer("proj", bake);
+		const c = await fs.layer("proj", { apt: "jq\nripgrep\n" }, bake);
 		expect(bakes).toBe(2);
 		expect(c.ok && c.path !== (a.ok ? a.path : "")).toBe(true);
 		expect(readdirSync(join(stateDir, "layers", "proj"))).toHaveLength(1);
@@ -1804,7 +2045,7 @@ describe("vmRootfs", () => {
 	test("a failed bake keeps no layer and reports the bake's tail", async () => {
 		const home = mkdtempSync(join(root, "rf-"));
 		const { fs, stateDir } = rootfs(home);
-		const r = await fs.layer("proj", async () => ({
+		const r = await fs.layer("proj", {}, async () => ({
 			exitCode: 100,
 			stderrTail: "E: Unable to locate package nope\n",
 		}));
@@ -1818,7 +2059,7 @@ describe("vmRootfs", () => {
 	test("an e2fsck exit of 1 still publishes the layer", async () => {
 		const home = mkdtempSync(join(root, "rh1-"));
 		const { fs, stateDir } = rootfs(home, 1);
-		const r = await fs.layer("proj", async () => ({
+		const r = await fs.layer("proj", {}, async () => ({
 			exitCode: 0,
 			stderrTail: "",
 		}));
@@ -1830,7 +2071,7 @@ describe("vmRootfs", () => {
 	test("a layer image that fails its post-bake check is not published", async () => {
 		const home = mkdtempSync(join(root, "rh4-"));
 		const { fs, stateDir, e2fsckArgv } = rootfs(home, 4);
-		const r = await fs.layer("proj", async () => ({
+		const r = await fs.layer("proj", {}, async () => ({
 			exitCode: 0,
 			stderrTail: "",
 		}));

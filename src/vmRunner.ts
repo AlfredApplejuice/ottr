@@ -46,8 +46,8 @@ import {
 import {
 	type BakeResult,
 	type LayerResult,
+	listFiles,
 	sparseFile,
-	workerListPaths,
 } from "./vmRootfs.ts";
 import {
 	cwdUnderTarget,
@@ -60,6 +60,7 @@ import {
 } from "./vmValidateShared.ts";
 import {
 	type DetachedRun,
+	type ProvisionLists,
 	type VmOutcome,
 	type VmSpec,
 	WORKER_DONE,
@@ -194,8 +195,10 @@ function* walkTar(
 }
 
 /**
- * A tar stream of `roots` (absolute paths), produced lazily one member at a time. A root's
- * `sent` set collects the regular files streamed from it.
+ * A tar stream of `roots` (absolute paths) plus in-memory `files`, produced lazily one
+ * member at a time. A root's `sent` set collects the regular files streamed from it.
+ * A file's `path` is guest-absolute; its member name is the same path relative to /
+ * (the guest extracts at /), like every walked member's name.
  */
 export function tarStream(
 	roots: {
@@ -203,10 +206,23 @@ export function tarStream(
 		skip?: (abs: string) => boolean;
 		sent?: Set<string>;
 	}[],
+	files: { path: string; text: string }[] = [],
 ): ReadableStream<Uint8Array> {
 	function* all(): Generator<Uint8Array> {
 		for (const r of roots)
 			yield* walkTar(r.path, r.skip ?? (() => false), r.sent);
+		for (const f of files) {
+			const data = enc.encode(f.text);
+			yield* memberHeader(
+				f.path.replace(/^\/+/, ""),
+				"0",
+				data.length,
+				0o644,
+				Date.now() / 1000,
+			);
+			yield data;
+			yield padding(data.length);
+		}
 		yield new Uint8Array(BLOCK * 2);
 	}
 	const it = all();
@@ -816,6 +832,18 @@ function checkCopyPaths(
 	return null;
 }
 
+/** The 400 reason for a `lists` field, null when it is absent or an object whose
+ * present fields are all strings (docs/specs/vm-list-isolation.md). Content
+ * validation happens at the consumer through the existing parsers. */
+function checkLists(lists: unknown, what: string): string | null {
+	if (lists === undefined) return null;
+	if (typeof lists !== "object" || lists === null)
+		return `${what} is not an object`;
+	for (const [k, v] of Object.entries(lists as Record<string, unknown>))
+		if (typeof v !== "string") return `${what}.${k} is not a string`;
+	return null;
+}
+
 /** Null when `vm` is a well-formed spec this runner may act on, else the 400 reason. */
 function checkVmSpec(
 	vm: unknown,
@@ -832,6 +860,7 @@ function checkVmSpec(
 	if (!isStrings(s.copyIn) || !isStrings(s.copyOut))
 		return "vm.copyIn/copyOut are not string lists";
 	return (
+		checkLists(s.lists, "vm.lists") ??
 		checkLayerDir(s, o.homeRoot) ??
 		checkCopyPaths([...s.copyIn, ...s.copyOut], join(o.dataRoot, project))
 	);
@@ -880,6 +909,8 @@ function checkValidateBody(body: unknown, dataRoot: string): string | null {
 		return `validate.targetTar must be a tar under ${projectRoot}/`;
 	if (!realParentInside(b.targetTar, projectRoot))
 		return `validate.targetTar ${b.targetTar} leaves ${projectRoot}/ through a link`;
+	const lists = checkLists(b.lists, "validate.lists");
+	if (lists !== null) return lists;
 	if (typeof b.job !== "object" || b.job === null)
 		return "validate.job is missing";
 	const job = b.job as ValidateRequest["job"];
@@ -1081,6 +1112,7 @@ export interface VmRunnerOptions {
 		base(): Promise<{ key: string; path: string }>;
 		layer(
 			project: string,
+			lists: ProvisionLists,
 			bake: (image: string) => Promise<BakeResult>,
 		): Promise<LayerResult>;
 	};
@@ -1283,6 +1315,7 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 			sent?: Set<string>;
 		}[],
 		signal: AbortSignal,
+		files: { path: string; text: string }[] = [],
 	): Promise<void> {
 		const present = roots.filter((r) => {
 			try {
@@ -1292,11 +1325,11 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 				return false;
 			}
 		});
-		if (present.length === 0) return;
+		if (present.length === 0 && files.length === 0) return;
 		const r = await guestFetch(`${vm.guestUrl}/files`, {
 			method: "PUT",
 			headers: { [GUEST_TOKEN_HEADER]: token },
-			body: tarStream(present),
+			body: tarStream(present, files),
 			signal,
 		});
 		if (!r.ok)
@@ -1392,7 +1425,12 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 					[GUEST_TOKEN_HEADER]: token,
 					"content-type": "application/json",
 				},
-				body: JSON.stringify({ project: spec.project }),
+				// The lists pass through exactly as the dispatch carried them:
+				// absent stays absent, and the guest never reads the shared home.
+				body: JSON.stringify({
+					project: spec.project,
+					...(spec.lists ? { lists: spec.lists } : {}),
+				}),
 				signal,
 			});
 			if (!r.ok || !r.body)
@@ -1436,13 +1474,15 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 					);
 					const signal = guestSignal(vm);
 					await waitGuest(vm, stopper.signal);
+					// The copy-in holds exactly the dispatch's trusted lists, built in
+					// memory (docs/specs/vm-list-isolation.md); the shared home —
+					// worker-writable — is never a provisioning input on this path.
 					await putFiles(
 						vm,
 						token,
-						workerListPaths(homeRoot, spec.project).map((path) => ({
-							path,
-						})),
+						[],
 						signal,
+						listFiles(spec.project, spec.lists ?? {}),
 					);
 					const r = await bakeTurn(push, vm, token, signal);
 					if (r.exitCode !== 0) return r; // the kill path: a dirty journal is the e2fsck gate's problem
@@ -1620,6 +1660,7 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 			if (stopper.signal.aborted) return null;
 			const layer = await opts.rootfs.layer(
 				spec.project,
+				spec.lists ?? {},
 				bake(base.path, board, boardName, push),
 			);
 			if (stopper.signal.aborted) return null;
@@ -1841,7 +1882,11 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 					[GUEST_TOKEN_HEADER]: token,
 					"content-type": "application/json",
 				},
-				body: JSON.stringify({ project: body.project }),
+				// The lists pass through exactly as the dispatch carried them.
+				body: JSON.stringify({
+					project: body.project,
+					...(body.lists ? { lists: body.lists } : {}),
+				}),
 				signal,
 			});
 			if (!r.ok || !r.body)
@@ -1943,13 +1988,14 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 						});
 						const signal = guestSignal(vm);
 						await waitGuest(vm, signal);
+						// Same rule as the run path: the copy-in is the dispatch's
+						// trusted lists, built in memory, never the shared home.
 						await putFiles(
 							vm,
 							token,
-							workerListPaths(homeRoot, body.project).map((path) => ({
-								path,
-							})),
+							[],
 							signal,
+							listFiles(body.project, body.lists ?? {}),
 						);
 						return await bakeTurn(vm, token, signal);
 					} catch (err) {
@@ -1958,7 +2004,11 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 						if (vm) await halt(vm);
 					}
 				};
-			const layer = await opts.rootfs.layer(body.project, bake(base.path));
+			const layer = await opts.rootfs.layer(
+				body.project,
+				body.lists ?? {},
+				bake(base.path),
+			);
 			if (stopper.signal.aborted) return finish(answer(null, "stopped"));
 			if (!layer.ok) return finish(answer(null, layer.stderrTail));
 

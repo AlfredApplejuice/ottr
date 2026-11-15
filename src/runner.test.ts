@@ -5273,6 +5273,47 @@ describe("startRun microVM dispatch", () => {
 		}
 	});
 
+	test("the /run dispatch carries the board home's trusted lists on vm.lists", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-vm-dispatch-"));
+		const tokens = new VmTokens({ file: null });
+		const { server, seen, url } = fakeRunner(tokens, "run");
+		const home = mkdtempSync(join(tmpdir(), "ottr-dispatch-home-"));
+		const proj = join(home, ".ottr", "workers", "p");
+		mkdirSync(proj, { recursive: true });
+		writeFileSync(
+			join(proj, "tools.json"),
+			'[{"name":"t","url":"https://t.test/t.tar.gz","sha256":"s"}]',
+		);
+		writeFileSync(join(proj, "apt.txt"), "jq\n");
+		const all = join(home, ".ottr", "workers", "_all");
+		mkdirSync(all, { recursive: true });
+		writeFileSync(
+			join(all, "requirements.txt"),
+			`q==2 --hash=sha256:${"b".repeat(64)}\n`,
+		);
+		const saved = process.env.OTTR_WORKERS_HOME;
+		try {
+			process.env.OTTR_WORKERS_HOME = home;
+			const run = await startRun(vmOpts(dir, tokens, url));
+			expect(run.url).toBe(url);
+			const r = await run.done;
+			expect(r.exitCode).toBe(0);
+			// The list texts ride the spec exactly as the home holds them; the
+			// project's apt list rides, the fleet apt list does not exist.
+			expect(seen[0]!.body.vm!.lists).toEqual({
+				tools: '[{"name":"t","url":"https://t.test/t.tar.gz","sha256":"s"}]',
+				apt: "jq\n",
+				requirementsAll: `q==2 --hash=sha256:${"b".repeat(64)}\n`,
+			});
+		} finally {
+			if (saved === undefined) delete process.env.OTTR_WORKERS_HOME;
+			else process.env.OTTR_WORKERS_HOME = saved;
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
 	test("VM requests exclude inherited, project and secondary production URLs", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-vm-database-"));
 		const tokens = new VmTokens({ file: null });

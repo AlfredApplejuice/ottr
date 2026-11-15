@@ -11,6 +11,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import { projectTrustedLists } from "./trustedLists.ts";
 import {
 	cwdUnderTarget,
 	type ValidateRequest,
@@ -186,6 +187,9 @@ export async function runSandboxJob(
 		id,
 		project,
 		targetTar,
+		// The validate bake reads the dispatch's trusted texts, never the shared
+		// home (docs/specs/vm-list-isolation.md).
+		lists: projectTrustedLists(project),
 		job: {
 			argv,
 			cwd,

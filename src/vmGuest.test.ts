@@ -1,17 +1,22 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
 	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
+	readlinkSync,
 	rmSync,
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { aptListPath } from "./apt.ts";
+import { requirementsListPath } from "./python.ts";
+import { buildToolsPath, toolsListPath } from "./tools.ts";
 import { type GuestOptions, serveGuest } from "./vmGuest.ts";
 import { type VmOutcome, WORKER_DONE } from "./workers.ts";
 
@@ -618,6 +623,225 @@ describe("POST /bake", () => {
 			body: JSON.stringify({ project: "../etc" }),
 		});
 		expect(bad.status).toBe(400);
+	});
+});
+
+describe("POST /bake lists", () => {
+	// parseToolsJson accepts https:// urls only, and a local https server would need a
+	// certificate the runtime fetch trusts: the two fixture hosts below are fetch shims
+	// (the src/tools.test.ts pattern) that map urls to in-memory bytes and count hits.
+	const TRUSTED = "https://trusted-a.ottr.test";
+	const PLANTED = "https://planted-b.ottr.test";
+	const hits: Record<string, number> = {};
+	const bodies: Record<string, Uint8Array> = {};
+	const realFetch = globalThis.fetch;
+	let fixtureN = 0;
+	const serveAt = (host: string, body: Uint8Array): string => {
+		const url = `${host}/fixture-${fixtureN++}`;
+		bodies[url] = body;
+		return url;
+	};
+	const fetchCount = (): number =>
+		Object.values(hits).reduce((sum, n) => sum + n, 0);
+
+	beforeAll(() => {
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input instanceof Request ? input.url : input);
+			if (!url.startsWith(`${TRUSTED}/`) && !url.startsWith(`${PLANTED}/`))
+				return realFetch(input, init);
+			const bytes = bodies[url];
+			hits[url] = (hits[url] ?? 0) + 1;
+			return new Response(bytes === undefined ? null : (bytes as BodyInit), {
+				status: bytes === undefined ? 404 : 200,
+			});
+		}) as typeof fetch;
+	});
+	afterAll(() => {
+		globalThis.fetch = realFetch;
+	});
+
+	const sha256 = (bytes: Uint8Array): string =>
+		new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+
+	const capture = (calls: string[]) => ({
+		packages: async (project: string, home: string) => {
+			calls.push(`apt ${project} ${home}`);
+			return [];
+		},
+		python: async (project: string, home: string) => {
+			calls.push(`pip ${project} ${home}`);
+			return [];
+		},
+	});
+
+	test("a bake writes the request lists over the planted ones; the planted tools never install", async () => {
+		const trustedBytes = new TextEncoder().encode("#!/bin/sh\necho trusted\n");
+		const plantedBytes = new TextEncoder().encode("#!/bin/sh\necho planted\n");
+		const fleetBytes = new TextEncoder().encode("#!/bin/sh\necho fleet\n");
+		const trustedUrl = serveAt(TRUSTED, trustedBytes);
+		const plantedUrl = serveAt(PLANTED, plantedBytes);
+		const fleetUrl = serveAt(PLANTED, fleetBytes);
+		const trustedSha = sha256(trustedBytes);
+		const plantedSha = sha256(plantedBytes);
+		const fleetSha = sha256(fleetBytes);
+
+		// Stale planted lists for the project sit in the guest home: planted tools
+		// pinned to the planted host, plus planted apt and requirements.
+		const home = fresh("bake-home");
+		const project = "victim";
+		const plants: [string, string][] = [
+			[
+				toolsListPath(project, home),
+				JSON.stringify([
+					{ name: "evil", url: plantedUrl, sha256: plantedSha, unpack: "none" },
+				]),
+			],
+			[
+				toolsListPath("_all", home),
+				JSON.stringify([
+					{ name: "fleet", url: fleetUrl, sha256: fleetSha, unpack: "none" },
+				]),
+			],
+			[aptListPath(project, home), "planted-pkg\n"],
+			[
+				requirementsListPath(project, home),
+				`planted==1.0.0 --hash=sha256:${"0".repeat(64)}\n`,
+			],
+		];
+		for (const [file, text] of plants) {
+			mkdirSync(dirname(file), { recursive: true });
+			writeFileSync(file, text);
+		}
+
+		// Real ensureProjectTools and buildToolsPath run; capture fakes only where the
+		// real command would install on the test machine (apt-get, pip venvs).
+		const calls: string[] = [];
+		const url = start({ home, ensure: capture(calls) });
+		const lists = {
+			tools: JSON.stringify([
+				{ name: "hello", url: trustedUrl, sha256: trustedSha, unpack: "none" },
+			]),
+			toolsAll: "[]",
+			apt: "trusted-pkg\n",
+			requirements: `trusted==2.0.0 --hash=sha256:${"1".repeat(64)}\n`,
+			requirementsAll: `fleet-req==3.0.0 --hash=sha256:${"2".repeat(64)}\n`,
+		};
+		const res = await fetch(`${url}/bake`, {
+			method: "POST",
+			headers: AUTH,
+			body: JSON.stringify({ project, lists }),
+		});
+		expect(res.status).toBe(200);
+		const lines = (await res.text()).split("\n").filter((l) => l !== "");
+		expect(lines).toContain(
+			`tools: installed hello (${trustedSha.slice(0, 12)})`,
+		);
+		expect(lines.at(-1)).toBe(
+			JSON.stringify({ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } }),
+		);
+		expect(calls).toEqual([`apt ${project} ${home}`, `pip ${project} ${home}`]);
+
+		// The trusted tool was fetched; the planted urls were never touched.
+		expect(hits[trustedUrl]).toBe(1);
+		expect(hits[plantedUrl] ?? 0).toBe(0);
+		expect(hits[fleetUrl] ?? 0).toBe(0);
+
+		// The home's tools tree holds the trusted pin and no planted artifact.
+		const root = join(home, ".ottr", "tools");
+		expect(existsSync(join(root, trustedSha))).toBe(true);
+		expect(existsSync(join(root, plantedSha))).toBe(false);
+		expect(existsSync(join(root, fleetSha))).toBe(false);
+
+		// buildToolsPath links the trusted pin only; no planted name links.
+		const links = buildToolsPath(project, home);
+		expect(links).not.toBe("");
+		expect(readdirSync(links).sort()).toEqual(["hello"]);
+		expect(readlinkSync(join(links, "hello"))).toBe(
+			join(root, trustedSha, "hello"),
+		);
+
+		// The request texts overwrote every planted file on disk.
+		expect(readFileSync(toolsListPath(project, home), "utf8")).toBe(
+			lists.tools,
+		);
+		expect(readFileSync(toolsListPath("_all", home), "utf8")).toBe(
+			lists.toolsAll,
+		);
+		expect(readFileSync(aptListPath(project, home), "utf8")).toBe(lists.apt);
+		expect(readFileSync(requirementsListPath(project, home), "utf8")).toBe(
+			lists.requirements,
+		);
+		expect(readFileSync(requirementsListPath("_all", home), "utf8")).toBe(
+			lists.requirementsAll,
+		);
+	});
+
+	test("a bake with no lists writes nothing and provisions nothing", async () => {
+		const home = fresh("bake-home");
+		const calls: string[] = [];
+		const url = start({ home, ensure: capture(calls) });
+		const fetchesBefore = fetchCount();
+		const res = await fetch(`${url}/bake`, {
+			method: "POST",
+			headers: AUTH,
+			body: JSON.stringify({ project: "proj" }),
+		});
+		expect(res.status).toBe(200);
+		// No note lines: the real tools wrapper found no list file and installed nothing.
+		expect((await res.text()).split("\n").filter((l) => l !== "")).toEqual([
+			JSON.stringify({ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } }),
+		]);
+		// No list file or tools tree anywhere under the home, and no fetch at all.
+		expect(existsSync(join(home, ".ottr"))).toBe(false);
+		expect(fetchCount()).toBe(fetchesBefore);
+		expect(calls).toEqual([`apt proj ${home}`, `pip proj ${home}`]);
+	});
+
+	test("a broken list ends the bake with the parser's error before any write or install", async () => {
+		const home = fresh("bake-home");
+		const calls: string[] = [];
+		const url = start({ home, ensure: capture(calls) });
+		const fetchesBefore = fetchCount();
+		const res = await fetch(`${url}/bake`, {
+			method: "POST",
+			headers: AUTH,
+			body: JSON.stringify({ project: "proj", lists: { tools: "{}" } }),
+		});
+		expect(res.status).toBe(200);
+		// The parser's message leads with its list name; the JSON syntax errors of
+		// JSON.parse carry no prefix, so the break here is a structural one.
+		expect((await res.text()).split("\n").filter((l) => l !== "")).toEqual([
+			JSON.stringify({
+				[WORKER_DONE]: { exitCode: 1, stderrTail: "tools: not a JSON array\n" },
+			}),
+		]);
+		expect(existsSync(join(home, ".ottr"))).toBe(false);
+		expect(calls).toEqual([]);
+		expect(fetchCount()).toBe(fetchesBefore);
+	});
+
+	test("a lists field that is not a string answers 400", async () => {
+		const url = start({});
+		for (const lists of [
+			42,
+			"x",
+			[],
+			null,
+			{ tools: 42 },
+			{ apt: {} },
+			{ requirementsAll: [] },
+		]) {
+			const res = await fetch(`${url}/bake`, {
+				method: "POST",
+				headers: AUTH,
+				body: JSON.stringify({ project: "proj", lists }),
+			});
+			expect(res.status).toBe(400);
+			expect(await res.text()).toBe("bad request");
+		}
 	});
 });
 

@@ -565,7 +565,11 @@ compose). The seed installs the lists into the board home's layers
 ([The agent layers](#the-agent-layers)), and the board reads them from the current
 layer at read time. The reason is R5-1: a
 worker turn can write the shared home, so a binary there must never run in the
-server. Until a seed runs, server-side turns get no tools.
+server. Until a seed runs, server-side turns get no tools. The VM bake path
+follows the same rule: the board puts the project's lists on the vm dispatch
+from its own home, and the bake installs from those texts only, never from the
+shared home. The pinned agent layer copy (`vm.layerDir`) still reads the shared
+home; its controls stay alate's provisioning and the post-run drift audit.
 
 An env var name a project's turns need goes into `env.txt` beside the other two
 files: one name per line, `#` comments allowed, never a value. The value lives on
@@ -936,7 +940,8 @@ fills its scratch disk gets `ENOSPC`. The defaults are not measured yet (see
   each VM's traffic (below).
 
 It mounts `ottr-data:/data` read-write, to copy a card's files in and out, and
-`home:/root` read-only, for the package lists and the agent layer. It never mounts
+`home:/root` read-only, for the pinned agent layer copy. The package lists ride
+the vm dispatch, never this mount. It never mounts
 `/workspace`, and no VM sees any of these mounts.
 
 ### Isolation model
@@ -989,10 +994,14 @@ three, so the turn writes only to its scratch disk. Files under `OTTR_VM_STATE_D
   when `vm-runner` starts, and a turn waits for it. The key hashes the Ottr version,
   `omp --version` and `package.json`, so a new image builds a new base.
 - `layers/<project>-<key>.ext4`: the project layer with the project's system packages,
-  tools and Python packages. The runner bakes it in a VM (bake mode, layer writable) from
-  the data repo lists (`workers/<project>/apt.txt`, `tools.json`, `requirements.txt`,
-  and the `_all` lists; see [System packages per project](#system-packages-per-project)).
-  The key hashes the base key and those lists. The layer is rebuilt lazily: the next
+  tools and Python packages. The runner bakes it in a VM (bake mode, layer writable). The
+  board sends the project's trusted lists on the vm dispatch: it reads the raw texts from
+  its own home (`OTTR_WORKERS_HOME` ?? `boardOmpHome()`, the same source its own
+  provisioning reads). The runner hashes those texts into the layer key with the base key
+  and pushes them into the bake VM, and the guest installs from the dispatch texts (see
+  [System packages per project](#system-packages-per-project)). The key format changed
+  when the lists moved to the dispatch, so the first turn of every project after that
+  change bakes its layer again, once. The layer is rebuilt lazily: the next
   turn of the project after a list or the base changes bakes a new layer, and later
   turns reuse it. Bakes of one project run one at a time. A failed bake ends that turn
   with exit code 1 and the bake's error tail. After a bake, the runner checks the layer

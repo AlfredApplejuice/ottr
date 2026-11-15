@@ -78,6 +78,19 @@ export interface WorkerRequest {
 	vm?: VmSpec;
 }
 
+/**
+ * The board's trusted provisioning lists, raw text. Every field is optional;
+ * a missing field means an empty list. No `aptAll`: apt installs read only the
+ * project's own list (src/apt.ts), so the fleet apt list has no consumer.
+ */
+export interface ProvisionLists {
+	tools?: string;
+	toolsAll?: string;
+	apt?: string;
+	requirements?: string;
+	requirementsAll?: string;
+}
+
 /** What vm-runner needs beyond the classic request to run the turn in a fresh microVM. */
 export interface VmSpec {
 	project: string;
@@ -100,6 +113,9 @@ export interface VmSpec {
 	copyIn: string[];
 	/** Absolute dirs under /data/<project>/ whose new/changed files sync back. */
 	copyOut: string[];
+	/** The board's trusted provisioning lists (docs/specs/vm-list-isolation.md): the bake
+	 * installs exactly these texts; the shared home is never a provisioning input. */
+	lists?: ProvisionLists;
 }
 
 /** The microVM's end state of the task branch, carried on the done sentinel. */

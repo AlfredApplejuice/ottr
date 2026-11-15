@@ -6,6 +6,7 @@
  * the endpoint. No request knob changes a limit: the audit proves the mode's
  * limits, so they are constants here.
  */
+import type { ProvisionLists } from "./workers.ts";
 
 /** The validation mode's fixed limits. */
 export const VM_VALIDATE = {
@@ -104,6 +105,9 @@ export interface ValidateRequest {
 	project: string;
 	/** Tar of the target checkout; under <dataRoot>/<project>/ on the runner. */
 	targetTar: string;
+	/** The board's trusted provisioning lists (docs/specs/vm-list-isolation.md); the
+	 * validate bake installs exactly these texts, never the shared home's. */
+	lists?: ProvisionLists;
 	job: {
 		argv: string[];
 		cwd: string;

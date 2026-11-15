@@ -5,8 +5,8 @@
  *   `omp --version` and /app/package.json, so an image update rebuilds it once.
  * - project layer: an ext4 holding the overlay `upper/` and `work/` dirs a bake VM fills with
  *   the project's apt/tools/pip installs (the worker's per-turn installs, done once). Keyed
- *   by the base key plus the project's and `_all`'s package lists, so a changed apt.txt
- *   re-bakes and nothing else does.
+ *   by the base key plus the dispatch's provisioning list texts (docs/specs/vm-list-isolation.md),
+ *   so a changed list re-bakes and nothing else does.
  * Only the current base and the current layer per project stay on disk; a VM still running
  * on an older image keeps its open inode.
  */
@@ -25,9 +25,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import type { Exec } from "./vmNet.ts";
-
-/** The per-project package lists a bake installs (src/apt.ts, src/tools.ts, src/python.ts). */
-const LAYER_INPUTS = ["apt.txt", "tools.json", "requirements.txt"] as const;
+import type { ProvisionLists } from "./workers.ts";
 
 /** Paths the base rootfs never copies: kernel filesystems, mounts, per-host state. */
 const BASE_EXCLUDES = [
@@ -64,11 +62,35 @@ function baseKey(i: {
 		.digest("hex");
 }
 
-/** The list files a bake of `project` installs, project first, then `_all`. */
-export function workerListPaths(homeRoot: string, project: string): string[] {
-	return [project, "_all"].flatMap((dir) =>
-		LAYER_INPUTS.map((f) => join(homeRoot, ".ottr", "workers", dir, f)),
-	);
+/**
+ * The list files a bake of `project` installs, one entry per present field, at the
+ * guest-absolute paths the guest's ensure wrappers read (docs/specs/vm-list-isolation.md).
+ * The bake copies these texts in memory; no shared-home file is ever read here.
+ */
+export function listFiles(
+	project: string,
+	lists: ProvisionLists,
+): { path: string; text: string }[] {
+	const out: { path: string; text: string }[] = [];
+	const root = "/root/.ottr/workers";
+	const at = (dir: string, file: string): string => `${root}/${dir}/${file}`;
+	if (lists.apt !== undefined)
+		out.push({ path: at(project, "apt.txt"), text: lists.apt });
+	if (lists.tools !== undefined)
+		out.push({ path: at(project, "tools.json"), text: lists.tools });
+	if (lists.toolsAll !== undefined)
+		out.push({ path: at("_all", "tools.json"), text: lists.toolsAll });
+	if (lists.requirements !== undefined)
+		out.push({
+			path: at(project, "requirements.txt"),
+			text: lists.requirements,
+		});
+	if (lists.requirementsAll !== undefined)
+		out.push({
+			path: at("_all", "requirements.txt"),
+			text: lists.requirementsAll,
+		});
+	return out;
 }
 
 const readOrNull = (path: string): string | null => {
@@ -79,17 +101,22 @@ const readOrNull = (path: string): string | null => {
 	}
 };
 
-export function layerKey(
-	base: string,
-	homeRoot: string,
-	project: string,
-	read: (path: string) => string | null = readOrNull,
-): string {
+export function layerKey(base: string, lists: ProvisionLists): string {
 	// A missing list (null) and an empty one ("") install the same, but keeping them apart
 	// costs one extra bake at most and never reuses a wrong layer.
-	const lists = workerListPaths(homeRoot, project).map((p) => [p, read(p)]);
 	return createHash("sha256")
-		.update(JSON.stringify([base, lists]))
+		.update(
+			JSON.stringify([
+				base,
+				[
+					lists.apt ?? null,
+					lists.tools ?? null,
+					lists.toolsAll ?? null,
+					lists.requirements ?? null,
+					lists.requirementsAll ?? null,
+				],
+			]),
+		)
 		.digest("hex");
 }
 
@@ -239,10 +266,11 @@ export class VmRootfs {
 	 */
 	layer(
 		project: string,
+		lists: ProvisionLists,
 		bake: (image: string) => Promise<BakeResult>,
 	): Promise<LayerResult> {
 		const prev = this.chains.get(project) ?? Promise.resolve();
-		const next = prev.then(() => this.layerNow(project, bake));
+		const next = prev.then(() => this.layerNow(project, lists, bake));
 		const tail = next.catch(() => {});
 		this.chains.set(project, tail);
 		tail.then(() => {
@@ -253,10 +281,11 @@ export class VmRootfs {
 
 	private async layerNow(
 		project: string,
+		lists: ProvisionLists,
 		bake: (image: string) => Promise<BakeResult>,
 	): Promise<LayerResult> {
 		const base = await this.base();
-		const key = layerKey(base.key, this.o.homeRoot, project);
+		const key = layerKey(base.key, lists);
 		const dir = join(this.o.stateDir, "layers", project);
 		const path = join(dir, `${key}.ext4`);
 		if (existsSync(path)) return { ok: true, path };

@@ -39,6 +39,7 @@ import { requirementsListPath } from "./python.ts";
 import { PROGRESS_EVENT, watchProgress } from "./stryker.ts";
 import { formatBytes } from "./tmpsweep.ts";
 import { toolsListPath } from "./tools.ts";
+import { projectTrustedLists } from "./trustedLists.ts";
 import type {
 	AskQuestion,
 	GitFacts,
@@ -2031,6 +2032,10 @@ function startVmRun(
 			...(pluginSkillsConfig ? [pluginSkillsConfig] : []),
 		],
 		copyOut: [o.sessionDir],
+		// The bake reads the dispatch's trusted texts, never the shared home
+		// (docs/specs/vm-list-isolation.md); the read resolves the board home's
+		// current layer, like the board's own provisioning reads.
+		lists: projectTrustedLists(vm.grant.project),
 	};
 	// Every --config overlay under the copied-in project data dir must ride copyIn:
 	// the guest reads the image's own extension-dir overlays at the same path, but a

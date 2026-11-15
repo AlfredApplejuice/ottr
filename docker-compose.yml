@@ -480,7 +480,7 @@ services:
     # endpoint and reaches providers through the board's /llm proxy.
     volumes:
       - ottr-data:/data # copies a turn's task data in and its new files back out
-      - home:/root:ro # project package and tool lists, the pinned agent layer (read only)
+      - home:/root:ro # the pinned agent layer copy (read only); lists ride the vm dispatch
       - vm-state:/var/lib/ottr-vm # base rootfs, project layers, scratch disks: large
     environment:
       # The same server-to-worker auth as the workers (x-otwr-token on every call).

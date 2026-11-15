@@ -11,12 +11,16 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
-import { ensureProjectPackages } from "./apt.ts";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { aptListPath, ensureProjectPackages, parseAptTxt } from "./apt.ts";
 import { platform } from "./platform/index.ts";
-import { ensureProjectPython } from "./python.ts";
-import { ensureProjectTools } from "./tools.ts";
-import { type VmOutcome, WORKER_DONE } from "./workers.ts";
+import {
+	ensureProjectPython,
+	parseRequirements,
+	requirementsListPath,
+} from "./python.ts";
+import { ensureProjectTools, parseToolsJson, toolsListPath } from "./tools.ts";
+import { type ProvisionLists, type VmOutcome, WORKER_DONE } from "./workers.ts";
 
 /**
  * The guest agent: the one process a microVM runs after its init (docker/ottr-vm-init). vm-runner
@@ -48,6 +52,62 @@ export interface GuestRunRequest {
 
 /** One bake install step: ensureProjectPackages / ensureProjectTools / ensureProjectPython. */
 export type Ensure = (project: string, home: string) => Promise<string[]>;
+
+/** The /bake body's optional `lists` fields, in write order. */
+const LIST_FIELDS = [
+	"tools",
+	"toolsAll",
+	"apt",
+	"requirements",
+	"requirementsAll",
+] as const;
+
+type ListField = (typeof LIST_FIELDS)[number];
+
+/** The /bake body's `lists`: every present field must be a raw text; null on any other shape. */
+const parseLists = (raw: unknown): ProvisionLists | null => {
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw))
+		return null;
+	const lists: ProvisionLists = {};
+	for (const field of LIST_FIELDS) {
+		const text = (raw as Record<string, unknown>)[field];
+		if (text === undefined) continue;
+		if (typeof text !== "string") return null;
+		lists[field] = text;
+	}
+	return lists;
+};
+
+/** Where a list field is written, resolved against the bake home. */
+const listPath = (field: ListField, project: string, home: string): string => {
+	switch (field) {
+		case "apt":
+			return aptListPath(project, home);
+		case "tools":
+			return toolsListPath(project, home);
+		case "toolsAll":
+			return toolsListPath("_all", home);
+		case "requirements":
+			return requirementsListPath(project, home);
+		case "requirementsAll":
+			return requirementsListPath("_all", home);
+	}
+};
+
+/** Parses one sent list with its own parser; the parser's message names the list. */
+const parseList = (field: ListField, text: string): void => {
+	switch (field) {
+		case "apt":
+			parseAptTxt(text);
+			return;
+		case "requirements":
+		case "requirementsAll":
+			parseRequirements(text);
+			return;
+		default:
+			parseToolsJson(text);
+	}
+};
 
 const TAIL = 4000;
 
@@ -265,6 +325,8 @@ export interface GuestOptions {
 	pushIntervalMs?: number;
 	/** Only for tests: replace the bake installs. */
 	ensure?: { packages?: Ensure; tools?: Ensure; python?: Ensure };
+	/** The home the bake writes the request lists into and provisions against; /root in the VM. */
+	home?: string;
 	/** Only for tests: how the agent process exits on POST /shutdown; process.exit(0) by default. */
 	exit?: () => void;
 }
@@ -520,11 +582,16 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 		);
 	};
 
-	/** Runs the bake installs, pushing each note line; the turn's exit code and stderr. */
+	/**
+	 * Writes the dispatch's trusted lists into the bake home, then runs the bake installs,
+	 * pushing each note line; the turn's exit code and stderr.
+	 */
 	const runBake = async (
 		project: string,
+		lists: ProvisionLists,
 		push: (text: string) => void,
 	): Promise<{ exitCode: number; stderrTail: string }> => {
+		const home = opts.home ?? "/root";
 		const steps: Ensure[] = [
 			opts.ensure?.packages ?? ensureProjectPackages,
 			opts.ensure?.tools ?? ensureProjectTools,
@@ -533,8 +600,25 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 		let exitCode = 0;
 		let stderrTail = "";
 		try {
+			// Every sent text parses before anything is written or installed: the first
+			// broken list ends the bake with the parser's message, naming its list.
+			for (const field of LIST_FIELDS) {
+				const text = lists[field];
+				if (text !== undefined) parseList(field, text);
+			}
+			// The dispatch is the only provisioning input: each sent text is written as-is
+			// over whatever the layer disk held, and the wrappers below re-read it. No
+			// lists means no writes, and the wrappers' missing-file guards then install
+			// nothing — there is no shared-home fallback anywhere on this path.
+			for (const field of LIST_FIELDS) {
+				const text = lists[field];
+				if (text === undefined) continue;
+				const file = listPath(field, project, home);
+				mkdirSync(dirname(file), { recursive: true });
+				writeFileSync(file, text);
+			}
 			for (const step of steps)
-				for (const line of await step(project, "/root")) push(`${line}\n`);
+				for (const line of await step(project, home)) push(`${line}\n`);
 		} catch (err) {
 			exitCode = 1;
 			stderrTail = tail(
@@ -544,10 +628,10 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 		return { exitCode, stderrTail };
 	};
 
-	const handleBake = (project: string): Response =>
+	const handleBake = (project: string, lists: ProvisionLists): Response =>
 		ndjson(
 			async (push) => {
-				const { exitCode, stderrTail } = await runBake(project, push);
+				const { exitCode, stderrTail } = await runBake(project, lists, push);
 				// vm-runner POSTs /shutdown after a clean sentinel, so PID 1 unmounts
 				// the layer and powers the VM off: the installs must be on the layer
 				// disk before it can read the line.
@@ -678,7 +762,15 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 		}
 		const project = bakeProject(body);
 		if (project === null) return new Response("bad request", { status: 400 });
-		return handleBake(project);
+		const rawLists =
+			typeof body === "object" && body !== null && "lists" in body
+				? body.lists
+				: undefined;
+		// A present lists must be an object of raw texts: any other shape is a 400
+		// before any write or install.
+		const lists = rawLists === undefined ? {} : parseLists(rawLists);
+		if (lists === null) return new Response("bad request", { status: 400 });
+		return handleBake(project, lists);
 	};
 
 	const handleRunRequest = async (request: Request): Promise<Response> => {
