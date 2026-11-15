@@ -42,11 +42,16 @@ next. Web push still worked because it rides the browser push service.
 - The board search matches `title` and `sessionTitle` only, and only the cards
   the client holds (the state window plus fetched pages). Prompt and summary
   text no longer ride the state, so searching them would mean shipping them.
-- Every other consumer keeps working: the check-ottr-board skill reads only
-  open cards' small fields (`stage`, `state`, `needsReason`, `asked`, `title`,
-  timestamps, `cancelledAt`) and `projects[].path` — none move. `/api/seen`
-  validation, web push, and the `/api/system` holds read store data or small
-  fields only.
+- Every other consumer keeps working: the check-ottr-board skill reads open
+  cards' small fields (`stage`, `state`, `needsReason`, `asked`, `title`,
+  timestamps, `cancelledAt`) and `projects[].path` — none move. Its
+  duplicate search (step 6) searched done history off the state; the state no
+  longer carries it, so the skill pages `GET /api/projects/<project>/done`
+  for that search, and its SKILL.md says so (updated in this change).
+  `scripts/e2e-steer.js` found the rules interview card by a prompt marker on
+  the state card; it now matches the card's `kind`, which stays on the state.
+  `/api/seen` validation, web push, and the `/api/system` holds read store
+  data or small fields only.
 
 ## Boundaries and error cases
 
@@ -57,9 +62,12 @@ next. Web push still worked because it rides the browser push service.
   their copy. A fetched card the user re-stars stays stale until the user
   refetches that page (star acts write through the store; the frame only
   covers the held window).
-- The server's pinned-keep mirrors the client's pinned predicate. The drift
-  guard is a test: over a seeded board, every card the client's
-  `donePage(..., DONE_PAGE)` would show is present in the state frame.
+- The server's pinned-keep mirrors the client's pinned rule. The drift guard
+  is a test: over a seeded board it computes the expected settled set with
+  the client's own `isUnread` (src/ui/queue.ts), the shared `answeredCard`
+  oracle for the answered fact, and the starred rule over the store rows and
+  the state frame's seen set and baseline, then asserts the frame matches it
+  exactly.
 - A drawer opened from a fetched page card works like one opened from the
   state window: the detail fetch fills the large fields.
 - No schema change: the store, its tables, and `listTasks` stay as they are.

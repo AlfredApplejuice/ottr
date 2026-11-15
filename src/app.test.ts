@@ -113,6 +113,7 @@ import {
 import type { QuotaLimit, QuotaState, TaskCard } from "./types.ts";
 import {
 	type AddProjectResponse,
+	answeredCard,
 	askAnswerLine,
 	DONE_PAGE,
 	doneReadKey,
@@ -123,6 +124,7 @@ import {
 	REVIEW_FOOTER,
 	type Task,
 } from "./types.ts";
+import { isUnread } from "./ui/queue.ts";
 import {
 	UPDATE_HOST_LEASE_MS,
 	type UpdateCycleView,
@@ -13678,6 +13680,101 @@ describe("slim state and done pages (OTTR-965)", () => {
 			projects: Array<{ name: string; doneTotal: number }>;
 		};
 		expect(b.projects.find((p) => p.name === "slim-total")?.doneTotal).toBe(3);
+	});
+
+	test("the Done window matches the client's pinned rule (drift guard)", async () => {
+		const { st, projects } = await slimBoard("slim-drift");
+		const m = await mount({ projects });
+		// Past the boot baseline, so the unread rule applies (the window test's seam).
+		const base = Date.now() + 10_000;
+		// The 24 newest stamps fill and overflow the cut; every pin sits behind it,
+		// so the guard fails when the server drops a pin and when it ships one too many.
+		const plain: string[] = [];
+		for (let i = 0; i < 24; i++)
+			plain.push(await seedDone(st, `drift plain ${i}`, base + i));
+		const answered = await seedAnswered(st, base - 1_010);
+		const readOne = await seedAnswered(st, base - 1_020);
+		const starred: string[] = [];
+		for (const at of [base - 1_030, base - 1_031])
+			starred.push(await seedDone(st, "drift starred", at, { starred: true }));
+		const starredGone = await seedDone(
+			st,
+			"drift starred, cancelled",
+			base - 1_040,
+			{ starred: true, cancelledAt: base - 1_040, state: "idle" },
+		);
+		const research = await seedDone(st, "drift research", base - 1_050, {
+			research: true,
+			steps: "yes",
+		});
+		const open = await st.createTask("drift open");
+		// Read one answered card with both keys, like the client's markRead posts.
+		expect(
+			(
+				await m.call("/api/seen", {
+					ids: [readOne, doneReadKey({ id: readOne, doneAt: base - 1_020 })],
+				})
+			).status,
+		).toBe(200);
+		const res = await m.call("/api/state");
+		expect(res.status).toBe(200);
+		const frame = JSON.parse(await res.text()) as {
+			tasks: Array<{
+				id: string;
+				stage: string;
+				cancelledAt: number | null;
+			}>;
+			seenAnswers: string[];
+			seenDoneSince: number;
+		};
+		const seen = new Set(frame.seenAnswers);
+		// The client's own rule over the store rows decides what the frame must
+		// carry: the window cut, isUnread, and the starred rule. answeredCard is
+		// the shared oracle for the answered fact, so the guard cannot read the
+		// server's stamp.
+		const rows = await st.listTasks();
+		const settled = rows
+			.filter((t) => t.stage === "done" || t.cancelledAt !== null)
+			.sort((a, c) => newestLanded(a, c));
+		const expected = new Set(settled.slice(0, DONE_PAGE).map((t) => t.id));
+		for (const t of settled) {
+			const answeredFact =
+				t.stage === "done" &&
+				t.kind !== "retro" &&
+				answeredCard(await st.listTurns(t.id));
+			if (
+				isUnread(
+					{
+						id: t.id,
+						answered: answeredFact,
+						cancelledAt: t.cancelledAt,
+						kind: t.kind,
+						stage: t.stage,
+						research: t.research,
+						steps: t.steps,
+						doneAt: t.doneAt,
+					},
+					seen,
+					frame.seenDoneSince,
+				) ||
+				(t.starred && t.cancelledAt === null)
+			)
+				expected.add(t.id);
+		}
+		const shipped = new Set(
+			frame.tasks
+				.filter((t) => t.stage === "done" || t.cancelledAt !== null)
+				.map((t) => t.id),
+		);
+		expect([...shipped].sort()).toEqual([...expected].sort());
+		// The rule's edges: the read answered card and the cancelled starred card
+		// drop; the unseen pins and the open card ride.
+		expect(shipped.has(readOne)).toBe(false);
+		expect(shipped.has(starredGone)).toBe(false);
+		for (const id of [answered, research, ...starred])
+			expect(shipped.has(id)).toBe(true);
+		// The open card rides the frame; it is not a settled card.
+		expect(frame.tasks.some((t) => t.id === open.id)).toBe(true);
 	});
 });
 

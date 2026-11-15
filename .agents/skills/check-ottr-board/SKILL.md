@@ -143,7 +143,7 @@ The id in the example is the card's handle on the board. `<task-id>` stands for 
 
 When the cause can also stop other cards (a board bug, a gap in a prompt or a rule, a tool that the worker image does not have, a gap in Alate), make sure that a card exists for it:
 
-1. Search the titles of all cards in `GET /api/state`, open and done. If a card exists, do not file a second one.
+1. Search the card titles before you file. The open cards are in `GET /api/state`. The state carries only each project's Done window: the newest 20 done and cancelled cards, plus the pinned ones (unread answers, starred cards). Page the done history with `GET /api/projects/<project>/done?page=N`; each page holds 20 cards, and `total` holds the project's full done and cancelled count. Stop at the first match. If a card exists, do not file a second one.
 2. File the card in the project that owns the cause: `ottr` for the board, `alate` for provisioning, `agent-data` for rules and skills, or the app repo for its own code.
 3. Write the card in STE: the goal, the facts with evidence (card ids, log lines, `file:line`), the change, what is out of scope, and an acceptance test that fails before the fix.
 4. Obey the hard stops of the project. For Ottr: no new npm dependency, no new wording in `src/prompts.ts`, and a migration for each schema change.

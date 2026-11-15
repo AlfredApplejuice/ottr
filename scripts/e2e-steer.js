@@ -4,7 +4,6 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { platform } from "../src/platform/index.ts";
-import { RULES_INTERVIEW_MARKER } from "../src/prompts.ts";
 
 const WT = resolve(import.meta.dir, "..");
 const SHIM_EXE = `omp${process.platform === "win32" ? ".exe" : ""}`;
@@ -138,9 +137,9 @@ try {
 	await $`git -C ${join(SCRATCH, "roots", "demo")} add -A`.quiet();
 	await $`git -C ${join(SCRATCH, "roots", "demo")} -c user.name=t -c user.email=t@t commit -m init`.quiet();
 	const state0 = await (await fetch(`${BASE}/api/state`)).json();
-	for (const it of state0.tasks.filter((x) =>
-		x.prompt?.startsWith(RULES_INTERVIEW_MARKER),
-	)) {
+	// The state cards carry no prompt text (OTTR-965): the interview card is the
+	// kind the server files it with (startInterview), not a prompt marker.
+	for (const it of state0.tasks.filter((x) => x.kind === "interview")) {
 		r = await post(`/api/projects/demo/tasks/${it.id}/cancel`, {
 			force: true,
 		});
