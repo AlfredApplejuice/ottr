@@ -1,11 +1,15 @@
 /**
- * sandbox_run's client (docs/specs/microvm-validation-mode.md, "Board tool:
- * sandbox_run"): packs the target checkout with git archive, writes the tar
- * under the run dir, and POSTs the runner's /validate. The endpoint caps the
- * job and the VM at VM_VALIDATE.timeoutSec + lifetimeSlackSec and answers
- * after both, so this client sets no timeout of its own. Callers:
- * extension/tracker.ts (the sandbox_run tool) and src/vmValidateSmoke.ts (the
- * host smoke). Everything effectful is injected, so tests run without git,
+ * sandbox_run's board client and server-side runner client
+ * (docs/specs/microvm-validation-mode.md, "Board endpoint and tool"). The
+ * tool (extension/tracker.ts) POSTs its args to the board's sandbox endpoint
+ * with the run's own credential (runSandboxViaBoard); the board's server
+ * packs the target checkout with git archive, writes the tar under the run
+ * dir, and POSTs the runner's /validate with its own token (runSandboxJob).
+ * The endpoint caps the job and the VM at VM_VALIDATE.timeoutSec +
+ * lifetimeSlackSec and answers after both, so neither client sets a timeout
+ * of its own. Callers: extension/tracker.ts (the tool), src/app.ts (the
+ * endpoint), src/vmValidateSmoke.ts and src/vmValidateBoardSmoke.ts (the
+ * host smokes). Everything effectful is injected, so tests run without git,
  * network or /data.
  */
 import { randomBytes } from "node:crypto";
@@ -244,4 +248,141 @@ export async function runSandboxJob(
 		};
 	}
 	return { ok: true, result };
+}
+
+/** The board coordinates the tracker injects into every task session; the
+ * sandbox_run tool reads them per call, like propose_task. */
+export interface SandboxBoardEnv {
+	/** OTTR_BOARD_URL, without a trailing slash. */
+	base: string;
+	/** OTTR_PROJECT: the calling run's own project, the route's scope. */
+	project: string;
+	/** OTTR_TASK_ID: the calling run's card; the endpoint checks its kind. */
+	taskId: string;
+	/** OTTR_BOARD_TOKEN; "" on loopback, where the wall needs no token. */
+	token: string;
+}
+
+/** The JSON body the tool POSTs to the board's sandbox endpoint. */
+export interface SandboxRunBody {
+	taskId: string;
+	project: string;
+	ref?: string;
+	argv: string[];
+	cwd?: string;
+	collect?: string[];
+}
+
+/**
+ * The arg rules the tool client and the board endpoint share: an agent sees
+ * the rule before a round trip, and the server re-checks the untrusted body
+ * at its boundary. Returns the error text, or null when the body is valid.
+ */
+export function sandboxRequestError(body: unknown): string | null {
+	if (typeof body !== "object" || body === null)
+		return "the sandbox request must be a JSON object";
+	const b = body as Record<string, unknown>;
+	if (typeof b.taskId !== "string" || b.taskId.trim() === "")
+		return "taskId must be this run's task id (OTTR_TASK_ID)";
+	if (typeof b.project !== "string" || !PROJECT_NAME.test(b.project))
+		return "project must be a project name (letters, digits, dot, dash, underscore)";
+	if (
+		!Array.isArray(b.argv) ||
+		b.argv.length === 0 ||
+		!b.argv.every((x) => typeof x === "string")
+	)
+		return "argv must be a non-empty list of strings";
+	if (b.ref !== undefined && (typeof b.ref !== "string" || b.ref.trim() === ""))
+		return "ref must be a non-empty string when given";
+	if (b.cwd !== undefined) {
+		if (typeof b.cwd !== "string" || cwdError(b.cwd) !== null)
+			return `cwd must be an absolute, normalized path at or under ${TARGET_ROOT}`;
+	}
+	if (b.collect !== undefined) {
+		if (
+			!Array.isArray(b.collect) ||
+			b.collect.some((x) => typeof x !== "string")
+		)
+			return "collect must be a list of scratch-relative paths";
+		const collectErrorText = collectError(b.collect as string[]);
+		if (collectErrorText !== null) return collectErrorText;
+	}
+	return null;
+}
+
+export type SandboxBoardResult =
+	| { ok: true; result: ValidateResponse }
+	| { ok: false; error: string };
+
+/**
+ * The board leg of sandbox_run: POST the args to the board's sandbox endpoint
+ * with this run's own credential. The server checks the run kind, packs and
+ * calls the runner with its own token; this client holds none. No client-side
+ * timeout: one validation runs up to the mode's job cap plus boot slack, and
+ * the endpoint lifts the idle cut for its request.
+ */
+export async function runSandboxViaBoard(
+	board: SandboxBoardEnv,
+	req: Omit<SandboxRunBody, "taskId">,
+	fetchImpl: typeof fetch = fetch,
+): Promise<SandboxBoardResult> {
+	const body: SandboxRunBody = { taskId: board.taskId, ...req };
+	const invalid = sandboxRequestError(body);
+	if (invalid !== null) return { ok: false, error: invalid };
+	let res: Response;
+	try {
+		res = await fetchImpl(
+			`${board.base}/api/projects/${encodeURIComponent(board.project)}/sandbox`,
+			{
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					origin: board.base,
+					...(board.token !== "" ? { "x-board-token": board.token } : {}),
+				},
+				body: JSON.stringify(body),
+			},
+		);
+	} catch (err) {
+		const why = err instanceof Error ? err.message : String(err);
+		return {
+			ok: false,
+			error: `the board at ${board.base} is unreachable (${why})`,
+		};
+	}
+	const text = await res.text();
+	if (res.status !== 200) {
+		const named = jsonError(text);
+		return {
+			ok: false,
+			error: named ?? `${res.status}: ${text.slice(0, 500)}`,
+		};
+	}
+	let parsed: { ok?: unknown; result?: unknown };
+	try {
+		parsed = JSON.parse(text) as { ok?: unknown; result?: unknown };
+	} catch (err) {
+		const why = err instanceof Error ? err.message : String(err);
+		return {
+			ok: false,
+			error: `the board answered 200 with invalid JSON (${why})`,
+		};
+	}
+	if (
+		parsed.ok !== true ||
+		typeof parsed.result !== "object" ||
+		parsed.result === null
+	)
+		return { ok: false, error: "the board answered 200 without a result" };
+	return { ok: true, result: parsed.result as ValidateResponse };
+}
+
+/** The board's `{"error": "..."}` text, or null when the body names no error. */
+function jsonError(text: string): string | null {
+	try {
+		const out = JSON.parse(text) as { error?: unknown };
+		return typeof out.error === "string" && out.error !== "" ? out.error : null;
+	} catch {
+		return null;
+	}
 }

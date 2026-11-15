@@ -134,6 +134,7 @@ import {
 import { loadSkips } from "./updates.ts";
 import { vmState } from "./vmState.ts";
 import { VmTokens } from "./vmTokens.ts";
+import { type ValidateResponse, VM_VALIDATE } from "./vmValidateShared.ts";
 import { PUSH_SUBJECT, saveSubs } from "./webpush.ts";
 import {
 	archReviewDelta,
@@ -9549,6 +9550,447 @@ describe("turns' own host", () => {
 		expect((await file(vm)).status).toBe(401);
 		vmTokens.revoke(other);
 	});
+});
+
+describe("sandbox endpoint", () => {
+	// asTurn again: the describe above mocks server.requestIP for its own tests and
+	// restores it, so these run with real loopback addressing.
+	const asTurn = (token: string | null, origin = "http://ottr:4852") => ({
+		Host: "ottr:4852",
+		Origin: origin,
+		...(token === null ? {} : { "x-board-token": token }),
+	});
+
+	// The runner's happy answer, copied from src/sandboxRun.test.ts guestResponse.
+	const guestResponse = (): ValidateResponse => ({
+		id: "val-1763000000-cafebabe",
+		selfCheck: {
+			ok: true,
+			checks: [{ name: "interfaces", ok: true, detail: "lo only" }],
+		},
+		missingControl: null,
+		job: {
+			argv: ["bun", "test", "src/parse.ts"],
+			cwd: "/target",
+			exitCode: 0,
+			signal: null,
+			timedOut: false,
+			stdoutTail: "1 pass",
+			stderrTail: "",
+		},
+		artifacts: [],
+		limits: { ...VM_VALIDATE },
+		bootMs: 812,
+		totalMs: 9400,
+		logTail: "",
+		resultSource: "guest",
+	});
+
+	/** Saves the runner env, sets the server-side values (`withRunnerUrl` false leaves
+	 * OTTR_VM_RUNNER_URL unset, the misconfigured-host case), and returns the data dir:
+	 * a fresh tmpdir, never /data, because runSandboxJob writes the packed tar there.
+	 * restore() undoes the env and removes the dir, so leaked values cannot break the
+	 * thousands of tests after this describe. */
+	const withRunnerEnv = (withRunnerUrl: boolean) => {
+		const saved = {
+			vmUrl: process.env.OTTR_VM_RUNNER_URL,
+			token: process.env.OTTR_WORKER_TOKEN,
+			dataDir: process.env.OTTR_DATA_DIR,
+		};
+		if (withRunnerUrl) process.env.OTTR_VM_RUNNER_URL = "http://vm-runner:8080";
+		else delete process.env.OTTR_VM_RUNNER_URL;
+		process.env.OTTR_WORKER_TOKEN = "worker-token";
+		const dataDir = mkdtempSync(join(tmpdir(), "ottr-sbx-endpoint-"));
+		process.env.OTTR_DATA_DIR = dataDir;
+		const restore = () => {
+			if (saved.vmUrl === undefined) delete process.env.OTTR_VM_RUNNER_URL;
+			else process.env.OTTR_VM_RUNNER_URL = saved.vmUrl;
+			if (saved.token === undefined) delete process.env.OTTR_WORKER_TOKEN;
+			else process.env.OTTR_WORKER_TOKEN = saved.token;
+			if (saved.dataDir === undefined) delete process.env.OTTR_DATA_DIR;
+			else process.env.OTTR_DATA_DIR = saved.dataDir;
+			rmSync(dataDir, { recursive: true, force: true });
+		};
+		return { dataDir, restore };
+	};
+
+	/** Stubs the runner leg: a POST whose path ends in /validate answers the guest
+	 * result, every other call passes through to the saved real fetch — the app runs
+	 * in-process, so this stub is exactly how a test fakes the runner. */
+	const stubRunner = () => {
+		const realFetch = globalThis.fetch;
+		const runnerCalls: Array<{ url: string; init: RequestInit }> = [];
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = new URL(String(input));
+			if (
+				url.pathname.endsWith("/validate") &&
+				(init?.method ?? "GET") === "POST"
+			) {
+				runnerCalls.push({ url: url.href, init: init ?? {} });
+				return new Response(JSON.stringify(guestResponse()), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return realFetch(input, init);
+		}) as typeof fetch;
+		const restore = () => {
+			globalThis.fetch = realFetch;
+		};
+		return { runnerCalls, restore };
+	};
+
+	// git archive -- HEAD needs a commit: seed the registered checkout and remove the
+	// repo in the test's finally (the checkout dir is shared with other describes).
+	const seedCommit = () => {
+		execSync("git init -q -b main", { cwd: projectDir, stdio: "ignore" });
+		execSync("git config user.email t@t && git config user.name t", {
+			cwd: projectDir,
+			stdio: "ignore",
+		});
+		writeFileSync(join(projectDir, "seed.txt"), "s");
+		execSync("git add seed.txt && git commit -qm seed", {
+			cwd: projectDir,
+			stdio: "ignore",
+		});
+	};
+	const dropGit = () =>
+		rmSync(join(projectDir, ".git"), { recursive: true, force: true });
+
+	test("a review run's token packs the checkout and relays the runner's result", async () => {
+		const card = await store.createTask("review run", null, "review");
+		const { dataDir, restore } = withRunnerEnv(true);
+		const { runnerCalls, restore: restoreFetch } = stubRunner();
+		seedCommit();
+		try {
+			const res = await post(
+				"/api/projects/p1/sandbox",
+				{
+					taskId: card.id,
+					project: "p1",
+					argv: ["bun", "test", "src/parse.ts"],
+				},
+				asTurn(BOARD_TOKEN),
+			);
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as {
+				ok?: unknown;
+				result?: ValidateResponse;
+			};
+			expect(b.ok).toBe(true);
+			expect(b.result?.resultSource).toBe("guest");
+			// The server called the runner with its own token, and the tar landed
+			// under the data dir the server env names, never under /data.
+			expect(runnerCalls.length).toBe(1);
+			const call = runnerCalls[0]!;
+			expect(new URL(call.url).pathname).toBe("/validate");
+			expect(call.init.headers).toEqual({
+				"x-otwr-token": "worker-token",
+				"content-type": "application/json",
+			});
+			const body = JSON.parse(String(call.init.body)) as {
+				project: string;
+				targetTar: string;
+			};
+			expect(body.project).toBe("p1");
+			expect(
+				body.targetTar.startsWith(join(dataDir, "p1", "validate-jobs")),
+			).toBe(true);
+		} finally {
+			await store.updateTask(card.id, { cancelledAt: Date.now() });
+			restoreFetch();
+			restore();
+			dropGit();
+		}
+	});
+
+	test("the target project's checkout is packed when it differs from the run's own", async () => {
+		const card = await store.createTask("review run", null, "review");
+		const { dataDir, restore } = withRunnerEnv(true);
+		const { runnerCalls, restore: restoreFetch } = stubRunner();
+		// The cross-project followUpOf describe replaces and deletes the module's
+		// p2 entry, so this test registers its own and restores whatever was there.
+		const prevP2 = projects.get("p2");
+		projects.set("p2", {
+			path: projectDir2,
+			name: "p2",
+			store: store2,
+			target: null,
+			gitless: false,
+			github: null,
+			protectedTarget: false,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		});
+		// Seed p2's own checkout: the tar bytes and the runner request must both
+		// name p2, never the calling run's p1.
+		execSync("git init -q -b main", { cwd: projectDir2, stdio: "ignore" });
+		execSync("git config user.email t@t && git config user.name t", {
+			cwd: projectDir2,
+			stdio: "ignore",
+		});
+		writeFileSync(join(projectDir2, "seed2.txt"), "s2");
+		execSync("git add seed2.txt && git commit -qm seed2", {
+			cwd: projectDir2,
+			stdio: "ignore",
+		});
+		const dropGit2 = () =>
+			rmSync(join(projectDir2, ".git"), { recursive: true, force: true });
+		try {
+			const res = await post(
+				"/api/projects/p1/sandbox",
+				{ taskId: card.id, project: "p2", argv: ["sh", "-c", "true"] },
+				asTurn(BOARD_TOKEN),
+			);
+			expect(res.status).toBe(200);
+			expect(runnerCalls.length).toBe(1);
+			const body = JSON.parse(String(runnerCalls[0]!.init.body)) as {
+				project: string;
+				targetTar: string;
+			};
+			expect(body.project).toBe("p2");
+			expect(
+				body.targetTar.startsWith(join(dataDir, "p2", "validate-jobs")),
+			).toBe(true);
+		} finally {
+			if (prevP2) projects.set("p2", prevP2);
+			else projects.delete("p2");
+			await store.updateTask(card.id, { cancelledAt: Date.now() });
+			restoreFetch();
+			restore();
+			dropGit2();
+		}
+	});
+
+	test("an unknown target project is refused before any packing", async () => {
+		const card = await store.createTask("review run", null, "review");
+		const { runnerCalls, restore: restoreFetch } = stubRunner();
+		try {
+			const res = await post(
+				"/api/projects/p1/sandbox",
+				{ taskId: card.id, project: "p1-nope", argv: ["sh", "-c", "true"] },
+				asTurn(BOARD_TOKEN),
+			);
+			expect(res.status).toBe(400);
+			expect(await errorOf(res)).toBe(
+				"unknown project p1-nope; sandbox_run packs a registered project's checkout",
+			);
+			expect(runnerCalls.length).toBe(0);
+		} finally {
+			await store.updateTask(card.id, { cancelledAt: Date.now() });
+			restoreFetch();
+		}
+	});
+
+	test("a work run's token is refused by kind before any packing", async () => {
+		const work = await store.createTask("plain work");
+		const { runnerCalls, restore: restoreFetch } = stubRunner();
+		try {
+			const res = await post(
+				"/api/projects/p1/sandbox",
+				{ taskId: work.id, project: "p1", argv: ["sh", "-c", "true"] },
+				asTurn(BOARD_TOKEN),
+			);
+			expect(res.status).toBe(403);
+			expect(await errorOf(res)).toBe(
+				"sandbox_run runs only in review or trending scout runs",
+			);
+			expect(runnerCalls.length).toBe(0);
+		} finally {
+			await store.updateTask(work.id, { cancelledAt: Date.now() });
+			restoreFetch();
+		}
+	});
+
+	test("an unknown card and a missing taskId get the run-kind refusals", async () => {
+		const missing = await post(
+			"/api/projects/p1/sandbox",
+			{ taskId: "P1-999", project: "p1", argv: ["sh", "-c", "true"] },
+			asTurn(BOARD_TOKEN),
+		);
+		expect(missing.status).toBe(403);
+		expect(await errorOf(missing)).toBe(
+			"unknown task P1-999; sandbox_run needs this run's review or scout card",
+		);
+		const noTask = await post(
+			"/api/projects/p1/sandbox",
+			{ project: "p1", argv: ["sh", "-c", "true"] },
+			asTurn(BOARD_TOKEN),
+		);
+		expect(noTask.status).toBe(400);
+		expect(await errorOf(noTask)).toBe(
+			"taskId must be this run's task id (OTTR_TASK_ID)",
+		);
+	});
+
+	test("the agent-host wall holds: boot token only, POST only", async () => {
+		const send = (headers: Record<string, string>) =>
+			post("/api/projects/p1/sandbox", {}, headers);
+		expect((await send(asTurn(null))).status).toBe(401);
+		expect((await send(asTurn("guess"))).status).toBe(401);
+		// With the token the route exists behind the wall: the body check answers,
+		// not the wall's 401 or 403.
+		const empty = await send(asTurn(BOARD_TOKEN));
+		expect(empty.status).toBe(400);
+		expect(await errorOf(empty)).toBe(
+			"taskId must be this run's task id (OTTR_TASK_ID)",
+		);
+		// No GET handler is registered, so a read never reaches the wall at all: the
+		// request falls through to the not-found fallback, whatever token it carries.
+		const read = await fetch(new URL("/api/projects/p1/sandbox", server.url), {
+			headers: asTurn(BOARD_TOKEN),
+		});
+		expect(read.status).toBe(404);
+		expect(await errorOf(read)).toBe("not found");
+	});
+
+	test("invalid args are refused before any runner call", async () => {
+		const card = await store.createTask("review run", null, "review");
+		const { runnerCalls, restore: restoreFetch } = stubRunner();
+		try {
+			const noArgv = await post(
+				"/api/projects/p1/sandbox",
+				{ taskId: card.id, project: "p1", argv: [] },
+				asTurn(BOARD_TOKEN),
+			);
+			expect(noArgv.status).toBe(400);
+			const escapeAttempt = await post(
+				"/api/projects/p1/sandbox",
+				{ taskId: card.id, project: "../evil", argv: ["sh"] },
+				asTurn(BOARD_TOKEN),
+			);
+			expect(escapeAttempt.status).toBe(400);
+			expect(runnerCalls.length).toBe(0);
+		} finally {
+			await store.updateTask(card.id, { cancelledAt: Date.now() });
+			restoreFetch();
+		}
+	});
+
+	test("a missing runner URL relays the server-side naming error as 502", async () => {
+		const card = await store.createTask("review run", null, "review");
+		const { restore } = withRunnerEnv(false);
+		try {
+			const res = await post(
+				"/api/projects/p1/sandbox",
+				{ taskId: card.id, project: "p1", argv: ["sh", "-c", "true"] },
+				asTurn(BOARD_TOKEN),
+			);
+			expect(res.status).toBe(502);
+			expect(await errorOf(res)).toContain("OTTR_VM_RUNNER_URL");
+		} finally {
+			await store.updateTask(card.id, { cancelledAt: Date.now() });
+			restore();
+		}
+	});
+
+	// Spec item 4: the tool as an agent process. childEnv strips the worker token,
+	// the runner URL and the data dir from every agent process, so the only path left
+	// is the board: the child registers the extension against a stub of omp's API and
+	// calls sandbox_run exactly as a review run's audit would. The dedicated mount
+	// serves on a real port, so the child's Host and Origin match the allowlist and
+	// loopback reaches the endpoint with no token, as the board's own container does.
+	test("the stripped-env agent process runs the tool through the board", async () => {
+		const m = await mount({ projects, realPort: true });
+		const card = await store.createTask("review run", null, "review");
+		const { restore } = withRunnerEnv(true);
+		const { restore: restoreFetch } = stubRunner();
+		seedCommit();
+		const fixtureDir = mkdtempSync(join(tmpdir(), "ottr-sbx-fixture-"));
+		const fixturePath = join(fixtureDir, "run-tool.js");
+		// fakePi copied from extension/tracker.test.ts: the same zod wiring, so the
+		// extension registers, and the same execute surface.
+		writeFileSync(
+			fixturePath,
+			[
+				"const tools = {};",
+				"const chain = () => {",
+				"\tconst s = {};",
+				"\ts.optional = () => s;",
+				"\ts.describe = (text) => { s.description = text; return s; };",
+				"\treturn s;",
+				"};",
+				"const pi = {",
+				"\tzod: {",
+				"\t\tobject: (shape) => shape,",
+				"\t\tenum: (values) => Object.assign(chain(), { values }),",
+				"\t\tstring: () => chain(),",
+				"\t\tnumber: () => chain(),",
+				"\t\tboolean: () => chain(),",
+				"\t\tarray: (element) => Object.assign(chain(), { element }),",
+				"\t},",
+				"\tregisterTool: (def) => { tools[def.name] = def; },",
+				"\ton: () => {},",
+				"\tgetSessionName: async () => undefined,",
+				"\tsetSessionName: async () => {},",
+				"};",
+				"const mod = await import(process.argv[2]);",
+				"mod.default(pi);",
+				"const out = await tools.sandbox_run.execute('t1', {",
+				"\tproject: 'p1',",
+				"\targv: ['sh', '-c', 'true'],",
+				"});",
+				"console.log(JSON.stringify({ text: out.content[0].text }));",
+			].join("\n"),
+		);
+		// The stripped env, exactly what src/runner.ts childEnv produces: the worker
+		// token, the runner URL and the data dir are gone; the board coordinates stay.
+		const childEnv: Record<string, string> = {};
+		for (const [k, v] of Object.entries(process.env)) {
+			if (
+				typeof v !== "string" ||
+				k === "OTTR_WORKER_TOKEN" ||
+				k === "OTTR_VM_RUNNER_URL" ||
+				k === "OTTR_DATA_DIR"
+			)
+				continue;
+			childEnv[k] = v;
+		}
+		// Bun's server.url carries a trailing slash; OTTR_BOARD_URL does not.
+		childEnv.OTTR_BOARD_URL = m.server.url.href.replace(/\/+$/, "");
+		childEnv.OTTR_PROJECT = "p1";
+		childEnv.OTTR_TASK_ID = card.id;
+		childEnv.OTTR_BOARD_TOKEN = BOARD_TOKEN;
+		childEnv.OTTR_REVIEW = "1"; // sandbox_run registers in review runs only
+		try {
+			const proc = Bun.spawn(
+				[
+					"bun",
+					fixturePath,
+					join(import.meta.dir, "..", "extension", "tracker.ts"),
+				],
+				{ env: childEnv, stdout: "pipe", stderr: "pipe" },
+			);
+			const [stdout, stderr, code] = await Promise.all([
+				new Response(proc.stdout).text(),
+				new Response(proc.stderr).text(),
+				proc.exited,
+			]);
+			// Surface the child's own output first: a broken fixture or a refused
+			// request must name its cause, not fail as an empty-stdout parse error.
+			if (code !== 0) console.error(`fixture stderr: ${stderr}`);
+			expect(code).toBe(0);
+			// The old direct path failed here with the stripped token's error; the
+			// board path returns the runner's result JSON as the tool text.
+			const parsed = JSON.parse(stdout) as { text?: string };
+			expect(parsed.text).toContain('"resultSource": "guest"');
+			expect(parsed.text).not.toContain("OTTR_WORKER_TOKEN is not set");
+		} finally {
+			await store.updateTask(card.id, { cancelledAt: Date.now() });
+			rmSync(fixtureDir, { recursive: true, force: true });
+			restoreFetch();
+			restore();
+			dropGit();
+		}
+	}, 30_000);
 });
 
 describe("readJson bounds untrusted bodies (R1-2)", () => {

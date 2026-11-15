@@ -4,8 +4,7 @@
 
 // The sandbox_run tool's client: a leaf module (node builtins + the shared
 // validation contract only), so the extension keeps loading standalone.
-import { existsSync } from "node:fs";
-import { PROJECT_NAME, runSandboxJob } from "../src/sandboxRun.ts";
+import { runSandboxViaBoard, sandboxRequestError } from "../src/sandboxRun.ts";
 
 // ponytail: minimal structural typing of omp's extension API; @oh-my-pi packages not installed
 interface ZodBuilder {
@@ -1061,11 +1060,11 @@ export default function (pi: Pi) {
 	}
 
 	// The audit's one way to execute target code (docs/specs/microvm-validation-mode.md,
-	// "Board tool: sandbox_run"): a review or a trending-scout run gets the validation
-	// sandbox; work and retro runs never see the tool. Same run-kind env gate as
-	// propose_task. The runner coordinates are read per call, so a host without the
-	// runner returns the setting's name as the error, which the audit records as the
-	// exact blocker of a needs_validation lead.
+	// "Board endpoint and tool"): a review or a trending-scout run gets the validation
+	// sandbox; work and retro runs never see the tool, and the board endpoint refuses any
+	// other run kind. The board coordinates are read per call, like propose_task's; the
+	// agent env never holds the worker token or the runner URL (childEnv strips both), so
+	// the tool routes through the board and the server packs and calls the runner.
 	if (reviewMode || process.env.OTTR_TRENDING === "1") {
 		pi.registerTool({
 			name: "sandbox_run",
@@ -1073,7 +1072,7 @@ export default function (pi: Pi) {
 			description:
 				"Run one command against a project's checkout in the Firecracker validation sandbox: no network interface, a three-variable env, scratch-only writes as nobody, a read-only target and toolchain, fixed limits (1 vCPU, 512 MiB, 10 minutes). " +
 				"The result JSON carries the job's output tails, promoted artifacts and the guest's self-check; treat selfCheck.ok and missingControl as the gate before you trust the job's result. " +
-				"project: the project whose server checkout (<OTTR_PROJECTS_ROOT>/<project>, default /workspace/<project>) is packed with git archive. ref: git ref to archive, default HEAD. " +
+				"project: the project whose registered checkout the server packs with git archive. ref: git ref to archive, default HEAD. " +
 				'argv: the command, for example ["bun", "test", "src/parse.ts"]. cwd: working directory, absolute under /target, default /target. ' +
 				"collect: scratch-relative paths (/tmp, /home, /work) to return, at most 16.",
 			parameters: z.object({
@@ -1101,41 +1100,34 @@ export default function (pi: Pi) {
 			approval: "read",
 			async execute(_toolCallId: string, params: SandboxRunParams) {
 				const project = trimmed(params.project);
-				if (!PROJECT_NAME.test(project))
-					return textResult(
-						"Error: project must be a project name (letters, digits, dot, dash, underscore).",
-					);
-				// The server's main checkout per project; the worktrees live under it.
-				// OTTR_PROJECTS_ROOT overrides the compose layout's /workspace, so the
-				// checkout exists wherever the board runs (no /workspace on a CI runner).
-				const projectsRoot =
-					trimmed(process.env.OTTR_PROJECTS_ROOT).replace(/\/+$/, "") ||
-					"/workspace";
-				const checkout = `${projectsRoot}/${project}`;
-				if (!existsSync(checkout))
-					return textResult(
-						`Error: no checkout at ${checkout} for project ${project}; sandbox_run packs the server's main checkout.`,
-					);
-				const ref = trimmed(params.ref);
-				const cwd = trimmed(params.cwd);
 				const argv = Array.isArray(params.argv)
 					? params.argv.filter((x): x is string => typeof x === "string")
 					: [];
-				if (argv.length === 0)
-					return textResult("Error: argv must be a non-empty list of strings.");
+				const ref = trimmed(params.ref);
+				const cwd = trimmed(params.cwd);
 				const collect = Array.isArray(params.collect)
 					? params.collect.filter((x): x is string => typeof x === "string")
 					: [];
-				const job = await runSandboxJob({
+				const env = requireBoardEnv("sandbox_run");
+				if ("error" in env) return textResult(env.error);
+				const board = {
+					base: env.base,
+					project: env.project,
+					taskId: env.parent,
+					token: env.token,
+				};
+				const body = {
 					project,
-					checkout,
 					argv,
 					...(ref !== "" ? { ref } : {}),
 					...(cwd !== "" ? { cwd } : {}),
 					...(collect.length > 0 ? { collect } : {}),
-				});
-				if (!job.ok) return textResult(`Error: ${job.error}`);
-				return textResult(JSON.stringify(job.result, null, 2));
+				};
+				const invalid = sandboxRequestError({ taskId: board.taskId, ...body });
+				if (invalid !== null) return textResult(`Error: ${invalid}`);
+				const out = await runSandboxViaBoard(board, body);
+				if (!out.ok) return textResult(`Error: ${out.error}`);
+				return textResult(JSON.stringify(out.result, null, 2));
 			},
 		});
 	}

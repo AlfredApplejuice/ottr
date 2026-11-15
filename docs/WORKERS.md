@@ -1062,13 +1062,17 @@ answer says so instead of a guess.
 
 `POST /validate` on the runner (the same `OTTR_WORKER_TOKEN`, the same health
 gate and slot pool as `/run`) takes the job and answers the result JSON. The
-board tool `sandbox_run` (review and scout runs) is the audit-facing way to call
-it: it packs the target with `git archive` from the project checkout on the
-server (`<OTTR_PROJECTS_ROOT>/<project>`, default `/workspace/<project>`),
-stages it under the board's data dir (`OTTR_DATA_DIR`, default `/data`), sends
-it to the runner, and returns the result. The runner also stores
-each result under `/data/<project>/validate-jobs/<id>/result.json`. Validations
-share the `OTTR_VM_MAX` slot pool with work turns, and a validation call is
+board tool `sandbox_run` (review and scout runs) is the audit-facing way to
+call it: it sends its args and the run's own card id to the board endpoint
+`POST /api/projects/<project>/sandbox` with the run's boot token, the server
+checks the run kind (review or trending scout only), packs the target with
+`git archive` from the project's registered checkout, stages the tar under the
+board's data dir (`OTTR_DATA_DIR`, default `/data`), and calls the runner with
+the server's own `OTTR_WORKER_TOKEN`. The agent process never holds the worker
+token or the runner URL; the result JSON returns as the tool result. The
+runner also stores each result under
+`/data/<project>/validate-jobs/<id>/result.json`. Validations share the
+`OTTR_VM_MAX` slot pool with work turns, and a validation call is
 synchronous: a board restart cancels it, and the caller re-runs it.
 
 To prove the controls on a KVM host, run the smoke job from the server container
@@ -1076,6 +1080,11 @@ To prove the controls on a KVM host, run the smoke job from the server container
 compose network; the image must carry this card's code):
 
     docker compose exec server bun /app/src/vmValidateSmoke.ts
+
+The same container proves the board path the tool takes (endpoint, run-kind
+check, server-side pack, runner call):
+
+    docker compose exec server bun /app/src/vmValidateBoardSmoke.ts
 
 The acceptance run works the same way from a host shell, against the vm-runner
 image built from the branch under test: the job is `scripts/vm-validate-smoke.ts`,

@@ -1,13 +1,14 @@
-import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import {
 	PROPOSE_TOOL_DESCRIPTION,
 	REVIEW_PROPOSE_TOOL_DESCRIPTION,
 } from "../src/prompts.ts";
 import { applyEvent, newEventState } from "../src/runner.ts";
 import { ProjectStore } from "../src/store.ts";
+import { VM_VALIDATE } from "../src/vmValidateShared.ts";
 import createTracker, { hasAcceptanceSection } from "./tracker.ts";
 
 // Hermeticity: every named omp session exports OTTR_SESSION_NAME into its child shells, and an
@@ -113,9 +114,6 @@ const envKeys = [
 	"OTTR_TRENDING",
 	"OTTR_MODELS",
 	"OTTR_VM_RUNNER_URL",
-	"OTTR_WORKER_TOKEN",
-	"OTTR_PROJECTS_ROOT",
-	"OTTR_DATA_DIR",
 ] as const;
 function setEnv(v: Partial<Record<(typeof envKeys)[number], string>>) {
 	for (const k of envKeys) if (v[k] !== undefined) process.env[k] = v[k];
@@ -1552,55 +1550,44 @@ describe("board tools called through the eval kernel", () => {
 	});
 });
 
-// A tiny real git checkout under the caller's projects root, so sandbox_run's execute
-// passes its existsSync check wherever the test runs — the tool derives the checkout
-// from env OTTR_PROJECTS_ROOT (default /workspace), which no CI runner has.
-function probeCheckout(projectsRoot: string, name: string): string {
-	const checkout = join(projectsRoot, name);
-	rmSync(checkout, { recursive: true, force: true });
-	mkdirSync(checkout, { recursive: true });
-	writeFileSync(join(checkout, "probe.txt"), "hi\n");
-	const sh = (...args: string[]) => {
-		const r = Bun.spawnSync(["git", ...args], {
-			cwd: checkout,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		if (r.exitCode !== 0)
-			throw new Error(`git ${args.join(" ")} failed: ${r.stderr.toString()}`);
-	};
-	sh("init", "-q", ".");
-	sh("config", "user.email", "probe@example.com");
-	sh("config", "user.name", "probe");
-	sh("add", "-A");
-	sh("commit", "-q", "-m", "probe", "--no-gpg-sign");
-	return checkout;
-}
-
-// The run dir's parent (<dataRoot>/<project>), so a test leaves no /data junk.
-function removeRunDir(targetTar: string): void {
-	rmSync(dirname(dirname(targetTar)), { recursive: true, force: true });
-}
-
 describe("sandbox_run tool", () => {
-	const runnerUrl = "http://vm-runner:8080";
-	const runnerEnv = {
-		OTTR_VM_RUNNER_URL: runnerUrl,
-		OTTR_WORKER_TOKEN: "worker-token",
+	// The board coordinates the runner injects into a review or scout session;
+	// the tool reads them per call and POSTs to the board, whose server holds
+	// the worker token (src/sandboxRun.ts runSandboxViaBoard).
+	const boardEnv = {
+		OTTR_BOARD_URL: "http://ottr:8080",
+		OTTR_PROJECT: "p1",
+		OTTR_TASK_ID: "P1-42",
+		OTTR_BOARD_TOKEN: "boot-token",
 	};
-	// The checkout root the tool reads from env: the tests’ own temp dir, so the
-	// describe passes on machines without a /workspace (the GitHub runner).
-	const projectsRoot = mkdtempSync(join(tmpdir(), "ottr-sbx-projects-"));
-	afterAll(() =>
-		rmSync(projectsRoot, { recursive: true, force: true, maxRetries: 5 }),
-	);
-	// The tar the tool writes must land under the test's own data root, never the
-	// shared /data: the CI runner has no /data and the write would EACCES there.
-	const dataRoot = mkdtempSync(join(tmpdir(), "ottr-sbx-data-"));
+	// The runner's answer fixture, copied from src/sandboxRun.test.ts.
+	const guestResponse = {
+		id: "val-1763000000-cafebabe",
+		selfCheck: {
+			ok: true,
+			checks: [{ name: "interfaces", ok: true, detail: "lo only" }],
+		},
+		missingControl: null,
+		job: {
+			argv: ["bun", "test", "src/parse.ts"],
+			cwd: "/target",
+			exitCode: 0,
+			signal: null,
+			timedOut: false,
+			stdoutTail: "1 pass",
+			stderrTail: "",
+		},
+		artifacts: [],
+		limits: { ...VM_VALIDATE },
+		bootMs: 812,
+		totalMs: 9400,
+		logTail: "",
+		resultSource: "guest",
+	};
 
 	test("absent without a review or scout run kind so work runs never see it", () => {
-		// The runner env alone must not enable the tool.
-		process.env.OTTR_VM_RUNNER_URL = runnerUrl;
+		// The board injection alone must not enable the tool.
+		setEnv(boardEnv);
 		expect(fakePi().sandbox_run).toBeUndefined();
 	});
 
@@ -1633,9 +1620,9 @@ describe("sandbox_run tool", () => {
 		]);
 	});
 
-	test("rejects a bad project name and a missing checkout before any call", async () => {
+	test("rejects a bad project name or an empty argv before any call", async () => {
 		process.env.OTTR_REVIEW = "1";
-		process.env.OTTR_PROJECTS_ROOT = projectsRoot;
+		setEnv(boardEnv);
 		const tools = fakePi();
 		let called = false;
 		globalThis.fetch = (async () => {
@@ -1650,99 +1637,134 @@ describe("sandbox_run tool", () => {
 				}),
 			),
 		).toContain("project must be a project name");
-		const out = text(
-			await tools.sandbox_run!.execute("t1", {
-				project: "ottr-no-such-project",
-				argv: ["true"],
-			}),
-		);
-		expect(out).toContain(
-			`no checkout at ${projectsRoot}/ottr-no-such-project`,
-		);
-		// The checkout comes from OTTR_PROJECTS_ROOT, not a hardcoded /workspace: the
-		// test’s own temp root proves the env drives the path, on any machine.
-		expect(out).not.toContain("/workspace/");
+		expect(
+			text(
+				await tools.sandbox_run!.execute("t2", {
+					project: "p1",
+					argv: [],
+				}),
+			),
+		).toBe("Error: argv must be a non-empty list of strings");
 		expect(called).toBe(false);
 	});
 
-	test("execute packs the checkout and returns the runner's JSON with the token on the wire only", async () => {
+	test("execute posts the run's args and credential to the board and returns the runner's JSON", async () => {
 		process.env.OTTR_REVIEW = "1";
-		process.env.OTTR_PROJECTS_ROOT = projectsRoot;
-		process.env.OTTR_DATA_DIR = dataRoot;
-		setEnv(runnerEnv);
-		const project = "ottr-sbx-probe";
-		const checkout = probeCheckout(projectsRoot, project);
-		try {
-			let seen: { url: string; init: RequestInit } | null = null;
-			globalThis.fetch = (async (url: string | URL, init: RequestInit) => {
-				seen = { url: String(url), init };
-				return new Response(
-					JSON.stringify({
-						id: "val-1-aabbccdd",
-						selfCheck: { ok: true, checks: [] },
-						missingControl: null,
-						job: null,
-						artifacts: [],
-						limits: {},
-						bootMs: 1,
-						totalMs: 2,
-						logTail: "",
-						resultSource: "guest",
-					}),
-					{ status: 200 },
-				);
-			}) as unknown as typeof fetch;
-			const out = await fakePi().sandbox_run!.execute("t1", {
-				project,
-				argv: ["sh", "-c", "true"],
+		setEnv(boardEnv);
+		// The regression this card fixes: the runner strips both credentials from
+		// agent env (src/runner.ts childEnv), and the run still lands through the
+		// board, whose server holds the worker token.
+		delete process.env.OTTR_WORKER_TOKEN;
+		delete process.env.OTTR_VM_RUNNER_URL;
+		expect(process.env.OTTR_WORKER_TOKEN).toBeUndefined();
+		let seen: { url: string; init: RequestInit } | null = null;
+		globalThis.fetch = (async (url: string | URL, init: RequestInit) => {
+			seen = { url: String(url), init };
+			return new Response(JSON.stringify({ ok: true, result: guestResponse }), {
+				status: 200,
 			});
-			const parsed = JSON.parse(text(out)) as {
-				id: string;
-				resultSource: string;
-			};
-			expect(parsed.id).toBe("val-1-aabbccdd");
-			expect(parsed.resultSource).toBe("guest");
-			expect(seen!.url).toBe(`${runnerUrl}/validate`);
-			expect(seen!.init.method).toBe("POST");
-			expect(seen!.init.headers).toMatchObject({
-				"x-otwr-token": "worker-token",
-				"content-type": "application/json",
-			});
-			const body = JSON.parse(String(seen!.init.body)) as {
-				project: string;
-				targetTar: string;
-				job: { argv: string[]; cwd: string };
-			};
-			expect(body.project).toBe(project);
-			expect(body.job).toEqual({ argv: ["sh", "-c", "true"], cwd: "/target" });
-			expect(body.targetTar).toContain(
-				`${dataRoot}/${project}/validate-jobs/val-`,
-			);
-			// The token rides the header only; the returned text never carries it.
-			expect(text(out)).not.toContain("worker-token");
-			removeRunDir(body.targetTar);
-		} finally {
-			rmSync(checkout, { recursive: true, force: true });
-		}
+		}) as unknown as typeof fetch;
+		const out = await fakePi().sandbox_run!.execute("t1", {
+			project: "p1",
+			argv: ["sh", "-c", "true"],
+			ref: "main",
+			collect: ["scratch/poc.txt"],
+		});
+		expect(seen!.url).toBe("http://ottr:8080/api/projects/p1/sandbox");
+		expect(seen!.init.method).toBe("POST");
+		expect(seen!.init.headers).toMatchObject({
+			"x-board-token": "boot-token",
+			origin: "http://ottr:8080",
+		});
+		expect(JSON.parse(String(seen!.init.body))).toEqual({
+			taskId: "P1-42",
+			project: "p1",
+			ref: "main",
+			argv: ["sh", "-c", "true"],
+			collect: ["scratch/poc.txt"],
+		});
+		const parsed = JSON.parse(text(out)) as {
+			id: string;
+			resultSource: string;
+		};
+		expect(parsed.id).toBe("val-1763000000-cafebabe");
+		expect(parsed.resultSource).toBe("guest");
+		// The board token rides the header only; the result text never carries it.
+		expect(text(out)).not.toContain("boot-token");
 	});
 
-	test("execute without OTTR_VM_RUNNER_URL returns the naming error", async () => {
+	test("relays the board's refusal and the runner blocker as the error text", async () => {
 		process.env.OTTR_REVIEW = "1";
-		process.env.OTTR_PROJECTS_ROOT = projectsRoot;
-		process.env.OTTR_DATA_DIR = dataRoot;
-		process.env.OTTR_WORKER_TOKEN = "worker-token";
-		const project = "ottr-sbx-probe";
-		const checkout = probeCheckout(projectsRoot, project);
-		try {
-			const out = await fakePi().sandbox_run!.execute("t1", {
-				project,
-				argv: ["true"],
+		setEnv(boardEnv);
+		globalThis.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					error: "sandbox_run runs only in review or trending scout runs",
+				}),
+				{ status: 403 },
+			)) as unknown as typeof fetch;
+		expect(
+			text(
+				await fakePi().sandbox_run!.execute("t1", {
+					project: "p1",
+					argv: ["true"],
+				}),
+			),
+		).toBe("Error: sandbox_run runs only in review or trending scout runs");
+		// The runner blocker rides through unchanged: the audit records it as the
+		// exact blocker of a needs_validation lead.
+		globalThis.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					error:
+						"OTTR_VM_RUNNER_URL is not set; set it and bring up the vm-runner compose service (--profile vm) to run sandbox jobs.",
+				}),
+				{ status: 502 },
+			)) as unknown as typeof fetch;
+		expect(
+			text(
+				await fakePi().sandbox_run!.execute("t2", {
+					project: "p1",
+					argv: ["true"],
+				}),
+			),
+		).toBe(
+			"Error: OTTR_VM_RUNNER_URL is not set; set it and bring up the vm-runner compose service (--profile vm) to run sandbox jobs.",
+		);
+	});
+
+	test("execute without the board coordinates reports the missing injection", async () => {
+		process.env.OTTR_REVIEW = "1";
+		setEnv(boardEnv);
+		delete process.env.OTTR_BOARD_URL;
+		const out = await fakePi().sandbox_run!.execute("t1", {
+			project: "p1",
+			argv: ["true"],
+		});
+		expect(text(out)).toStartWith("Error: ");
+		expect(text(out)).toContain("OTTR_BOARD_URL");
+		expect(text(out)).toContain("sandbox_run is unavailable");
+	});
+
+	test("posts no token header on loopback, where the wall needs none", async () => {
+		process.env.OTTR_REVIEW = "1";
+		setEnv({
+			OTTR_BOARD_URL: "http://ottr:8080",
+			OTTR_PROJECT: "p1",
+			OTTR_TASK_ID: "P1-42",
+		});
+		let seen: { url: string; init: RequestInit } | null = null;
+		globalThis.fetch = (async (url: string | URL, init: RequestInit) => {
+			seen = { url: String(url), init };
+			return new Response(JSON.stringify({ ok: true, result: guestResponse }), {
+				status: 200,
 			});
-			expect(text(out)).toStartWith("Error: ");
-			expect(text(out)).toContain("OTTR_VM_RUNNER_URL");
-			expect(text(out)).toContain("--profile vm");
-		} finally {
-			rmSync(checkout, { recursive: true, force: true });
-		}
+		}) as unknown as typeof fetch;
+		await fakePi().sandbox_run!.execute("t1", {
+			project: "p1",
+			argv: ["sh", "-c", "true"],
+		});
+		const headers = seen!.init.headers as Record<string, string>;
+		expect(headers["x-board-token"]).toBeUndefined();
 	});
 });

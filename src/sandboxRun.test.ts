@@ -2,7 +2,13 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type GitSpawn, newJobId, runSandboxJob } from "./sandboxRun.ts";
+import {
+	type GitSpawn,
+	newJobId,
+	runSandboxJob,
+	runSandboxViaBoard,
+	sandboxRequestError,
+} from "./sandboxRun.ts";
 import { type ValidateResponse, VM_VALIDATE } from "./vmValidateShared.ts";
 
 const TAR = new Uint8Array([0x1f, 0x8b, 8, 0, 1, 2, 3, 4]);
@@ -426,4 +432,150 @@ test("OTTR_DATA_DIR moves the target tar out of /data", async () => {
 	} finally {
 		rmSync(dataRoot, { recursive: true, force: true, maxRetries: 5 });
 	}
+});
+
+const boardEnv = {
+	base: "http://ottr:8080",
+	project: "ottr",
+	taskId: "OTTR-1",
+	token: "boot-token",
+};
+
+const validReq = { project: "ottr", argv: ["true"] };
+
+describe("sandboxRequestError", () => {
+	test("accepts the tool's arg shape and names each rule it breaks", () => {
+		expect(
+			sandboxRequestError({ taskId: "T-1", project: "ottr", argv: ["x"] }),
+		).toBeNull();
+		expect(
+			sandboxRequestError({
+				taskId: "T-1",
+				project: "ottr",
+				argv: ["x"],
+				ref: "main",
+				cwd: "/target/sub",
+				collect: ["scratch/poc.txt"],
+			}),
+		).toBeNull();
+		expect(sandboxRequestError(null)).toContain("JSON object");
+		expect(sandboxRequestError({ project: "ottr", argv: ["x"] })).toContain(
+			"taskId",
+		);
+		expect(
+			sandboxRequestError({ taskId: "T-1", project: "../evil", argv: ["x"] }),
+		).toContain("project must be a project name");
+		expect(
+			sandboxRequestError({ taskId: "T-1", project: "ottr", argv: [] }),
+		).toContain("non-empty list of strings");
+		expect(
+			sandboxRequestError({
+				taskId: "T-1",
+				project: "ottr",
+				argv: ["x"],
+				cwd: "rel",
+			}),
+		).toContain("cwd must be an absolute");
+		expect(
+			sandboxRequestError({
+				taskId: "T-1",
+				project: "ottr",
+				argv: ["x"],
+				collect: ["../x"],
+			}),
+		).toContain("relative paths");
+	});
+});
+
+describe("runSandboxViaBoard", () => {
+	test("posts the run's args and credential to the project's sandbox route", async () => {
+		const { fetchImpl, seen } = fakeFetch(
+			200,
+			JSON.stringify({ ok: true, result: guestResponse }),
+		);
+		const res = await runSandboxViaBoard(
+			boardEnv,
+			{
+				...validReq,
+				ref: "main",
+				cwd: "/target",
+				collect: ["scratch/poc.txt"],
+			},
+			fetchImpl,
+		);
+		expect(res.ok).toBe(true);
+		if (res.ok) expect(res.result.id).toBe(guestResponse.id);
+		expect(seen[0]?.url).toBe("http://ottr:8080/api/projects/ottr/sandbox");
+		expect(seen[0]?.init.method).toBe("POST");
+		expect(seen[0]?.init.headers).toMatchObject({
+			"x-board-token": "boot-token",
+			origin: boardEnv.base,
+			"content-type": "application/json",
+		});
+		expect(JSON.parse(String(seen[0]?.init.body))).toEqual({
+			taskId: "OTTR-1",
+			project: "ottr",
+			ref: "main",
+			argv: ["true"],
+			cwd: "/target",
+			collect: ["scratch/poc.txt"],
+		});
+	});
+
+	test("omits the token header on loopback, where the wall needs none", async () => {
+		const { fetchImpl, seen } = fakeFetch(
+			200,
+			JSON.stringify({ ok: true, result: guestResponse }),
+		);
+		await runSandboxViaBoard({ ...boardEnv, token: "" }, validReq, fetchImpl);
+		expect(seen[0]?.init.headers).not.toHaveProperty("x-board-token");
+	});
+
+	test("relays the board's error text as the exact blocker", async () => {
+		const { fetchImpl } = fakeFetch(
+			403,
+			JSON.stringify({
+				error: "sandbox_run runs only in review or trending scout runs",
+			}),
+		);
+		const res = await runSandboxViaBoard(boardEnv, validReq, fetchImpl);
+		expect(res).toEqual({
+			ok: false,
+			error: "sandbox_run runs only in review or trending scout runs",
+		});
+	});
+
+	test("an error-less failure keeps the status and a body slice", async () => {
+		const { fetchImpl } = fakeFetch(502, "bad gateway");
+		const res = await runSandboxViaBoard(boardEnv, validReq, fetchImpl);
+		expect(res.ok).toBe(false);
+		if (!res.ok) expect(res.error).toStartWith("502: bad gateway");
+	});
+
+	test("an unreachable board names the board, not a token", async () => {
+		const fetchImpl = (async () => {
+			throw new Error("connection refused");
+		}) as unknown as typeof fetch;
+		const res = await runSandboxViaBoard(boardEnv, validReq, fetchImpl);
+		expect(res.ok).toBe(false);
+		if (!res.ok)
+			expect(res.error).toContain(
+				"the board at http://ottr:8080 is unreachable",
+			);
+	});
+
+	test("invalid args stop before the round trip", async () => {
+		let called = false;
+		const fetchImpl = (async () => {
+			called = true;
+			return new Response("{}", { status: 200 });
+		}) as unknown as typeof fetch;
+		const res = await runSandboxViaBoard(
+			boardEnv,
+			{ project: "ottr", argv: [] },
+			fetchImpl,
+		);
+		expect(res.ok).toBe(false);
+		expect(called).toBe(false);
+	});
 });

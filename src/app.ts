@@ -288,6 +288,7 @@ import {
 	originRefusal,
 	upgradeRefusal,
 } from "./requestGuards.ts";
+import { runSandboxJob, sandboxRequestError } from "./sandboxRun.ts";
 import {
 	archReviewDue,
 	type DepResolution,
@@ -4655,11 +4656,12 @@ export async function createApp(deps: AppDeps) {
 
 	/**
 	 * A card starts an agent run, so the turns' host files cards (and the trending scout's
-	 * verdicts, which file proposal cards) and nothing else, and only with the boot token every
+	 * verdicts, which file proposal cards, and the sandbox_run tool's one validation POST to
+	 * the board's sandbox endpoint) and nothing else, and only with the boot token every
 	 * task session carries (OTTR_BOARD_TOKEN): anyone else who reaches the port gets 401. A
 	 * microVM turn (OTTR-532) holds no boot token: its live per-turn VM token files cards in
-	 * its own project only, and no trending verdicts. Hosted mode passes the boot token itself:
-	 * there the token, not the Host, routes a turn here (see hostedRefusal).
+	 * its own project only, and no trending verdicts or sandbox runs. Hosted mode passes the
+	 * boot token itself: there the token, not the Host, routes a turn here (see hostedRefusal).
 	 */
 	function agentRefusal(
 		req: Request,
@@ -4673,9 +4675,10 @@ export async function createApp(deps: AppDeps) {
 		const vm = boot ? null : (deps.vmTokens?.check(token) ?? null);
 		if (!boot && vm === null) return json({ error: "unauthorized" }, 401);
 		const path = new URL(req.url).pathname;
-		const m = /^\/api\/projects\/([^/]+)\/(tasks|trending\/verdicts)$/.exec(
-			path,
-		);
+		const m =
+			/^\/api\/projects\/([^/]+)\/(tasks|trending\/verdicts|sandbox)$/.exec(
+				path,
+			);
 		if (req.method !== "POST" || m === null)
 			return json({ error: "this host only files cards" }, 403);
 		if (vm !== null) {
@@ -11851,6 +11854,76 @@ export async function createApp(deps: AppDeps) {
 		return await fileTrending(e, v, p);
 	}
 
+	// The sandbox_run tool's board leg (docs/specs/microvm-validation-mode.md, "Board
+	// endpoint and tool"): agentRefusal already checked the run's boot token, so the
+	// handler checks the run kind (review or trending scout only) against the route's
+	// project — the calling run's own — and packs the TARGET project's registered
+	// checkout server-side. runSandboxJob reads the server's own env
+	// (OTTR_VM_RUNNER_URL, OTTR_WORKER_TOKEN, OTTR_DATA_DIR); the agent process never
+	// holds them (src/runner.ts childEnv strips OTTR_WORKER_TOKEN on purpose).
+	async function handlePOSTProjectsSandboxByProject(
+		req: BunRequest<"/api/projects/:project/sandbox">,
+	): Promise<Response> {
+		const r = await readJson(req);
+		if ("error" in r) return r.error;
+		const e = deps.projects.get(req.params.project);
+		if (!e) return json({ error: "unknown project" }, 404);
+		if (e.gitless) return json({ error: "init a git repository first" }, 409);
+		const invalid = sandboxRequestError(r.body);
+		if (invalid !== null) return json({ error: invalid }, 400);
+		const b = r.body as {
+			taskId: string;
+			project: string;
+			ref?: string;
+			argv: string[];
+			cwd?: string;
+			collect?: string[];
+		};
+		const task = await e.store.getTask(b.taskId);
+		if (task === null)
+			return json(
+				{
+					error: `unknown task ${b.taskId}; sandbox_run needs this run's review or scout card`,
+				},
+				403,
+			);
+		if (task.kind !== "review" && task.kind !== "trending")
+			return json(
+				{ error: "sandbox_run runs only in review or trending scout runs" },
+				403,
+			);
+		// The body's project names the checkout to pack, which may differ from the
+		// calling run's own project: the tar bytes and the runner request must name
+		// the same project, so the target's own entry decides both.
+		const target = deps.projects.get(b.project);
+		if (!target)
+			return json(
+				{
+					error: `unknown project ${b.project}; sandbox_run packs a registered project's checkout`,
+				},
+				400,
+			);
+		if (target.gitless)
+			return json({ error: `init a git repository first: ${b.project}` }, 409);
+		if (!existsSync(target.path))
+			return json(
+				{
+					error: `no checkout at ${target.path} for project ${b.project}; sandbox_run packs the server's registered checkout`,
+				},
+				400,
+			);
+		const out = await runSandboxJob({
+			project: b.project,
+			checkout: target.path,
+			argv: b.argv,
+			...(b.ref !== undefined ? { ref: b.ref } : {}),
+			...(b.cwd !== undefined ? { cwd: b.cwd } : {}),
+			...(b.collect !== undefined ? { collect: b.collect } : {}),
+		});
+		if (!out.ok) return json({ error: out.error }, 502);
+		return json({ ok: true, result: out.result });
+	}
+
 	async function resolveFollowUpOf(
 		project: string,
 		value: unknown,
@@ -13692,6 +13765,19 @@ export async function createApp(deps: AppDeps) {
 						costly: true,
 					},
 				),
+		},
+		// The sandbox_run tool's board leg (docs/specs/microvm-validation-mode.md, "Board endpoint and
+		// tool"): the run's boot token opens it (agentRefusal), the handler checks the run kind
+		// (review or trending scout only) and packs server-side with the server's own worker token.
+		"/api/projects/:project/sandbox": {
+			POST: async (req, server) => {
+				server.timeout(req, 0);
+				return await api(
+					req,
+					async () => await handlePOSTProjectsSandboxByProject(req),
+					{ costly: true },
+				);
+			},
 		},
 		"/api/projects/:project/tasks/:id": {
 			GET: async (req) =>

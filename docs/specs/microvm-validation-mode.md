@@ -211,24 +211,59 @@ and removes the run dir as today. A lazy layer bake reuses the networked bake VM
 unchanged; only then does the run bring its tap and iptables rules up, and the
 validate VM itself never gets the network-interfaces entry.
 
-## Board tool: `sandbox_run` (extension/tracker.ts)
+## Board endpoint and tool: `sandbox_run` (src/app.ts, extension/tracker.ts)
 
 One eval-kernel tool for review and scout runs. The audit calls it; it is the
 only way the harness executes target code on this board.
 
-- Args: `project`, `ref` (default `HEAD`), `argv`, `cwd` (target-relative),
-  `collect`. The limits are the mode's fixed constants; the tool takes none.
-- Guard: the agent-host guard rules apply (project-scoped, like `propose_task`).
-  The tool runs only when `OTTR_VM_RUNNER_URL` is set and the runner answers
-  `/healthz`; otherwise it returns the health reason as the error, which the
-  audit records as the exact blocker of a `needs_validation` lead.
-- Target bytes: `git archive <ref>` from the project's main checkout on the
-  server, staged under the board's data dir (`OTTR_DATA_DIR`, default `/data`)
-  at `/data/<project>/validate-jobs/<id>/target.tar`, then
-  `POST /validate`. The response JSON is returned to the agent as the tool
-  result and stays in `result.json`.
-- The tool adds no secret to the request; the runner request carries the shared
-  `OTTR_WORKER_TOKEN` on the wire only, as `/run` does today.
+The v0.5.0 review (OTTR-969) showed the direct path cannot work: the tool ran
+in the agent's eval kernel, and `childEnv` (src/runner.ts) strips
+`OTTR_WORKER_TOKEN` from every agent process on purpose — a turn must never
+hold the worker credential, and the strip stays. The tool therefore routes
+through the board like `propose_task`:
+
+- Args stay: `project`, `ref` (default `HEAD`), `argv`, `cwd`
+  (target-relative), `collect`. The limits are the mode's fixed constants; the
+  tool takes none.
+- The tool (registered in review and trending-scout runs only, as today)
+  validates the args with the shared `sandboxRequestError` check
+  (src/sandboxRun.ts), then POSTs them unchanged plus this run's card id to
+  the board: `POST <OTTR_BOARD_URL>/api/projects/<OTTR_PROJECT>/sandbox`,
+  body `{ taskId, project, ref?, argv, cwd?, collect? }`, the
+  `x-board-token` header with `OTTR_BOARD_TOKEN`, and the `Origin` the
+  mutation wall demands. `runSandboxViaBoard` (src/sandboxRun.ts) is the
+  client; the agent env never holds `OTTR_WORKER_TOKEN` or
+  `OTTR_VM_RUNNER_URL` at any point on this path.
+- The endpoint sits behind the same agent-host wall as card filing
+  (`agentRefusal` in src/app.ts): the boot token, POST only; a loopback caller
+  from the board's own container needs no token; a microVM turn's per-turn VM
+  token stays outside, exactly as for trending verdicts. The route lifts the
+  request idle timeout: one validation runs up to the 600 s job cap plus boot
+  slack.
+- The server refuses before it packs:
+  - the caller's card must exist and be a review or trending-scout card (the
+    body's `taskId`, checked against the store's `kind`); a work, retro,
+    interview or pr_review run gets `403` with
+    `"sandbox_run runs only in review or trending scout runs"`, and an absent
+    or empty `taskId` gets the same class of refusal;
+  - the args must pass `sandboxRequestError` (`400` otherwise);
+  - a gitless project gets `409`, an unknown project `404`.
+- On a pass the server packs and runs the job itself (`runSandboxJob`):
+  `git archive <ref>` from the project's registered checkout (`Entry.path`,
+  the path the board already tracks), the tar staged under the board's data
+  dir (`OTTR_DATA_DIR`, default `/data`) at
+  `/data/<project>/validate-jobs/<id>/target.tar`, then `POST /validate` with
+  the server's own `OTTR_WORKER_TOKEN`. The runner request carries that token
+  on the wire only, server-side to server-side.
+- The endpoint answers `200 {"ok":true,"result":<ValidateResponse>}`, or an
+  error JSON whose `error` text is the exact blocker the audit records (the
+  runner's health reason, an unreachable runner, a failed archive). The tool
+  relays a failure after `Error: ` and returns the result JSON unchanged as
+  the tool result; it also stays in `result.json`.
+
+The tool still returns the runner's health reason as its error when the server
+cannot reach the runner, which the audit records as the exact blocker of a
+`needs_validation` lead.
 
 ## Skill integration (documentation here; skill files change in agent-data)
 
@@ -253,7 +288,20 @@ retains from `result.json`.
    shows each attempt blocked in its result. The ready report states that this
    check needs the host and gives the exact host commands (the
    `scripts/vm-validate-smoke.ts` run).
-4. `bun run check` and `bun test` exit 0 in the turn container.
+4. A test runs the tool as an agent process with the stripped env (no
+   `OTTR_WORKER_TOKEN`, no `OTTR_VM_RUNNER_URL`) against a booted test board
+   and a stubbed runner, and gets the runner's result JSON. Before the fix
+   this test fails with the "OTTR_WORKER_TOKEN is not set" error.
+5. Test: a work-turn run gets the endpoint refusal (403, the
+   review-or-trending-scout message), as does a request without this run's
+   task id.
+6. Real run on the KVM host (not from a turn container): the board-path smoke
+   (`src/vmValidateBoardSmoke.ts`) exercises the endpoint path the tool uses
+   and the job's result lands at
+   `/data/<project>/validate-jobs/<id>/result.json` with `selfCheck.ok` true.
+   The ready report states that this check needs the host and gives the exact
+   host commands.
+7. `bun run check` and `bun test` exit 0 in the turn container.
 
 ## Alternatives considered
 
@@ -309,10 +357,12 @@ retains from `result.json`.
    on `OTTR_VM_MODE=validate`.
 4. `docker/ottr-vm-init`: the `validate` mode branch (mounts above, relaxed
    cmdline checks, `OTTR_VM_MODE=validate`).
-5. `src/sandboxRun.ts`, `extension/tracker.ts`, `src/vmValidateSmoke.ts`: the
-   `sandbox_run` tool (guard, `git archive` packing, runner call) and the CLI
-   the host acceptance run uses (in `src/`, because the server image ships
-   `src/`, not `scripts/`).
+5. `src/sandboxRun.ts`, `src/app.ts`, `extension/tracker.ts`,
+   `src/vmValidateSmoke.ts`, `src/vmValidateBoardSmoke.ts`: the `sandbox_run`
+   tool (board client, `runSandboxViaBoard`), the board endpoint that checks
+   the run kind and packs with `git archive` (`runSandboxJob` with the
+   server's own worker token; OTTR-1043), and the two host CLIs (in `src/`,
+   because the server image ships `src/`, not `scripts/`).
 6. Tests: `src/vmRunner.test.ts` (fake launcher: checks 1-2, absent result),
    `src/vmValidate.test.ts` (guest flow with injected probes), the extension
    tool tests in the extension's test file.

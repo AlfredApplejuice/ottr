@@ -56,8 +56,10 @@ docs/specs/microvm-validation-mode.md. One VM runs one validation job:
   missing control and the job does not run.
 - `POST /validate` on the runner (worker token, health gate, shared slot pool)
   takes the job and answers the result; a board tool `sandbox_run`
-  (extension/tracker.ts) is the one audit-facing way to call it, packing the
-  target with `git archive` from the project checkout on the server.
+  (extension/tracker.ts) is the one audit-facing way to call it. The tool
+  routes through the board (OTTR-1043: an agent process never holds the
+  worker token), and the board packs the target with `git archive` from the
+  project checkout on the server.
 
 ## Consequences
 
