@@ -114,6 +114,8 @@ const envKeys = [
 	"OTTR_MODELS",
 	"OTTR_VM_RUNNER_URL",
 	"OTTR_WORKER_TOKEN",
+	"OTTR_PROJECTS_ROOT",
+	"OTTR_DATA_DIR",
 ] as const;
 function setEnv(v: Partial<Record<(typeof envKeys)[number], string>>) {
 	for (const k of envKeys) if (v[k] !== undefined) process.env[k] = v[k];
@@ -1592,6 +1594,9 @@ describe("sandbox_run tool", () => {
 	afterAll(() =>
 		rmSync(projectsRoot, { recursive: true, force: true, maxRetries: 5 }),
 	);
+	// The tar the tool writes must land under the test's own data root, never the
+	// shared /data: the CI runner has no /data and the write would EACCES there.
+	const dataRoot = mkdtempSync(join(tmpdir(), "ottr-sbx-data-"));
 
 	test("absent without a review or scout run kind so work runs never see it", () => {
 		// The runner env alone must not enable the tool.
@@ -1662,6 +1667,8 @@ describe("sandbox_run tool", () => {
 
 	test("execute packs the checkout and returns the runner's JSON with the token on the wire only", async () => {
 		process.env.OTTR_REVIEW = "1";
+		process.env.OTTR_PROJECTS_ROOT = projectsRoot;
+		process.env.OTTR_DATA_DIR = dataRoot;
 		setEnv(runnerEnv);
 		const project = "ottr-sbx-probe";
 		const checkout = probeCheckout(projectsRoot, project);
@@ -1708,7 +1715,9 @@ describe("sandbox_run tool", () => {
 			};
 			expect(body.project).toBe(project);
 			expect(body.job).toEqual({ argv: ["sh", "-c", "true"], cwd: "/target" });
-			expect(body.targetTar).toContain(`/data/${project}/validate-jobs/val-`);
+			expect(body.targetTar).toContain(
+				`${dataRoot}/${project}/validate-jobs/val-`,
+			);
 			// The token rides the header only; the returned text never carries it.
 			expect(text(out)).not.toContain("worker-token");
 			removeRunDir(body.targetTar);
@@ -1719,6 +1728,8 @@ describe("sandbox_run tool", () => {
 
 	test("execute without OTTR_VM_RUNNER_URL returns the naming error", async () => {
 		process.env.OTTR_REVIEW = "1";
+		process.env.OTTR_PROJECTS_ROOT = projectsRoot;
+		process.env.OTTR_DATA_DIR = dataRoot;
 		process.env.OTTR_WORKER_TOKEN = "worker-token";
 		const project = "ottr-sbx-probe";
 		const checkout = probeCheckout(projectsRoot, project);

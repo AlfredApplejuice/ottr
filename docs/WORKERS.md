@@ -1064,7 +1064,9 @@ answer says so instead of a guess.
 gate and slot pool as `/run`) takes the job and answers the result JSON. The
 board tool `sandbox_run` (review and scout runs) is the audit-facing way to call
 it: it packs the target with `git archive` from the project checkout on the
-server, sends it to the runner, and returns the result. The runner also stores
+server (`<OTTR_PROJECTS_ROOT>/<project>`, default `/workspace/<project>`),
+stages it under the board's data dir (`OTTR_DATA_DIR`, default `/data`), sends
+it to the runner, and returns the result. The runner also stores
 each result under `/data/<project>/validate-jobs/<id>/result.json`. Validations
 share the `OTTR_VM_MAX` slot pool with work turns, and a validation call is
 synchronous: a board restart cancels it, and the caller re-runs it.

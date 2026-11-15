@@ -150,7 +150,14 @@ export async function runSandboxJob(
 		};
 
 	const id = (o.idFactory ?? newJobId)();
-	const runDir = join(o.dataRoot ?? "/data", project, "validate-jobs", id);
+	const runDir = join(
+		// OTTR_DATA_DIR is the board’s data dir (the compose stack sets it to /data);
+		// honoring it here keeps the tar on the volume the runner reads, on any layout.
+		o.dataRoot ?? env.OTTR_DATA_DIR ?? "/data",
+		project,
+		"validate-jobs",
+		id,
+	);
 	const targetTar = join(runDir, "target.tar");
 
 	const spawn = o.spawnImpl ?? defaultSpawn;

@@ -393,3 +393,37 @@ test("a dashed ref cannot reach git as an option: the spawn puts -- before it", 
 		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 	}
 });
+
+test("OTTR_DATA_DIR moves the target tar out of /data", async () => {
+	const dataRoot = mkdtempSync(join(tmpdir(), "ottr-sbx-dataroot-"));
+	try {
+		const { fetchImpl } = fakeFetch(200, JSON.stringify(guestResponse));
+		const res = await runSandboxJob({
+			project: "ottr",
+			argv: ["true"],
+			checkout: "/workspace/ottr",
+			fetchImpl,
+			spawnImpl: async () => ({ code: 0, stdout: TAR, stderr: "" }),
+			env: {
+				OTTR_VM_RUNNER_URL: "http://r:1",
+				OTTR_WORKER_TOKEN: "tok",
+				OTTR_DATA_DIR: dataRoot,
+			},
+			idFactory: () => "val-1763000000-dataroot",
+		});
+		expect(res.ok).toBe(true);
+		expect(
+			readFileSync(
+				join(
+					dataRoot,
+					"ottr",
+					"validate-jobs",
+					"val-1763000000-dataroot",
+					"target.tar",
+				),
+			).length,
+		).toBeGreaterThan(0);
+	} finally {
+		rmSync(dataRoot, { recursive: true, force: true, maxRetries: 5 });
+	}
+});

@@ -223,7 +223,8 @@ only way the harness executes target code on this board.
   `/healthz`; otherwise it returns the health reason as the error, which the
   audit records as the exact blocker of a `needs_validation` lead.
 - Target bytes: `git archive <ref>` from the project's main checkout on the
-  server, written to `/data/<project>/validate-jobs/<id>/target.tar`, then
+  server, staged under the board's data dir (`OTTR_DATA_DIR`, default `/data`)
+  at `/data/<project>/validate-jobs/<id>/target.tar`, then
   `POST /validate`. The response JSON is returned to the agent as the tool
   result and stays in `result.json`.
 - The tool adds no secret to the request; the runner request carries the shared
