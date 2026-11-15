@@ -22,16 +22,26 @@ const envLine = "ATTEMPT env HOME LANG PATH";
 // reaches the real runSandboxJob today (every main() test injects its runner),
 // but a future one that drops the dep would stage under the ambient env — point
 // that at a disposable dir, and fail the file if anything ever stages in it.
-const ambientDataRoot = mkdtempSync(join(tmpdir(), "ottr-sbx-smoke-ambient-"));
+// The sandbox data guard provides OTTR_TEST_DATA_ROOT: the belt then IS the
+// guard's watched dir, so an ambient staging call fails here and in the guard.
+const providedRoot = process.env.OTTR_TEST_DATA_ROOT;
+const ambientDataRoot =
+	providedRoot ?? mkdtempSync(join(tmpdir(), "ottr-sbx-smoke-ambient-"));
+// Only remove and restore what this file created; the guard owns its own dir.
+const ownsRoot = providedRoot === undefined;
 const savedDataDir = process.env.OTTR_DATA_DIR;
 beforeAll(() => {
+	// Both modes: in guard mode this re-establishes the value after earlier
+	// files delete it, so ambient staging still lands in the belt root.
 	process.env.OTTR_DATA_DIR = ambientDataRoot;
 });
 afterAll(() => {
 	const staged = readdirSync(ambientDataRoot);
 	if (savedDataDir === undefined) delete process.env.OTTR_DATA_DIR;
 	else process.env.OTTR_DATA_DIR = savedDataDir;
-	rmSync(ambientDataRoot, { recursive: true, force: true, maxRetries: 5 });
+	// The guard owns its watched dir; this file removes only what it created.
+	if (ownsRoot)
+		rmSync(ambientDataRoot, { recursive: true, force: true, maxRetries: 5 });
 	expect(staged).toEqual([]);
 });
 

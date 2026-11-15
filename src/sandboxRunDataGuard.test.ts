@@ -9,9 +9,10 @@ import { join } from "node:path";
 // the way the board's merge and review turns run the suite — in a process whose
 // OTTR_DATA_DIR points at a live data root — and checks two leak channels the
 // child files cannot see themselves:
-// 1. The child's ambient root (this temp dir) must stay empty: a staging call
-//    with neither its own env nor its own data root lands here, and on the
-//    server the ambient root is the board's own /data.
+// 1. The child's ambient root (this temp dir) must stay empty: the belt files
+//    use OTTR_TEST_DATA_ROOT as their root, so a staging call with neither its
+//    own env nor its own data root lands here — on the server the ambient root
+//    would be the board's own /data. The child file's afterAll fails with it.
 // 2. The live validate-jobs dir must gain nothing test-made: a call whose
 //    explicit env lacks OTTR_DATA_DIR bypasses the child's ambient root and
 //    writes /data directly. A real job's dir gains result.json when the runner
@@ -32,7 +33,11 @@ test("the suite's sandbox paths never stage a job in the ambient OTTR_DATA_DIR",
 	try {
 		const run = Bun.spawnSync(["bun", "test", ...sandboxTestFiles], {
 			cwd: join(import.meta.dir, ".."),
-			env: { ...process.env, OTTR_DATA_DIR: dataDir },
+			env: {
+				...process.env,
+				OTTR_DATA_DIR: dataDir,
+				OTTR_TEST_DATA_ROOT: dataDir,
+			},
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -42,9 +47,11 @@ test("the suite's sandbox paths never stage a job in the ambient OTTR_DATA_DIR",
 			console.error(run.stdout.toString().slice(-2000));
 			console.error(run.stderr.toString().slice(-2000));
 		}
-		expect(run.exitCode).toBe(0);
-		// Channel 1: the ambient root stays empty.
+		// Channel 1 first, so it reports even when the child is already red: the
+		// belt files use OTTR_TEST_DATA_ROOT as their root, so a staging call that
+		// consults the ambient env lands right here.
 		expect(readdirSync(dataDir)).toEqual([]);
+		expect(run.exitCode).toBe(0);
 		// Channel 2: the live dir gains only real jobs (they carry result.json).
 		if (before !== null) {
 			const added = readdirSync(liveJobsDir).filter((n) => !before.includes(n));

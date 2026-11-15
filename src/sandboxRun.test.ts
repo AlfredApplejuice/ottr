@@ -36,8 +36,15 @@ const TOKEN = "worker-token";
 // calls that resolve through process.env. The two env-missing refusal tests
 // carry the belt in their own literals: their minimal env objects bypass jobEnv,
 // and a mutant that disables the refusal check would otherwise stage into /data
-// before the assertions fail.
-const ambientDataRoot = mkdtempSync(join(tmpdir(), "ottr-sbx-ambient-"));
+// before the assertions fail. The sandbox data guard
+// (src/sandboxRunDataGuard.test.ts) provides OTTR_TEST_DATA_ROOT: the belt then
+// IS the guard's watched dir, so a staging call that consults the ambient env
+// lands there and both this file's afterAll and the guard's emptiness check fail.
+const providedRoot = process.env.OTTR_TEST_DATA_ROOT;
+const ambientDataRoot =
+	providedRoot ?? mkdtempSync(join(tmpdir(), "ottr-sbx-ambient-"));
+// Only remove and restore what this file created; the guard owns its own dir.
+const ownsRoot = providedRoot === undefined;
 
 const jobEnv = (url = "http://vm-runner:8080///"): NodeJS.ProcessEnv => ({
 	OTTR_VM_RUNNER_URL: url,
@@ -103,6 +110,9 @@ function tmpRoot(): string {
 
 const savedDataDir = process.env.OTTR_DATA_DIR;
 beforeAll(() => {
+	// Both modes: in guard mode this re-establishes the value after
+	// tracker.test.ts's afterEach deletes it, so ambient staging still lands in
+	// the belt root instead of the "/data" fallback.
 	process.env.OTTR_DATA_DIR = ambientDataRoot;
 });
 afterAll(() => {
@@ -110,7 +120,9 @@ afterAll(() => {
 	const staged = readdirSync(ambientDataRoot);
 	if (savedDataDir === undefined) delete process.env.OTTR_DATA_DIR;
 	else process.env.OTTR_DATA_DIR = savedDataDir;
-	rmSync(ambientDataRoot, { recursive: true, force: true, maxRetries: 5 });
+	// The guard owns its watched dir; this file removes only what it created.
+	if (ownsRoot)
+		rmSync(ambientDataRoot, { recursive: true, force: true, maxRetries: 5 });
 	// Nothing may stage through the ambient env; every call here owns its root.
 	expect(staged).toEqual([]);
 });
