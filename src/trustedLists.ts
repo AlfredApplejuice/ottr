@@ -6,15 +6,12 @@
  */
 import { readFileSync } from "node:fs";
 import { aptListPath } from "./apt.ts";
-import { boardOmpHome } from "./login.ts";
+import { turnListHome } from "./login.ts";
 import { requirementsListPath } from "./python.ts";
 import { toolsListPath } from "./tools.ts";
 import type { ProvisionLists } from "./workers.ts";
 
-/** The home the board reads its lists from: the dev override, else the board's
- * own home — the exact resolution server.ts's prepareTurn uses. */
-export const turnListHome = (): string =>
-	process.env.OTTR_WORKERS_HOME ?? boardOmpHome();
+export { turnListHome };
 
 /** The file's text, or undefined when it is missing (never an empty string). */
 const readIfPresent = (path: string): string | undefined => {

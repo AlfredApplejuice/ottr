@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { aptListPath } from "./apt.ts";
 import { requirementsListPath } from "./python.ts";
-import { buildToolsPath, toolsListPath } from "./tools.ts";
+import { buildToolsPath, parseToolsJson, toolsListPath } from "./tools.ts";
 import { type GuestOptions, serveGuest } from "./vmGuest.ts";
 import { type VmOutcome, WORKER_DONE } from "./workers.ts";
 
@@ -755,8 +755,12 @@ describe("POST /bake lists", () => {
 		expect(existsSync(join(root, plantedSha))).toBe(false);
 		expect(existsSync(join(root, fleetSha))).toBe(false);
 
-		// buildToolsPath links the trusted pin only; no planted name links.
-		const links = buildToolsPath(project, home);
+		// buildToolsPath links the trusted pin only; no planted name links. The
+		// entries ride in the worker's canonical order: project first, then _all.
+		const links = buildToolsPath(
+			[...parseToolsJson(lists.tools!), ...parseToolsJson(lists.toolsAll!)],
+			home,
+		);
 		expect(links).not.toBe("");
 		expect(readdirSync(links).sort()).toEqual(["hello"]);
 		expect(readlinkSync(join(links, "hello"))).toBe(

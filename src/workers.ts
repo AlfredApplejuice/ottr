@@ -58,21 +58,9 @@ export interface WorkerRequest {
 	githubReadEnv?: Record<string, string>;
 	/** The board's trusted provisioning lists, read from the board home and carried on the
 	 * request (docs/specs/worker-list-isolation.md). A worker never reads the shared-home
-	 * copies. Classic worker turns only; a vm-runner dispatch may carry it, and the VM
-	 * bake path ignores it (a separate card owns that path). */
-	lists?: {
-		/** Raw tools.json text, the project's own list. */
-		tools?: string;
-		/** Raw tools.json text, the fleet (_all) list. */
-		toolsAll?: string;
-		/** Raw apt.txt text, the project's own list (the fleet apt list feeds no
-		 * turn-time provisioning, so there is no aptAll). */
-		apt?: string;
-		/** Raw requirements.txt text, the project's own list. */
-		requirements?: string;
-		/** Raw requirements.txt text, the fleet list. */
-		requirementsAll?: string;
-	};
+	 * copies. Classic worker turns carry them here; the vm-runner dispatch carries the
+	 * VM bake's own lists on VmSpec (docs/specs/vm-list-isolation.md). */
+	lists?: ProvisionLists;
 	/** Set only for a vm-runner dispatch (docs/adr/0009-microvm-workers.md); classic workers
 	 * are never sent one and ignore it. */
 	vm?: VmSpec;
