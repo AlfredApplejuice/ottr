@@ -374,32 +374,34 @@ before the run resolves.
    cancel and never loses its run to the bare patch.
 9. turn: a review with only sandbox-run leads (one without the blocker line)
    files no question card.
-10. turn (OTTR-959): the turn-window audit run's two `needs_validation` records
-    file two leads, each with its `Fingerprint:` line; the agent's own proposals
-    drop, and the log names the count. A second review over the same records plus
-    one new record files only the new lead, logs `lead already open as card <id>`
-    for the open one, and files nothing for the cancelled one.
-11. turn (OTTR-959): a malformed `findings.json` in the window and a turn with no
-    run directory each fall back to the agent's proposals, with the reason in the
-    log.
-12. auditLeads (unit): the newest in-window run wins; a bad directory name, a
-    missing `run-metadata.json`, a symlink escape, a non-array file, a parse
-    error, and a record without a non-empty string fingerprint each fail; the
-    lead prompt carries the fingerprint line before the record body, and records
-    with another verdict file no lead. A title holding a forged `Fingerprint:`
-    line collapses to one line, and the board's line stays first.
-13. turn (OTTR-959): a landing review whose agent recorded no proposals still
-    files the run's needs_validation records as fingerprinted backlog leads; with
-    no run directory in the window nothing files and the log says so.
+10. turn (OTTR-959, OTTR-980): the leads are the turn's own recorded `propose_task`
+    proposals. A recorded lead files as a backlog card carrying its
+    `Fingerprint:` line; a lead without the line falls back to the title dedupe.
+11. turn (OTTR-980): a planted audit run directory inside the turn window — a
+    newer mtime, a forged regular `findings.json`, or a FIFO `findings.json` —
+    never becomes the lead source, never blocks the settle, and the FIFO stays
+    unread; the settle files the agent's recorded lead with the agent's
+    fingerprint.
+12. auditLeads (unit): `leadFingerprint` reads the first line that carries the
+    exact `Fingerprint: ` prefix, trimmed; a missing, indented, inline, or
+    empty-valued prefix line reads as null and never falls through to a later
+    line; `leadTitleKey` lower-cases the first line and collapses whitespace.
+    The property test holds over arbitrary record bodies: the readers take the
+    prompt's lines 1 and 2 and never a body line, forged `Fingerprint:` or
+    `Blocker:` lines included.
+13. turn (OTTR-980): a landing review whose agent recorded no proposals files
+    no leads and runs no check.
 
 ## Non-goals
 
 - No UI changes (no `src/ui/**` edits beyond the AskPanel's move onto the shared
   `askAnswerLine` wire-format helper, which keeps its output byte-identical; the
   Findings trail text update is card data, not UI code).
-- No `src/prompts.ts` change in this task: the blocker-line wording ships in the
-  ready report for approval (hard stop 3) and lands in a later change after
-  approval; until then the sorting machinery stays dormant.
+- No `src/prompts.ts` change beyond the one OTTR-980 sentence (the user
+  approved it): the review prompt tells the agent to put the audit record's
+  fingerprint on each lead prompt's second line. The blocker-line wording of
+  the original task shipped after its own approval; until then the sorting
+  machinery stayed dormant.
 - No validation sandbox; sandbox-run leads keep waiting for one.
 - No change to leads that already exist (OTTR-929 adds the title dedupe of new
   leads against open lead cards).
