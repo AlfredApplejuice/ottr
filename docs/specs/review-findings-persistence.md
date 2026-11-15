@@ -165,10 +165,13 @@ stage `backlog` when its review finished:
 - The migration (`ProjectStore.open`) adds the column additively and backfills
   reviews that finished before it existed, from the stage history (`events`,
   kind `stage`): a finding whose last stage change at or before the review's
-  `done_at` left it in `backlog` was a parked lead then. The backfill runs only
-  when the tasks table carries every column it reads — tables old enough to miss
-  one predate review findings entirely — and fills only NULL rows, so it is
-  idempotent. A finding without stage history keeps NULL and keeps today's hold.
+  `done_at` left it in `backlog` was a parked lead then. The backfill runs on
+  the same open that adds the column — `addColumn` records each ALTERed name in
+  the column list it works from, so the gate reads a fresh list — and on every
+  later open (only NULL rows fill, so it is idempotent). It runs only when the
+  tasks table carries every column it reads — tables old enough to miss one
+  predate review findings entirely — and a finding without stage history keeps
+  NULL and keeps today's hold.
 - Direct follow-ups only: leads file as direct children
   (`fileKeptFindings`), and a deeper closure card that misses the stamp keeps
   today's hold.

@@ -1385,15 +1385,20 @@ export class ProjectStore {
 		return await ProjectStore.open(root);
 	}
 
-	/** Additive column convergence: adds one column when the (possibly stale) column list lacks it. */
+	/** Additive column convergence: adds one column when the (possibly stale) column list
+	 * lacks it, and records the name in the list — the ALTER never updates the PRAGMA
+	 * snapshot, so later readers in the same open (further addColumns, migration gates)
+	 * would otherwise miss a column this open just added and skip work until the next
+	 * restart (OTTR-963's backfill did exactly that). */
 	private static async addColumn(
 		db: SQLiteDatabase,
-		cols: readonly string[],
+		cols: string[],
 		col: string,
 		ddl: string,
 	): Promise<void> {
 		if (cols.includes(col)) return;
 		await db.exec(ddl);
+		cols.push(col);
 	}
 
 	/** Rebuilds the tasks table in one transaction when its stored DDL still carries the

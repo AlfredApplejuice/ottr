@@ -5840,12 +5840,34 @@ describe("review findings storage", () => {
 		raw.close();
 	});
 
-	test("open backfills leadAtDone from the stage history of reviews that finished before the column existed (OTTR-963)", async () => {
-		const dir = join(root, "lead-flag-migration");
-		// First open creates the current schema and runs the backfill over an empty
-		// database; the raw rows below simulate a board from before the column existed.
-		await (await open(dir)).close();
+	// A converged database from before lead_at_done existed: the pre-findings shape
+	// plus the later columns the backfill's gate reads. The single open below is
+	// the upgrade open a deploy takes, so it must add the column and stamp the
+	// old leads in the same pass.
+	const PRE_LEAD_FLAG_TASKS_DDL = `${PRE_FINDINGS_TASKS_DDL.replace(
+		/\)\s*$/,
+		`,
+		done_at INTEGER,
+		kind TEXT NOT NULL DEFAULT 'work',
+		findings_checked_at INTEGER
+	)`,
+	)}`;
+	const EVENTS_DDL = `CREATE TABLE IF NOT EXISTS events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		at INTEGER NOT NULL,
+		task_id TEXT,
+		kind TEXT NOT NULL CHECK (kind IN ('create','stage','state','error')),
+		from_value TEXT,
+		to_value TEXT,
+		detail TEXT
+	)`;
+
+	test("open adds lead_at_done and backfills it on the upgrade open itself (OTTR-963)", async () => {
+		const dir = join(root, "lead-flag-upgrade");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		raw.exec(PRE_LEAD_FLAG_TASKS_DDL);
+		raw.exec(EVENTS_DDL);
 		const card = (
 			id: string,
 			o: {
@@ -5926,7 +5948,9 @@ describe("review findings storage", () => {
 		stageEvent("c1", 750, "backlog");
 		raw.close();
 
-		// Reopening runs the idempotent backfill over the raw rows.
+		// One open: the column lands and the old leads get their stamps in the same
+		// pass — no second restart. (This failed while addColumn left the column
+		// list stale: the gate then still saw a pre-column table and skipped.)
 		const store = await open(dir);
 		const flag = async (id: string) => (await store.getTask(id))?.leadAtDone;
 		expect(await flag("f1")).toBe(true);
@@ -5935,6 +5959,10 @@ describe("review findings storage", () => {
 		expect(await flag("f4")).toBe(true);
 		expect(await flag("f5")).toBe(false);
 		expect(await flag("c1")).toBe(false);
+		// A later open fills nothing new: the stamp is set once and stays.
+		await store.close();
+		const again = await open(dir);
+		expect((await again.getTask("f1"))?.leadAtDone).toBe(true);
 	});
 
 	test("a review landing done stamps its backlog findings, and the stamp survives re-queues (OTTR-963)", async () => {
