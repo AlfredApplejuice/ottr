@@ -13659,7 +13659,10 @@ describe("slim state and done pages (OTTR-965)", () => {
 		for (const id of expectDone) expect(ids.has(id)).toBe(true);
 		// The wide prompt text no longer rides.
 		expect(b.tasks.every((t) => t.prompt === undefined)).toBe(true);
-	});
+		// Seeding runs 6000 real store writes; measured 6.5-6.8 s on the dev
+		// workstation, so the 5000 ms default cannot hold. 20 s leaves about
+		// 3x headroom and still bounds a broken seed path.
+	}, 20_000);
 
 	test("the Done window keeps the cut plus pinned cards and drops the rest", async () => {
 		const { st, projects } = await slimBoard("slim-window");
