@@ -223,7 +223,9 @@ A card with **!** needs you. Reply in its drawer and the agent continues in the 
 
 Before the first turn of a new card, the duplicate-work gate checks if the work already exists in the code on main or in another card that is in progress, is merging, or is a done research card without a follow-up. When the whole work exists, the board cancels the new card and shows the reason with the matched cards or files in its drawer. When only a part exists, the card runs and its agent gets a note about the overlap.
 
-A proposal card (a retro or fork proposal parked with **!**) opens on a **Decide** panel at the top of its drawer: what changes, why, the gain, the risk and the check, each on one line, with **Accept**, **Edit** and **Cancel** beside them and the full prompt under a collapsed section. The board card carries a **Decide** button that opens the drawer. Accept starts the card, Edit rewrites its prompt first, Cancel declines it. Older proposals without the stored summary show the prompt's first paragraph instead of the five lines.
+A proposal card (a retro or fork proposal) opens with a decision panel at the top of its drawer. In the column view, open the card itself. The card has no separate **Decide** button.
+
+The panel shows what changes, why, the gain, the risk and the check, each on one line. **Accept** starts the card. **Edit** opens its prompt editor. **Cancel task** declines the proposal. The full prompt stays under a collapsed section. Older proposals without the stored summary show the prompt's first paragraph instead of the five lines.
 
 When a running turn writes nothing to its task log for 2 hours, its card shows a warning: the agent may wait on a hung command. Ottr does not stop the run. Steer, stop, or cancel the card. The warning goes away when the log grows again. A log that reached its 2 MiB limit keeps no new text, but new output still clears the warning.
 

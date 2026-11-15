@@ -1,8 +1,7 @@
 # Proposal decision panel
 
-A proposal card (a retro or fork proposal parked at needs_you) gets a decision panel
-at the top of its drawer and a Decide entry on the board card, so the user decides in
-a few seconds without reading the full prompt.
+A proposal card (a retro or fork proposal parked at needs_you) has a decision panel
+at the top of its drawer. The card itself opens the drawer in the column view.
 
 ## Behavior
 
@@ -17,8 +16,8 @@ a few seconds without reading the full prompt.
   - a collapsed "Full prompt" section with the whole prompt.
 - The yellow needs-reason box and the standalone Prompt section stay hidden on
   proposal cards; the panel carries both. Other needs-you cards keep the old box.
-- Board card: proposal cards get a "Decide" button beside the card body (same click
-  rules as the hold-link chips); it opens the drawer, where the panel sits on top.
+- Board card: the card link opens the drawer, where the decision panel sits on top.
+  Proposal cards have no separate "Decide" button.
 - Fallback: a proposal without stored fields (older cards, fork proposals) shows the
   first paragraph of the prompt as the summary body; the five labels stay out.
 - Edit on a held proposal: /edit and /edit/start accept a todo card in needs_you
@@ -49,6 +48,8 @@ a few seconds without reading the full prompt.
 
 - The five lines and the three buttons fit without scrolling at 1280x800 and
   390x844.
+- Column view: proposal cards have no "Decide" button. The card link still opens
+  the drawer, and Accept, Edit and Cancel task keep their current behavior.
 - Tests cover: each panel action hits today's endpoint, the no-fields fallback,
   keyboard access (Tab order, accessible names), the edit gate for proposals, the
   migration convergence, and the runner capture rules.

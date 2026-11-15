@@ -1018,28 +1018,6 @@ function cardTags(
 	);
 }
 
-/** A proposal card's Decide chip beside the card tags: it opens the drawer, where the
- *  decision panel sits on top. Same click rules as the hold-link chips. The caller renders
- *  it only for a proposal card (isProposalCard). */
-function cardDecide(task: TaskCard, onOpen: (id: string) => void): ReactNode {
-	return (
-		<span className="card-tags">
-			<button
-				type="button"
-				className="decide-link"
-				title="Accept, edit or cancel this proposal"
-				onClick={(e) => {
-					// The card body is a stretched open link: keep the click off it.
-					e.stopPropagation();
-					onOpen(task.id);
-				}}
-			>
-				Decide
-			</button>
-		</span>
-	);
-}
-
 const Card = memo(function Card({
 	task,
 	github,
@@ -1147,9 +1125,6 @@ const Card = memo(function Card({
 				{cardMutation(task, sp, spLeft)}
 			</a>
 			{cardTags(task, github, release, holdRelease, onOpenTask, onRerelease)}
-			{/* A proposal card gets a Decide chip beside the card tags: it opens the drawer,
-			    where the decision panel sits on top. Same click rules as the hold-link chips. */}
-			{proposal && cardDecide(task, onOpen)}
 		</div>
 	);
 });

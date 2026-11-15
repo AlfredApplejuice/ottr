@@ -8359,7 +8359,7 @@ describe("Drawer proposal decision panel", () => {
 		expect(html).not.toContain('id="drawer-decide"');
 	});
 
-	test("a proposal card reads as a draft with a Decide chip; an ordinary needs_you card keeps the alarm", () => {
+	test("a proposal card opens through its card link without a separate action; an ordinary needs_you card keeps the alarm", () => {
 		const laneBase = {
 			projectTasks: [] as TaskCard[],
 			hasRules: true,
@@ -8386,10 +8386,11 @@ describe("Drawer proposal decision panel", () => {
 		const withProposal = renderToStaticMarkup(
 			<LaneCol {...laneBase} stage="todo" tasks={[proposal]} />,
 		);
-		expect(withProposal).toContain('class="decide-link"');
-		expect(withProposal).toContain(">Decide</button>");
-		expect(withProposal).toContain(
-			'title="Accept, edit or cancel this proposal"',
+		const document = new Window().document;
+		document.body.innerHTML = withProposal;
+		expect(document.querySelectorAll(".card button").length).toBe(0);
+		expect(document.querySelector("a.card-open")?.getAttribute("href")).toBe(
+			"/projects/proj/tasks/t1",
 		);
 		// A suggestion, not a fault: the draft face, no amber error line, no needs triangle.
 		expect(withProposal).toContain("data-proposal");
@@ -8404,7 +8405,6 @@ describe("Drawer proposal decision panel", () => {
 		const withPlain = renderToStaticMarkup(
 			<LaneCol {...laneBase} stage="todo" tasks={[plain]} />,
 		);
-		expect(withPlain).not.toContain("decide-link");
 		expect(withPlain).not.toContain("data-proposal");
 		expect(withPlain).toContain('class="card-error"');
 		expect(withPlain).toContain("mark-needs");
