@@ -14773,46 +14773,36 @@ describe("work card check", () => {
 	});
 });
 
-// Release-line gate auto-hold (OTTR-960): a Dependabot card the gate parks waits with a
-// timer and restarts by itself when the line settles — but only when the board's own
-// gate probe proves the card's gates fail only at that line, and a park the board can
-// pin on another cause keeps the needs_you park.
+// Release-line auto-hold (OTTR-960, data-only seam since OTTR-972): a Dependabot
+// card the stamp parks waits with a timer and restarts by itself when the line
+// settles. The block derives from the card's worktree data alone (bun.lock,
+// package.json, origin/main's lock, registry packuments) through the
+// releaseLineBlocked seam — the board spawns no worktree script for the hold, and
+// a park the board can pin on another cause, an ask, and every derivation failure
+// keep the needs_you park (fail closed).
 describe("turn release line hold (dependabot gate park)", () => {
 	const DAY = 86_400_000;
 	const T1 = Date.now() + DAY;
 	const T2 = T1 + DAY;
 	const PARK_QUESTION =
 		"Re-run this card's integration turn after the release line settles.";
-	const marker = (
+
+	type BlockedEntry = { name: string; version: string; waitUntilMs: number };
+
+	/** The derived block of a card whose dependency bump is release-line blocked. */
+	const holdEntries = (
 		entries: Array<[name: string, version: string, waitUntilMs: number]>,
-	): string =>
-		`release line blocked: ${JSON.stringify({
-			blocked: entries.map(([name, version, waitUntilMs]) => ({
-				name,
-				version,
-				waitUntilMs,
-			})),
-		})}\n`;
+	): BlockedEntry[] =>
+		entries.map(([name, version, waitUntilMs]) => ({
+			name,
+			version,
+			waitUntilMs,
+		}));
 
-	type GateProbe = {
-		check: { ok: boolean; output: string };
-		test: { ran: boolean; ok: boolean };
-	};
-	/** The probe result of a card whose gates fail only at the release line. */
-	const gateRed = (output: string): GateProbe => ({
-		check: { ok: false, output },
-		test: { ran: true, ok: true },
-	});
-
-	/** startRun override whose run reports the OTTR-938-style needs_you park, and a
-	 * runProjectGates stub that answers the probe the stamp makes. */
-	function gateRun(
-		record: Recorded,
-		probeOutput: () => GateProbe,
-	): Partial<TurnOps> {
+	/** startRun override whose run reports the OTTR-938-style needs_you park. */
+	function parkRun(record: Recorded): Partial<TurnOps> {
 		return {
 			commitsAhead: async () => 0,
-			runProjectGates: async () => probeOutput(),
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -14835,15 +14825,24 @@ describe("turn release line hold (dependabot gate park)", () => {
 		};
 	}
 
-	async function gateCase(probeOutput: () => GateProbe) {
+	/** The park case with a releaseLineBlocked stub whose call count the tests
+	 * read: a guard that returns early must never read the lock data. */
+	async function holdCase(blocked: () => BlockedEntry[] | null) {
+		let calls = 0;
 		const store = await freshStore();
 		const record = baseRecord();
 		const projects = new Map([[store.name, fakeProject(store)]]);
 		const loop = holdFollowUps(
 			projects,
-			fakeOps(record, gateRun(record, probeOutput)),
+			fakeOps(record, {
+				...parkRun(record),
+				releaseLineBlocked: async () => {
+					calls += 1;
+					return blocked();
+				},
+			}),
 		);
-		return { store, loop, projects };
+		return { store, loop, projects, blockedCalls: () => calls };
 	}
 
 	async function dependabotTask(store: ProjectStore) {
@@ -14854,13 +14853,11 @@ describe("turn release line hold (dependabot gate park)", () => {
 	}
 
 	test("a gate-blocked dependabot card arms the hold at the latest clear time", async () => {
-		const { store, loop } = await gateCase(() =>
-			gateRed(
-				`other steps pass\n${marker([
-					["@biomejs/biome", "2.6.7", T1],
-					["knip", "6.44.1", T2],
-				])}`,
-			),
+		const { store, loop } = await holdCase(() =>
+			holdEntries([
+				["@biomejs/biome", "2.6.7", T1],
+				["knip", "6.44.1", T2],
+			]),
 		);
 		const task = await dependabotTask(store);
 
@@ -14893,8 +14890,8 @@ describe("turn release line hold (dependabot gate park)", () => {
 	});
 
 	test("a merge-kind dependabot card requeues at merging with the same hold", async () => {
-		const { store, loop } = await gateCase(() =>
-			gateRed(`${marker([["@biomejs/biome", "2.6.7", T1]])}`),
+		const { store, loop } = await holdCase(() =>
+			holdEntries([["@biomejs/biome", "2.6.7", T1]]),
 		);
 		const task = await dependabotTask(store);
 		await store.updateTask(task.id, { stage: "merging" });
@@ -14913,16 +14910,10 @@ describe("turn release line hold (dependabot gate park)", () => {
 		).toContain(task.id);
 	});
 
-	test("a red test gate beside the red release line keeps the needs_you park", async () => {
-		// The check failed at the marker step (the probe ran the test gate), but the
-		// test gate is red too: the card does not fail only on the release line.
-		const { store, loop } = await gateCase(() => ({
-			check: {
-				ok: false,
-				output: `${marker([["@biomejs/biome", "2.6.7", T1]])}`,
-			},
-			test: { ran: true, ok: false },
-		}));
+	test("a null derivation keeps the needs_you park", async () => {
+		// The fail-closed shape: a registry error or an unreadable file returns
+		// null, and the park stays a park.
+		const { store, loop } = await holdCase(() => null);
 		const task = await dependabotTask(store);
 
 		await loop.runTurn(store.name, task.id);
@@ -14935,12 +14926,9 @@ describe("turn release line hold (dependabot gate park)", () => {
 		expect(after.pendingPrompt).toBeNull();
 	});
 
-	test("a check run that fails on another step keeps the needs_you park", async () => {
-		// No marker line: the probe skips the test gate (its verdict cannot matter).
-		const { store, loop } = await gateCase(() => ({
-			check: { ok: false, output: "error TS2321: cannot find name 'x'\n" },
-			test: { ran: false, ok: false },
-		}));
+	test("an empty derived set keeps the needs_you park", async () => {
+		// The data read fine but names no blocked package: nothing to wait for.
+		const { store, loop } = await holdCase(() => []);
 		const task = await dependabotTask(store);
 
 		await loop.runTurn(store.name, task.id);
@@ -14953,11 +14941,12 @@ describe("turn release line hold (dependabot gate park)", () => {
 		expect(after.pendingPrompt).toBeNull();
 	});
 
-	test("a card with a broken push state keeps the park even with a red gate", async () => {
+	test("a card with a broken push state keeps the park even with blocked packages", async () => {
 		// The board can pin the park on the AGENTS.md step-1 failure (mainUnpushed):
-		// the hold never replaces a park the board knows is not the gate's.
-		const { store, loop, projects } = await gateCase(() =>
-			gateRed(`${marker([["@biomejs/biome", "2.6.7", T1]])}`),
+		// the hold never replaces a park the board knows is not the gate's, and the
+		// guard returns before any data read.
+		const { store, loop, projects, blockedCalls } = await holdCase(() =>
+			holdEntries([["@biomejs/biome", "2.6.7", T1]]),
 		);
 		projects.get(store.name)!.mainUnpushed = true;
 		const task = await dependabotTask(store);
@@ -14968,13 +14957,13 @@ describe("turn release line hold (dependabot gate park)", () => {
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(PARK_QUESTION);
 		expect(after.holdUntil).toBeNull();
+		expect(blockedCalls()).toBe(0);
 	});
 
-	test("a passing probe keeps the park, and a non-dependabot card never probes", async () => {
-		const { store, loop } = await gateCase(() => ({
-			check: { ok: true, output: "" },
-			test: { ran: false, ok: false },
-		}));
+	test("a non-dependabot card never reads the lock data", async () => {
+		const { store, loop, blockedCalls } = await holdCase(() =>
+			holdEntries([["@biomejs/biome", "2.6.7", T1]]),
+		);
 		const task = await dependabotTask(store);
 		await store.updateTask(task.id, { sourcePrDependabot: false });
 
@@ -14982,12 +14971,14 @@ describe("turn release line hold (dependabot gate park)", () => {
 
 		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(PARK_QUESTION);
 		expect(after.holdUntil).toBeNull();
+		expect(blockedCalls()).toBe(0);
 	});
 
-	test("a marker whose clear time already passed keeps the park", async () => {
-		const { store, loop } = await gateCase(() =>
-			gateRed(`${marker([["@biomejs/biome", "2.6.7", Date.now() - 1]])}`),
+	test("a clear time already passed keeps the park", async () => {
+		const { store, loop } = await holdCase(() =>
+			holdEntries([["@biomejs/biome", "2.6.7", Date.now() - 1]]),
 		);
 		const task = await dependabotTask(store);
 
@@ -14996,6 +14987,131 @@ describe("turn release line hold (dependabot gate park)", () => {
 		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.holdUntil).toBeNull();
+	});
+
+	/** The live acceptance (spec check 26): the real releaseLineBlocked derives the
+	 * hold from a real git fixture and a real registry listener, and the board
+	 * spawns no worktree script on the way — the fixture's check script is a
+	 * canary that would write canary-env.txt if anything ran it. */
+	test("the live derivation arms the hold and spawns no worktree script", async () => {
+		const base = Date.now();
+		const store = await freshStore();
+		const record = baseRecord();
+		const projects = new Map([[store.name, fakeProject(store)]]);
+		const loop = holdFollowUps(projects, fakeOps(record, parkRun(record)));
+		const task = await dependabotTask(store);
+		const wt = join(store.worktreesDir, task.id);
+
+		// The real lock of this repo with the biome pin bumped one patch up (V2,
+		// V3 for the registry): the packages key and the root workspace tuple both
+		// move, like a real Dependabot bump.
+		const realLock = readFileSync(
+			join(import.meta.dir, "..", "bun.lock"),
+			"utf8",
+		);
+		const v1 = /"@biomejs\/biome@(\d+\.\d+\.\d+)"/.exec(realLock)![1]!;
+		const bump = (version: string, by: number): string => {
+			const [major = "0", minor = "0", patch = "0"] = version.split(".");
+			return `${major}.${minor}.${Number(patch) + by}`;
+		};
+		const v2 = bump(v1, 1);
+		const v3 = bump(v1, 2);
+		const bumpedLock = realLock.replaceAll(
+			`"@biomejs/biome@${v1}"`,
+			`"@biomejs/biome@${v2}"`,
+		);
+
+		// Base commit: the unbumped lock, so origin/main:bun.lock is the scan's
+		// base. No remote: the ref alone answers rev-parse and cat-file.
+		const git = (...args: string[]): void => {
+			execSync(`git ${args.join(" ")}`, { cwd: wt, stdio: "ignore" });
+		};
+		writeFileSync(join(wt, "bun.lock"), realLock);
+		writeFileSync(
+			join(wt, "package.json"),
+			JSON.stringify({ name: "hold-fixture", type: "module" }),
+		);
+		git("init", "-q", "-b", "main");
+		git("add", ".");
+		git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base");
+		git("update-ref", "refs/remotes/origin/main", "HEAD");
+
+		// The card's working tree: the bump, uncommitted, and a canary check
+		// script — `bun run check` would dump the board process's environment
+		// (the sentinels below) into canary-env.txt if anything spawned it.
+		writeFileSync(join(wt, "bun.lock"), bumpedLock);
+		writeFileSync(
+			join(wt, "package.json"),
+			JSON.stringify({
+				name: "hold-fixture",
+				type: "module",
+				scripts: { check: "env > canary-env.txt" },
+				devDependencies: { "@biomejs/biome": `^${v2}` },
+			}),
+		);
+
+		// Local registry: V2 sits past the 7-day age line, V3 is the young
+		// blocker; the 14-day cap is not reached, so the hold waits for V3's age.
+		const requests: Array<{ method: string; path: string }> = [];
+		const server = Bun.serve({
+			port: 0,
+			fetch(req) {
+				const url = new URL(req.url);
+				requests.push({ method: req.method, path: url.pathname });
+				return Response.json({
+					versions: { [v2]: {}, [v3]: {} },
+					time: {
+						[v2]: new Date(base - 8 * DAY).toISOString(),
+						[v3]: new Date(base - 2 * DAY).toISOString(),
+					},
+				});
+			},
+		});
+
+		// Sentinels the canary would capture on any spawn; restored in finally.
+		const savedEnv = {
+			OTTR_NPM_REGISTRY: process.env.OTTR_NPM_REGISTRY,
+			OTTR_WORKER_TOKEN: process.env.OTTR_WORKER_TOKEN,
+			ALATE_API_KEY: process.env.ALATE_API_KEY,
+			GH_TOKEN: process.env.GH_TOKEN,
+		};
+		process.env.OTTR_NPM_REGISTRY = `http://127.0.0.1:${server.port}`;
+		process.env.OTTR_WORKER_TOKEN = "sentinel-ottr-worker-token";
+		process.env.ALATE_API_KEY = "sentinel-alate-api-key";
+		process.env.GH_TOKEN = "sentinel-gh-token";
+		try {
+			await loop.runTurn(store.name, task.id);
+
+			const after = (await store.getTask(task.id))!;
+			expect(after.state).toBe("queued");
+			expect(after.stage).toBe("in_progress");
+			expect(after.holdProvider).toBeNull();
+			expect(after.pendingPrompt).not.toBeNull();
+			// The hold waits for the young release V3 to cross the age line:
+			// published 2 days before base, clear at +7 days.
+			expect(
+				Math.abs(after.holdUntil! - (base - 2 * DAY + 7 * DAY)),
+			).toBeLessThan(30_000);
+			expect(after.needsReason).toContain("@biomejs/biome");
+			// The hold text names the installed version (v2), not the blocker
+			// (v3); the blocker only shows in the clear time, asserted above.
+			expect(after.needsReason).toContain(v2);
+			expect(after.needsReason).toContain(
+				`The turn parked with: ${PARK_QUESTION}`,
+			);
+			// One packument fetch, scoped name with %2F (the OMP_PACKAGE_URL style).
+			expect(requests).toHaveLength(1);
+			expect(requests[0]!.method).toBe("GET");
+			expect(requests[0]!.path).toBe("/@biomejs%2Fbiome");
+			// The security acceptance: no worktree script ran.
+			expect(existsSync(join(wt, "canary-env.txt"))).toBe(false);
+		} finally {
+			server.stop(true);
+			for (const [key, value] of Object.entries(savedEnv)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
 	});
 });
 

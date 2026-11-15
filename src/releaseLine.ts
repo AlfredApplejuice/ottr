@@ -12,8 +12,8 @@ export type RegistryRelease = {
 
 /** The machine-readable report the bun.lock check prints when a direct package is
  * blocked (OTTR-960): one stdout line `RELEASE_LINE_MARKER + {json}`, after the human
- * failure lines. The board's gate probe triggers the test gate on it, and the hold
- * parses the blocked packages and their clear times from it. */
+ * failure lines. The board does not parse it: its hold computes the same entries from
+ * the lock data itself (OTTR-972). */
 export const RELEASE_LINE_MARKER = "release line blocked: ";
 
 const STABLE_RE = /^\d+\.\d+\.\d+$/;

@@ -132,8 +132,9 @@ export function releaseLineWaitUntil(
 ): number | null;
 
 /** The stdout marker line the bun.lock check prints when a direct package is blocked
- * (OTTR-960); the board's gate probe triggers the test gate on it and the hold parses
- * the blocked packages from it. */
+ * (OTTR-960): the script's machine-readable report, after its human failure lines.
+ * The board does not parse it; the board computes the same entries from the lock
+ * data (OTTR-972). */
 export const RELEASE_LINE_MARKER: string;
 ```
 
@@ -269,11 +270,11 @@ local registry listener, fixture lock derived from the real `bun.lock`):
     open fail card, v1.3.1 aged 2 days: the target is null (line 1.2 waited 8 days; the
     cap on line 1.3 is above the walk and cannot bless v1.2.0).
 
-## Board auto-hold for Dependabot cards (OTTR-960)
+## Board auto-hold for Dependabot cards (OTTR-960, changed by OTTR-972)
 
-A Dependabot card whose gates fail only on this check parks needs_you and waits for a
-person to re-run its turn after the wait. The board now waits with a timer and starts the
-turn again by itself when the line settles.
+A Dependabot card parks needs_you when its gates fail. When the card's dependency bump
+is release-line blocked, the park has no human cause: the board arms a timer and starts
+the turn again when the line settles.
 
 ### Marker: the script's machine-readable report
 
@@ -296,33 +297,52 @@ epoch ms at which the gate passes for that package: the earlier of
 New pure function `releaseLineWaitUntil(releases, version, now, ageMs, capMs)` in
 `src/releaseLine.ts`; null when `version` is not blocked now.
 
-### The board's hold (`src/turn.ts`)
+### The board's hold (`src/turn.ts`, `src/releaseLineScan.ts`)
+
+OTTR-972: the board no longer runs the card's gates for the hold. A gate run executes
+the worktree's own scripts (`bun run check`, `bun run test`) inside the board process
+with the server environment. A Dependabot worktree holds work-turn-controlled code, so
+that run let a steered turn reach the worker token, the Alate key, provider keys, and
+GH_TOKEN (run-8, severity high). The board now reads data only: it spawns no worktree
+script for the hold.
 
 At a settle whose classified outcome is needs_you with no ask, on a card with
 `sourcePrDependabot true`, turn kind work or merge, and no interview, grill, scout,
-review, or release identity, the board re-runs the card's gates itself in the card's
-worktree (`worktreesDir/<id>`; a missing worktree keeps the park). The run goes through a
-new optional ops seam `runProjectGates`, whose default (`src/worktree.ts`) spawns
-`bun run check` and then `bun run test` like `runMergeGates` does (same env rule,
-30-minute kill per gate) and returns the check's uncapped combined output.
+review, or release identity, the board derives the block from the card's worktree
+(`worktreesDir/<id>`; a missing worktree keeps the park). The derivation goes through a
+new optional ops seam `releaseLineBlocked`, whose default (`src/releaseLineScan.ts`)
+does:
 
-**Attribution.** The arm needs proof that the card's gates fail only at the release
-line, and the board reads only its own run, never agent text:
+1. Read `<worktree>/bun.lock` and `<worktree>/package.json`. A missing or unreadable
+   file keeps the park (fail closed).
+2. Read the base lock with `git rev-parse --verify origin/main`, then
+   `git ls-tree origin/main -- bun.lock` for the file's presence, then
+   `git cat-file blob origin/main:bun.lock`, all in the worktree. No origin/main
+   keeps the park. Git trouble keeps the park. No bun.lock on origin/main means an
+   empty base map. `git cat-file blob` runs no textconv, filter, or hook, so no
+   worktree-controlled code runs.
+3. Compute the changed set like the script: registry entries keyed by their `packages`
+   map key; changed when the key is added, or when its resolved name or version
+   differs; stable versions only; ascending by name; identical pairs scan once.
+4. For each changed package whose name is direct, fetch the packument from the registry
+   (the shared `fetchReleases`; the board makes network calls, never script calls). A
+   registry error keeps the park (fail closed).
+5. A direct package whose line is unsettled and not cap-lifted gives one entry
+   `{ name, version, waitUntilMs }` (`releaseLineWaitUntil`).
 
-- The check chain is `&&`-ordered and the release-line step is not its last step, so a
-  check run that exits non-zero and carries exactly one `release line blocked: ` marker
-  line failed at that gate: every earlier step passed and the steps after it never ran.
-- The probe runs `bun run test` exactly when the check's output carries that marker
-  line, so a card whose test gate is red keeps the park; the test's verdict proves the
-  gate is the check's only failing step across both merge gates.
+`scanReleaseLines` in the same module holds steps 3 to 5 as one shared core. The script
+and the board both call it, so their verdicts match.
 
-A park the board can attribute to another cause keeps the park without a probe: the
-project's push state is broken (`mainUnpushed`, the AGENTS.md step-1 failure). An
-ask-tool question keeps the park. The agent's own park reason stays on the card, appended
-after the hold text, so a park whose cause the board cannot verify is never lost — a
-reply runs the card at once.
+**Attribution.** The changed set mirrors the gate's own scan exactly: a direct changed
+package with an unsettled line is a package the card's release-line step fails on. The
+board proves the gate's data verdict, not the whole check run: the state of the other
+gates stays unknown to the hold. A park the board can attribute to another cause keeps
+the park without the read: the project's push state is broken (`mainUnpushed`, the
+AGENTS.md step-1 failure). An ask-tool question keeps the park. The agent's own park
+reason stays on the card, appended after the hold text, so a park whose cause the hold
+cannot verify is never lost — a reply runs the card at once.
 
-**Arm.** When the check failed at the marker step and the test passed, the park becomes
+**Arm.** When the derivation returns at least one entry, the park becomes
 `state queued` at the unchanged stage with:
 
 - `holdUntil` = the latest `waitUntilMs` (it must be in the future),
@@ -337,25 +357,28 @@ still runs the card now: the existing reply and requeue paths write `holdUntil n
 
 ### Acceptance checks
 
-21. `releaseLineWaitUntil`: blocked by one young release above → its publish time plus
-    `ageMs`; with the cap earlier → the cap time; not blocked → null; two young releases
-    above → the newest one's publish time plus `ageMs`.
-22. Script: the unsettled direct dependency fixture exits 1 with the human line and the
-    exact marker line naming the package, version, and the computed `waitUntilMs`.
-23. Fake clock: a Dependabot card whose check run fails with marker times T1 < T2 and a
-    passing test gate parks `state queued` with `holdUntil T2`; `pickRunnable` at
-    `now = T2` picks the card, at `T2 - 1` it does not. The card's reason names the
-    packages, the time, and the park reason it replaces. Each fails before the change.
-24. The same card with a failing test gate (the probe ran it: check failed at the marker
-    step, test failed) keeps today's needs_you park; so does a check that fails on
-    another step (no marker line, the probe skips the test gate), a passing probe, a
-    marker whose clear time already passed, a card with a broken push state
-    (`mainUnpushed`), and a non-Dependabot card.
+21. `releaseLineWaitUntil`: unchanged; the pure module tests keep covering it.
+22. Script: the unsettled direct dependency fixture still exits 1 with the human line
+    and the exact marker line naming the package, version, and the computed
+    `waitUntilMs` (`scripts/check-release-lines.test.ts` runs the refactored script
+    unchanged).
+23. Fake clock (seam stub): a Dependabot card whose derived entries carry clear times
+    T1 < T2 parks `state queued` with `holdUntil T2`; `pickRunnable` at `now = T2`
+    picks the card, at `T2 - 1` it does not. The card's reason names the packages, the
+    time, and the park reason it replaces.
+24. Keep-park cases, each with the seam stub: an empty derived set, a null derivation
+    (every fail-closed shape), a clear time already passed, a card with a broken push
+    state (`mainUnpushed`), and a non-Dependabot card.
 25. `releaseUsageHolds` leaves the armed hold (null provider) armed across a quota
     refresh that saw the provider blocked and then free.
-26. Live spawn (`runProjectGates`): a check that fails at a marker-printing step runs
-    the test gate and reports its verdict; a check that fails without the marker or
-    passes skips the test gate.
+26. Live reader (OTTR-972): a fixture worktree with a real git `origin/main`, a
+    `bun.lock` derived from this repo's real lock, and a `package.json` whose `check`
+    script writes its environment into a canary file; sentinel values for
+    `OTTR_WORKER_TOKEN`, `ALATE_API_KEY`, and `GH_TOKEN` sit in the board env; a local
+    registry listener answers the packument. The hold arms with the fixture's clear
+    time; the listener saw method `GET` and the exact encoded path `/<name>` with `/`
+    as `%2F`, not a substring; the canary file does not exist: no server-side spawn
+    happened.
 
 Gates: `bun run check` and `bun test` exit 0.
 
@@ -365,7 +388,8 @@ Gates: `bun run check` and `bun test` exit 0.
 - GitHub Actions, Docker base image, Dependabot behavior, the 7-day age.
 - No new dependency; no ADR.
 - The gate's rule, the Dependabot config, and non-Dependabot cards stay unchanged
-  (OTTR-960). `bun test` takes no part in the attribution.
+  (OTTR-960). The hold reads lock data only; no gate runs on the board for the hold
+  (OTTR-972).
 
 ## Alternatives considered
 
@@ -375,24 +399,33 @@ Gates: `bun run check` and `bun test` exit 0.
   (decision 6 records the cooldown stays).
 - A per-package threshold configuration: rejected; one rule with fixed 7 and 14 days.
 - Parsing the agent's park reason for the wait: rejected; agent text can quote any
-  marker, so the board reads only its own check run's output.
-- Probing only the release-line script without the check chain: rejected; the marker
-  alone proves the gate red, not that the run failed at the gate, so another red gate
-  would also arm the timer.
-- Running the test gate on every probe: rejected; its verdict matters only when the
-  marker proves the check failed at the gate step, so the minutes stay unspent on every
-  other park.
+  marker, so the board reads only data it derived itself.
+- Running the probe as the card's gate scripts in the board process (OTTR-960 as
+  shipped): replaced by OTTR-972; the probe executed work-turn-controlled worktree code
+  with the server environment (run-8, severity high).
+- Dispatching the probe through a worker: rejected for this fix; it keeps script
+  execution for the hold and adds a worker round-trip to the settle path.
+- Stripping the env at the spawn (`childEnv` + `stripGitAuthEnv`): rejected; worktree
+  scripts would still run as the board, only with fewer secrets.
+- Proving the whole check run (only the release-line step red, the test gate green):
+  dropped with the probe (OTTR-972); the board knows the gate's data verdict, and the
+  park reason stays on the card for every other cause.
 
 ## Risks
 
 - Registry outage fails the check by decision. Mitigation: the error names the package;
   re-running `bun run check` retries.
+- The board-side hold reads the worktree's lock files as untrusted input and makes
+  registry GETs; it runs no worktree code. A crafted lock can only shape which packages
+  the board asks the registry about; the registry answers with its own data, and the
+  rule functions bound the result.
+- A park whose cause is not the gate still arms the hold when the bump is
+  release-line blocked; the turn resumes at the clear time and parks again. Mitigation:
+  the hold text keeps the park reason on the card, and a reply runs the card at once.
+- A registry error keeps the park (fail closed), so a Dependabot card behind a registry
+  outage waits for a person instead of a timer.
 - npm changes the lockfile entry shape or the packument envelope: the parser skips what
   it cannot read, so a silent under-check is possible; the fixture tests pin today's
   shape and the spec names the revisit trigger.
 - The cap can take an unsettled-line version after 14 days of waiting; that is the
   decided tradeoff against waiting forever.
-- The probe runs the full check chain, and the test gate too when the check failed at
-  the marker step (about a minute, plus registry calls, plus a test run) inside the
-  settle; it runs only for Dependabot needs_you parks with no ask. A flaky test fails
-  the probe and keeps the park (fail closed).
