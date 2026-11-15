@@ -1817,6 +1817,25 @@ export function createSupervisor(
 				workCheckReport: null,
 				workCheckSendbacks: 0,
 				workCheckLog: [],
+				// OTTR-977: the first life's PR fields must not survive into the second.
+				// A kept prNumber settles the parked merge turn done against the merged
+				// PR (the fix never ships and the park's question is lost), and kept
+				// source fields would route the re-ship at the merged source PR. The
+				// second life ships a fresh PR like a fresh card. sourcePrDependabot
+				// stays: with the source number null it is the ship-time marker that
+				// skips resolveLegacyDependabotPr (the prompt's first line still names
+				// the merged Dependabot PR) and keeps the release-line hold attribution.
+				prNumber: null,
+				prUrl: null,
+				prHeadSha: null,
+				prWatchAt: null,
+				followUpPrNumber: null,
+				followUpPrUrl: null,
+				sourcePrNumber: null,
+				sourcePrUrl: null,
+				sourcePrHeadRef: null,
+				sourcePrHeadSha: null,
+				sourcePrCrossRepo: false,
 			}))
 		)
 			return true;

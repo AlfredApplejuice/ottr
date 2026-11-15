@@ -22666,6 +22666,48 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.sourcePrNumber).toBe(null);
 	});
 
+	test("a reopened Dependabot card ships a fresh PR, not the merged source PR (OTTR-977)", async () => {
+		const fetches: unknown[][] = [];
+		const comments: unknown[] = [];
+		const opens: { repo: string; branch: string; base: string }[] = [];
+		const { store, loop, task } = await prMergeSetup({
+			fetchPrHead: async (...args: unknown[]) => {
+				fetches.push(args);
+				return null;
+			},
+			prComment: async (o) => {
+				comments.push(o);
+				return { ok: true as const };
+			},
+			openPr: async (o) => {
+				opens.push(o);
+				return {
+					ok: true as const,
+					pr: { number: 12, url: "https://github.com/acme/repo/pull/12" },
+				};
+			},
+		});
+		// The CI-failure reopen cleared the PR fields and kept the Dependabot flag:
+		// the only row shape that holds the flag with a null source number. The
+		// prompt's first line still names the merged PR #30, so without the skip the
+		// legacy resolve would adopt it and ship at a PR that can never merge again.
+		await store.updateTask(task.id, {
+			prompt: `${dependabotHead(30, "acme/repo")}: Bump vite from 5 to 7`,
+			sourcePrDependabot: true,
+		});
+		await loop.runTurn(store.name, task.id);
+		// The legacy resolve never ran: no head fetch, no @dependabot comment.
+		expect(fetches).toEqual([]);
+		expect(comments).toEqual([]);
+		expect(opens).toHaveLength(1);
+		expect(opens[0]).toMatchObject({ repo: "acme/repo", base: "main" });
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.prNumber).toBe(12);
+		expect(after.sourcePrNumber).toBe(null);
+	});
+
 	test("a legacy re-ship after a rebase refreshes the head and adopts the PR (OTTR-809)", async () => {
 		const fetches: unknown[][] = [];
 		const { store, loop, task } = await prMergeSetup({

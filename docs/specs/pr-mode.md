@@ -582,17 +582,35 @@ that owns the work:
   board reopens that card. The write sets `in_progress`/`queued` with
   `needsReason` null, queues the failed-check list plus the failed steps'
   log as the pending prompt, and clears `pushSha`, `worktree`, `branch`,
-  `base` and the first life's work-check state (`workCheckHead`,
-  `workCheckReport`, `workCheckSendbacks`, `workCheckLog`). `doneAt`
+  `base`, the first life's work-check state (`workCheckHead`,
+  `workCheckReport`, `workCheckSendbacks`, `workCheckLog`) and the first
+  life's PR fields (`prNumber`, `prUrl`, `prHeadSha`, `prWatchAt`,
+  `followUpPrNumber`, `followUpPrUrl`, `sourcePrNumber`, `sourcePrUrl`,
+  `sourcePrHeadRef`, `sourcePrHeadSha`, `sourcePrCrossRepo`). `doneAt`
   stays: nothing reads it while the stage is not `done`, and the next done
   write stamps it fresh.
+- The PR fields are part of the same fresh-card rule (OTTR-977): the first
+  life's PR has already merged, so no second-life verdict can belong to it.
+  A kept `prNumber` would settle the parked merge turn done against the
+  merged PR — the next PR poll answers the merge, the park's question is
+  lost, and the old PR's branch delete runs. The second life is therefore a
+  card with no PR of record: `prPass` skips it, and the ship step opens a
+  fresh PR for the fix. `sourcePrDependabot` stays set. On the reopened row
+  the flag with a null `sourcePrNumber` occurs nowhere else (the Dependabot
+  filer stamps the number at creation, and a pre-OTTR-760 legacy card has
+  the flag false), so it is the ship-time marker that makes
+  `resolveLegacyDependabotPr` return "none" — the prompt's first line still
+  names the merged Dependabot PR, and adopting it would ship the fix at a
+  PR that can never merge again. The kept flag also keeps the release-line
+  hold attribution for the reopened bump.
 - The next turn dispatch reads the cleared row fields and takes the same
   create path as a fresh card: `resolveTarget` fetches the target fresh,
   and `prepareTurnHeader`'s `task.base ?? sha` fallback stamps the current
   target tip as the base of the new worktree and branch, while the card's
   `sessionId` carries over untouched, so the agent resumes its own
   session. The fix ships through the normal merge flow; a PR-mode card
-  re-ships and opens a new PR (OTTR-799).
+  ships a fresh PR (the OTTR-799 re-ship, which updates an existing PR,
+  applies only to a card that never lost its PR fields).
 - The same dedupe as the follow-up flow: the cleared `pushSha` is the
   one-fix-per-head rule (a cleared head never replies twice, and the next
   ship pins a new head for the next verdict), and the per-check rule runs
@@ -708,7 +726,10 @@ server remains the only writer of origin.
 - CI failure after the merge (OTTR-915): a failed run whose head sha
   matches exactly one done card reopens that card — `in_progress`/`queued`
   with the failed-step log in the pending prompt, `pushSha`, `worktree`,
-  `branch`, `base` and the first life's work-check state cleared, no
+  `branch`, `base`, the first life's work-check state and the first life's
+  PR fields cleared (OTTR-977: the second life ships a fresh PR, and a
+  parked merge turn survives a PR poll against the merged old PR; the kept
+  Dependabot flag with the null source number skips the legacy resolve), no
   follow-up card filed, and the next tick replies nothing. A run matching
   two done cards files one follow-up card as today and reopens nothing. A
   failed log fetch keeps the refetch instruction in the reopen prompt.

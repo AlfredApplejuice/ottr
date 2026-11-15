@@ -6005,6 +6005,171 @@ describe("CI reopen after the merge", () => {
 		expect(after.workCheckLog).toEqual([]);
 		await store.close();
 	});
+
+	test("the reopen clears the first life's PR fields (OTTR-977)", async () => {
+		const store = await prModeProject("ci-reopen-prfields");
+		await store.setSettings({
+			originUrl: "https://github.com/acme/widget.git",
+		});
+		const t = await store.createTask("parent");
+		await store.updateTask(t.id, {
+			stage: "done",
+			state: "idle",
+			pushSha: "abc1234567890",
+			prNumber: 7,
+			prUrl: "https://github.com/acme/widget/pull/7",
+			prHeadSha: "abc1234567890",
+			prWatchAt: 123,
+			followUpPrNumber: 9,
+			followUpPrUrl: "https://github.com/acme/widget/pull/9",
+			sourcePrNumber: 7,
+			sourcePrUrl: "https://github.com/acme/widget/pull/7",
+			sourcePrHeadRef: "dependabot/npm_and_yarn/vite-7.1.2",
+			sourcePrHeadSha: "abc1234567890",
+			sourcePrDependabot: true,
+			branch: "ottr/552",
+			base: "main",
+			worktree: join(root, "ci-reopen-prfields", ".wt-gone"),
+		});
+		const ops = fakeOps({
+			ghResult: {
+				code: 0,
+				stdout: runsJson([
+					{
+						status: "completed",
+						conclusion: "failure",
+						name: "build",
+						html_url: "https://run/1",
+						id: 418,
+					},
+				]),
+				stderr: "",
+			},
+			runViewResult: {
+				code: 0,
+				stdout: "error: Process completed with exit code 1.",
+				stderr: "",
+			},
+		});
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
+		const after = (await store.getTask(t.id))!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("queued");
+		// A kept prNumber settles the second life's parked merge turn done against
+		// the merged PR, and kept source fields route the re-ship at the merged
+		// source PR. The second life ships a fresh PR like a fresh card. The
+		// Dependabot flag stays: with the source number null it marks the reopened
+		// card at ship time, so the legacy resolve skips it (OTTR-977).
+		expect(after.prNumber).toBeNull();
+		expect(after.prUrl).toBeNull();
+		expect(after.prHeadSha).toBeNull();
+		expect(after.prWatchAt).toBeNull();
+		expect(after.followUpPrNumber).toBeNull();
+		expect(after.followUpPrUrl).toBeNull();
+		expect(after.sourcePrNumber).toBeNull();
+		expect(after.sourcePrUrl).toBeNull();
+		expect(after.sourcePrHeadRef).toBeNull();
+		expect(after.sourcePrHeadSha).toBeNull();
+		expect(after.sourcePrCrossRepo).toBe(false);
+		expect(after.sourcePrDependabot).toBe(true);
+		await store.close();
+	});
+
+	test("a parked merge turn of a reopened PR card survives prPass against the merged old PR (OTTR-977)", async () => {
+		const store = await prModeProject("ci-reopen-park");
+		await store.setSettings({
+			originUrl: "https://github.com/acme/widget.git",
+		});
+		const t = await store.createTask("parent");
+		await store.updateTask(t.id, {
+			stage: "done",
+			state: "idle",
+			pushSha: "abc1234567890",
+			prNumber: 7,
+			prUrl: "https://github.com/acme/widget/pull/7",
+			prHeadSha: "abc1234567890",
+			branch: "ottr/552",
+			base: "main",
+			worktree: join(root, "ci-reopen-park", ".wt-gone"),
+		});
+		const ops = fakeOps({
+			ghResult: {
+				code: 0,
+				stdout: runsJson([
+					{
+						status: "completed",
+						conclusion: "failure",
+						name: "build",
+						html_url: "https://run/1",
+						id: 419,
+					},
+				]),
+				stderr: "",
+			},
+			runViewResult: {
+				code: 0,
+				stdout: "error: Process completed with exit code 1.",
+				stderr: "",
+			},
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		// Tick 1: the CI failure on the merge push reopens the card.
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
+		const reopened = (await store.getTask(t.id))!;
+		expect(reopened.stage).toBe("in_progress");
+		// The fix's merge turn parks (a failed push, a failed PR open, a gate ask):
+		// the agent's question must reach the human, not a PR poll verdict. The fix
+		// turn consumed the reopen's reply at dispatch, so the park holds no pending
+		// prompt — the row is exactly what a real merge-turn park leaves.
+		await store.updateTask(t.id, {
+			stage: "merging",
+			state: "needs_you",
+			needsReason: "Server push to origin failed",
+			pendingPrompt: null,
+			pendingBy: null,
+		});
+		// The next PR pass reads the old PR #7: merged.
+		ops.time += 6 * 60_000; // past the PR poll window
+		ops.apiResult = (url) =>
+			url.endsWith("/pulls/7")
+				? {
+						code: 0,
+						stdout: pullBody({
+							mergedAt: "2026-11-06T00:00:00Z",
+							mergeSha: MERGE_SHA,
+						}),
+						stderr: "",
+					}
+				: openList([]);
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
+		const after = (await store.getTask(t.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("Server push to origin failed");
+		expect(after.pushSha).toBeNull();
+		// The pass ran (one open-PR list) and the card has no PR of record: no
+		// per-PR read of the old number, so nothing settles the park.
+		expect(
+			ops.apiCalls.some((c) =>
+				(c[1] ?? "").startsWith("repos/acme/widget/pulls?"),
+			),
+		).toBe(true);
+		expect(ops.apiCalls.some((c) => c[1] === "repos/acme/widget/pulls/7")).toBe(
+			false,
+		);
+		// The old PR's branch delete never runs for the second life.
+		expect(ops.calls.deletes).toEqual([]);
+		await store.close();
+	});
 });
 
 // ---- manual tick filter -------------------------------------------------------

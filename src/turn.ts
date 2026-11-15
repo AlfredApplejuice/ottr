@@ -7161,6 +7161,13 @@ export function createTurnLoop(
 		| { kind: "parked" }
 		| { kind: "match"; n: number; src: SourcePrRef }
 	> {
+		// OTTR-977: a CI-failure reopen clears the PR fields but keeps the prompt, so
+		// a reopened Dependabot card reads here exactly like a legacy one. The flag
+		// with a null source number only occurs on that reopened row (the filer stamps
+		// the number at creation); the named PR already merged, so the re-ship must
+		// open a fresh PR, never adopt the merged one.
+		if (st.task.sourcePrDependabot === true && st.task.sourcePrNumber === null)
+			return { kind: "none" };
 		if (!(await canShipPr(st))) return { kind: "parked" };
 		const repo = st.e.github === null ? null : ownerRepo(st.e.github);
 		if (repo === null) return { kind: "none" };
