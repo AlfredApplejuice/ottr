@@ -12022,11 +12022,19 @@ describe("state cache and single-flight build (OTTR-866)", () => {
 
 describe("web push (R1-1, R2-3)", () => {
 	let timersControlled = false;
-	afterEach(() => {
+	const alertApps: App[] = [];
+	afterEach(async () => {
 		if (!timersControlled) return;
-		jest.clearAllTimers();
-		jest.useRealTimers();
-		timersControlled = false;
+		try {
+			// Drain each fixture before the next test shares its sender and timer queue.
+			await Promise.all(alertApps.map((created) => created.close()));
+		} finally {
+			alertApps.length = 0;
+			jest.clearAllTimers();
+			jest.useRealTimers();
+			setSystemTime();
+			timersControlled = false;
+		}
 	});
 
 	const pushSub = {
@@ -12167,17 +12175,25 @@ describe("web push (R1-1, R2-3)", () => {
 		pushFail = null;
 	});
 
-	/** Isolated board for the alert flow (OTTR-494): own global store, one project named like
-	 * its folder, and a settable clock for the presence window. Sends land in pushSends. */
+	/** Isolated board for the alert flow (OTTR-494): own stores and a frozen clock.
+	 * Both Date.now and the app clock advance through clock.now. Sends land in pushSends. */
 
 	const alertBoard = async (name: string) => {
 		// Explicit frames and flush own publishSoon, including after reboot; HTTP stays real.
 		jest.useFakeTimers();
+		setSystemTime(new Date(1_000_000_000));
 		timersControlled = true;
 		const dir = join(root, name);
 		mkdirSync(dir, { recursive: true });
 		const s = await ProjectStore.open(dir);
-		const clock = { now: 1_000_000_000 };
+		const clock = {
+			get now() {
+				return Date.now();
+			},
+			set now(value: number) {
+				setSystemTime(new Date(value));
+			},
+		};
 		const projects = new Map<string, Entry>([
 			[
 				name,
@@ -12203,6 +12219,7 @@ describe("web push (R1-1, R2-3)", () => {
 			projects,
 			now: () => clock.now,
 		});
+		alertApps.push(m.app);
 		const subscribe = async (endpoint: string) =>
 			expect(
 				(
@@ -12221,8 +12238,15 @@ describe("web push (R1-1, R2-3)", () => {
 			await s.updateTask(id, { state: "needs_you", needsReason: "?" });
 		/** A second board process on the same global store and project: a server restart. */
 
-		const reboot = async () =>
-			await mount({ gstore: m.g, projects, now: () => clock.now });
+		const reboot = async () => {
+			const rebooted = await mount({
+				gstore: m.g,
+				projects,
+				now: () => clock.now,
+			});
+			alertApps.push(rebooted.app);
+			return rebooted;
+		};
 		const flush = async () => {
 			jest.runOnlyPendingTimers();
 			await m.app.publishState();
@@ -12619,6 +12643,7 @@ describe("web push (R1-1, R2-3)", () => {
 			draft: run,
 			comments: null,
 		});
+		await b.flush();
 		const from = pushSends.length;
 		expect(
 			(
@@ -12641,9 +12666,13 @@ describe("web push (R1-1, R2-3)", () => {
 				prOccurrence?: { draft: number | null; comments: number | null };
 			}>;
 		};
-		expect(
-			quietFrame.tasks.find((c) => c.id === t.id)?.prOccurrence,
-		).toBeUndefined();
+		const quietCard = quietFrame.tasks.find((c) => c.id === t.id);
+		expect(quietCard).toBeDefined();
+		expect(quietCard?.prOccurrence).toBeUndefined();
+		// The final GET queues another publish. Await it and all tracked push work.
+		await b.flush();
+		await b.m.app.close();
+		expect(b.sentSince(from)).toEqual([]);
 	});
 
 	test("a focused tab holds pushes for 60 s; held events are dropped, never sent later", async () => {
