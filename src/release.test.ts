@@ -43,6 +43,7 @@ describe("releaseBlocked", () => {
 		stage: "todo",
 		state: "queued",
 		createdAt: 1,
+		queuedAt: 1,
 		doneAt: null,
 		dependsOn: [],
 		followUpOf: null,

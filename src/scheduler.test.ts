@@ -740,7 +740,7 @@ describe("pickRunnable", () => {
 		const finding = task({
 			followUpOf: review.id,
 			createdAt: 300,
-			queuedAt: 700,
+			queuedAt: 400,
 		});
 		const byHand = task({ createdAt: 300, stage: "merging", queuedAt: 600 });
 		expect(mergeHold([review, finding, byHand], byHand)).toBe(
@@ -843,6 +843,62 @@ describe("pickRunnable", () => {
 		expect(pickRunnable([review, fixed, lead, other], opts)).toEqual([other]);
 	});
 
+	test("a done release's promoted lead never holds another merge (OTTR-963)", () => {
+		// ALAT and velvarr 2026-11-15: the lead sat in the backlog when the release
+		// finished (OTTR-889's exemption), the user promoted it, and findingOpen then
+		// counted it again — every other merge of the project parked for hours.
+		const review = task({
+			kind: "review",
+			releaseVersion: "v0.4.0",
+			base: "abc",
+			stage: "done",
+			state: "idle",
+			createdAt: 100,
+			doneAt: 500,
+		});
+		// The lead files into the backlog at 310 and leaves it at 700: queuedAt is
+		// set only when it leaves, after the release's doneAt (500).
+		const lead = task({
+			followUpOf: review.id,
+			createdAt: 310,
+			stage: "in_progress",
+			state: "running",
+			queuedAt: 700,
+		});
+		const other = task({ stage: "merging", queuedAt: 100 });
+		expect(mergeHold([review, lead, other], other)).toBeNull();
+		expect(pickRunnable([review, lead, other], opts)).toEqual([other]);
+		// The same lead waiting to merge holds nothing either.
+		const ready = {
+			...lead,
+			stage: "merging" as const,
+			state: "queued" as const,
+		};
+		expect(mergeHold([review, ready, other], other)).toBeNull();
+	});
+
+	test("a done release's open non-lead finding still holds other merges (OTTR-963)", () => {
+		const review = task({
+			kind: "review",
+			releaseVersion: "v0.4.0",
+			base: "abc",
+			stage: "done",
+			state: "idle",
+			createdAt: 100,
+			doneAt: 500,
+		});
+		// A commitment when the review finished: it queued at 400, before doneAt.
+		const finding = task({
+			followUpOf: review.id,
+			createdAt: 300,
+			stage: "merging",
+			queuedAt: 400,
+		});
+		const other = task({ stage: "merging", queuedAt: 100 });
+		expect(mergeHold([review, finding, other], other)).toBe(FINDINGS_HOLD);
+		expect(pickRunnable([review, finding, other], opts)).toEqual([finding]);
+	});
+
 	test("an older release's finding does not wait for a newer open release's findings (OTTR-940)", () => {
 		// velvarr 2026-11-13: every merge parked in a hold cycle. The done release's
 		// finding waited for the open release, the open release waited for its own
@@ -860,7 +916,7 @@ describe("pickRunnable", () => {
 			followUpOf: older.id,
 			createdAt: 300,
 			stage: "merging",
-			queuedAt: 600,
+			queuedAt: 400,
 		});
 		const newer = task({
 			kind: "review",
@@ -937,7 +993,7 @@ describe("pickRunnable", () => {
 		const finding = task({
 			followUpOf: review.id,
 			createdAt: 300,
-			queuedAt: 700,
+			queuedAt: 400,
 			dependsOn: [prereq.id],
 		});
 		const sub = task({
@@ -1540,6 +1596,7 @@ describe("arch-review changed-line coverage", () => {
 			createdAt: 500,
 			followUpOf: review.id,
 			stage: "in_progress",
+			queuedAt: 500,
 		});
 		expect(mergeHold([review, merge, edge], merge)).toBe(
 			"waiting for the review's findings to be implemented",

@@ -135,6 +135,37 @@ lands the question card Done (`stage: "done"`, `state: "idle"`, `asked: null`,
 No schema change: the question card reuses the existing `asked` column and its
 `AskQuestion` normalization.
 
+#### A promoted lead of a done review never holds merges (OTTR-963)
+
+A lead that sits in the backlog when its review finishes is optional work: the
+review's Done ignored it (`findingsOpen` skips `backlog` children, OTTR-889), and
+the review settled. When the user later promotes that lead (the answer above, or a
+manual queue), `findingsOpen` counts it again, and the findings hold would park
+every non-finding merge of the project behind optional work. Incident 2026-11-15:
+seven alate and two velvarr merges waited up to 8 hours behind leads of releases
+that had shipped days earlier.
+
+The rule in `reviewHoldFor` (`src/scheduler.ts`): for a review at `stage: "done"`,
+an open finding holds other merges only when it was a commitment when the review
+finished — `queuedAt` set and `queuedAt <= doneAt`. Every other open finding of a
+done review never holds, also after it leaves the backlog. The facts are stored
+card fields, no title text:
+
+- Leads file with `queuedAt: null` (`fileKeptFindings`) and set `queuedAt` only
+  when they leave the backlog: the user's answer, or a manual queue. So
+  `queuedAt > doneAt` (or still `null`) proves the card sat in the backlog at
+  `doneAt`, where the review's Done ignored it.
+- Kept findings queue at filing time, before the review settles done
+  (`createTask` stamps `queued_at = now`), so `queuedAt <= doneAt` proves the
+  finding was a commitment then, and it keeps holding.
+
+A done card without a `doneAt` stamp keeps today's hold. The review's own Done
+guard is unchanged: a lead promoted while the review still runs parks the review
+at `merging` until the lead reaches done or cancelled, as today. `reviewBlocked`
+is unchanged too: a promoted lead still delays the project's next review until it
+finishes. All other holds stay: an open release hold, a running review hold, and
+the findings hold of a review that is not done.
+
 #### Lead fingerprint dedupe
 
 Each audit run carries its open leads into the next audit (docs/specs/security-audit-harness.md

@@ -19033,6 +19033,7 @@ describe("board warnings", () => {
 				pendingBy: null,
 				project: "p",
 				createdAt: now - 10_000,
+				queuedAt: now - 10_000,
 				doneAt: null,
 				dependsOn: [],
 				followUpOf: null,
