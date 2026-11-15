@@ -1760,6 +1760,13 @@ export function createSupervisor(
 		head: string,
 	): Promise<boolean> {
 		if (t.stage !== "done" || t.cancelledAt !== null) return false;
+		// OTTR-978: a release-stamped done card stays done. A reopen would keep the
+		// releaseVersion stamp on a live card — isReview then turns the fix into a
+		// release card whose "waiting for release" hold parks every other merge and
+		// whose ship path republishes the old version. The follow-up fallback
+		// answers the failure instead: a fresh normal card that lands through a
+		// normal merge.
+		if (t.releaseVersion !== null) return false;
 		const matches = (await e.store.listTasks()).filter(
 			(x) =>
 				x.stage === "done" && x.cancelledAt === null && x.pushSha === pushSha,

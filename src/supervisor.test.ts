@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ARCH_REVIEW_MARKER, RULES_INTERVIEW_MARKER } from "./prompts.ts";
 import { classify } from "./runner.ts";
-import { pickRunnable } from "./scheduler.ts";
+import { mergeHold, pickRunnable } from "./scheduler.ts";
 import { ProjectStore, type TaskPatch } from "./store.ts";
 import {
 	churnTend,
@@ -5518,6 +5518,69 @@ describe("CI reopen after the merge", () => {
 		await tick(new Map([["proj", entry(store)]]), ops);
 		expect((await store.getTask(t.id))!.pendingPrompt).toBe(prompt);
 		expect(ops.calls.scheduled).toBe(scheduled);
+		await store.close();
+	});
+
+	test("a CI failure on a release-stamped done card files a follow-up and keeps the stamp", async () => {
+		const { store, t } = await ciProject("ci-reopen-release");
+		await store.updateTask(t.id, {
+			stage: "done",
+			state: "idle",
+			releaseVersion: "v1.2.0",
+			base: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			worktree: join(root, "ci-reopen-release", ".wt-gone"),
+			branch: "ott/ci-reopen-release",
+			sessionId: "sess-123",
+		});
+		// A merge the reopened card would hold behind "waiting for release".
+		const other = await store.createTask("other merge");
+		await store.updateTask(other.id, { stage: "merging", state: "idle" });
+		const ops = fakeOps({
+			ghResult: {
+				code: 0,
+				stdout: runsJson([
+					{
+						status: "completed",
+						conclusion: "failure",
+						name: "build",
+						html_url: "https://run/1",
+						id: 410,
+					},
+				]),
+				stderr: "",
+			},
+			runViewResult: {
+				code: 0,
+				stdout: "error: Process completed with exit code 1.",
+				stderr: "",
+			},
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		// The release card stays done with its stamp: a reopen would keep
+		// releaseVersion on a live card and turn the fix into a release card.
+		const after = (await store.getTask(t.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.releaseVersion).toBe("v1.2.0");
+		expect(after.pushSha).toBeNull();
+		// The failure was answered on the follow-up fallback path instead.
+		const child = (await store.listTasks()).find((x) => x.followUpOf === t.id);
+		expect(child).toBeDefined();
+		expect(child!.releaseVersion).toBeNull();
+		expect(
+			child!.prompt.startsWith(
+				"CI failed on the merge push of this card's parent task (abc1234 on main).",
+			),
+		).toBe(true);
+		// No merge waits behind "waiting for release v1.2.0": the release card is
+		// done, and a follow-up filed after its doneAt is not a finding of the
+		// finished review (the createdAt cutoff in followUpsByParent), so nothing
+		// holds the other merge.
+		expect(
+			mergeHold(await store.listTasks(), (await store.getTask(other.id))!),
+		).toBeNull();
+		const log = await Bun.file(await store.logPath(t.id)).text();
+		expect(log).toContain("filed follow-up");
 		await store.close();
 	});
 
