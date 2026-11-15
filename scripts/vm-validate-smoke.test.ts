@@ -1,5 +1,5 @@
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SandboxJobOptions } from "../src/sandboxRun.ts";
@@ -16,6 +16,24 @@ import {
 // A fixed sample line, not derived from the expected value: if the allowlist ever
 // changes, the real-probe tests below catch the drift, not this fixture.
 const envLine = "ATTEMPT env HOME LANG PATH";
+
+// Belt against /data: merge and review turns run bun test inside the server
+// container, where OTTR_DATA_DIR is the board's live data root. No test here
+// reaches the real runSandboxJob today (every main() test injects its runner),
+// but a future one that drops the dep would stage under the ambient env — point
+// that at a disposable dir, and fail the file if anything ever stages in it.
+const ambientDataRoot = mkdtempSync(join(tmpdir(), "ottr-sbx-smoke-ambient-"));
+const savedDataDir = process.env.OTTR_DATA_DIR;
+beforeAll(() => {
+	process.env.OTTR_DATA_DIR = ambientDataRoot;
+});
+afterAll(() => {
+	const staged = readdirSync(ambientDataRoot);
+	if (savedDataDir === undefined) delete process.env.OTTR_DATA_DIR;
+	else process.env.OTTR_DATA_DIR = savedDataDir;
+	rmSync(ambientDataRoot, { recursive: true, force: true, maxRetries: 5 });
+	expect(staged).toEqual([]);
+});
 
 const heldResult = (
 	over: Partial<ValidateResponse> = {},

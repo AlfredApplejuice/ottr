@@ -1,5 +1,18 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	describe,
+	expect,
+	test,
+} from "bun:test";
+import {
+	existsSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -14,9 +27,19 @@ import { type ValidateResponse, VM_VALIDATE } from "./vmValidateShared.ts";
 const TAR = new Uint8Array([0x1f, 0x8b, 8, 0, 1, 2, 3, 4]);
 const TOKEN = "worker-token";
 
+// Belt against /data: merge and review turns run bun test inside the server
+// container, where OTTR_DATA_DIR is the board's live data root. Every staging
+// call here passes its own dataRoot, but a refactor or a review's mutation run
+// that defeats `o.dataRoot ?? env.OTTR_DATA_DIR ?? "/data"` (Stryker drops one
+// operand at a time) must still land in a disposable dir, never /data. jobEnv
+// carries the belt for calls with an explicit env, the beforeAll below for
+// calls that resolve through process.env.
+const ambientDataRoot = mkdtempSync(join(tmpdir(), "ottr-sbx-ambient-"));
+
 const jobEnv = (url = "http://vm-runner:8080///"): NodeJS.ProcessEnv => ({
 	OTTR_VM_RUNNER_URL: url,
 	OTTR_WORKER_TOKEN: TOKEN,
+	OTTR_DATA_DIR: ambientDataRoot,
 });
 
 const spawnOk: GitSpawn = async () => ({ code: 0, stdout: TAR, stderr: "" });
@@ -74,6 +97,20 @@ function tmpRoot(): string {
 	tmpRoots.push(root);
 	return root;
 }
+
+const savedDataDir = process.env.OTTR_DATA_DIR;
+beforeAll(() => {
+	process.env.OTTR_DATA_DIR = ambientDataRoot;
+});
+afterAll(() => {
+	// Read, restore, remove, then assert: a failure here must not orphan the dir.
+	const staged = readdirSync(ambientDataRoot);
+	if (savedDataDir === undefined) delete process.env.OTTR_DATA_DIR;
+	else process.env.OTTR_DATA_DIR = savedDataDir;
+	rmSync(ambientDataRoot, { recursive: true, force: true, maxRetries: 5 });
+	// Nothing may stage through the ambient env; every call here owns its root.
+	expect(staged).toEqual([]);
+});
 
 describe("runSandboxJob", () => {
 	test("packs the checkout, posts the job, and returns the runner's answer", async () => {
