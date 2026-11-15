@@ -211,9 +211,9 @@ unchanged).
 - A card filed for a lead joins the fingerprint index for the rest of the same
   pass, so two leads with one fingerprint file once.
 
-The review prompt does not yet tell the reviewer to write the fixed line
-(`src/prompts.ts` wording changes need the user's approval). Until the wording
-lands, most leads carry no line, and the title dedupe below applies to them.
+The review prompt tells the reviewer to write the fixed line: the audit record's
+fingerprint, second line of the lead prompt, before any record body (OTTR-959,
+OTTR-980). A lead without the line falls back to the title dedupe below.
 
 #### Lead title dedupe
 
@@ -236,61 +236,29 @@ open lead card already holds (OTTR-929).
 - A card filed for a lead joins the title index for the rest of the same pass,
   so two leads with one title file once.
 
-#### Leads come from the audit run's findings.json (OTTR-959)
+#### Leads come from the turn's recorded proposals (OTTR-959, OTTR-980)
 
-The agent writes the lead prompts. The prompts carry no `Fingerprint:` line and no
-stable titles, so the two dedupe rules above never matched: 0 of 70 lead cards
-carried the line. The stable fingerprints live in the audit run's output. The board
-therefore takes each lead from the run's `findings.json`, and the dedupe then works.
+The agent records every `needs_validation` lead with `propose_task`, the same
+channel as every other recorded finding, and arrival persistence stores it
+before the run settles. The review prompt tells the reviewer to put the audit
+record's fingerprint on the prompt's second line, in the exact form
+`Fingerprint: <fingerprint>`, before any other text (the value comes from the
+audit run's `findings.json`). Line 1 is the lead tag, `Needs validation:
+<title>`, and line 2 is the board's fingerprint line: the strict reader takes
+the first line that carries the exact prefix (an empty value reads as no
+fingerprint), so a forged line in the record body never wins.
+The board files the leads from the turn's recorded set, and the fingerprint
+dedupe, the title dedupe, and the blocker sorting run on the prompts as below.
 
-The board looks for the run directory when the settle pass files leads. The
-directory lives on the board host at `<auditRunsRoot>/<project>/run-N`.
-`<auditRunsRoot>` is `/root/security-audit-skill` (`TurnOps.auditRunsRoot` overrides
-it; tests point it at a temp directory). `<project>` is the board project's name.
-The one rule: among the `run-N` directories whose `run-metadata.json` mtime falls
-inside the turn window (the run's `runStartedAt` to the settle time), the newest
-mtime wins; equal mtimes break on the higher N. The comparison allows a skew of
-five seconds on each side, because filesystem mtimes can sit a few milliseconds
-off the board's clock. A directory name must match
-`run-N` with digits only, and it must hold a readable `run-metadata.json`; the
-board skips every other entry.
-
-- No run directory in the window: today's path stays. The agent's own lead
-  proposals file, and the review log says that no run directory was created during
-  the turn.
-- A run directory found: the board reads its `findings.json` and validates the
-  file before use. The file's real path (realpath) must stay inside
-  `<auditRunsRoot>/<project>` (a symlinked `findings.json` or `run-N` directory
-  cannot escape the root). The JSON must parse to an array. Every element must be
-  an object with a non-empty string `fingerprint`. One failed check fails the
-  whole file: the review log names the reason, and the lead source falls back to
-  the agent's proposals.
-- A valid file: the pass's leads are one per record with `verdict` equal to
-  `needs_validation`, in file order. `model`, `rank`, and `security` stay null.
-  The agent's own lead proposals of the pass are dropped; the log says how many,
-  and the count joins the card's not-filed sum. Each lead prompt holds the record
-  fields as untrusted data:
-  - Line 1: `Needs validation: <title>` (the lead tag the board reads first).
-    The title collapses to one line, so no untrusted field renders before the
-    board's own lines.
-  - Line 2: `Fingerprint: <fingerprint>`. The line sits before the record body,
-    because the strict reader takes the first `Fingerprint:` line and the body
-    must not forge it.
-  - Then the description, the claimed root cause, and the trace, evidence,
-    blockers, and validation plan as one JSON line each, plus one line that marks
-    the record as untrusted audit data.
-- The fingerprint dedupe, the title dedupe, the blocker sorting, and the backlog
-  filing run unchanged. A file lead carries no `Blocker:` line, so it sorts as a
-  sandbox-run lead and files no question card.
-
-Limits: an audit that ran inside a worker microVM leaves no run directory on the
-board host, so the pass falls back with a log line. The lead source also engages
-when the agent recorded no proposals at all: a review card settling to done, to
-merging (the Done hold), or to needs_you with no check stamp still files the
-run's needs_validation records (no confirmed selection exists, so the
-second-model check does not run on that pass). A
-record's prose can carry a `Blocker:` line in the board's format; the
-worst case is one question card the user answers, so the board accepts the risk.
+The lead source reads no audit run directory. The directory lives on the
+worker-shared home (`/root/security-audit-skill`), where every classic worker
+mounts the volume read-write and every turn runs as root, so a planted `run-N`
+directory with a chosen mtime inside the turn window could once forge or
+suppress another project's leads, and a planted FIFO as `findings.json` could
+block the board's thread (OTTR-980). The settle pass reads no shared-home path
+for leads anymore: a planted run directory is inert whatever its mtime, a pass
+whose agent records no lead proposals files none, and the prompts the agent
+records carry whatever the audit run held.
 
 ### 5. research-report.md survives the worktree
 

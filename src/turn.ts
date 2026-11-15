@@ -6,12 +6,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import type { ensureProjectPackages } from "./apt.ts";
-import {
-	AUDIT_RUNS_ROOT,
-	type AuditRun,
-	findAuditRunDir,
-	readAuditLeads,
-} from "./auditLeads.ts";
+import { leadFingerprint, leadTitleKey } from "./auditLeads.ts";
 import {
 	copyBelow,
 	readBelow,
@@ -855,9 +850,6 @@ export interface TurnOps {
 	maxTotalRuns(): number | null;
 	/** The board's review-check switch (POST /api/settings); absent counts as on, so test fakes need nothing. */
 	reviewCheck?: () => boolean | Promise<boolean>;
-	/** OTTR-959: the audit runs root the review lead source reads on this host
-	 * (`/root/security-audit-skill` when absent); tests point it at a temp dir. */
-	auditRunsRoot?: () => string;
 	/** The home the local run's provision audit reads (`homedir()` when absent); tests
 	 * point it at a temp home so a drifted host ~/.omp layer cannot park their runs
 	 * (OTTR-976). */
@@ -1775,19 +1767,6 @@ function findingHead(f: RecordedFinding): string {
 	return f.prompt.split("\n")[0]?.slice(0, 120) ?? "";
 }
 
-/** A lead's audit fingerprint, read from its fixed line `Fingerprint: <value>`
- * (docs/specs/review-findings-persistence.md §4; the value is the record's
- * fingerprint from the security-audit-harness audit output). Strict: the exact
- * prefix at line start, no case or spacing variants. Null: the lead carries no
- * line and files as today. Exported so the audit-leads tests hit the real
- * reader, not a copy of its regex. */
-export function leadFingerprint(prompt: string): string | null {
-	const m = /^Fingerprint: (.+)$/m.exec(prompt);
-	if (m === null) return null;
-	const value = m[1]?.trim() ?? "";
-	return value === "" ? null : value;
-}
-
 /** Picks the card a lead dedupes against: an open card first (the lead is
  * already tracked), then a cancelled one (the user declined it), then a done
  * one (the lead came back). Ties break on the lowest id. */
@@ -1805,16 +1784,6 @@ function pickLeadMatch(
 	for (const t of byId)
 		if (t.stage === "done") return { card: t, kind: "done" };
 	return null;
-}
-
-/** A lead card's title key for the fingerprint-less dedupe: the prompt's first
- * line, lower-cased, with runs of whitespace collapsed to one space and trimmed
- * (docs/specs/review-findings-persistence.md "Lead title dedupe"). */
-function leadTitleKey(prompt: string): string {
-	return (prompt.split("\n")[0] ?? "")
-		.toLowerCase()
-		.replace(/\s+/g, " ")
-		.trim();
 }
 
 export function createTurnLoop(
@@ -6403,7 +6372,7 @@ export function createTurnLoop(
 		if (cancelled) return true;
 		st.plannedNext = planned;
 		await fileRetroProposal(st, planned);
-		if (await runReviewCheck(st, planned)) return true;
+		if (await runReviewCheck(st)) return true;
 		if (await runWorkCheck(st, planned)) return true;
 		await writePostCheckState(st, planned);
 		await stampDoneCard(st, planned);
@@ -9418,109 +9387,31 @@ export function createTurnLoop(
 		);
 	}
 
-	/** OTTR-959: the pass's lead source. `used`: the settling turn's audit run — the
-	 * newest run-N directory whose run-metadata.json mtime sits inside the turn window
-	 * — carried a valid findings.json, and its needs_validation records replace the
-	 * agent's own lead proposals. `no-run` and `invalid`: the agent's proposals file,
-	 * and the reason rides the review log (docs/specs/review-findings-persistence.md
-	 * §4, "Leads come from the audit run's findings.json"). */
-	function auditRunLeads(
-		root: string,
-		st: TurnSettle,
-	):
-		| { state: "used"; run: string; leads: RecordedFinding[] }
-		| { state: "no-run" }
-		| { state: "invalid"; reason: string } {
-		const run: AuditRun | null = findAuditRunDir(
-			root,
-			st.name,
-			st.dispatch.runStartedAt,
-			st.now,
-		);
-		if (run === null) return { state: "no-run" };
-		const read = readAuditLeads(root, st.name, run);
-		if (!read.ok) return { state: "invalid", reason: read.error };
-		return { state: "used", run: `${st.name}/${run.name}`, leads: read.leads };
-	}
-
 	/** A review's recorded findings: Ottr caps them, checks the selection with a second model
 	 * (a fresh session — never --resume, never the review's own — memory off, read/grep/glob
 	 * only), and files the kept ones as queued cards linked to the review, the flow
-	 * create_task's per-finding calls did inline before. A landing review with no recorded
-	 * proposals still files the audit run's needs_validation records (OTTR-959). An
+	 * create_task's per-finding calls did inline before. An
 	 * approved review holds at merging (FINDINGS_HOLD) and a needs_you review keeps its
 	 * park: either way the card stays
 	 * in_progress/running until the deferred write below stores the final state.
 	 * True: the turn stopped (a credit stop or a taken-over check). */
-	async function runReviewCheck(st: TurnSettle, next: Next): Promise<boolean> {
-		// OTTR-959: the lead source engages even when the agent recorded no
-		// proposals — an agent that leaves out its leads is the case the audit
-		// run's findings.json exists for. The landing is a review card settling
-		// to its final state with no check stamp: done (parkReviewDone held
-		// nothing), merging (the findings hold), or needs_you. Non-landing
-		// reviews keep today's fast exit, and so does a landing whose run
-		// directory holds nothing to file.
-		const landing =
-			st.idn.reviewCard &&
-			st.task.findingsCheckedAt === null &&
-			(next.stage === "done" ||
-				next.stage === "merging" ||
-				next.state === "needs_you");
-		if (st.reviewFindings.length === 0 && !landing) return false;
+	async function runReviewCheck(st: TurnSettle): Promise<boolean> {
+		// OTTR-980: the leads are the pass's own recorded proposals (the
+		// "Needs validation" tag), read from the turn's result channel only. The
+		// settle pass reads no audit run directory: the run directories live on
+		// the worker-shared home, where any work turn could plant one (a forged
+		// lead set, a suppression, or a FIFO that blocks the reader), so a review
+		// whose agent records no lead proposals files none at all.
+		if (st.reviewFindings.length === 0) return false;
 		const checkOn = (await ops.reviewCheck?.()) ?? true;
 		// Leads (the prompt's "Needs validation" tag) never enter the selection or the cap:
 		// they file as unverified backlog cards without a second-model opinion.
 		const confirmed = st.reviewFindings.filter(
 			(f) => !f.prompt.startsWith("Needs validation"),
 		);
-		const agentLeads = st.reviewFindings.filter((f) =>
+		const leads = st.reviewFindings.filter((f) =>
 			f.prompt.startsWith("Needs validation"),
 		);
-		// OTTR-959: when the settling turn ran the security audit on this host (a run-N
-		// directory created inside the turn window), the pass's leads come from that
-		// run's findings.json — the stable fingerprints — and the agent's own lead
-		// proposals drop. No valid run in the window: the agent's proposals file, and
-		// the log says why.
-		const auditRoot = ops.auditRunsRoot?.() ?? AUDIT_RUNS_ROOT;
-		const audit = auditRunLeads(auditRoot, st);
-		let leads = agentLeads;
-		let droppedAgentLeads: RecordedFinding[] = [];
-		if (audit.state === "used") {
-			leads = audit.leads;
-			droppedAgentLeads = agentLeads;
-			const n = audit.leads.length;
-			const d = droppedAgentLeads.length;
-			await st.log(
-				`- leads come from the audit run's findings.json (${audit.run}, ${n} needs-validation record${n === 1 ? "" : "s"}; ${d} agent lead proposal${d === 1 ? "" : "s"} dropped)`,
-			);
-		} else if (audit.state === "invalid") {
-			await st.log(
-				`- the audit run's findings.json is invalid (${audit.reason}); leads come from the agent's proposals`,
-			);
-		} else {
-			await st.log(
-				`- no audit run directory was created during this turn under ${auditRoot}/${st.name}; leads come from the agent's proposals`,
-			);
-		}
-		if (st.reviewFindings.length === 0) {
-			// The pass holds no recorded proposals: file the audit run's
-			// needs_validation records only. No confirmed selection exists, so the
-			// second-model check has no input and does not run.
-			if (audit.state !== "used" || audit.leads.length === 0) return false;
-			await fileKeptFindings(st, {
-				kept: [],
-				dropped: [],
-				belowCap: [],
-				leads: audit.leads,
-				droppedAgentLeads: [],
-				checkOn: false,
-				checkMs: 0,
-				checkFailed: null,
-				checkModel: null,
-				checkWarn: null,
-			});
-			return false;
-		}
 		const selected = selectFindings(confirmed);
 		const selectedSet = new Set(selected);
 		const belowCap = confirmed.filter((f) => !selectedSet.has(f));
@@ -9559,7 +9450,6 @@ export function createTurnLoop(
 			dropped,
 			belowCap,
 			leads,
-			droppedAgentLeads,
 			checkOn,
 			checkMs,
 			checkFailed,
@@ -9920,10 +9810,6 @@ export function createTurnLoop(
 			dropped: { id: number; finding: RecordedFinding; reason: string }[];
 			belowCap: RecordedFinding[];
 			leads: RecordedFinding[];
-			/** OTTR-959: the agent's own lead proposals this pass dropped because the
-			 * leads came from the audit run's findings.json (empty otherwise). Their
-			 * count joins the not-filed sum; the log names it. */
-			droppedAgentLeads: RecordedFinding[];
 			checkOn: boolean;
 			checkMs: number;
 			checkFailed: string | null;
@@ -10117,10 +10003,7 @@ export function createTurnLoop(
 				}
 				await st.log(
 					`- review findings: ${st.reviewFindings.length} recorded, ${filed.length} filed, ${
-						args.belowCap.length +
-						args.dropped.length +
-						leadNotFiled.length +
-						args.droppedAgentLeads.length
+						args.belowCap.length + args.dropped.length + leadNotFiled.length
 					} not filed${args.checkOn ? `, check ${(args.checkMs / 1000).toFixed(0)}s` : ", check off"}`,
 				);
 				// The counts and every unfiled finding with its reason live on the review card: the

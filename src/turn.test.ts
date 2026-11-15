@@ -19,7 +19,9 @@ import {
 	readFileSync,
 	readlinkSync,
 	rmSync,
+	statSync,
 	symlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25551,259 +25553,98 @@ describe("stored review findings", () => {
 		return { ...s, checkRuns };
 	}
 
-	/** One audit record shaped like the harness's findings.json entries. */
-	const auditRecord = (
-		fingerprint: string,
-		verdict = "needs_validation",
-		title = `Title ${fingerprint}`,
-	) => ({
-		verdict,
-		fingerprint,
-		title,
-		description: `Description ${fingerprint}`,
-		claimed_root_cause: `Cause ${fingerprint}`,
-		trace: [{ kind: "entrypoint", file: "src/a.ts", line: 1 }],
-		evidence: [{ file: "src/a.ts", line: 2 }],
-		blockers: ["No OS-enforced sandbox"],
-		validation_plan: { local: "run in a sandbox" },
-	});
-
-	/** Writes run-N into an audit root the way the harness does: run-metadata.json
-	 * plus findings.json (a string writes raw, so a test can plant a malformed
-	 * file). Nothing writes when records is undefined (no run in the window). */
-	const writeAuditRun = (
-		root: string,
-		project: string,
-		n: number,
-		records: unknown,
-	): void => {
-		if (records === undefined) return;
-		const dir = join(root, project, `run-${n}`);
-		mkdirSync(dir, { recursive: true });
+	test("a planted audit run directory is not a lead source (OTTR-980)", async () => {
+		// Another writer can plant a run-N directory on the worker-shared home
+		// with a chosen mtime inside the turn window and chosen content, or a
+		// FIFO as findings.json that blocks a plain reader in open(2). The
+		// settle pass reads the turn's recorded proposals only: it files the
+		// agent's lead, never the planted record, and never opens the FIFO.
+		const planted = mkdtempSync(join(tmpdir(), "turn-audit-planted-"));
+		dirs.push(planted);
+		const run1 = join(planted, "run-1");
+		const run2 = join(planted, "run-2");
+		mkdirSync(run1, { recursive: true });
+		mkdirSync(run2, { recursive: true });
 		writeFileSync(
-			join(dir, "run-metadata.json"),
-			JSON.stringify({ run_id: `${project}-run-${n}` }),
+			join(run1, "run-metadata.json"),
+			JSON.stringify({ run_id: "planted-run-1" }),
 		);
 		writeFileSync(
-			join(dir, "findings.json"),
-			typeof records === "string" ? records : JSON.stringify(records),
+			join(run2, "run-metadata.json"),
+			JSON.stringify({ run_id: "planted-run-2" }),
 		);
-	};
+		writeFileSync(
+			join(run1, "findings.json"),
+			JSON.stringify([
+				{
+					verdict: "needs_validation",
+					fingerprint: "fp-planted",
+					title: "Planted lead",
+					description: "planted body",
+				},
+			]),
+		);
+		// A FIFO, not a regular file: a plain open(2) blocks until a writer appears.
+		const fifo = join(run2, "findings.json");
+		const mk = Bun.spawnSync(["mkfifo", fifo]);
+		if (!mk.success) throw new Error(`mkfifo failed: ${mk.stderr.toString()}`);
 
-	/** storedReviewSetup plus an audit runs root: each main run writes run-N into
-	 * the root first (the write lands inside that turn's window, the way the
-	 * harness creates the run mid-turn), so the settle pass finds it like the
-	 * board does — through the real filesystem reader. */
-	async function auditReviewSetup(
-		root: string,
-		recordsForRun: (n: number) => unknown,
-		findings: RecordedFinding[],
-		result: RunResult | { fail: Error },
-		checks: RunResult[],
-		overrides: FixtureOps = {},
-	) {
 		const record = baseRecord();
 		const checkRuns: StartOpts[] = [];
-		let runNo = 0;
 		const s = await setupWith(record, {
 			commitsAhead: async () => 0,
 			holdFollowUps: true,
-			maxTotalRuns: () => null,
 			startRun: async (o: StartOpts) => {
 				let done: Promise<RunResult>;
 				if (o.maxTime) {
-					// The second-model check over the stored set: a fresh capped session.
+					// The second-model check over the stored set.
 					checkRuns.push(o);
-					done = Promise.resolve(
-						checks.shift() ?? runResult({ finalText: "[]" }),
-					);
+					done = Promise.resolve(runResult({ finalText: "[]" }));
 				} else {
-					runNo += 1;
-					writeAuditRun(root, s.store.name, runNo, recordsForRun(runNo));
 					record.runs.push(o);
 					await o.onSession?.("sess");
-					// The run "parses" each propose_task as it arrives, before settling.
-					for (const f of findings) await o.onRecorded?.(f);
-					done =
-						record.runs.length === 1
-							? "fail" in result
-								? Promise.reject(result.fail)
-								: Promise.resolve(result)
-							: Promise.resolve(
-									runResult({
-										outcome: { status: "answered", summary: "reply" },
-									}),
-								);
+					// The planted runs take their mtimes mid-turn, the way the old
+					// mtime pick expected its window candidate; run-2 lands newer.
+					const now = new Date();
+					utimesSync(join(run1, "run-metadata.json"), now, now);
+					const newer = new Date(Date.now() + 5);
+					utimesSync(join(run2, "run-metadata.json"), newer, newer);
+					for (const f of [
+						mkFinding("Bug 1", 1),
+						mkFinding(
+							"Needs validation: agent lead A\nFingerprint: fp-agent\nThe open fact.",
+						),
+					])
+						await o.onRecorded?.(f);
+					done = Promise.resolve(
+						runResult({
+							outcome: { status: "answered", summary: "review done" },
+						}),
+					);
 				}
 				return { pid: 4242, done, kill: async () => {} };
 			},
-			auditRunsRoot: () => root,
-			...overrides,
 		});
-		return { ...s, checkRuns };
-	}
+		const review = await reviewCard(s.store);
+		await s.loop.runTurn(s.store.name, review.id);
 
-	test("leads come from the turn's audit run findings.json; the agent's proposals drop (OTTR-959)", async () => {
-		const root = mkdtempSync(join(tmpdir(), "turn-audit-runs-"));
-		dirs.push(root);
-		const run1 = [
-			auditRecord("fp-a"),
-			auditRecord("fp-b"),
-			auditRecord("fp-x", "confirmed"),
-		];
-		const { store, loop, checkRuns } = await auditReviewSetup(
-			root,
-			(n) => (n === 1 ? run1 : [...run1, auditRecord("fp-c")]),
-			[
-				mkFinding("Bug 1", 1),
-				mkFinding("Needs validation: agent phrasing of A\nFingerprint: fp-a"),
-				mkFinding("Needs validation: agent phrasing of B\nFingerprint: fp-b"),
-			],
-			runResult({ outcome: { status: "answered", summary: "review done" } }),
-			// The check sees the confirmed finding only and drops it.
-			[verdicts([1, false, "not real"])],
-		);
-		const review = await reviewCard(store);
-		await loop.runTurn(store.name, review.id);
-
-		// The two needs_validation records filed as backlog leads with their
-		// fingerprint lines; the confirmed record and the agent's own proposals did not.
-		const kids = await kidsOf(store, review.id);
-		expect(kids).toHaveLength(2);
-		for (const k of kids) {
-			expect(k.stage).toBe("backlog");
-			expect(k.state).toBe("idle");
-			expect(k.prompt.split("\n")[1]).toMatch(/^Fingerprint: fp-[ab]$/);
-			expect(k.details).toContain("Waits for a validation sandbox");
-			expect(k.prompt).not.toContain("agent phrasing");
-		}
-		const [a] = kids.filter((k) => k.prompt.includes("Fingerprint: fp-a"));
-		const [b] = kids.filter((k) => k.prompt.includes("Fingerprint: fp-b"));
-		expect(a).toBeDefined();
-		expect(b).toBeDefined();
-		const log = await readFileSync(await store.logPath(review.id), "utf8");
-		expect(log).toContain("leads come from the audit run's findings.json");
-		expect(log).toContain("run-1");
-		expect(log).toContain("2 agent lead proposals dropped");
+		// The settle filed the agent's lead with the agent's fingerprint; the
+		// planted record never surfaced and the FIFO never blocked the settle.
+		const kids = await kidsOf(s.store, review.id);
+		expect(kids).toHaveLength(1);
+		expect(kids[0]!.prompt).toContain("agent lead A");
+		expect(kids[0]!.prompt).toContain("Fingerprint: fp-agent");
+		expect(kids[0]!.prompt).not.toContain("fp-planted");
 		expect(checkRuns).toHaveLength(1);
-
-		// The user cancels the fp-b lead. A second review re-reads the same records
-		// plus one new record: fp-a dedupes as already open, the cancelled fp-b
-		// files nothing, only the new fp-c files.
-		await store.updateTask(b!.id, {
-			stage: "backlog",
-			state: "idle",
-			queuedAt: null,
-			cancelledAt: 1,
-			needsReason: "user declined",
-		});
-		const review2 = await reviewCard(store);
-		await loop.runTurn(store.name, review2.id);
-
-		const kids2 = await kidsOf(store, review2.id);
-		expect(kids2).toHaveLength(1);
-		expect(kids2[0]!.prompt.split("\n")[1]).toBe("Fingerprint: fp-c");
-		const log2 = await readFileSync(await store.logPath(review2.id), "utf8");
-		expect(log2).toContain(`lead already open as card ${a!.id}`);
-		expect(log2).toContain(`matches cancelled card ${b!.id}`);
-		expect(log2).toContain("run-2");
-		const aAfter = (await store.getTask(a!.id))!;
-		expect(aAfter.details).toContain(`Seen again in review ${review2.id}`);
+		// The FIFO is still a FIFO: the settle never opened or consumed it.
+		expect(statSync(fifo).isFIFO()).toBe(true);
 	});
 
-	test("a malformed findings.json falls back to the agent's proposals (OTTR-959)", async () => {
-		const root = mkdtempSync(join(tmpdir(), "turn-audit-bad-"));
-		dirs.push(root);
-		const { store, loop } = await auditReviewSetup(
-			root,
-			() => "{ not json",
-			[
-				mkFinding("Bug 1", 1),
-				mkFinding("Needs validation: agent phrasing of A\nFingerprint: fp-a"),
-			],
-			runResult({ outcome: { status: "answered", summary: "review done" } }),
-			[verdicts([1, false, "not real"])],
-		);
-		const review = await reviewCard(store);
-		await loop.runTurn(store.name, review.id);
-
-		const kids = await kidsOf(store, review.id);
-		expect(kids).toHaveLength(1);
-		expect(kids[0]!.prompt).toContain("agent phrasing of A");
-		const log = await readFileSync(await store.logPath(review.id), "utf8");
-		expect(log).toContain("findings.json is invalid");
-		expect(log).toContain("leads come from the agent's proposals");
-	});
-
-	test("no run directory in the turn window files the agent's proposals (OTTR-959)", async () => {
-		const root = mkdtempSync(join(tmpdir(), "turn-audit-empty-"));
-		dirs.push(root);
-		const { store, loop } = await auditReviewSetup(
-			root,
-			() => undefined,
-			[
-				mkFinding("Bug 1", 1),
-				mkFinding("Needs validation: agent phrasing of A\nFingerprint: fp-a"),
-			],
-			runResult({ outcome: { status: "answered", summary: "review done" } }),
-			[verdicts([1, false, "not real"])],
-		);
-		const review = await reviewCard(store);
-		await loop.runTurn(store.name, review.id);
-
-		const kids = await kidsOf(store, review.id);
-		expect(kids).toHaveLength(1);
-		expect(kids[0]!.prompt).toContain("agent phrasing of A");
-		const log = await readFileSync(await store.logPath(review.id), "utf8");
-		expect(log).toContain(
-			"no audit run directory was created during this turn",
-		);
-	});
-
-	test("a landing review with no recorded proposals files the run's leads (OTTR-959)", async () => {
-		const root = mkdtempSync(join(tmpdir(), "turn-audit-noprop-"));
-		dirs.push(root);
-		const records = [
-			auditRecord("fp-a"),
-			auditRecord("fp-b"),
-			auditRecord("fp-x", "confirmed"),
-		];
-		const { store, loop, checkRuns } = await auditReviewSetup(
-			root,
-			() => records,
+	test("a landing review with no recorded proposals files no leads (OTTR-980)", async () => {
+		const record = baseRecord();
+		const { store, loop, checkRuns } = await storedReviewSetup(
+			record,
 			// The agent recorded no propose_task findings at all.
-			[],
-			runResult({ outcome: { status: "answered", summary: "review done" } }),
-			[], // nothing to check, so no check run exists
-		);
-		const review = await reviewCard(store);
-		await loop.runTurn(store.name, review.id);
-
-		// The run's needs_validation records filed as fingerprinted backlog leads
-		// even though the pass recorded nothing.
-		const kids = await kidsOf(store, review.id);
-		expect(kids).toHaveLength(2);
-		for (const k of kids) {
-			expect(k.stage).toBe("backlog");
-			expect(k.prompt.split("\n")[1]).toMatch(/^Fingerprint: fp-[ab]$/);
-			expect(k.details).toContain("Waits for a validation sandbox");
-		}
-		const log = await readFileSync(await store.logPath(review.id), "utf8");
-		expect(log).toContain("leads come from the audit run's findings.json");
-		expect(log).toContain("run-1");
-		expect(checkRuns).toHaveLength(0);
-		// Leads never hold Done: the review settles through with the leads open.
-		const after = (await store.getTask(review.id))!;
-		expect(after.stage).toBe("done");
-		expect(after.findingsCheckedAt).not.toBeNull();
-	});
-
-	test("a landing review with no proposals and no run files nothing (OTTR-959)", async () => {
-		const root = mkdtempSync(join(tmpdir(), "turn-audit-norun-"));
-		dirs.push(root);
-		const { store, loop } = await auditReviewSetup(
-			root,
-			() => undefined,
 			[],
 			runResult({ outcome: { status: "answered", summary: "review done" } }),
 			[],
@@ -25812,10 +25653,7 @@ describe("stored review findings", () => {
 		await loop.runTurn(store.name, review.id);
 
 		expect(await kidsOf(store, review.id)).toHaveLength(0);
-		const log = await readFileSync(await store.logPath(review.id), "utf8");
-		expect(log).toContain(
-			"no audit run directory was created during this turn",
-		);
+		expect(checkRuns).toHaveLength(0);
 	});
 
 	test("findings persist through a never-settling run and a later answered turn checks and files them", async () => {
