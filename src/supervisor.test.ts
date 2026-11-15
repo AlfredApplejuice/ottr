@@ -5395,6 +5395,49 @@ describe("CI on the PR head", () => {
 		await store.close();
 	});
 
+	test("no CI watch on the fix turn a feedback reply or restart queued", async () => {
+		// prFeedbackFixReply and the restart route queue the fix turn with pushSha
+		// cleared (one fix attempt per head SHA): a failed run on the old PR head
+		// must not file a merge-push follow-up for it.
+		const store = await prModeProject("ci-pr-head-fix-turn");
+		const t = await prCard(store);
+		await store.updateTask(t.id, {
+			stage: "in_progress",
+			state: "queued",
+			pendingBy: "supervisor",
+			pendingFeedback: true,
+			pendingPrompt:
+				"CI failed on the PR head of this card (abc1234 on ottr/552).\n\nREVIEW COMMENT by alice\n<<<DATA\nPlease fix the leak\nDATA>>>",
+			pushSha: null,
+		});
+		const failed = runsJson([
+			{
+				id: 42,
+				status: "completed",
+				conclusion: "failure",
+				name: "build",
+				html_url: "https://example.com/run/42",
+			},
+		]);
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.includes("/actions/runs?")
+					? { code: 0, stdout: failed, stderr: "" }
+					: openList([]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(
+			(await store.listTasks()).filter((x) =>
+				x.prompt.startsWith("CI failed on the merge push"),
+			),
+		).toHaveLength(0);
+		const after = (await store.getTask(t.id))!;
+		expect(after.state).toBe("queued");
+		expect(after.pushSha).toBeNull();
+		expect(ops.runViewCalls).toBe(0);
+		await store.close();
+	});
+
 	test("a CI failure requeues a feedback park with both texts", async () => {
 		const store = await prModeProject("ci-pr-head-feedback");
 		const t = await prCard(store);

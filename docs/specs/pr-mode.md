@@ -348,7 +348,11 @@ write clears both.
 
 A reply on the parked card queues a work fix turn (stage `in_progress`);
 the merge turn after it re-ships the branch and updates the same pull
-request (OTTR-799). The watch makes no model call and takes no daily-cap
+request (OTTR-799). The reply and the feedback restart clear `pushSha`
+with the queued fix turn: one fix attempt per head SHA, the same rule the
+CI-failure reply follows, so a failed run on the old PR head files no
+follow-up card ("CI watch on the PR head" above). The re-ship
+re-pins the new head. The watch makes no model call and takes no daily-cap
 slot; its cost is at most three paged `gh api` list reads per watched card
 per window.
 

@@ -8663,12 +8663,16 @@ export async function createApp(deps: AppDeps) {
 			pendingPrompt: prompt,
 			pendingBy: "supervisor",
 			state: "queued",
-			...(blocks !== null ? { stage: "in_progress" as const } : {}),
+			...(blocks !== null
+				? { stage: "in_progress" as const, pushSha: null }
+				: {}),
 			holdUntil: null,
 			queuedAt: Date.now(),
 			needsReason: null,
 			// With feedback the blocks are the new ask's data, so the flag stays and
-			// the passes keep settling through it; without, the ask is plain.
+			// the passes keep settling through it; without, the ask is plain. The fix
+			// turn unpins the head (ciPrHeadReply's one-fix-per-SHA rule): no CI watch
+			// on the old PR head, the re-ship re-pins the new one.
 			pendingFeedback: blocks !== null,
 		});
 		await deps.schedule();
@@ -11081,6 +11085,10 @@ export async function createApp(deps: AppDeps) {
 			await updateSnapshot(e, task, {
 				...replyPatch(task, text, images),
 				stage: "in_progress",
+				// One fix attempt per head SHA (ciPrHeadReply's rule): the unpinned head
+				// cannot file a merge-push follow-up, and the fix turn's merge turn
+				// re-ships and re-pins the new PR head (OTTR-799).
+				pushSha: null,
 			});
 		} catch (err) {
 			// The merge settled between the reply's snapshot and this write: the card

@@ -2353,6 +2353,7 @@ describe("task routes", () => {
 			prNumber: 7,
 			pendingPrompt: blocks,
 			pendingBy: "supervisor",
+			pushSha: "b".repeat(40),
 		});
 		const before = calls;
 		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
@@ -2364,6 +2365,8 @@ describe("task routes", () => {
 		expect(row.state).toBe("queued");
 		expect(row.needsReason).toBeNull();
 		expect(row.pendingPrompt).toBe(`${blocks}\n\nfix it`);
+		// One fix attempt per head SHA: the unpinned head cannot file a merge-push follow-up.
+		expect(row.pushSha).toBeNull();
 		expect(calls).toBe(before + 1);
 	});
 
@@ -7575,6 +7578,7 @@ describe("restart session route", () => {
 				"REVIEW COMMENT by alice at 2026-11-01T12:00:00Z\n<<<DATA\nPlease fix the leak\nDATA>>>",
 			pendingBy: "supervisor",
 			pendingFeedback: true,
+			pushSha: "b".repeat(40),
 		});
 		const res = await post(
 			`/api/projects/p1/tasks/${t.id}/restart-session`,
@@ -7592,14 +7596,19 @@ describe("restart session route", () => {
 		expect(after.state).toBe("queued");
 		expect(after.pendingBy).toBe("supervisor");
 		expect(after.sessionId).toBeNull();
+		// One fix attempt per head SHA: the unpinned head cannot file a merge-push follow-up.
+		expect(after.pushSha).toBeNull();
 	});
 
 	test("a restart without feedback queues the lost-session ask alone", async () => {
 		const t = await store.createTask("parked plain");
 		await store.updateTask(t.id, {
+			stage: "merging",
+			prNumber: 7,
 			state: "needs_you",
 			sessionId: "sess-1",
 			pendingFeedback: false,
+			pushSha: "b".repeat(40),
 		});
 		const res = await post(
 			`/api/projects/p1/tasks/${t.id}/restart-session`,
@@ -7612,6 +7621,9 @@ describe("restart session route", () => {
 		expect(after.stage).not.toBe("in_progress");
 		expect(after.state).toBe("queued");
 		expect(after.sessionId).toBeNull();
+		// No feedback: the card keeps its stage and its CI watch (a conflict park's
+		// merging stage answers CI failures on the head with ciPrHeadReply).
+		expect(after.pushSha).toBe("b".repeat(40));
 	});
 });
 
