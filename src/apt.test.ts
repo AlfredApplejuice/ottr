@@ -143,7 +143,9 @@ describe("the server's ensurePackages wiring", () => {
 				// The exact expression the server wires for a local run's packages.
 				const lines = await ensureProjectPackages("ui", turnListHome());
 				expect(lines).toHaveLength(1);
-				expect(lines[0]).toContain(join(trusted, "ui", "apt.txt"));
+				expect(lines[0]).toContain(
+					join(trusted, ".ottr", "workers", "ui", "apt.txt"),
+				);
 				expect(lines[0]).not.toContain("planted");
 				expect(lines[0]).not.toContain("libnss3");
 			} finally {
