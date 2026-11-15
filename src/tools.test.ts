@@ -765,16 +765,18 @@ describe("buildToolsPath", () => {
 			[],
 			h,
 		);
-		const dir = buildToolsPath("linker", h);
+		const dir = buildToolsPath(readToolsList("linker", h), h);
 		writeFileSync(join(dir, "git"), "#!/bin/sh\necho MARKER\n");
-		expect(() => buildToolsPath("linker", h)).toThrow(
+		expect(() => buildToolsPath(readToolsList("linker", h), h)).toThrow(
 			"link dir does not match the tool set (. differs)",
 		);
 		rmSync(join(dir, "git"));
-		expect(buildToolsPath("linker", h)).toBe(dir);
+		expect(buildToolsPath(readToolsList("linker", h), h)).toBe(dir);
 		rmSync(join(dir, "tool"));
 		writeFileSync(join(dir, "tool"), "#!/bin/sh\necho MARKER\n");
-		expect(() => buildToolsPath("linker", h)).toThrow("(tool differs)");
+		expect(() => buildToolsPath(readToolsList("linker", h), h)).toThrow(
+			"(tool differs)",
+		);
 	});
 });
 
