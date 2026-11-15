@@ -3,9 +3,10 @@ import {
 	type SpawnOptions,
 	spawn,
 } from "node:child_process";
-import { readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { aptListPath } from "./apt.ts";
 import { mkdirBelow, touchBelow, writeBelow } from "./confine.ts";
 import {
 	type CommitIdentity,
@@ -28,13 +29,16 @@ import {
 	boardOmpHome,
 	LENT_ENV,
 	signIns,
+	turnListHome,
 } from "./login.ts";
 import { ensureMemoryOverlay, memoryBackendFromEnv } from "./memory.ts";
 import { platform } from "./platform/index.ts";
 import { ensurePluginSkillsOverlay } from "./pluginSkills.ts";
 import { LOST_SESSION } from "./prompts.ts";
+import { requirementsListPath } from "./python.ts";
 import { PROGRESS_EVENT, watchProgress } from "./stryker.ts";
 import { formatBytes } from "./tmpsweep.ts";
+import { toolsListPath } from "./tools.ts";
 import type {
 	AskQuestion,
 	GitFacts,
@@ -47,7 +51,7 @@ import type {
 } from "./types.ts";
 import { askQuestions, OUTCOME_STATUSES } from "./types.ts";
 import type { VmGrant, VmTokens } from "./vmTokens.ts";
-import type { VmSpec, WorkerTarget } from "./workers.ts";
+import type { VmSpec, WorkerRequest, WorkerTarget } from "./workers.ts";
 import { runWorker, WorkerBusyError, WorkerConnectError } from "./workers.ts";
 import {
 	GIT_AUTH_ENV_NAME,
@@ -2111,6 +2115,34 @@ function startVmRun(
 	};
 }
 
+/**
+ * The provisioning lists a classic worker dispatch carries on its /run request: the raw texts
+ * of the project's tools.json, apt.txt and requirements.txt plus the fleet (_all) tools and
+ * requirements texts, read from the board's list home (turnListHome, R5-1: never the shared
+ * home a worker turn can write). A missing file omits its field, and there is no aptAll —
+ * turn-time provisioning reads only the project's apt.txt
+ * (docs/specs/worker-list-isolation.md).
+ */
+export function workerTurnLists(
+	project: string,
+	home = turnListHome(),
+): NonNullable<WorkerRequest["lists"]> {
+	const read = (file: string): string | undefined =>
+		existsSync(file) ? readFileSync(file, "utf8") : undefined;
+	const tools = read(toolsListPath(project, home));
+	const toolsAll = read(toolsListPath("_all", home));
+	const apt = read(aptListPath(project, home));
+	const requirements = read(requirementsListPath(project, home));
+	const requirementsAll = read(requirementsListPath("_all", home));
+	return {
+		...(tools === undefined ? {} : { tools }),
+		...(toolsAll === undefined ? {} : { toolsAll }),
+		...(apt === undefined ? {} : { apt }),
+		...(requirements === undefined ? {} : { requirements }),
+		...(requirementsAll === undefined ? {} : { requirementsAll }),
+	};
+}
+
 /** The classic worker dispatch: the worker container runs omp; a connect failure settles as
  * a lost worker, never a local fallback. */
 function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
@@ -2162,6 +2194,10 @@ function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
 	});
 	// One id for the request and the handle: the worker's GET /stats reports usage by it.
 	const runId = crypto.randomUUID();
+	// The board's trusted lists ride the request (R5-1): the worker never reads the shared
+	// home, so the dispatch carries exactly what a server-local turn would read
+	// (docs/specs/worker-list-isolation.md). No OTTR_PROJECT: the worker ignores lists.
+	const project = env.OTTR_PROJECT;
 	const workerHandle = runWorker(
 		{
 			id: runId,
@@ -2170,6 +2206,7 @@ function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
 			stdin: o.prompt,
 			env,
 			githubReadEnv: withoutDatabaseUrl(o.githubReadEnv),
+			...(project === undefined ? {} : { lists: workerTurnLists(project) }),
 		},
 		worker,
 		sink,

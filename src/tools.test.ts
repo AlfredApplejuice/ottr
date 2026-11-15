@@ -16,13 +16,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	buildToolsPath,
-	ensureAllTools,
 	ensureProjectTools,
 	envListPath,
 	envValuesByKind,
+	installTools,
 	listedEnvNames,
 	parseEnvTxt,
 	parseToolsJson,
+	readToolsList,
 	readUserLayer,
 	type ToolEntry,
 	toolsListPath,
@@ -573,46 +574,51 @@ describe("ensureProjectTools", () => {
 	});
 });
 
-describe("ensureAllTools", () => {
-	test("a bad folder adds an error line, the good one still installs", async () => {
-		const h = mkdtempSync(join(home, "all-"));
-		const body = new TextEncoder().encode("good\n");
-		provision(
-			"a-good",
+describe("installTools", () => {
+	test("installs the entries in the order given, and a rerun downloads nothing", async () => {
+		const h = mkdtempSync(join(home, "core-"));
+		const first = new TextEncoder().encode("first\n");
+		const second = new TextEncoder().encode("second\n");
+		const lines = await installTools(
 			[
 				{
-					name: "good",
-					url: serveFile(body),
-					sha256: sha256(body),
+					name: "first",
+					url: serveFile(first),
+					sha256: sha256(first),
+					unpack: "none",
+				},
+				{
+					name: "second",
+					url: serveFile(second),
+					sha256: sha256(second),
 					unpack: "none",
 				},
 			],
-			[],
 			h,
 		);
-		provision(
-			"b-bad",
-			[
-				{
-					name: "BAD",
-					url: "https://x/y",
-					sha256: "e".repeat(64),
-					unpack: "none",
-				},
-			],
-			[],
-			h,
-		);
-		const lines = await ensureAllTools(h);
 		expect(lines).toEqual([
-			`tools: installed good (${sha256(body).slice(0, 12)})`,
-			'tools: b-bad: tools: not a tool name: "BAD"',
+			`tools: installed first (${sha256(first).slice(0, 12)})`,
+			`tools: installed second (${sha256(second).slice(0, 12)})`,
 		]);
-		expect(existsSync(join(h, ".ottr", "tools", sha256(body)))).toBe(true);
+		expect(
+			await installTools(
+				[
+					{
+						name: "first",
+						url: serveFile(first),
+						sha256: sha256(first),
+						unpack: "none",
+					},
+				],
+				h,
+			),
+		).toEqual([]);
 	});
 
-	test("a home without workers installs nothing", async () => {
-		expect(await ensureAllTools(mkdtempSync(join(home, "none-")))).toEqual([]);
+	test("no entries installs nothing", async () => {
+		expect(await installTools([], mkdtempSync(join(home, "empty-")))).toEqual(
+			[],
+		);
 	});
 });
 
@@ -658,7 +664,12 @@ describe("buildToolsPath", () => {
 			[],
 			h,
 		);
-		const dir = buildToolsPath("picker", h);
+		// Link priority: the project's list first, then the fleet's.
+		const entries = [
+			...readToolsList("picker", h),
+			...readToolsList("_all", h),
+		];
+		const dir = buildToolsPath(entries, h);
 		expect(readlinkSync(join(dir, "shared"))).toBe(
 			join(h, ".ottr", "tools", projSha, "shared"),
 		);
@@ -669,8 +680,8 @@ describe("buildToolsPath", () => {
 			"all\n",
 		);
 		// Same tool set, same dir: repeated turns add no new link dir and leave no build dir.
-		expect(buildToolsPath("picker", h)).toBe(dir);
-		expect(buildToolsPath("_all", h)).not.toBe(dir);
+		expect(buildToolsPath(entries, h)).toBe(dir);
+		expect(buildToolsPath(readToolsList("_all", h), h)).not.toBe(dir);
 		expect(
 			readdirSync(join(h, ".ottr", "tools")).filter((n) =>
 				n.startsWith("path-"),
@@ -693,7 +704,9 @@ describe("buildToolsPath", () => {
 			[],
 			h,
 		);
-		expect(() => buildToolsPath("ghost", h)).toThrow("missing from");
+		expect(() => buildToolsPath(readToolsList("ghost", h), h)).toThrow(
+			"missing from",
+		);
 	});
 
 	test("godot gets --headless only when no display is set", async () => {
@@ -709,7 +722,7 @@ describe("buildToolsPath", () => {
 			[],
 			h,
 		);
-		const godot = join(buildToolsPath("game", h), "godot");
+		const godot = join(buildToolsPath(readToolsList("game", h), h), "godot");
 		const run = async (env: Record<string, string>) => {
 			const p = Bun.spawn([godot, "--path", "a b"], {
 				env: { PATH: process.env.PATH ?? "", ...env },
@@ -735,7 +748,7 @@ describe("buildToolsPath", () => {
 		);
 		// install trusts the existing dir; the link step must not.
 		expect(await ensureProjectTools("victim", h)).toEqual([]);
-		expect(() => buildToolsPath("victim", h)).toThrow(
+		expect(() => buildToolsPath(readToolsList("victim", h), h)).toThrow(
 			"installed binary does not match its sha256",
 		);
 	});

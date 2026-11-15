@@ -8,16 +8,26 @@ import {
 } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { ensureProjectPackages } from "./apt.ts";
+import { ensurePackages as ensureAptPackages, parseAptTxt } from "./apt.ts";
 import { type SignIn, signIns } from "./login.ts";
 import { platform } from "./platform/index.ts";
 import { redirectProxyHint } from "./proxyHint.ts";
-import { ensureProjectPython } from "./python.ts";
+import {
+	ensurePython as buildPythonVenv,
+	mergeRequirements,
+	parseRequirements,
+	type RequirementLine,
+} from "./python.ts";
 import type { RunSink } from "./runner.ts";
 import { watchProgress } from "./stryker.ts";
 import { readCgroup } from "./systemStats.ts";
 import { tmpDiskSpace } from "./tmpsweep.ts";
-import { buildToolsPath, ensureProjectTools } from "./tools.ts";
+import {
+	buildToolsPath,
+	installTools,
+	parseToolsJson,
+	type ToolEntry,
+} from "./tools.ts";
 import type { RunResult } from "./types.ts";
 import { stripGitAuthEnv, stripProxyCredentials } from "./worktree.ts";
 
@@ -46,6 +56,23 @@ export interface WorkerRequest {
 	/** The board's confirmed read-only GitHub token env (docs/specs/turn-read-token.md),
 	 * applied after the strips — the only GitHub token names a turn may hold. */
 	githubReadEnv?: Record<string, string>;
+	/** The board's trusted provisioning lists, read from the board home and carried on the
+	 * request (docs/specs/worker-list-isolation.md). A worker never reads the shared-home
+	 * copies. Classic worker turns only; a vm-runner dispatch may carry it, and the VM
+	 * bake path ignores it (a separate card owns that path). */
+	lists?: {
+		/** Raw tools.json text, the project's own list. */
+		tools?: string;
+		/** Raw tools.json text, the fleet (_all) list. */
+		toolsAll?: string;
+		/** Raw apt.txt text, the project's own list (the fleet apt list feeds no
+		 * turn-time provisioning, so there is no aptAll). */
+		apt?: string;
+		/** Raw requirements.txt text, the project's own list. */
+		requirements?: string;
+		/** Raw requirements.txt text, the fleet list. */
+		requirementsAll?: string;
+	};
 	/** Set only for a vm-runner dispatch (docs/adr/0009-microvm-workers.md); classic workers
 	 * are never sent one and ignore it. */
 	vm?: VmSpec;
@@ -136,12 +163,15 @@ export function serveWorker(opts: {
 	token?: string | null;
 	/** Only for tests: the command the daemon runs instead of `omp`. */
 	ompPath?: string;
+	/** Only for tests: the home provisioning reads and installs into instead of the worker's
+	 * own home (the daemon's homedir()). */
+	home?: string;
 	/** Only for tests: replaces the apt install that runs before omp. */
-	ensurePackages?: typeof ensureProjectPackages;
-	/** Only for tests: replaces the tools.json install that runs before omp. */
-	ensureTools?: typeof ensureProjectTools;
-	/** Only for tests: replaces the requirements.txt venv build that runs before omp. */
-	ensurePython?: typeof ensureProjectPython;
+	ensurePackages?: typeof ensureAptPackages;
+	/** Only for tests: replaces the tools install that runs before omp. */
+	ensureTools?: typeof installTools;
+	/** Only for tests: replaces the requirements venv build that runs before omp. */
+	ensurePython?: typeof buildPythonVenv;
 	/** Only for tests: replaces the link dir prepended to the child's PATH. */
 	buildPath?: typeof buildToolsPath;
 	/** The post-run provision guard (docs/specs/turn-provision-guard.md): the daemon audits its
@@ -320,18 +350,22 @@ export function serveWorker(opts: {
 			return handleDetachKill(request);
 		return new Response("not found", { status: 404 });
 	};
-	// A failed install ends the run with the error as its stderr tail (the sentinel), so
-	// the client sees the provisioner's failure and no run spawns.
+	// The daemon provisions into its own home (the test's when opts.home is set). The
+	// request lists are texts, so no read path can reach for the shared home.
+	const workerHome = opts.home ?? homedir();
+	// A failed install or a broken request list ends the run with the error as its stderr
+	// tail (the sentinel), so the client sees the provisioner's failure and no run spawns.
 	const provisionResponse = async (
-		project: string,
+		body: WorkerRequest,
 	): Promise<{ notes: string; pathDir: string } | Response> => {
 		try {
 			return await provisionRun(
-				opts.ensurePackages ?? ensureProjectPackages,
-				opts.ensureTools ?? ensureProjectTools,
-				opts.ensurePython ?? ensureProjectPython,
+				opts.ensurePackages ?? ensureAptPackages,
+				opts.ensureTools ?? installTools,
+				opts.ensurePython ?? buildPythonVenv,
 				opts.buildPath ?? buildToolsPath,
-				project,
+				parseTurnLists(body.lists),
+				workerHome,
 			);
 		} catch (err) {
 			const stderrTail = `${err instanceof Error ? err.message : String(err)}\n`;
@@ -354,17 +388,18 @@ export function serveWorker(opts: {
 			return new Response("bad request", { status: 400 });
 		return body;
 	};
-	// The project's package list (alate provisions it into the shared home) is installed
-	// in this container before omp starts; a failed install ends the run with apt's error,
-	// and the client giving up mid-install must not orphan the run.
+	// The request's provisioning lists (the board's trusted copies, never the shared home)
+	// install in this container before omp starts; a failed install or a broken list ends
+	// the run with the error, and the client giving up mid-install must not orphan the run.
 	const prepared = async (
 		request: Request,
 		body: WorkerRequest,
 	): Promise<{ notes: string; pathDir: string } | Response> => {
 		const project = body.env?.OTTR_PROJECT;
 		if (typeof project !== "string" || project === "")
+			// No project: no provisioning, and the lists stay ignored (nothing to provision for).
 			return { notes: "", pathDir: "" };
-		const provided = await provisionResponse(project);
+		const provided = await provisionResponse(body);
 		if (provided instanceof Response) return provided;
 		// The client gave up during the install: spawning now would orphan the run.
 		if (request.signal.aborted) return new Response("aborted", { status: 499 });
@@ -503,7 +538,29 @@ export function serveWorker(opts: {
 	return Object.assign(server, { runStarts });
 }
 
-/** A /run request is well-formed when argv is all strings and cwd is an existing absolute directory. */
+/** The request's list fields; every one optional, a string when present. */
+const LIST_FIELDS = [
+	"tools",
+	"toolsAll",
+	"apt",
+	"requirements",
+	"requirementsAll",
+] as const;
+
+/** The lists ride as raw texts: any other shape answers 400 before any provisioning
+ * (the parsers own the content, and a broken list fails the run like an install does). */
+function validLists(lists: WorkerRequest["lists"]): boolean {
+	if (lists === undefined) return true;
+	if (typeof lists !== "object" || lists === null || Array.isArray(lists))
+		return false;
+	const rec = lists as Record<string, unknown>;
+	return LIST_FIELDS.every(
+		(f) => rec[f] === undefined || typeof rec[f] === "string",
+	);
+}
+
+/** A /run request is well-formed when argv is all strings, cwd is an existing absolute
+ * directory, and the lists are texts. */
 function validRunBody(body: WorkerRequest): boolean {
 	return (
 		Array.isArray(body.argv) &&
@@ -512,26 +569,81 @@ function validRunBody(body: WorkerRequest): boolean {
 		body.cwd !== "" &&
 		isAbsolute(body.cwd) &&
 		existsSync(body.cwd) &&
-		statSync(body.cwd).isDirectory()
+		statSync(body.cwd).isDirectory() &&
+		validLists(body.lists)
 	);
 }
 
-/** Installs the project's packages, tools and python venv, and resolves the tools PATH dir.
- * Throws when an install fails: the caller answers with the error as the run's stderr tail. */
+/** The request's lists, parsed once at the boundary; absent fields mean empty lists. */
+interface TurnLists {
+	tools: ToolEntry[];
+	toolsAll: ToolEntry[];
+	apt: string[];
+	requirements: RequirementLine[];
+	requirementsAll: RequirementLine[];
+}
+
+/** Parses one list field with an existing parser; a failure names the field, so the run's
+ * stderr tail says which list was bad. */
+function parseListField<T>(
+	field: string,
+	text: string | undefined,
+	parse: (raw: string) => T,
+): T {
+	if (text === undefined) return [] as T;
+	try {
+		return parse(text);
+	} catch (err) {
+		throw new Error(
+			`${err instanceof Error ? err.message : String(err)} (request field: ${field})`,
+		);
+	}
+}
+
+function parseTurnLists(lists: WorkerRequest["lists"]): TurnLists {
+	return {
+		tools: parseListField("tools", lists?.tools, parseToolsJson),
+		toolsAll: parseListField("toolsAll", lists?.toolsAll, parseToolsJson),
+		apt: parseListField("apt", lists?.apt, parseAptTxt),
+		requirements: parseListField(
+			"requirements",
+			lists?.requirements,
+			parseRequirements,
+		),
+		requirementsAll: parseListField(
+			"requirementsAll",
+			lists?.requirementsAll,
+			parseRequirements,
+		),
+	};
+}
+
+/** Installs the request's packages, tools and python venv, and resolves the tools PATH dir.
+ * Throws when a list parse or an install fails: the caller answers with the error as the
+ * run's stderr tail. */
 async function provisionRun(
-	ensurePackages: typeof ensureProjectPackages,
-	ensureTools: typeof ensureProjectTools,
-	ensurePython: typeof ensureProjectPython,
+	ensurePackages: typeof ensureAptPackages,
+	ensureTools: typeof installTools,
+	ensurePython: typeof buildPythonVenv,
 	buildPath: typeof buildToolsPath,
-	project: string,
+	lists: TurnLists,
+	home: string,
 ): Promise<{ notes: string; pathDir: string }> {
-	const aptLines = await ensurePackages(project);
-	const toolLines = await ensureTools(project);
+	const aptLines = await ensurePackages(lists.apt, "the run request");
+	// Install order stays the fleet's entries first, then the project's own.
+	const toolLines = await ensureTools(
+		[...lists.toolsAll, ...lists.tools],
+		home,
+	);
 	// The venv builds into the shared home, but stays off the PATH: a worker work
 	// turn keeps its ad-hoc pip --user flow, and a venv bin dir first on PATH would
 	// shadow the user site it installs into (docs/specs/merge-turn-packages.md).
-	const pipLines = await ensurePython(project);
-	const pathDir = buildPath(project);
+	const pipLines = await ensurePython(
+		mergeRequirements(lists.requirements, lists.requirementsAll),
+		home,
+	);
+	// Link priority stays the project's name first, then _all (buildToolsPath first-wins).
+	const pathDir = buildPath([...lists.tools, ...lists.toolsAll], home);
 	const notes = [...aptLines, ...toolLines, ...pipLines]
 		.map((l) => `${l}\n`)
 		.join("");

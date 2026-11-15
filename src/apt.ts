@@ -1,7 +1,9 @@
 // System packages a project's turns need (e.g. the shared libraries Chrome needs for omp's
 // browser tool). The list lives in the data repo as workers/<project>/apt.txt; alate provisions
-// it into the shared home volume. A worker installs every list when it starts, and the
-// container that runs a turn installs what it still lacks.
+// it into the shared home volume, and the board seed copies it into the board home. The board
+// sends the trusted list text on every worker turn request and a worker installs from that
+// request only (docs/specs/worker-list-isolation.md); the container that runs a turn installs
+// what it still lacks.
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -32,28 +34,6 @@ export function aptListPath(project: string, home = homedir()): string {
 	return join(layer, ".ottr", "workers", project, "apt.txt");
 }
 
-/**
- * Runs `ensure` for every worker project in turn and joins its log lines. A project that
- * throws adds `<prefix><project>: <error>`, and the other projects still run.
- */
-export async function eachWorkerProject(
-	home: string,
-	prefix: string,
-	ensure: (project: string, home: string) => Promise<string[]>,
-): Promise<string[]> {
-	const lines: string[] = [];
-	for (const project of workerProjects(resolveAgentLayer(home)?.dir ?? home)) {
-		try {
-			lines.push(...(await ensure(project, home)));
-		} catch (err) {
-			lines.push(
-				`${prefix}${project}: ${err instanceof Error ? err.message : err}`,
-			);
-		}
-	}
-	return lines;
-}
-
 /** apt.txt: one Debian package per line; `#` comments and blank lines are ignored. */
 export function parseAptTxt(text: string): string[] {
 	const names = text
@@ -79,16 +59,15 @@ export function missingFrom(names: string[], status: string): string[] {
 let queue: Promise<unknown> = Promise.resolve();
 
 /**
- * Installs the listed packages this machine lacks, before a turn runs here. Returns lines for
- * the turn log (none when nothing was missing); throws apt's own error, so the turn stops.
+ * Installs the listed packages this machine lacks, before a turn runs here; `source` names the
+ * list the names came from in the guard line and the install note (the file path for the
+ * server wrapper, the run request on a worker). Throws apt's own error, so the turn stops.
  */
-export async function ensureProjectPackages(
-	project: string,
-	home = homedir(),
+export async function ensurePackages(
+	names: string[],
+	source: string,
+	run: Exec = exec,
 ): Promise<string[]> {
-	const file = aptListPath(project, home);
-	if (!existsSync(file)) return [];
-	const names = parseAptTxt(readFileSync(file, "utf8"));
 	if (names.length === 0) return [];
 	if (
 		process.platform !== "linux" ||
@@ -96,21 +75,23 @@ export async function ensureProjectPackages(
 		!Bun.which("apt-get")
 	)
 		return [
-			`apt: ${file} lists ${names.length} package(s), but only root on Debian or Ubuntu installs them here: install them yourself`,
+			`apt: ${source} lists ${names.length} package(s), but only root on Debian or Ubuntu installs them here: install them yourself`,
 		];
 	// ponytail: one install at a time per process (each container runs one ottr process);
 	// apt's lock timeout covers other callers, e.g. an agent running apt-get itself.
-	const run = queue.then(() => install(names, file));
-	queue = run.catch(() => {});
-	return run;
+	const runQ = queue.then(() => install(names, source, run));
+	queue = runQ.catch(() => {});
+	return runQ;
 }
 
-/**
- * Every provisioned list, when a worker starts, so a project's first turn there does not wait
- * for its packages. A list that fails adds its error line, and the other lists still install.
- */
-export async function ensureAllPackages(home = homedir()): Promise<string[]> {
-	return eachWorkerProject(home, "", ensureProjectPackages);
+/** The server-local wrapper: read the project's apt.txt (aptListPath resolves the layer), install. */
+export async function ensureProjectPackages(
+	project: string,
+	home = homedir(),
+): Promise<string[]> {
+	const file = aptListPath(project, home);
+	if (!existsSync(file)) return [];
+	return ensurePackages(parseAptTxt(readFileSync(file, "utf8")), file);
 }
 
 /** The packages `dpkg --audit` names: each sits on a line `" <name>[:arch]  <summary>"`. */

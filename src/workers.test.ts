@@ -1,10 +1,11 @@
 import { Database } from "bun:sqlite";
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	readlinkSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
@@ -119,8 +120,10 @@ writeFileSync(oomKillPath, `process.kill(process.pid, "SIGKILL");`);
 // Such tests carry a 30 s budget: the 5 s default bounds the machine, not the assertions.
 
 const servers: Bun.Server<never>[] = [];
+const workerHomes: string[] = [];
 afterAll(() => {
 	for (const s of servers) s.stop(true);
+	for (const h of workerHomes) rmSync(h, { recursive: true, force: true });
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -130,6 +133,55 @@ function start(opts: Parameters<typeof serveWorker>[0] = {}) {
 	const server = serveWorker({ port: 0, ...opts });
 	servers.push(server);
 	return `http://127.0.0.1:${server.port}`;
+}
+
+// The tools install path pins https:// downloads and parseToolsJson refuses every other
+// scheme, so a plain HTTP listener cannot serve a tools.json entry. Same shim as
+// tools.test.ts: the fixture host maps to in-memory bodies and records hits, so a test can
+// assert a planted url was never fetched; everything past fetch (hash, unpack, rename) is real.
+const hits: Record<string, number> = {};
+const bodies: Record<string, Uint8Array> = {};
+const HOST = "https://fixtures.ottr.test";
+const realFetch = globalThis.fetch;
+beforeAll(() => {
+	globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+		const url = String(input instanceof Request ? input.url : input);
+		if (!url.startsWith(`${HOST}/`)) return realFetch(input, init);
+		const path = url.slice(HOST.length);
+		hits[path] = (hits[path] ?? 0) + 1;
+		const body = bodies[path];
+		return new Response(body === undefined ? null : (body as BodyInit), {
+			status: body === undefined ? 404 : 200,
+		});
+	}) as typeof fetch;
+});
+
+let fixtureN = 0;
+function serveFile(body: Uint8Array): string {
+	const path = `/fixture-${fixtureN++}`;
+	bodies[path] = body;
+	return `${HOST}${path}`;
+}
+
+const sha256 = (bytes: Uint8Array) =>
+	new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+
+/** A fresh provisioning home for the worker server (cleaned up in afterAll). */
+function freshWorkerHome(): string {
+	const h = mkdtempSync(join(tmpdir(), "ottr-worker-home-"));
+	workerHomes.push(h);
+	return h;
+}
+
+/** Plants a provisioning list file the way a past worker turn would have (the shared home). */
+function plant(
+	project: string,
+	file: string,
+	text: string,
+	home: string,
+): void {
+	mkdirSync(join(home, ".ottr", "workers", project), { recursive: true });
+	writeFileSync(join(home, ".ottr", "workers", project, file), text);
 }
 
 /** Real sink plumbing with a recording wrapper; log files land in the temp dir. */
@@ -631,12 +683,12 @@ describe("serveWorker", () => {
 		expect(sentinel[WORKER_DONE].host.length).toBeGreaterThan(0);
 	}, 30_000);
 
-	test("the project's package list installs before omp; its notes ride stdout, not the stderr tail", async () => {
-		const asked: string[] = [];
+	test("the request's package list installs before omp; its notes ride stdout, not the stderr tail", async () => {
+		const asked: string[][] = [];
 		const url = start({
 			ompPath: process.execPath,
-			ensurePackages: async (project) => {
-				asked.push(project);
+			ensurePackages: async (names) => {
+				asked.push(names);
 				return ["apt: installed libnss3"];
 			},
 		});
@@ -649,6 +701,7 @@ describe("serveWorker", () => {
 				cwd: dir,
 				stdin: "",
 				env: { OTTR_PROJECT: "velvarr" },
+				lists: { apt: "libnss3\n" },
 			}),
 		});
 		const lines = await readLines(res);
@@ -659,7 +712,8 @@ describe("serveWorker", () => {
 				host: string;
 			};
 		};
-		expect(asked).toEqual(["velvarr"]);
+		// The core got the request's parsed names, not a project name to read files for.
+		expect(asked).toEqual([["libnss3"]]);
 		expect(sentinel[WORKER_DONE].exitCode).toBe(3); // omp still ran
 		// The notes streamed as a plain line before the sentinel; the sentinel's tail holds
 		// only omp's stderr, so classify's no-stderr death rules still fire.
@@ -758,9 +812,13 @@ describe("serveWorker", () => {
 		);
 		const linkDir = join(dir, "tools-link");
 		const containerPath = "/usr/local/bin:/usr/bin";
+		const asked: string[][] = [];
 		const url = start({
 			ompPath: process.execPath,
-			ensureTools: async () => ["tools: installed ruff"],
+			ensureTools: async (entries) => {
+				asked.push(entries.map((e) => e.name));
+				return ["tools: installed ruff"];
+			},
 			buildPath: () => linkDir,
 		});
 		const res = await fetch(`${url}/run`, {
@@ -778,6 +836,8 @@ describe("serveWorker", () => {
 		const sentinel = JSON.parse(lines.at(-1)!) as {
 			[WORKER_DONE]: { exitCode: number | null; stderrTail: string };
 		};
+		// The request carried no tools lists, so the core got no entries.
+		expect(asked).toEqual([[]]);
 		expect(lines[0]).toBe("tools: installed ruff");
 		expect(JSON.parse(lines[1]!) as { path: string }).toEqual({
 			path: `${linkDir}:${containerPath}`,
@@ -823,6 +883,224 @@ describe("serveWorker", () => {
 			path: containerPath,
 		});
 		expect(lines).toHaveLength(2);
+	}, 30_000);
+
+	test("bad lists shapes answer 400 before any provisioning", async () => {
+		const url = start();
+		for (const lists of [
+			"nope",
+			5,
+			[],
+			{ tools: 5 },
+			{ apt: null },
+			{ requirementsAll: ["x"] },
+		] as unknown[]) {
+			expect(
+				(
+					await fetch(`${url}/run`, {
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify({
+							id: "lists-shape",
+							argv: [echoPath],
+							cwd: dir,
+							stdin: "",
+							env: { OTTR_PROJECT: "p" },
+							lists,
+						}),
+					})
+				).status,
+			).toBe(400);
+		}
+	});
+
+	test("a broken list ends the run with the parser's message naming the list", async () => {
+		const url = start({ ompPath: process.execPath });
+		const res = await fetch(`${url}/run`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				id: "lists-broken",
+				argv: [echoPath],
+				cwd: dir,
+				stdin: "",
+				env: { OTTR_PROJECT: "p" },
+				lists: { apt: "--allow-unauthenticated\n" },
+			}),
+		});
+		expect(res.status).toBe(200);
+		const lines = await readLines(res);
+		expect(lines).toHaveLength(1);
+		const sentinel = JSON.parse(lines[0]!) as {
+			[WORKER_DONE]: { exitCode: number | null; stderrTail: string };
+		};
+		expect(sentinel[WORKER_DONE].exitCode).toBe(1);
+		expect(sentinel[WORKER_DONE].stderrTail).toContain(
+			"apt: not a Debian package name",
+		);
+		expect(sentinel[WORKER_DONE].stderrTail).toContain("(request field: apt)");
+	}, 30_000);
+
+	// The shared home the worker runs with is worker-writable (home:/root on compose), so
+	// a past turn could plant tools.json / apt.txt / requirements.txt there for any project.
+	// The provisioning lists ride the /run request instead, and the daemon provisions from
+	// those texts only (docs/specs/worker-list-isolation.md).
+	const PLANT_PROJECT = "victim";
+	const plantedBytes = new TextEncoder().encode("#!/bin/sh\necho planted\n");
+	const plantedSha = sha256(plantedBytes);
+
+	function plantSharedHome(home: string): void {
+		plant(
+			PLANT_PROJECT,
+			"tools.json",
+			JSON.stringify([
+				{
+					name: "planted",
+					url: `${HOST}/planted-tool`,
+					sha256: plantedSha,
+					unpack: "none",
+				},
+			]),
+			home,
+		);
+		plant(PLANT_PROJECT, "apt.txt", "planted-pkg\n", home);
+		plant(
+			PLANT_PROJECT,
+			"requirements.txt",
+			`plantedpkg==1.0 --hash=sha256:${"b".repeat(64)}\n`,
+			home,
+		);
+	}
+
+	test("the request's lists provision; the shared home's plants never do", async () => {
+		const home = freshWorkerHome();
+		plantSharedHome(home);
+		const trustedBytes = new TextEncoder().encode("#!/bin/sh\necho trusted\n");
+		const trustedSha = sha256(trustedBytes);
+		const trustedUrl = serveFile(trustedBytes);
+		// Real tools install and real link dir (no injection); capture fakes only where the
+		// real command would apt-get install or pip-build on this machine.
+		const aptAsked: string[][] = [];
+		const pipAsked: string[][] = [];
+		const pathEchoPath = join(dir, "echo-path-lists.js");
+		writeFileSync(
+			pathEchoPath,
+			`process.stdout.write(JSON.stringify({ path: process.env.PATH }) + "\\n");process.exit(0);`,
+		);
+		const containerPath = "/usr/local/bin:/usr/bin";
+		const url = start({
+			ompPath: process.execPath,
+			home,
+			ensurePackages: async (names) => {
+				aptAsked.push(names);
+				return [];
+			},
+			ensurePython: async (reqs) => {
+				pipAsked.push(reqs.map((r) => r.name));
+				return [];
+			},
+		});
+		const res = await fetch(`${url}/run`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				id: "lists-plant",
+				argv: [pathEchoPath],
+				cwd: dir,
+				stdin: "",
+				env: { OTTR_PROJECT: PLANT_PROJECT, PATH: containerPath },
+				lists: {
+					tools: JSON.stringify([
+						{
+							name: "trusted",
+							url: trustedUrl,
+							sha256: trustedSha,
+							unpack: "none",
+						},
+					]),
+					apt: "libnss3\n",
+					requirements: `idna==3.10 --hash=sha256:${"a".repeat(64)}\n`,
+				},
+			}),
+		});
+		const lines = await readLines(res);
+		const sentinel = JSON.parse(lines.at(-1)!) as {
+			[WORKER_DONE]: { exitCode: number | null; stderrTail: string };
+		};
+		expect(sentinel[WORKER_DONE].exitCode).toBe(0);
+		// The trusted tool went through the real fetch + install path into the worker home.
+		expect(lines[0]).toBe(
+			`tools: installed trusted (${trustedSha.slice(0, 12)})`,
+		);
+		expect(hits[new URL(trustedUrl).pathname]).toBe(1);
+		expect(
+			existsSync(join(home, ".ottr", "tools", trustedSha, "trusted")),
+		).toBe(true);
+		// The child's PATH dir links the trusted tool and no planted name.
+		const child = JSON.parse(lines[1]!) as { path: string };
+		const pathDir = child.path.split(":")[0]!;
+		expect(pathDir.startsWith(join(home, ".ottr", "tools", "path-"))).toBe(
+			true,
+		);
+		expect(readlinkSync(join(pathDir, "trusted"))).toBe(
+			join(home, ".ottr", "tools", trustedSha, "trusted"),
+		);
+		expect(existsSync(join(pathDir, "planted"))).toBe(false);
+		// The planted entry's url was never fetched and never installed.
+		expect(hits["/planted-tool"] ?? 0).toBe(0);
+		expect(existsSync(join(home, ".ottr", "tools", plantedSha))).toBe(false);
+		// apt and pip saw only the request lists' content, never the planted files'.
+		expect(aptAsked).toEqual([["libnss3"]]);
+		expect(pipAsked).toEqual([["idna"]]);
+	}, 30_000);
+
+	test("no lists field: the plants provision nothing and no PATH dir is built", async () => {
+		const home = freshWorkerHome();
+		plantSharedHome(home);
+		const aptAsked: string[][] = [];
+		const pipAsked: string[][] = [];
+		const pathEchoPath = join(dir, "echo-path-nolists.js");
+		writeFileSync(
+			pathEchoPath,
+			`process.stdout.write(JSON.stringify({ path: process.env.PATH }) + "\\n");process.exit(0);`,
+		);
+		const containerPath = "/usr/local/bin:/usr/bin";
+		const url = start({
+			ompPath: process.execPath,
+			home,
+			ensurePackages: async (names) => {
+				aptAsked.push(names);
+				return [];
+			},
+			ensurePython: async (reqs) => {
+				pipAsked.push(reqs.map((r) => r.name));
+				return [];
+			},
+		});
+		const res = await fetch(`${url}/run`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				id: "lists-absent",
+				argv: [pathEchoPath],
+				cwd: dir,
+				stdin: "",
+				env: { OTTR_PROJECT: PLANT_PROJECT, PATH: containerPath },
+			}),
+		});
+		const lines = await readLines(res);
+		const sentinel = JSON.parse(lines.at(-1)!) as {
+			[WORKER_DONE]: { exitCode: number | null; stderrTail: string };
+		};
+		expect(sentinel[WORKER_DONE].exitCode).toBe(0);
+		// No fallback read: the child runs on the container PATH, nothing installs or links.
+		expect(JSON.parse(lines[0]!) as { path: string }).toEqual({
+			path: containerPath,
+		});
+		expect(aptAsked).toEqual([[]]);
+		expect(pipAsked).toEqual([[]]);
+		expect(hits["/planted-tool"] ?? 0).toBe(0);
+		expect(existsSync(join(home, ".ottr", "tools"))).toBe(false);
 	}, 30_000);
 
 	test("client abort kills the child: the response ends without a sentinel", async () => {

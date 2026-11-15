@@ -362,6 +362,18 @@ export const boardOmpHome = (): string => {
 };
 
 /**
+ * The home a turn's provisioning lists are read from: OTTR_WORKERS_HOME when set, else the
+ * board home. R5-1: never the process's own homedir() — on compose that IS the shared home
+ * a worker turn can write, so a bare default would let one project's turn choose what another
+ * project's turn installs (docs/specs/worker-list-isolation.md). The worker dispatch reads the
+ * same home, so the lists it sends match what a server-local turn would read.
+ */
+export const turnListHome = (): string => {
+	const set = process.env.OTTR_WORKERS_HOME?.trim();
+	return set ? resolve(set) : boardOmpHome();
+};
+
+/**
  * Env for every omp the board spawns for itself (merge, release review and release turns,
  * `omp models`, `omp usage`, `omp login`, the fork-analysis gateway): `base` with HOME moved to
  * the board home's current agent layer when one resolves — pinnedAgentLayer also prepares the

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
@@ -11,9 +12,12 @@ import { join } from "node:path";
 import fc from "fast-check";
 import {
 	ensureProjectPython,
+	ensurePython,
+	mergeRequirements,
 	parseRequirements,
 	pipVenvDir,
 	pythonPathDir,
+	pythonPathFor,
 	type RequirementLine,
 	requirementsKey,
 	requirementsListPath,
@@ -184,6 +188,76 @@ describe("ensureProjectPython", () => {
 		await expect(ensureProjectPython("p", h, run)).rejects.toThrow(
 			"pip: python3 -m venv failed (exit 1)",
 		);
+	});
+});
+
+describe("mergeRequirements", () => {
+	const line = (name: string, version: string): RequirementLine => ({
+		name,
+		version,
+		hashes: [A64],
+	});
+
+	test("the project's line wins, and the fleet's unseen names join", () => {
+		expect(
+			mergeRequirements(
+				[line("numpy", "1.26.4")],
+				[line("numpy", "2.0.0"), line("idna", "3.10")],
+			),
+		).toEqual([line("numpy", "1.26.4"), line("idna", "3.10")]);
+	});
+
+	test("a name clash folds case: the project's spelling wins", () => {
+		expect(
+			mergeRequirements([line("NumPy", "1.9")], [line("numpy", "2.0")]),
+		).toEqual([line("NumPy", "1.9")]);
+	});
+});
+
+describe("ensurePython", () => {
+	test("builds one venv from the given lines with --require-hashes", async () => {
+		const h = freshHome();
+		const reqs = parseRequirements(`idna==3.10 --hash=sha256:${A64}\n`);
+		const rec = recorder();
+		const built = await ensurePython(reqs, h, rec.run);
+		expect(built).toEqual([
+			expect.stringMatching(
+				/^pip: installed 1 package\(s\) into the project venv \([0-9a-f]{12}\)$/,
+			),
+		]);
+		expect(rec.calls).toHaveLength(2);
+		expect(rec.calls[1]).toContain("--require-hashes");
+		expect(rec.stagedText).toBe(`idna==3.10 --hash=sha256:${A64}\n`);
+		// The venv lands under the key of exactly these lines.
+		expect(existsSync(pipVenvDir(requirementsKey(reqs), h))).toBe(true);
+	});
+
+	test("no lines is a no-op", async () => {
+		const h = freshHome();
+		const { calls, run } = recorder();
+		expect(await ensurePython([], h, run)).toEqual([]);
+		expect(calls).toEqual([]);
+	});
+
+	test("an existing venv is a no-op: no commands, no lines", async () => {
+		const h = freshHome();
+		const reqs = parseRequirements(`idna==3.10 --hash=sha256:${A64}\n`);
+		mkdirSync(pipVenvDir(requirementsKey(reqs), h), { recursive: true });
+		const { calls, run } = recorder();
+		expect(await ensurePython(reqs, h, run)).toEqual([]);
+		expect(calls).toEqual([]);
+	});
+});
+
+describe("pythonPathFor", () => {
+	test("empty without lines or before the build; the bin dir after it", () => {
+		const h = freshHome();
+		expect(pythonPathFor([], h)).toBe("");
+		const reqs = parseRequirements(`idna==3.10 --hash=sha256:${A64}\n`);
+		expect(pythonPathFor(reqs, h)).toBe("");
+		const bin = join(pipVenvDir(requirementsKey(reqs), h), "bin");
+		mkdirSync(bin, { recursive: true });
+		expect(pythonPathFor(reqs, h)).toBe(bin);
 	});
 });
 

@@ -5,12 +5,13 @@ import { join } from "node:path";
 import {
 	aptListPath,
 	auditedPackages,
-	ensureAllPackages,
+	ensurePackages,
 	ensureProjectPackages,
 	install,
 	missingFrom,
 	parseAptTxt,
 } from "./apt.ts";
+import { turnListHome } from "./login.ts";
 
 const home = mkdtempSync(join(tmpdir(), "ottr-apt-"));
 afterAll(() => rmSync(home, { recursive: true, force: true }));
@@ -101,28 +102,58 @@ describe("ensureProjectPackages", () => {
 	);
 });
 
-describe("ensureAllPackages", () => {
-	test("a home without provisioned lists installs nothing", async () => {
-		expect(await ensureAllPackages(mkdtempSync(join(home, "none-")))).toEqual(
-			[],
-		);
+describe("ensurePackages", () => {
+	test("no names installs nothing, before the guard even runs", async () => {
+		expect(await ensurePackages([], "/h/apt.txt")).toEqual([]);
 	});
 
 	test.skipIf(rootApt)(
-		"every list gets its turn, and a bad list does not stop the ones after it",
+		"where it cannot install, it names the source instead of failing the turn",
 		async () => {
-			const h = mkdtempSync(join(home, "all-"));
-			list("a-ui", "libnss3\n", h);
-			list("b-bad", "--allow-unauthenticated\n", h);
-			list("c-ui", "libgbm1\n", h);
-			mkdirSync(join(h, ".ottr", "workers", "d-nolist"));
-			const lines = await ensureAllPackages(h);
-			expect(lines).toHaveLength(3);
-			expect(lines[0]).toContain(join("a-ui", "apt.txt"));
-			expect(lines[1]).toBe(
-				"b-bad: apt: not a Debian package name: --allow-unauthenticated",
+			const lines = await ensurePackages(
+				["libnss3"],
+				join("/h", "ui", "apt.txt"),
 			);
-			expect(lines[2]).toContain(join("c-ui", "apt.txt"));
+			expect(lines).toHaveLength(1);
+			expect(lines[0]).toContain("install them yourself");
+			expect(lines[0]).toContain(join("/h", "ui", "apt.txt"));
+		},
+	);
+});
+
+describe("the server's ensurePackages wiring", () => {
+	test.skipIf(rootApt)(
+		"turnListHome reads the board home, never the HOME the process carries",
+		async () => {
+			// The plant: a past worker turn wrote an apt.txt into the shared home (the
+			// process HOME). The trusted copy sits in the board home.
+			const planted = mkdtempSync(join(tmpdir(), "ottr-apt-planted-"));
+			const trusted = mkdtempSync(join(tmpdir(), "ottr-apt-trusted-"));
+			list("ui", "libnss3\n", planted);
+			list("ui", "libgbm1\n", trusted);
+			const saved = {
+				HOME: process.env.HOME,
+				OTTR_BOARD_OMP_HOME: process.env.OTTR_BOARD_OMP_HOME,
+				OTTR_WORKERS_HOME: process.env.OTTR_WORKERS_HOME,
+			};
+			process.env.HOME = planted;
+			delete process.env.OTTR_WORKERS_HOME;
+			process.env.OTTR_BOARD_OMP_HOME = trusted;
+			try {
+				// The exact expression the server wires for a local run's packages.
+				const lines = await ensureProjectPackages("ui", turnListHome());
+				expect(lines).toHaveLength(1);
+				expect(lines[0]).toContain(join(trusted, "ui", "apt.txt"));
+				expect(lines[0]).not.toContain("planted");
+				expect(lines[0]).not.toContain("libnss3");
+			} finally {
+				for (const [k, v] of Object.entries(saved)) {
+					if (v === undefined) delete process.env[k];
+					else process.env[k] = v;
+				}
+				rmSync(planted, { recursive: true, force: true });
+				rmSync(trusted, { recursive: true, force: true });
+			}
 		},
 	);
 });

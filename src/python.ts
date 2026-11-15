@@ -1,7 +1,10 @@
 // Python packages a project's turns need (numpy, Pillow, hypothesis, ruff, ...). The list lives
 // in the data repo as workers/<project>/requirements.txt (workers/_all/requirements.txt for the
 // fleet); alate provisions it beside apt.txt and tools.json, and the board seed copies it into
-// the board home. Every line is pinned and hashed (`name==version --hash=sha256:...`, transitive
+// the board home. The board sends the trusted list texts on every worker turn request, and a
+// worker builds from that request only, never from the shared home copies
+// (docs/specs/worker-list-isolation.md). Every line is pinned and hashed
+// (`name==version --hash=sha256:...`, transitive
 // deps included), so pip installs with --require-hashes and nothing unpinned slips in, in either
 // home. Each installing home builds its own venv under <home>/.ottr/pip/<sha256 of the merged
 // list>/, so the server never reads or runs anything from the worker-writable shared home (R5-1).
@@ -19,7 +22,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { eachWorkerProject, PROJECT } from "./apt.ts";
+import { PROJECT } from "./apt.ts";
 import { resolveAgentLayer } from "./layers.ts";
 
 // One line per package: a pinned name==version plus at least one sha256 hash. No options, no
@@ -86,19 +89,31 @@ function canonical(lines: RequirementLine[]): string {
 		.join("\n")}\n`;
 }
 
-/** The project's lines first, then the fleet's unseen ones: the project wins on a name clash. */
-function readRequirements(project: string, home: string): RequirementLine[] {
-	const read = (p: string): RequirementLine[] => {
-		const file = requirementsListPath(p, home);
-		if (!existsSync(file)) return [];
-		return parseRequirements(readFileSync(file, "utf8"));
-	};
+/**
+ * The project's lines first, then the fleet's unseen ones: the project wins on a name clash
+ * (case-insensitive, pip names fold case). Both the server wrapper and the worker path merge
+ * through this helper, so one list always means one venv key.
+ */
+export function mergeRequirements(
+	project: RequirementLine[],
+	all: RequirementLine[],
+): RequirementLine[] {
 	const byName = new Map<string, RequirementLine>();
-	for (const line of [...read(project), ...read("_all")]) {
+	for (const line of [...project, ...all]) {
 		const key = line.name.toLowerCase();
 		if (!byName.has(key)) byName.set(key, line);
 	}
 	return [...byName.values()];
+}
+
+/** One project's requirements.txt (requirementsListPath resolves the layer); a missing file lists nothing. */
+function readRequirementsFile(
+	project: string,
+	home: string,
+): RequirementLine[] {
+	const file = requirementsListPath(project, home);
+	if (!existsSync(file)) return [];
+	return parseRequirements(readFileSync(file, "utf8"));
 }
 
 /** Content-addressed venv key: one list, one venv, and a rerun against the same list is a no-op. */
@@ -112,14 +127,27 @@ export function pipVenvDir(key: string, home = homedir()): string {
 }
 
 /**
- * The venv bin dir for a turn's PATH, or "" when the project lists no packages or the venv is
- * not built yet; callers run ensureProjectPython first. It never installs anything.
+ * The venv bin dir for a merged list, or "" when the list is empty or the venv is not built
+ * yet; callers run ensurePython first. It never installs anything.
  */
-export function pythonPathDir(project: string, home = homedir()): string {
-	const lines = readRequirements(project, home);
+export function pythonPathFor(
+	lines: RequirementLine[],
+	home = homedir(),
+): string {
 	if (lines.length === 0) return "";
 	const dir = join(pipVenvDir(requirementsKey(lines), home), "bin");
 	return existsSync(dir) ? dir : "";
+}
+
+/** The server-local wrapper: the merged list's venv bin dir for a project's turn PATH. */
+export function pythonPathDir(project: string, home = homedir()): string {
+	return pythonPathFor(
+		mergeRequirements(
+			readRequirementsFile(project, home),
+			readRequirementsFile("_all", home),
+		),
+		home,
+	);
 }
 
 type Exec = (argv: string[]) => Promise<string>;
@@ -146,16 +174,17 @@ async function exec(argv: string[]): Promise<string> {
 let queue: Promise<unknown> = Promise.resolve();
 
 /**
- * Builds the project's venv under this home when the machine still lacks it, before a turn runs
- * here. Returns lines for the turn log (none when nothing was missing); throws on the first
- * failure, so the turn stops: missing declared packages are the ASSE-6 failure mode.
+ * Builds the venv for the given merged lines under this home when the machine still lacks it,
+ * before a turn runs here; a worker passes the request's merged list (the project's lines win
+ * over the fleet's, mergeRequirements). Returns lines for the turn log (none when nothing was
+ * missing); throws on the first failure, so the turn stops: missing declared packages are the
+ * ASSE-6 failure mode.
  */
-export async function ensureProjectPython(
-	project: string,
+export async function ensurePython(
+	lines: RequirementLine[],
 	home = homedir(),
 	run: Exec = exec,
 ): Promise<string[]> {
-	const lines = readRequirements(project, home);
 	if (lines.length === 0) return [];
 	const key = requirementsKey(lines);
 	const target = pipVenvDir(key, home);
@@ -171,12 +200,20 @@ export async function ensureProjectPython(
 	return build;
 }
 
-/**
- * Every provisioned list, when a worker starts, so a project's first turn there does not wait
- * for its venv. A list that fails adds its error line, and the other lists still build.
- */
-export async function ensureAllPython(home = homedir()): Promise<string[]> {
-	return eachWorkerProject(home, "", ensureProjectPython);
+/** The server-local wrapper: read both files, merge (the project's lines win), build. */
+export async function ensureProjectPython(
+	project: string,
+	home = homedir(),
+	run: Exec = exec,
+): Promise<string[]> {
+	return ensurePython(
+		mergeRequirements(
+			readRequirementsFile(project, home),
+			readRequirementsFile("_all", home),
+		),
+		home,
+		run,
+	);
 }
 
 async function buildVenv(

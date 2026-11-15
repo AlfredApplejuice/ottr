@@ -330,7 +330,7 @@ omp. Two parts do the work:
    commits in the checkout itself never reach the image. A cached build is cheap, and a
    build that changes the running image restarts that service at once
    (`up -d --no-deps --wait`). Such a restart needs no idle board: no turn calls the
-   service — a worker installs the packages the shared home volume already holds, and the
+   service — a worker turn installs the lists its request carries, and the
    board's provision trigger lands a layer with one atomic switch, so it needs no idle
    board either (on an alate without layer support it still waits for one). The checkout
    itself
@@ -498,12 +498,15 @@ packages its turns need in the data repo as `workers/<project>/apt.txt`: one
 package per line, `#` comments allowed. For example, a project with UI changes
 lists the shared libraries and fonts that the image's Chrome needs for screenshot proofs.
 The browser tools reuse Chrome at `/opt/google/chrome/chrome`. Alate provisions
-the lists to `~/.ottr/workers/<project>/apt.txt` in the home volume. A worker
-installs every list when it starts, so a project's first turn there does not wait;
-its log (`docker compose logs worker-a`) names what was installed, and a list that
-fails does not stop the others. Before a turn starts, the container that runs it
-installs the packages it still lacks: a worker for work turns, the server for merge
-turns. The turn log names what was installed. Before the install, the container
+the lists to `~/.ottr/workers/<project>/apt.txt` in the home volume. The files
+stay there for alate's manifest and the provision guard. The home volume is
+not a provisioning input. A worker turn can write it, so a planted list must
+never drive an install (R5-1). The board reads its trusted copy and puts the
+text on the `/run` request. Before a turn starts, the container that runs it
+installs the packages the request lists: a worker for work turns, the server
+for merge turns. The turn log names what was installed. A request with no
+lists installs nothing, for example when the seed has not run yet. Before the
+install, the container
 runs `dpkg --configure -a` and reinstalls the packages that `dpkg --audit` still
 names, so an apt run that a container stop interrupted does not block it. An install
 that fails stops the turn with apt's error. The packages stay until the container is
@@ -530,7 +533,11 @@ archive (`none` means the download itself is the executable). Alate provisions
 the file beside `apt.txt`, and the container that runs a turn installs it the
 same moment it installs the apt lists, into `/root/.ottr/tools/<sha256>/` on the
 home volume, keyed by hash: every container on the host shares one download, and
-a recreated container does not download again. Each turn then gets a link folder
+a recreated container does not download again. The worker reads its `tools.json`
+only from the `/run` request. The board puts the texts of the project list and
+the `_all` list on the request. A tool planted in the shared home downloads
+nothing and gets no PATH name.
+Each turn then gets a link folder
 ahead of the image PATH: the project's tools first, then the fleet folder
 `workers/_all/tools.json`, and a project's `name` wins over the same `name` in
 `_all`. The container PATH itself never changes, so two projects never see each
@@ -591,7 +598,10 @@ per package, transitive dependencies included, each pinned and hashed:
 installs with `--require-hashes`, so nothing unpinned can slip in, in either home.
 Alate provisions the file like `tools.json`, and the board seed copies it into the
 board home. The project's lines win over the `_all` lines for the same package
-name. The board's provisioning view shows the list as the Python column.
+name. A worker reads its lists only from the `/run` request: the board sends
+the project list and the `_all` list, and the project's lines win there too.
+A requirements list planted in the shared home builds nothing.
+The board's provisioning view shows the list as the Python column.
 
 The machine that runs a turn builds a venv under its own home,
 `~/.ottr/pip/<sha256 of the merged list>/`, once per list: `python3 -m venv` plus

@@ -21,7 +21,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { eachWorkerProject, PROJECT, workerProjects } from "./apt.ts";
+import { PROJECT, workerProjects } from "./apt.ts";
 import { resolveAgentLayer } from "./layers.ts";
 import { boardOmpHome } from "./login.ts";
 
@@ -307,17 +307,24 @@ export function envValuesByKind(
 
 let queue: Promise<unknown> = Promise.resolve();
 
+/** Reads one project's tools.json (toolsListPath resolves the layer); a missing file lists nothing. */
+export function readToolsList(project: string, home = homedir()): ToolEntry[] {
+	const file = toolsListPath(project, home);
+	if (!existsSync(file)) return [];
+	return parseToolsJson(readFileSync(file, "utf8"));
+}
+
 /**
- * Installs the listed tools this machine lacks (the "_all" list first, then the project's own),
- * before a turn runs here, and checks every archive tool it already has against its pin.
- * Returns lines for the turn log (none when nothing was missing); throws on the first
- * failure, so the turn stops.
+ * Installs the listed entries this machine lacks, before a turn runs here, and checks every
+ * archive tool it already has against its pin; the caller passes them in install order (the
+ * "_all" entries first, then the project's own — the server wrapper below, the /run request on
+ * a worker, docs/specs/worker-list-isolation.md). Returns lines for the turn log (none when
+ * nothing was missing); throws on the first failure, so the turn stops.
  */
-export async function ensureProjectTools(
-	project: string,
+export async function installTools(
+	entries: ToolEntry[],
 	home = homedir(),
 ): Promise<string[]> {
-	const entries = [...readTools("_all", home), ...readTools(project, home)];
 	if (entries.length === 0) return [];
 	// ponytail: one install at a time per process (each container runs one ottr process);
 	// the sha256-keyed target dir makes a rerun a no-op anyway.
@@ -326,18 +333,15 @@ export async function ensureProjectTools(
 	return run;
 }
 
-/**
- * Every provisioned list, when a worker starts, so a project's first turn there does not wait
- * for its tools. A list that fails adds its error line, and the other lists still install.
- */
-export async function ensureAllTools(home = homedir()): Promise<string[]> {
-	return eachWorkerProject(home, "tools: ", ensureProjectTools);
-}
-
-function readTools(project: string, home: string): ToolEntry[] {
-	const file = toolsListPath(project, home);
-	if (!existsSync(file)) return [];
-	return parseToolsJson(readFileSync(file, "utf8"));
+/** The server-local wrapper: read both files (the "_all" list first, then the project's), install. */
+export async function ensureProjectTools(
+	project: string,
+	home = homedir(),
+): Promise<string[]> {
+	return installTools(
+		[...readToolsList("_all", home), ...readToolsList(project, home)],
+		home,
+	);
 }
 
 function sha256Hex(data: string | Uint8Array): string {
@@ -535,7 +539,8 @@ async function exec(argv: string[]): Promise<string> {
 }
 
 /**
- * The PATH dir for a turn: the project's tools first, then "_all", a project name winning.
+ * The PATH dir for a turn: the entries in priority order, the first entry with a name winning
+ * (the server passes the project's list first, then "_all"; a worker passes the request's).
  * Links only what is already installed; it never installs anything. The dir is keyed by a
  * hash of its content, so every turn with the same tool set reuses one dir and none leaks.
  */
@@ -552,14 +557,14 @@ function verifyPinnedBinary(
 		);
 }
 
-/** The symlink/wrapper layout for the turn's entries: name → target, godot wrapped. */
+/** The symlink/wrapper layout for the turn's entries: name → target, godot wrapped.
+ *  The caller passes the entries in priority order; the first entry with a name wins. */
 function linkTargets(
-	project: string,
-	home: string,
+	entries: ToolEntry[],
 	root: string,
 ): Map<string, ToolLink> {
 	const links = new Map<string, ToolLink>();
-	for (const e of [...readTools(project, home), ...readTools("_all", home)]) {
+	for (const e of entries) {
 		if (links.has(e.name)) continue;
 		const target = join(root, e.sha256, e.bin ?? e.name);
 		if (!existsSync(target))
@@ -639,9 +644,9 @@ function linksDirDiff(
 	return null;
 }
 
-export function buildToolsPath(project: string, home = homedir()): string {
+export function buildToolsPath(entries: ToolEntry[], home = homedir()): string {
 	const root = join(home, ".ottr", "tools");
-	const links = linkTargets(project, home, root);
+	const links = linkTargets(entries, root);
 	// "" = nothing to prepend: the callers skip the PATH prefix for an empty turn.
 	if (links.size === 0) return "";
 	const key = sha256Hex(JSON.stringify([...links]));

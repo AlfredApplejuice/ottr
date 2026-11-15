@@ -24,7 +24,7 @@ import type { CommitIdentity } from "./gitIdentity.ts";
 import { GlobalStore } from "./globalStore.ts";
 import { controlPlaneHooks, type Hosted, takeHostedConfig } from "./hosted.ts";
 import { startLlmGateway } from "./llmGateway.ts";
-import { agentDir, boardOmpEnv, boardOmpHome } from "./login.ts";
+import { agentDir, boardOmpEnv, boardOmpHome, turnListHome } from "./login.ts";
 import {
 	createOmpStatsDashboard,
 	parseOmpStatsPort,
@@ -65,6 +65,7 @@ import {
 	ensureProjectTools,
 	envValuesByKind,
 	listedEnvNames,
+	readToolsList,
 } from "./tools.ts";
 import {
 	appendLog,
@@ -784,7 +785,11 @@ const loop = createTurnLoop(projects, {
 	// cancel; with no workerTarget configured the loop never probes.
 	detachedRuns: (url, token) => detachedRunsRequest(url, token),
 	killDetached: (url, token, id) => killDetachedRequest(url, token, id),
-	ensurePackages: (project) => ensureProjectPackages(project, workersHome),
+	// R5-1: the list home is turnListHome() (OTTR_WORKERS_HOME ?? boardOmpHome()), never the
+	// process homedir(): on compose that IS the shared home a worker turn can write, so a
+	// merge turn must not read a worker-plantable apt.txt from there
+	// (docs/specs/worker-list-isolation.md).
+	ensurePackages: (project) => ensureProjectPackages(project, turnListHome()),
 	turnEnv: (project, model) =>
 		turnEnv(
 			project,
@@ -806,7 +811,7 @@ const loop = createTurnLoop(projects, {
 	// turn re-runs the gates against the declared package set with no install step and no
 	// question (docs/specs/merge-turn-packages.md).
 	prepareTurn: async (project) => {
-		const home = workersHome ?? boardOmpHome();
+		const home = turnListHome();
 		const lines = [
 			...(await ensureProjectTools(project, home)),
 			...(await ensureProjectPython(project, home)),
@@ -815,8 +820,16 @@ const loop = createTurnLoop(projects, {
 		if (venvBin !== "")
 			lines.push("pip: the project venv's bin dir is on this turn's PATH");
 		const pathDir =
-			[buildToolsPath(project, home), venvBin].filter(Boolean).join(":") ||
-			null;
+			[
+				buildToolsPath(
+					// Link priority: the project's names first, then the fleet's.
+					[...readToolsList(project, home), ...readToolsList("_all", home)],
+					home,
+				),
+				venvBin,
+			]
+				.filter(Boolean)
+				.join(":") || null;
 		return { lines, pathDir };
 	},
 	publishRelease,

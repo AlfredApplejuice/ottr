@@ -48,6 +48,7 @@ import {
 	vmRunnerFromEnv,
 	WORKER_LOST,
 	workerFromEnv,
+	workerTurnLists,
 } from "./runner.ts";
 import fc from "./test/properties.ts";
 import type {
@@ -3569,6 +3570,52 @@ describe("workerFromEnv", () => {
 	});
 });
 
+describe("workerTurnLists", () => {
+	function seedLists(
+		home: string,
+		project: string,
+		file: string,
+		text: string,
+	): void {
+		mkdirSync(join(home, ".ottr", "workers", project), { recursive: true });
+		writeFileSync(join(home, ".ottr", "workers", project, file), text);
+	}
+
+	test("carries the board home's list texts, project and _all", () => {
+		const home = mkdtempSync(join(tmpdir(), "ottr-turnlists-"));
+		seedLists(home, "velvarr", "tools.json", '[{"name":"board-tool"}]\n');
+		seedLists(home, "_all", "tools.json", '[{"name":"fleet-tool"}]\n');
+		seedLists(home, "velvarr", "apt.txt", "libgbm1\n");
+		seedLists(
+			home,
+			"velvarr",
+			"requirements.txt",
+			"idna==3.10 --hash=sha256:a\n",
+		);
+		seedLists(
+			home,
+			"_all",
+			"requirements.txt",
+			"ruff==0.6.9 --hash=sha256:b\n",
+		);
+		expect(workerTurnLists("velvarr", home)).toEqual({
+			tools: '[{"name":"board-tool"}]\n',
+			toolsAll: '[{"name":"fleet-tool"}]\n',
+			apt: "libgbm1\n",
+			requirements: "idna==3.10 --hash=sha256:a\n",
+			requirementsAll: "ruff==0.6.9 --hash=sha256:b\n",
+		});
+	});
+
+	test("a project with no lists carries no fields, and there is no aptAll", () => {
+		const home = mkdtempSync(join(tmpdir(), "ottr-turnlists-none-"));
+		expect(workerTurnLists("empty", home)).toEqual({});
+		// Only the project's own apt.txt rides along; the fleet apt list is boot-only history.
+		seedLists(home, "_all", "apt.txt", "fleet-only\n");
+		expect(workerTurnLists("empty", home)).toEqual({});
+	});
+});
+
 describe("startRun worker dispatch", () => {
 	// The compiled omp stand-in is built once at module scope (see the top of this file).
 
@@ -3634,6 +3681,70 @@ describe("startRun worker dispatch", () => {
 			const log = readFileSync(logPath, "utf8");
 			expect(log).toContain(`"--config","${overlay}"`);
 		} finally {
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("a worker dispatch carries the board home's list texts in the request body", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-lists-"));
+		const board = join(dir, "board-home");
+		const seed = (project: string, file: string, text: string): void => {
+			mkdirSync(join(board, ".ottr", "workers", project), { recursive: true });
+			writeFileSync(join(board, ".ottr", "workers", project, file), text);
+		};
+		seed("velvarr", "tools.json", '[{"name":"board-tool"}]\n');
+		seed("_all", "tools.json", '[{"name":"fleet-tool"}]\n');
+		seed("velvarr", "apt.txt", "libgbm1\n");
+		seed("velvarr", "requirements.txt", "idna==3.10 --hash=sha256:a\n");
+		seed("_all", "requirements.txt", "ruff==0.6.9 --hash=sha256:b\n");
+		// A capture stub instead of a real daemon: the assertion is the request body.
+		const bodies: WorkerRequest[] = [];
+		const server = Bun.serve({
+			port: 0,
+			fetch: async (req) => {
+				bodies.push((await req.json()) as WorkerRequest);
+				return new Response(
+					`${JSON.stringify({ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } })}\n`,
+				);
+			},
+		});
+		const saved = {
+			OTTR_BOARD_OMP_HOME: process.env.OTTR_BOARD_OMP_HOME,
+			OTTR_WORKERS_HOME: process.env.OTTR_WORKERS_HOME,
+		};
+		delete process.env.OTTR_WORKERS_HOME;
+		process.env.OTTR_BOARD_OMP_HOME = board;
+		try {
+			const { done } = await startRun({
+				...baseOpts(dir, join(dir, "run.log")),
+				worker: { urls: [`http://127.0.0.1:${server.port}`] },
+				launcher: (() => {
+					throw new Error("a worker turn must never spawn locally");
+				}) as RunLauncher,
+				board: {
+					url: "http://board.test",
+					token: "tok",
+					project: "velvarr",
+					taskId: "5",
+				},
+			});
+			const r = await done;
+			expect(r.exitCode).toBe(0);
+			expect(bodies).toHaveLength(1);
+			// The request texts are exactly the board home's files, _all included.
+			expect(bodies[0]!.lists).toEqual({
+				tools: '[{"name":"board-tool"}]\n',
+				toolsAll: '[{"name":"fleet-tool"}]\n',
+				apt: "libgbm1\n",
+				requirements: "idna==3.10 --hash=sha256:a\n",
+				requirementsAll: "ruff==0.6.9 --hash=sha256:b\n",
+			});
+		} finally {
+			for (const [k, v] of Object.entries(saved)) {
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
 			server.stop(true);
 			rmSync(dir, { recursive: true, force: true });
 		}

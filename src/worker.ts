@@ -1,9 +1,6 @@
 import { homedir, tmpdir } from "node:os";
-import { ensureAllPackages } from "./apt.ts";
 import { auditProvisioned, rulesDirEntries } from "./provision.ts";
-import { ensureAllPython } from "./python.ts";
 import { formatBytes, sweepTmpDirs } from "./tmpsweep.ts";
-import { ensureAllTools } from "./tools.ts";
 import { serveWorker } from "./workers.ts";
 
 // Import-safe: Stryker's bun runner eagerly imports every mutated file to prime per-test
@@ -44,32 +41,9 @@ if (import.meta.main) {
 	sweep();
 	setInterval(sweep, 60 * 60 * 1000);
 
-	// Serving starts at once: a turn that arrives during the install queues behind it (src/apt.ts).
-	Promise.all([
-		ensureAllPackages().then(
-			(lines) => lines,
-			(err) => {
-				throw new Error(`apt: ${err instanceof Error ? err.message : err}`);
-			},
-		),
-		ensureAllTools().then(
-			(lines) => lines,
-			(err) => {
-				throw new Error(`tools: ${err instanceof Error ? err.message : err}`);
-			},
-		),
-		ensureAllPython().then(
-			(lines) => lines,
-			(err) => {
-				throw new Error(`pip: ${err instanceof Error ? err.message : err}`);
-			},
-		),
-	]).then(
-		(results) => {
-			for (const line of results.flat()) console.log(line);
-		},
-		(err) => console.error(err instanceof Error ? err.message : String(err)),
-	);
+	// The shared home is no longer a provisioning input (docs/specs/worker-list-isolation.md),
+	// so startup has nothing to pre-warm from: a project's first turn here installs its tools
+	// inline from the lists the board sends on its /run request. Serving already started.
 
 	process.on("SIGINT", () => {
 		server.stop(true);
