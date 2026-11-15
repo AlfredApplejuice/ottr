@@ -858,6 +858,10 @@ export interface TurnOps {
 	/** OTTR-959: the audit runs root the review lead source reads on this host
 	 * (`/root/security-audit-skill` when absent); tests point it at a temp dir. */
 	auditRunsRoot?: () => string;
+	/** The home the local run's provision audit reads (`homedir()` when absent); tests
+	 * point it at a temp home so a drifted host ~/.omp layer cannot park their runs
+	 * (OTTR-976). */
+	provisionHome?: () => string;
 	/** The board's work-check switch (POST /api/settings); absent counts as on, so test fakes need nothing. */
 	workCheck?: () => boolean | Promise<boolean>;
 	/** Role → selector map the check run's model resolves from; overridable for tests. */
@@ -5906,8 +5910,12 @@ export function createTurnLoop(
 		return {
 			meter: ops.hosted !== undefined,
 			auditProvisioned: (sinceMs, rulesAtStart) =>
-				auditProvisioned(homedir(), sinceMs, rulesAtStart),
-			rulesAtStart: () => rulesDirEntries(homedir()),
+				auditProvisioned(
+					ops.provisionHome?.() ?? homedir(),
+					sinceMs,
+					rulesAtStart,
+				),
+			rulesAtStart: () => rulesDirEntries(ops.provisionHome?.() ?? homedir()),
 			...(runMeter !== null && { onUsage: runMeter.onUsage }),
 			cwd: loc.wt,
 			prompt: input.prompt,
@@ -9781,8 +9789,12 @@ export function createTurnLoop(
 		return await ops.startRun({
 			meter: ops.hosted !== undefined,
 			auditProvisioned: (sinceMs, rulesAtStart) =>
-				auditProvisioned(homedir(), sinceMs, rulesAtStart),
-			rulesAtStart: () => rulesDirEntries(homedir()),
+				auditProvisioned(
+					ops.provisionHome?.() ?? homedir(),
+					sinceMs,
+					rulesAtStart,
+				),
+			rulesAtStart: () => rulesDirEntries(ops.provisionHome?.() ?? homedir()),
 			...(checkMeter !== null && { onUsage: checkMeter.onUsage }),
 			cwd: st.loc.wt,
 			prompt: input,

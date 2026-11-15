@@ -101,6 +101,10 @@ const CHECK_USAGE: TokenUsage = {
 };
 
 const root = mkdtempSync(join(tmpdir(), "hosted-e2e-"));
+// The provision audit must not read the host's real ~/.omp layer: this file drives the
+// real startRun, so host drift would park the runs (OTTR-976). An empty home has no
+// manifest and no rules record, so the audit returns [].
+const provisionHome = mkdtempSync(join(tmpdir(), "hosted-e2e-home-"));
 const servers: Server<undefined>[] = [];
 const apps: App[] = [];
 const stores: { close(): Promise<void> }[] = [];
@@ -620,6 +624,8 @@ async function mountBoard(
 		resetBranchTo,
 		pidAlive: (pid) => livePids.has(pid),
 		vmTokens,
+		// The provision audit reads this clean temp home, not the host's (OTTR-976).
+		provisionHome: () => provisionHome,
 		// The real runner: argv, stdin prompt, run sink and applyEvent; only the child is fake.
 		startRun:
 			o.startRun ??
@@ -717,6 +723,7 @@ afterAll(async () => {
 	// createApp installs the hosted git credential resolver process-wide: leave none behind.
 	setHostedGitAuth(null);
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+	rmSync(provisionHome, { recursive: true, force: true, maxRetries: 5 });
 });
 
 /** Bounded wait for a store fact that no event exposes (the turn loop has no settle signal). */
