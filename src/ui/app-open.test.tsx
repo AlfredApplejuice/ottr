@@ -9,6 +9,7 @@ import type {
 	SystemSnapshot,
 	TaskCard,
 } from "../types.ts";
+import { refreshState } from "./socket.ts";
 
 // Storage must exist before the import: app.tsx reads sessionStorage at module
 // load. The DOM globals register after the import instead — app.tsx auto-renders
@@ -989,6 +990,122 @@ test("a failed state poll shows the offline banner without a second probe", asyn
 		);
 		expect(document.querySelector("main.main")).not.toBeNull();
 		expect(stateCalls).toEqual(["/api/state"]);
+	} finally {
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
+// --- offline banner reason classes (OTTR-964) -------------------------------
+
+/** Swaps the global navigator.onLine getter; returns the restore function. */
+function stubOnLine(value: boolean): () => void {
+	Object.defineProperty(window.navigator, "onLine", {
+		configurable: true,
+		get: () => value,
+	});
+	return () => {
+		delete (window.navigator as unknown as Record<string, unknown>).onLine;
+	};
+}
+
+test("the banner names an offline device", async () => {
+	const realFetch = host.fetch;
+	const restoreOnLine = stubOnLine(false);
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) === "/api/state") throw new TypeError("network down");
+		return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+			input,
+		);
+	}) as typeof fetch;
+	try {
+		await mountRaw("/projects/alpha");
+		await waitFor(() =>
+			document.body.textContent!.includes("This device is offline."),
+		);
+		const banner = document.querySelector(".conn-banner");
+		expect(banner?.getAttribute("role")).toBe("status");
+	} finally {
+		restoreOnLine();
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
+test("the banner names a server that did not answer in time", async () => {
+	const realFetch = host.fetch;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) === "/api/state")
+			throw new DOMException("The operation was aborted.", "AbortError");
+		return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+			input,
+		);
+	}) as typeof fetch;
+	try {
+		await mountRaw("/projects/alpha");
+		await waitFor(() =>
+			document.body.textContent!.includes(
+				"The server did not answer within 5 s (timeout).",
+			),
+		);
+		expect(document.body.textContent).toMatch(/Next retry in \d+ s\./);
+	} finally {
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
+test("the banner names the HTTP answer a proxy returned", async () => {
+	const realFetch = host.fetch;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) === "/api/state")
+			return new Response("bad gateway", { status: 502 });
+		return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+			input,
+		);
+	}) as typeof fetch;
+	try {
+		await mountRaw("/projects/alpha");
+		await waitFor(() =>
+			document.body.textContent!.includes(
+				"The server answered HTTP 502. A proxy (for example tailscale serve) answers, but the board behind it does not.",
+			),
+		);
+	} finally {
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
+test("the banner names an unreachable host and shows the contact facts", async () => {
+	const realFetch = host.fetch;
+	let polls = 0;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) === "/api/state") {
+			polls++;
+			if (polls === 1)
+				return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+					input,
+				); // the first poll is the last good contact
+			throw new TypeError("network down");
+		}
+		return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+			input,
+		);
+	}) as typeof fetch;
+	try {
+		await mountAt("/projects/alpha");
+		refreshState(); // poll now: this poll fails
+		await waitFor(() =>
+			document.body.textContent!.includes("No connection to localhost."),
+		);
+		expect(document.body.textContent).toMatch(
+			/The browser does not say if the connection was refused, the name did not resolve, or a VPN such as Tailscale is off\./,
+		);
+		expect(document.body.textContent).toMatch(
+			/Last good contact \d{2}:\d{2}:\d{2}\./,
+		);
+		expect(document.body.textContent).toMatch(/Next retry in \d+ s\./);
 	} finally {
 		host.fetch = realFetch;
 		await unmountApp();

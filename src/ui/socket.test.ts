@@ -4,6 +4,7 @@ import {
 	connectLive,
 	connectPolling,
 	liveEvents,
+	type OfflineInfo,
 	parseServerMessage,
 	reconnectDelay,
 	refreshState,
@@ -278,6 +279,10 @@ class FakeWebSocket {
 	shut(): void {
 		this.onclose?.();
 	}
+	/** Test-side: the transport reports an error. */
+	fail(): void {
+		this.onerror?.();
+	}
 }
 
 /** The nth socket connectLive created; fails loudly when the test's assumption is wrong. */
@@ -365,12 +370,21 @@ describe("connectLive", () => {
 	});
 
 	const makeHandlers = () => {
-		const calls = { state: 0, update: 0, online: 0, offline: 0 };
+		const calls = {
+			state: 0,
+			update: 0,
+			online: 0,
+			offline: 0,
+			offlineInfo: null as OfflineInfo | null,
+		};
 		const h: Parameters<typeof connectLive>[0] = {
 			onState: () => calls.state++,
 			onUpdate: () => calls.update++,
 			onOnline: () => calls.online++,
-			onOffline: () => calls.offline++,
+			onOffline: (info) => {
+				calls.offline++;
+				calls.offlineInfo = info;
+			},
 		};
 		return { h, calls };
 	};
@@ -466,6 +480,47 @@ describe("connectLive", () => {
 		dispose();
 		advance(60000);
 		expect(FakeWebSocket.created).toHaveLength(1); // never reconnects after dispose
+	});
+
+	test("drop names its cause and the next retry delay to onOffline", () => {
+		// The 5 s connect timeout: the socket never opens. First drop, first rung.
+		const a = makeHandlers();
+		const disposeA = connectLive(a.h);
+		advance(5000);
+		expect(a.calls.offline).toBe(1);
+		expect(a.calls.offlineInfo).toEqual({
+			reason: "connect-timeout",
+			retryMs: 500,
+		});
+		disposeA();
+
+		// The 15 s watchdog: opened, then silent. The open reset the attempt
+		// counter, so the retry delay is the first rung again.
+		const b = makeHandlers();
+		const disposeB = connectLive(b.h);
+		socketAt(1).open();
+		advance(15000);
+		expect(b.calls.offline).toBe(1);
+		expect(b.calls.offlineInfo).toEqual({ reason: "watchdog", retryMs: 500 });
+		disposeB();
+
+		// The error event; the close that always follows drops only once.
+		const c = makeHandlers();
+		const disposeC = connectLive(c.h);
+		socketAt(2).fail();
+		expect(c.calls.offline).toBe(1);
+		expect(c.calls.offlineInfo).toEqual({ reason: "error", retryMs: 500 });
+		socketAt(2).shut();
+		expect(c.calls.offline).toBe(1);
+		disposeC();
+
+		// The close event alone.
+		const d = makeHandlers();
+		const disposeD = connectLive(d.h);
+		socketAt(3).shut();
+		expect(d.calls.offline).toBe(1);
+		expect(d.calls.offlineInfo).toEqual({ reason: "close", retryMs: 500 });
+		disposeD();
 	});
 });
 
@@ -564,6 +619,7 @@ describe("connectPolling", () => {
 			online: number;
 			offline: number;
 			offlineStatus: number | null;
+			offlineInfo: OfflineInfo | null;
 		} = {
 			state: null,
 			behind: -1,
@@ -571,6 +627,7 @@ describe("connectPolling", () => {
 			online: 0,
 			offline: 0,
 			offlineStatus: null,
+			offlineInfo: null,
 		};
 		const h: Parameters<typeof connectPolling>[0] = {
 			onState: (s) => {
@@ -583,9 +640,10 @@ describe("connectPolling", () => {
 			onOnline: () => {
 				seen.online++;
 			},
-			onOffline: (status?: number) => {
+			onOffline: (info) => {
 				seen.offline++;
-				seen.offlineStatus = status ?? null;
+				seen.offlineStatus = info.status ?? null;
+				seen.offlineInfo = info;
 			},
 		};
 		return { h, seen };
@@ -643,6 +701,11 @@ describe("connectPolling", () => {
 		// a rejected fetch has no HTTP status: the transport status 0 tells the App
 		// this cannot be a session loss, so it never probes /api/state again
 		expect(seen.offlineStatus).toBe(0);
+		expect(seen.offlineInfo).toEqual({
+			reason: "error",
+			status: 0,
+			retryMs: 5000,
+		});
 		expect(seen.online).toBe(1);
 		expect(seen.state).toEqual(STATE);
 		dispose();
@@ -720,6 +783,7 @@ describe("connectPolling", () => {
 		await drain();
 		expect(seen.offline).toBe(1);
 		expect(seen.offlineStatus).toBe(0);
+		expect(seen.offlineInfo?.reason).toBe("timeout"); // the aborted 5 s flight
 		expect(states()).toBe(2);
 		expect(seen.online).toBe(1);
 		dispose();
@@ -733,6 +797,7 @@ describe("connectPolling", () => {
 		await drain();
 		expect(seen.offline).toBe(1);
 		expect(seen.offlineStatus).toBe(401);
+		expect(seen.offlineInfo).toEqual({ status: 401, retryMs: 5000 });
 		// system went out in parallel with the failed state poll
 		expect(calls).toEqual(["/api/state", "/api/system"]);
 		dispose();

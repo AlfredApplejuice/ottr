@@ -60,6 +60,8 @@ const {
 	recommendsSteps,
 	serverLine,
 	gateAfterLostSession,
+	dropReasonDiag,
+	pollTransportDiag,
 	setupHints,
 	reportHtml,
 	Drawer,
@@ -1148,6 +1150,35 @@ describe("gateAfterLostSession", () => {
 		expect(gateAfterLostSession("setup")).toBe("setup");
 		expect(gateAfterLostSession(null)).toBe("login");
 		expect(gateAfterLostSession("login")).toBe("login");
+	});
+});
+
+describe("dropReasonDiag", () => {
+	test("the timeout reasons carry their seconds; error and close carry none", () => {
+		expect(dropReasonDiag("connect-timeout")).toEqual({
+			kind: "timeout",
+			seconds: 5,
+		});
+		expect(dropReasonDiag("timeout")).toEqual({ kind: "timeout", seconds: 5 });
+		expect(dropReasonDiag("watchdog")).toEqual({
+			kind: "timeout",
+			seconds: 15,
+		});
+		// An error/close proves nothing: the probe decides the reason class.
+		expect(dropReasonDiag("error")).toBeNull();
+		expect(dropReasonDiag("close")).toBeNull();
+		expect(dropReasonDiag(undefined)).toBeNull();
+	});
+
+	test("a poll transport failure reads as timeout on the abort, network otherwise", () => {
+		expect(pollTransportDiag("timeout", "localhost")).toEqual({
+			kind: "timeout",
+			seconds: 5,
+		});
+		expect(pollTransportDiag("error", "localhost")).toEqual({
+			kind: "network",
+			host: "localhost",
+		});
 	});
 });
 

@@ -236,6 +236,8 @@ import {
 	connectPolling,
 	latestSystem,
 	liveEvents,
+	type OfflineInfo,
+	type OfflineReason,
 	refreshState,
 } from "./socket.ts";
 import {
@@ -15929,12 +15931,84 @@ function AppDrawer(p: {
 	);
 }
 
+/** What the offline banner can name, from facts the browser has: the device's own
+ * network state, a server that missed a deadline, the HTTP answer something on the
+ * path returned, or a host the browser could not reach. The browser never says why
+ * a fetch failed, so the network class must not guess between refusal, DNS and a
+ * dead VPN. */
+export type OfflineDiag =
+	| { kind: "offline" }
+	| { kind: "timeout"; seconds: number }
+	| { kind: "http"; status: number }
+	| { kind: "network"; host: string };
+
+/** The connect timeout, the poll flight deadline and the offline probe share the
+ * 5 s budget (POLL_MS in socket.ts); the watchdog gives a silent socket 15 s. */
+const PROBE_TIMEOUT_S = 5;
+const PROBE_TIMEOUT_MS = PROBE_TIMEOUT_S * 1000;
+const WATCHDOG_S = 15;
+
+/** The reason class a drop reason already proves. An error/close proves nothing
+ * about the cause — the /api/state probe decides between HTTP, timeout and network. */
+export function dropReasonDiag(
+	reason: OfflineReason | undefined,
+): OfflineDiag | null {
+	switch (reason) {
+		case "connect-timeout":
+		case "timeout":
+			return { kind: "timeout", seconds: PROBE_TIMEOUT_S };
+		case "watchdog":
+			return { kind: "timeout", seconds: WATCHDOG_S };
+		case "error":
+		case "close":
+		case undefined:
+			return null;
+	}
+}
+
+/** The diagnostic a poll transport failure proves: the aborted flight is a
+ * timeout fact; any other rejection is a plain transport error to the host. */
+export function pollTransportDiag(
+	reason: OfflineReason | undefined,
+	host: string,
+): OfflineDiag {
+	return reason === "timeout"
+		? { kind: "timeout", seconds: PROBE_TIMEOUT_S }
+		: { kind: "network", host };
+}
+
+/** The banner's reason sentence. */
+function diagText(d: OfflineDiag): string {
+	switch (d.kind) {
+		case "offline":
+			return "This device is offline.";
+		case "timeout":
+			return `The server did not answer within ${d.seconds} s (timeout).`;
+		case "http": {
+			const proxy =
+				d.status === 502 || d.status === 503 || d.status === 504
+					? " A proxy (for example tailscale serve) answers, but the board behind it does not."
+					: "";
+			return `The server answered HTTP ${d.status}.${proxy}`;
+		}
+		case "network":
+			return `No connection to ${d.host}. The browser does not say if the connection was refused, the name did not resolve, or a VPN such as Tailscale is off.`;
+	}
+}
+
+/** The local clock time of a contact, HH:MM:SS. */
+const fmtClock = (at: number): string =>
+	new Date(at).toLocaleTimeString([], { hour12: false });
+
 /** Board-level overlays: the add-project modal, the upstream-updates panel and the
  * offline banner. */
 function AppOverlays(p: {
 	showAdd: boolean;
 	showUpdates: boolean;
 	offline: boolean;
+	connDiag: OfflineDiag | null;
+	lastContact: number | null;
+	retryAt: number | null;
 	state: StateResponse | null;
 	tasks: TaskCard[];
 	act: Act;
@@ -15947,6 +16021,9 @@ function AppOverlays(p: {
 		showAdd,
 		showUpdates,
 		offline,
+		connDiag,
+		lastContact,
+		retryAt,
 		state,
 		tasks,
 		act,
@@ -15955,6 +16032,19 @@ function AppOverlays(p: {
 		setShowUpdates,
 		setNotice,
 	} = p;
+	// The retry countdown recounts every second while the banner shows.
+	const [, setRetryTick] = useState(0);
+	useEffect(() => {
+		if (!offline) return;
+		const timer = setInterval(() => setRetryTick((c) => c + 1), 1000);
+		return () => clearInterval(timer);
+	}, [offline]);
+	// navigator.onLine is the strongest fact: an offline device cannot reach any
+	// server, whatever the poll or probe observed before it went down.
+	const shown: OfflineDiag | null = navigator.onLine
+		? connDiag
+		: { kind: "offline" };
+	const reasonLine = shown === null ? "" : ` ${diagText(shown)}`;
 	return (
 		<>
 			{showAdd && (
@@ -15981,7 +16071,16 @@ function AppOverlays(p: {
 			{offline && (
 				<div className="conn-banner" role="status">
 					<Mark kind="crit" />
-					<span>Server connection lost. Retrying…</span>
+					<span>
+						Server connection lost. Retrying…
+						{reasonLine}
+						{lastContact !== null
+							? ` Last good contact ${fmtClock(lastContact)}.`
+							: ""}
+						{retryAt !== null
+							? ` Next retry in ${Math.max(0, Math.ceil((retryAt - Date.now()) / 1000))} s.`
+							: ""}
+					</span>
 				</div>
 			)}
 		</>
@@ -16122,6 +16221,12 @@ export function App() {
 	const [error, setError] = useState<string | null>(null);
 	const [notice, setNotice] = useState<string | null>(null);
 	const [offline, setOffline] = useState(false);
+	/** OTTR-964: why the board cannot reach the server, for the offline banner. */
+	const [connDiag, setConnDiag] = useState<OfflineDiag | null>(null);
+	/** The last good frame or online event, shown by the offline banner. */
+	const [lastContact, setLastContact] = useState<number | null>(null);
+	/** When the connection logic next retries; the banner counts down to it. */
+	const [retryAt, setRetryAt] = useState<number | null>(null);
 	/** Inbox keys acknowledged in this tab since the last state frame (optimistic, cleared per frame). */
 	const [ackLocal, setAckLocal] = useState<ReadonlySet<string>>(
 		() => new Set(),
@@ -16298,8 +16403,26 @@ export function App() {
 	// One push-only socket per tab: state, update banner and System snapshots all arrive over it.
 	useEffect(() => {
 		if (live === null) return; // boot hasn't answered yet
+		/** One /api/state probe per live drop: an expired or revoked session gates
+		 * the board, and the answer names the banner's reason class. The probe
+		 * cannot hang — its flight budget is the 5 s connect timeout. */
+		const probeState = (): void => {
+			void fetch("/api/state", {
+				signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+			})
+				.then((r) => {
+					if (sessionLost(r.status)) setGate(gateAfterLostSession);
+					else setConnDiag({ kind: "http", status: r.status });
+				})
+				.catch((e: unknown) => {
+					if (e instanceof DOMException && e.name === "TimeoutError")
+						setConnDiag({ kind: "timeout", seconds: PROBE_TIMEOUT_S });
+					else setConnDiag({ kind: "network", host: location.host });
+				});
+		};
 		const h = {
 			onState: (s: StateResponse) => {
+				setLastContact(Date.now());
 				// Unchanged cards keep their previous object (reuseCards), so the memoized
 				// cards skip their render and only the changed card redraws.
 				setState((prev) => reuseCards(prev, s));
@@ -16332,22 +16455,36 @@ export function App() {
 			},
 			onUpdate: (behind: number, commits: string[]) =>
 				setUpdate({ behind, commits }),
-			onOnline: () => setOffline(false),
-			// A dead socket cannot show the HTTP status, so live mode asks once per drop: an
-			// expired or revoked session lands on the login page instead of an endless
-			// "Retrying…". Polling always carries the failed /api/state's status here —
-			// 0 on a transport failure, which cannot be a session loss — so it never refetches.
-			onOffline: (status?: number) => {
+			onOnline: () => {
+				setOffline(false);
+				setConnDiag(null);
+				setLastContact(Date.now());
+				setRetryAt(null);
+			},
+			// Polling always carries the failed /api/state's status here — 0 on a
+			// transport failure, which cannot be a session loss — so it never refetches:
+			// the poll was its own probe. A dead socket carries no status, so live mode
+			// asks once per drop: an expired or revoked session lands on the login page
+			// instead of an endless "Retrying…", and the answer names the reason class
+			// for the banner.
+			onOffline: (info: OfflineInfo) => {
 				setOffline(true);
-				if (status !== undefined) {
-					if (sessionLost(status)) setGate(gateAfterLostSession);
+				setRetryAt(Date.now() + info.retryMs);
+				if (info.status !== undefined && info.status !== 0) {
+					if (sessionLost(info.status)) setGate(gateAfterLostSession);
+					else setConnDiag({ kind: "http", status: info.status });
 					return;
 				}
-				void fetch("/api/state")
-					.then((r) => {
-						if (sessionLost(r.status)) setGate(gateAfterLostSession);
-					})
-					.catch(() => {}); // server down: the banner already says so
+				if (info.status === 0) {
+					// The poll was its own probe: its rejection carries the transport
+					// facts, so no second fetch runs.
+					setConnDiag(pollTransportDiag(info.reason, location.host));
+					return;
+				}
+				// A dead socket: the connect timeout and the watchdog are timeout facts
+				// already; an error/close has no reason class until the probe answers.
+				setConnDiag(dropReasonDiag(info.reason));
+				probeState();
 			},
 		};
 		// Prod board polls: the server refuses the socket in production mode.
@@ -16986,6 +17123,9 @@ export function App() {
 				showAdd={showAdd}
 				showUpdates={showUpdates}
 				offline={offline}
+				connDiag={connDiag}
+				lastContact={lastContact}
+				retryAt={retryAt}
 				state={state}
 				tasks={tasks}
 				act={act}

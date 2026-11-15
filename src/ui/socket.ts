@@ -5,14 +5,33 @@ import type {
 	SystemSnapshot,
 } from "../types.ts";
 
+/** Why the connection dropped, as far as the browser can tell: the 5 s connect
+ * timeout, the 15 s watchdog, the poll flight aborted at its deadline ("timeout"),
+ * or the socket's error/close event pair. */
+export type OfflineReason =
+	| "connect-timeout"
+	| "watchdog"
+	| "timeout"
+	| "error"
+	| "close";
+
+/** What onOffline carries. reason rides when the transport itself died (a dead
+ * socket names its cause; a poll names it only for transport failures); status
+ * rides when a failed /api/state produced one — 0 on a transport failure, never
+ * a session loss; retryMs is when the caller tries again, so the banner can
+ * count down to it. */
+export interface OfflineInfo {
+	reason?: OfflineReason;
+	status?: number;
+	retryMs: number;
+}
+
 /** Handlers the App passes to its one live socket. */
 interface LiveHandlers {
 	onState(state: StateResponse): void;
 	onUpdate(behind: number, commits: string[]): void;
 	onOnline(): void;
-	/** `status` rides when the caller knows it: the poll's failed /api/state passes the
-	 * response status, or 0 on a transport failure (never a session loss); a dead socket passes none. */
-	onOffline(status?: number): void;
+	onOffline(info: OfflineInfo): void;
 }
 
 /** Narrow one text frame; null for anything the guards reject, so a bad frame never reaches the UI. */
@@ -130,23 +149,24 @@ export function connectLive(h: LiveHandlers): () => void {
 		socket.close();
 	};
 
-	/** Treat any lost connection uniformly: notify, then reconnect with backoff. */
-	const drop = (): void => {
+	/** Treat any lost connection uniformly: notify with the cause, then reconnect with backoff. */
+	const drop = (reason: OfflineReason): void => {
 		if (dropped || disposed) return;
 		dropped = true;
 		clearTimeout(connectTimeout);
 		clearTimeout(watchdog);
-		h.onOffline();
+		const delay = reconnectDelay(attempt++);
+		h.onOffline({ reason, retryMs: delay });
 		reconnect = setTimeout(() => {
 			if (!disposed) ws = open();
-		}, reconnectDelay(attempt++));
+		}, delay);
 	};
 
 	const armWatchdog = (): void => {
 		clearTimeout(watchdog);
 		watchdog = setTimeout(() => {
 			if (ws !== null) abandon(ws); // the silent socket must be closed or it leaks and could revive
-			drop();
+			drop("watchdog");
 		}, 15000); // the server pings every 5 s, so silence means death
 	};
 
@@ -159,7 +179,7 @@ export function connectLive(h: LiveHandlers): () => void {
 		connectTimeout = setTimeout(() => {
 			if (socket.readyState !== WebSocket.OPEN) {
 				abandon(socket); // detach first: the late close event must not fire drop() again
-				drop();
+				drop("connect-timeout");
 			}
 		}, 5000);
 		socket.onopen = () => {
@@ -201,10 +221,10 @@ export function connectLive(h: LiveHandlers): () => void {
 		};
 		// A socket abandoned above must not re-drop once its close event lands late.
 		socket.onerror = () => {
-			if (socket === ws) drop();
+			if (socket === ws) drop("error");
 		};
 		socket.onclose = () => {
-			if (socket === ws) drop();
+			if (socket === ws) drop("close");
 		};
 		return socket;
 	};
@@ -267,7 +287,7 @@ export function connectPolling(h: LiveHandlers): () => void {
 				if (!r.ok) {
 					// The failed /api/state carries its status, so onOffline can gate on it
 					// without fetching /api/state a second time.
-					h.onOffline(r.status);
+					h.onOffline({ status: r.status, retryMs: POLL_MS });
 					return;
 				}
 				const state = (await r.json()) as StateResponse;
@@ -279,8 +299,19 @@ export function connectPolling(h: LiveHandlers): () => void {
 			})
 			// Transport failure (network error, abort, bad JSON, a throw in a handler):
 			// no HTTP status exists. Status 0 tells the App this cannot be a session
-			// loss, so it reports the banner without probing /api/state again.
-			.catch(() => h.onOffline(0));
+			// loss, so it reports the banner without probing /api/state again. An
+			// aborted flight is a timeout fact; any other rejection is a plain
+			// transport error.
+			.catch((e: unknown) =>
+				h.onOffline({
+					reason:
+						e instanceof DOMException && e.name === "AbortError"
+							? "timeout"
+							: "error",
+					status: 0,
+					retryMs: POLL_MS,
+				}),
+			);
 		const systemReq = fetch("/api/system", { signal })
 			.then(async (sr) => {
 				if (!sr.ok) return;
