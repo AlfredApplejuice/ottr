@@ -1500,6 +1500,51 @@ describe("createPrWatcher", () => {
 		expect(
 			s.logs.filter((m) => m.includes("re-review over budget")),
 		).toHaveLength(1);
+		// An explicit request on the same head rebuilds the prompt and logs nothing new.
+		await s.watcher.reviewNow({ project: "p", number: 22, note: "look again" });
+		expect(
+			s.logs.filter((m) => m.includes("re-review over budget")),
+		).toHaveLength(1);
+	});
+	test("a retried over-budget re-review logs the dropped block once", async () => {
+		const s = await setup();
+		s.setOpen([pr(22, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		await s.store.savePrReview({
+			...(await s.store.getPrReview(22))!,
+			postedHead: sha("a"),
+			postedUrl: `${prUrl("o/r", 22)}#pullrequestreview-1`,
+			postedLogin: "bot",
+		});
+		s.setOpen([pr(22, sha("c"))]);
+		s.setReviews([
+			ghReview(
+				1,
+				sha("a"),
+				"Earlier: the error panel leaks state",
+				"2026-01-01T00:00:00Z",
+			),
+		]);
+		s.setCompare("R".repeat(400_001));
+		// The prompt builds before the run claims a cap slot, so the drop logs even
+		// when the model call then fails and the head retries on a later tick.
+		s.setReviewFail(true);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.logs.some((m) => m.includes("#22 review failed"))).toBe(true);
+		expect(
+			s.logs.filter((m) => m.includes("re-review over budget")),
+		).toHaveLength(1);
+		s.setReviewFail(false);
+		await s.watcher.tick();
+		// The retry reviews and saves the draft, and the line stays at one.
+		expect(await s.cards()).toHaveLength(1);
+		expect(
+			s.logs.filter((m) => m.includes("re-review over budget")),
+		).toHaveLength(1);
 	});
 	test("an over-budget earlier review degrades to a first review", async () => {
 		const s = await setup();

@@ -959,6 +959,13 @@ interface PrWatcherCtx {
 		head: string,
 		reason: string,
 	) => void;
+	/** OTTR-966: logs a dropped re-review block once per project, PR and head. */
+	logDropped: (
+		project: string,
+		number: number,
+		head: string,
+		dropped: string[],
+	) => void;
 }
 
 /** The repo id of a project's GitHub remote; throws on a malformed id. */
@@ -1402,9 +1409,7 @@ async function reviewOnce(
 			perfCandidates: candidates.length > 0 ? candidates : undefined,
 			onDropped: (dropped) => {
 				degraded = dropped.includes("EARLIER REVIEW");
-				ctx.log(
-					`prs: ${project.name}: #${row.number} re-review over budget: dropped ${dropped.join(" and ")}`,
-				);
+				ctx.logDropped(project.name, row.number, row.head, dropped);
 			},
 		});
 	} catch (e) {
@@ -1667,6 +1672,7 @@ export function createPrWatcher(deps: {
 	skipNotices(): string[];
 } {
 	const gh = deps.gh ?? runGh;
+	const log = deps.log;
 	const now = deps.now ?? Date.now;
 	const review: ReviewFn =
 		deps.review ?? ((m) => runGateway(m, deps.spawn, undefined, "@plan"));
@@ -1690,6 +1696,26 @@ export function createPrWatcher(deps: {
 			text: `${project}: PR #${number} review skipped: ${reason}`,
 		});
 	};
+	// OTTR-966: the dropped-block line logs once per project, PR and head, deduped
+	// like the skip notices. The prompt builds before the run claims a cap slot, so a
+	// failed model call, a cap stop, or an explicit request rebuilds it for the same
+	// head, and the retry must not repeat the line. Bounded and without TTL, like
+	// skipNotices; a restart writes the line again on the first dropping build.
+	const droppedKeys: string[] = [];
+	const logDropped = (
+		project: string,
+		number: number,
+		head: string,
+		dropped: string[],
+	): void => {
+		const key = `${project}/${number}/${head}`;
+		if (droppedKeys.includes(key)) return;
+		while (droppedKeys.length >= PR_SKIP_NOTICE_MAX) droppedKeys.shift();
+		droppedKeys.push(key);
+		log(
+			`prs: ${project}: #${number} re-review over budget: dropped ${dropped.join(" and ")}`,
+		);
+	};
 	const ctx: PrWatcherCtx = {
 		projects: deps.projects,
 		log: deps.log,
@@ -1699,6 +1725,7 @@ export function createPrWatcher(deps: {
 		perfScan: deps.perfScan ?? perfFindings,
 		forgetSeen: deps.forgetSeen,
 		recordSkipNotice,
+		logDropped,
 	};
 	// Review requests serialize through one chain per watcher; reviewIdle resolves when it drains.
 	let tail: Promise<void> = Promise.resolve();
