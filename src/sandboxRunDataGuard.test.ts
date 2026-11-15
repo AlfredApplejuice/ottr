@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,17 +7,28 @@ import { join } from "node:path";
 // job dirs, extension/tracker.test.ts drives the sandbox_run tool, and
 // scripts/vm-validate-smoke.test.ts drives the smoke CLI. This guard runs them
 // the way the board's merge and review turns run the suite — in a process whose
-// OTTR_DATA_DIR points at a live data root — but points that root here: on the
-// server OTTR_DATA_DIR is /data, and one staging call without its own data root
-// would drop a val-* job dir into the board's own validate-jobs.
+// OTTR_DATA_DIR points at a live data root — and checks two leak channels the
+// child files cannot see themselves:
+// 1. The child's ambient root (this temp dir) must stay empty: a staging call
+//    with neither its own env nor its own data root lands here, and on the
+//    server the ambient root is the board's own /data.
+// 2. The live validate-jobs dir must gain nothing test-made: a call whose
+//    explicit env lacks OTTR_DATA_DIR bypasses the child's ambient root and
+//    writes /data directly. A real job's dir gains result.json when the runner
+//    answers, so a target.tar-only dir names the leak. A job that is still
+//    running while the child executes could false-red here; a rerun clears it.
+// On a machine without /data the second channel skips; the first still runs.
 const sandboxTestFiles = [
 	"src/sandboxRun.test.ts",
 	"extension/tracker.test.ts",
 	"scripts/vm-validate-smoke.test.ts",
 ];
 
+const liveJobsDir = "/data/ottr/validate-jobs";
+
 test("the suite's sandbox paths never stage a job in the ambient OTTR_DATA_DIR", () => {
 	const dataDir = mkdtempSync(join(tmpdir(), "ottr-sbx-guard-"));
+	const before = existsSync(liveJobsDir) ? readdirSync(liveJobsDir) : null;
 	try {
 		const run = Bun.spawnSync(["bun", "test", ...sandboxTestFiles], {
 			cwd: join(import.meta.dir, ".."),
@@ -32,9 +43,16 @@ test("the suite's sandbox paths never stage a job in the ambient OTTR_DATA_DIR",
 			console.error(run.stderr.toString().slice(-2000));
 		}
 		expect(run.exitCode).toBe(0);
-		// Empty afterward: a job dir here proves a sandbox path staged through
-		// the ambient OTTR_DATA_DIR instead of its own data root.
+		// Channel 1: the ambient root stays empty.
 		expect(readdirSync(dataDir)).toEqual([]);
+		// Channel 2: the live dir gains only real jobs (they carry result.json).
+		if (before !== null) {
+			const added = readdirSync(liveJobsDir).filter((n) => !before.includes(n));
+			const testMade = added.filter(
+				(n) => !existsSync(join(liveJobsDir, n, "result.json")),
+			);
+			expect(testMade).toEqual([]);
+		}
 	} finally {
 		rmSync(dataDir, { recursive: true, force: true, maxRetries: 5 });
 	}

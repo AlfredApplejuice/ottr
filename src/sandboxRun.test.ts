@@ -33,7 +33,10 @@ const TOKEN = "worker-token";
 // that defeats `o.dataRoot ?? env.OTTR_DATA_DIR ?? "/data"` (Stryker drops one
 // operand at a time) must still land in a disposable dir, never /data. jobEnv
 // carries the belt for calls with an explicit env, the beforeAll below for
-// calls that resolve through process.env.
+// calls that resolve through process.env. The two env-missing refusal tests
+// carry the belt in their own literals: their minimal env objects bypass jobEnv,
+// and a mutant that disables the refusal check would otherwise stage into /data
+// before the assertions fail.
 const ambientDataRoot = mkdtempSync(join(tmpdir(), "ottr-sbx-ambient-"));
 
 const jobEnv = (url = "http://vm-runner:8080///"): NodeJS.ProcessEnv => ({
@@ -250,7 +253,8 @@ describe("runSandboxJob", () => {
 				spawned += 1;
 				return { code: 0, stdout: TAR, stderr: "" };
 			},
-			env: { OTTR_WORKER_TOKEN: TOKEN },
+			env: { OTTR_WORKER_TOKEN: TOKEN, OTTR_DATA_DIR: ambientDataRoot },
+			dataRoot: tmpRoot(),
 		});
 		if (res.ok) throw new Error("expected a refusal");
 		expect(res.error).toContain("OTTR_VM_RUNNER_URL");
@@ -264,7 +268,11 @@ describe("runSandboxJob", () => {
 			project: "ottr",
 			argv: ["true"],
 			spawnImpl: spawnOk,
-			env: { OTTR_VM_RUNNER_URL: "http://vm-runner:8080" },
+			env: {
+				OTTR_VM_RUNNER_URL: "http://vm-runner:8080",
+				OTTR_DATA_DIR: ambientDataRoot,
+			},
+			dataRoot: tmpRoot(),
 		});
 		if (res.ok) throw new Error("expected a refusal");
 		expect(res.error).toContain("OTTR_WORKER_TOKEN");
