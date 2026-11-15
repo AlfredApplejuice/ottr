@@ -24,6 +24,7 @@ import { join } from "node:path";
 import { PROJECT, workerProjects } from "./apt.ts";
 import { resolveAgentLayer } from "./layers.ts";
 import { boardOmpHome } from "./login.ts";
+import { pluginSkillDirs } from "./pluginSkills.ts";
 
 /**
  * The home a board list read targets: the current agent layer's dir when `<home>/.alate/current`
@@ -64,7 +65,10 @@ const objectKeys = (value: unknown): string[] =>
  *  alate installs an item only when the data repo has it, so a missing dir or file is an
  *  empty list, never an error. A skill is a folder with a SKILL.md; plugins come from
  *  omp-plugins.lock.json's `plugins` map; MCP servers from mcp.json's `mcpServers`; rules
- *  are the .md files in .omp/agent/rules (dot-prefixed files stay out). */
+ *  are the .md files in .omp/agent/rules (dot-prefixed files stay out). Skills also
+ *  come from the enabled plugins' `pi.skills` directories (pluginSkillDirs): a
+ *  plugin-shipped skill folder with a SKILL.md counts, so a worker that has the
+ *  skill only through a plugin does not report it missing. */
 export function readUserLayer(home: string): {
 	skills: string[];
 	plugins: string[];
@@ -72,19 +76,21 @@ export function readUserLayer(home: string): {
 	rules: string[];
 } {
 	const skills = new Set<string>();
-	for (const dir of USER_SKILL_DIRS) {
+	const addSkillNames = (dir: string): void => {
 		let names: string[];
 		try {
-			names = readdirSync(join(home, dir));
+			names = readdirSync(dir);
 		} catch {
-			continue;
+			return;
 		}
 		for (const name of names) {
 			if (name.startsWith(".")) continue;
-			if (!existsSync(join(home, dir, name, "SKILL.md"))) continue;
+			if (!existsSync(join(dir, name, "SKILL.md"))) continue;
 			skills.add(name);
 		}
-	}
+	};
+	for (const dir of USER_SKILL_DIRS) addSkillNames(join(home, dir));
+	for (const dir of pluginSkillDirs(home)) addSkillNames(dir);
 	const lock = readJsonObject(
 		join(home, ".omp", "plugins", "omp-plugins.lock.json"),
 	);

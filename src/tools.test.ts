@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { missingByUse } from "./requiredSkills.ts";
 import {
 	buildToolsPath,
 	ensureProjectTools,
@@ -854,5 +855,132 @@ describe("readUserLayer", () => {
 			mcp: [],
 			rules: [],
 		});
+	});
+
+	test("an enabled plugin's pi.skills skills count as installed skills", () => {
+		const h = mkdtempSync(join(home, "plugyes-"));
+		const pkgDir = join(
+			h,
+			".omp",
+			"plugins",
+			"node_modules",
+			"@dietrichgebert",
+			"ponytail",
+		);
+		mkdirSync(join(pkgDir, "skills", "ponytail-audit"), { recursive: true });
+		writeFileSync(
+			join(pkgDir, "package.json"),
+			JSON.stringify({
+				name: "@dietrichgebert/ponytail",
+				pi: { skills: ["./skills"] },
+			}),
+		);
+		writeFileSync(join(pkgDir, "skills", "ponytail-audit", "SKILL.md"), "x\n");
+		mkdirSync(join(h, ".omp", "plugins"), { recursive: true });
+		writeFileSync(
+			join(h, ".omp", "plugins", "omp-plugins.lock.json"),
+			JSON.stringify({
+				plugins: {
+					"@dietrichgebert/ponytail": {
+						version: "5.3.3",
+						enabledFeatures: null,
+						enabled: true,
+					},
+				},
+			}),
+		);
+		const layer = readUserLayer(h);
+		expect(layer.skills).toContain("ponytail-audit");
+		expect(missingByUse(layer).review).not.toContain("ponytail-audit");
+	});
+
+	test("a disabled plugin adds no skills", () => {
+		const h = mkdtempSync(join(home, "plugno-"));
+		const pkgDir = join(
+			h,
+			".omp",
+			"plugins",
+			"node_modules",
+			"@dietrichgebert",
+			"ponytail",
+		);
+		mkdirSync(join(pkgDir, "skills", "ponytail-audit"), { recursive: true });
+		writeFileSync(
+			join(pkgDir, "package.json"),
+			JSON.stringify({
+				name: "@dietrichgebert/ponytail",
+				pi: { skills: ["./skills"] },
+			}),
+		);
+		writeFileSync(join(pkgDir, "skills", "ponytail-audit", "SKILL.md"), "x\n");
+		mkdirSync(join(h, ".omp", "plugins"), { recursive: true });
+		writeFileSync(
+			join(h, ".omp", "plugins", "omp-plugins.lock.json"),
+			JSON.stringify({
+				plugins: {
+					"@dietrichgebert/ponytail": {
+						version: "5.3.3",
+						enabledFeatures: null,
+						enabled: false,
+					},
+				},
+			}),
+		);
+		const layer = readUserLayer(h);
+		expect(layer.skills).toEqual([]);
+		// The plugin itself still lists; only its skills stay out.
+		expect(layer.plugins).toEqual(["@dietrichgebert/ponytail"]);
+	});
+
+	test("a pi.skills path that leaves the plugin folder adds no skills", () => {
+		const h = mkdtempSync(join(home, "plugesc-"));
+		// The escape target exists and holds a SKILL.md folder; containment must skip it.
+		mkdirSync(
+			join(h, ".omp", "plugins", "node_modules", "elsewhere", "skills", "evil"),
+			{ recursive: true },
+		);
+		writeFileSync(
+			join(
+				h,
+				".omp",
+				"plugins",
+				"node_modules",
+				"elsewhere",
+				"skills",
+				"evil",
+				"SKILL.md",
+			),
+			"x\n",
+		);
+		const pkgDir = join(
+			h,
+			".omp",
+			"plugins",
+			"node_modules",
+			"@dietrichgebert",
+			"ponytail",
+		);
+		mkdirSync(pkgDir, { recursive: true });
+		writeFileSync(
+			join(pkgDir, "package.json"),
+			JSON.stringify({
+				name: "@dietrichgebert/ponytail",
+				pi: { skills: ["../../elsewhere/skills"] },
+			}),
+		);
+		mkdirSync(join(h, ".omp", "plugins"), { recursive: true });
+		writeFileSync(
+			join(h, ".omp", "plugins", "omp-plugins.lock.json"),
+			JSON.stringify({
+				plugins: {
+					"@dietrichgebert/ponytail": {
+						version: "5.3.3",
+						enabledFeatures: null,
+						enabled: true,
+					},
+				},
+			}),
+		);
+		expect(readUserLayer(h).skills).toEqual([]);
 	});
 });

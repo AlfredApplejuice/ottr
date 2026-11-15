@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { readBelow, writeBelow } from "./confine.ts";
 import { overlayDirFor } from "./memory.ts";
@@ -36,7 +36,8 @@ const withinPkg = (pkgDir: string, dir: string): boolean => {
  * Fail-soft like `tools.ts readUserLayer`: a missing lock, a disabled plugin, a package
  * without `pi.skills`, a skill dir that is not a directory — each drops its entry, the
  * rest still loads. A plugin name or a `pi.skills` entry that resolves outside the
- * plugin's own package directory skips the plugin. */
+ * plugin's own package directory skips the plugin; a symlinked skill dir counts as
+ * outside when its real path leaves the package. */
 export function pluginSkillDirs(home: string): string[] {
 	const pluginsDir = join(home, ".omp", "plugins");
 	const lock = readJsonObject(join(pluginsDir, "omp-plugins.lock.json"));
@@ -60,6 +61,9 @@ export function pluginSkillDirs(home: string): string[] {
 			if (!withinPkg(pkgDir, dir)) continue;
 			try {
 				if (!statSync(dir).isDirectory()) continue;
+				// A symlink inside the package can still point out; the real path is
+				// the one that must stay inside the plugin's own folder.
+				if (!withinPkg(realpathSync(pkgDir), realpathSync(dir))) continue;
 			} catch {
 				continue;
 			}

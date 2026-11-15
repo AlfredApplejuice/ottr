@@ -110,6 +110,24 @@ describe("pluginSkillDirs", () => {
 		}
 	});
 
+	test("a pi.skills dir that symlinks out of the plugin package skips", () => {
+		const home = mkdtempSync(join(tmpdir(), "ottr-plugins-"));
+		try {
+			const pkgDir = writePlugin(home, "linker", {
+				pi: { skills: ["./skills"] },
+			});
+			mkdirSync(join(home, "outside", "evil"), { recursive: true });
+			writeFileSync(join(home, "outside", "evil", "SKILL.md"), "x\n");
+			symlinkSync(join(home, "outside"), join(pkgDir, "skills"));
+			writeLock(home, {
+				linker: { version: "1", enabledFeatures: null, enabled: true },
+			});
+			expect(pluginSkillDirs(home)).toEqual([]);
+		} finally {
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
 	test("no lock or a corrupt lock yields an empty list", () => {
 		const home = mkdtempSync(join(tmpdir(), "ottr-plugins-"));
 		try {
