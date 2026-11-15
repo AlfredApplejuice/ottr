@@ -4868,6 +4868,41 @@ describe("turn settleReviews", () => {
 		expect(record.publishSoon).toBe(first);
 		expect((await store.getTask(review.id))!.state).toBe("idle");
 	});
+
+	test("a raw store write ships on the next tick with OTTR_SERVER_DATA_DIR set (OTTR-974)", async () => {
+		const saved = process.env.OTTR_SERVER_DATA_DIR;
+		const serverData = mkdtempSync(join(tmpdir(), "turn-test-server-"));
+		dirs.push(serverData);
+		process.env.OTTR_SERVER_DATA_DIR = serverData;
+		try {
+			const record = baseRecord();
+			const { store, loop } = await setupWith(record, {});
+			// The env var binds at store open: tasks.db and its WAL live in the
+			// server dir (the compose layout), never under <proj>/.tasks.
+			expect(store.serverDir.startsWith(serverData)).toBe(true);
+			expect(existsSync(join(store.serverDir, "tasks.db-wal"))).toBe(true);
+			// Settle the fingerprint baseline: the first refresh cycle's flag edge
+			// can publish late under load, so tick until two consecutive quiet ticks.
+			let calm = 0;
+			while (calm < 2) {
+				const seen = record.publishSoon;
+				await loop.scheduleTick();
+				await flushPromises();
+				calm = record.publishSoon === seen ? calm + 1 : 0;
+			}
+			const base = record.publishSoon;
+			// A raw store write (no publishSoon) moves the server-dir WAL. Settings,
+			// not a card: a fresh work card would be dispatched by the same tick, and
+			// the dispatch's own publish calls would mask the WAL check under test.
+			await store.setSettings({ releaseCommand: "bin release" });
+			await loop.scheduleTick();
+			await flushPromises();
+			expect(record.publishSoon).toBeGreaterThan(base);
+		} finally {
+			if (saved === undefined) delete process.env.OTTR_SERVER_DATA_DIR;
+			else process.env.OTTR_SERVER_DATA_DIR = saved;
+		}
+	});
 });
 
 describe("turn merge outcomes", () => {

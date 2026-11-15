@@ -3214,12 +3214,13 @@ export function createTurnLoop(
 		await scheduleDispatch();
 	}
 
-	// WAL fingerprint per project store path: size and mtime of tasks.db-wal.
+	// WAL fingerprint per project store db: size and mtime of tasks.db-wal in
+	// the store's server dir (OTTR_SERVER_DATA_DIR moves it off the project).
 	const walSeen = new Map<string, string>();
 	function boardWritesLanded(): boolean {
 		let moved = false;
 		for (const e of projects.values()) {
-			const wal = join(e.store.path, ".tasks", "tasks.db-wal");
+			const wal = join(e.store.serverDir, "tasks.db-wal");
 			let mark: string;
 			try {
 				const st = statSync(wal, { throwIfNoEntry: false });

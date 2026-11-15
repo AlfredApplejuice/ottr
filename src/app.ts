@@ -4423,7 +4423,9 @@ export async function createApp(deps: AppDeps) {
 	let buildWalMark = "";
 	const storePaths = (): string[] => [
 		...Array.from(deps.projects.values(), (e) =>
-			join(e.store.path, ".tasks", "tasks.db-wal"),
+			// The db lives in the store's server dir (serverDirFor): OTTR_SERVER_DATA_DIR
+			// moves it off the project's .tasks (compose layout).
+			join(e.store.serverDir, "tasks.db-wal"),
 		),
 	];
 	function storeWalMark(): string {

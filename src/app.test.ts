@@ -12097,6 +12097,72 @@ describe("web push (R1-1, R2-3)", () => {
 		mountStores.push(g);
 	});
 
+	test("a raw store write invalidates the GET frame with OTTR_SERVER_DATA_DIR set (OTTR-974)", async () => {
+		const saved = process.env.OTTR_SERVER_DATA_DIR;
+		const serverData = join(root, "server-dir-974");
+		mkdirSync(serverData, { recursive: true });
+		process.env.OTTR_SERVER_DATA_DIR = serverData;
+		try {
+			const projDir = join(root, "server-dir-974-proj");
+			const st = await ProjectStore.open(projDir);
+			testStores.add(st);
+			// The env var binds at store open: tasks.db and its WAL live in the
+			// server dir (the compose layout), never under the project's .tasks.
+			expect(st.serverDir).toBe(join(serverData, "server-dir-974-proj"));
+			const entry: Entry = {
+				path: projDir,
+				name: "server-dir-974-proj",
+				store: st,
+				target: null,
+				gitless: false,
+				github: null,
+				protectedTarget: false,
+				remote: null,
+				dirty: false,
+				mainUnpushed: false,
+				mainBranch: null,
+				latestRelease: null,
+				latestImage: null,
+				archReview: null,
+			};
+			const g = await GlobalStore.open(join(root, "g-serverdir-974"));
+			mountStores.push(g);
+			const m = await mount({
+				gstore: g,
+				projects: new Map([[entry.name, entry]]),
+			});
+			// A plain fetch, not m.call: the seam calls publishSoon() on /api/state,
+			// which bumps the version gate and would mask the WAL-fingerprint path
+			// this test exercises (a production GET runs no publishSoon).
+			const state = async () =>
+				await fetch(new URL("/api/state", m.server.url), {
+					headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
+				});
+			// Baseline: the frame builds and caches without the card.
+			const res1 = await state();
+			expect(res1.status).toBe(200);
+			const before = m.app.stateBuilds();
+			const frame1 = (await res1.json()) as { tasks: { title: string }[] };
+			expect(frame1.tasks.some((t) => t.title === "seen by the next get")).toBe(
+				false,
+			);
+			// A raw store write (no publishSoon) moves the server-dir WAL.
+			await st.createTask("seen by the next get");
+			// The next GET must rebuild and reflect the write instead of serving
+			// the frame that predates it: the fingerprint reads the real WAL.
+			const res2 = await state();
+			expect(res2.status).toBe(200);
+			const frame2 = (await res2.json()) as { tasks: { title: string }[] };
+			expect(frame2.tasks.some((t) => t.title === "seen by the next get")).toBe(
+				true,
+			);
+			expect(m.app.stateBuilds()).toBe(before + 1);
+		} finally {
+			if (saved === undefined) delete process.env.OTTR_SERVER_DATA_DIR;
+			else process.env.OTTR_SERVER_DATA_DIR = saved;
+		}
+	});
+
 	test("push config heals a stored @localhost subject", async () => {
 		const g = await GlobalStore.open(join(root, "g-vapid"));
 		await g.set("config", {
