@@ -29,51 +29,56 @@ function flagValue(name: string): string | undefined {
 	return process.argv[i + 1];
 }
 
-const project = flagValue("project") ?? "ottr";
-const checkout = flagValue("checkout") ?? `/workspace/${project}`;
-const ref = flagValue("ref");
-const cwd = flagValue("cwd");
-const collectFlag = flagValue("collect");
-const collect =
-	collectFlag === undefined
-		? undefined
-		: collectFlag
-				.split(",")
-				.map((s) => s.trim())
-				.filter((s) => s !== "");
-// Comma-split, never trimmed: a job command's parts are byte-exact.
-const argvFlag = flagValue("argv");
-const argv =
-	argvFlag === undefined
-		? PROBE_ARGV
-		: argvFlag.split(",").filter((s) => s !== "");
+// The body runs only as the CLI (docker compose exec server bun /app/src/vmValidateSmoke.ts).
+// The Stryker bun-runner's coverage preload imports every mutated module, so an unguarded
+// top-level run here killed the mutation dry run (OTTR-973).
+if (import.meta.main) {
+	const project = flagValue("project") ?? "ottr";
+	const checkout = flagValue("checkout") ?? `/workspace/${project}`;
+	const ref = flagValue("ref");
+	const cwd = flagValue("cwd");
+	const collectFlag = flagValue("collect");
+	const collect =
+		collectFlag === undefined
+			? undefined
+			: collectFlag
+					.split(",")
+					.map((s) => s.trim())
+					.filter((s) => s !== "");
+	// Comma-split, never trimmed: a job command's parts are byte-exact.
+	const argvFlag = flagValue("argv");
+	const argv =
+		argvFlag === undefined
+			? PROBE_ARGV
+			: argvFlag.split(",").filter((s) => s !== "");
 
-const job = await runSandboxJob({
-	project,
-	checkout,
-	argv,
-	...(ref ? { ref } : {}),
-	...(cwd ? { cwd } : {}),
-	...(collect !== undefined && collect.length > 0 ? { collect } : {}),
-});
+	const job = await runSandboxJob({
+		project,
+		checkout,
+		argv,
+		...(ref ? { ref } : {}),
+		...(cwd ? { cwd } : {}),
+		...(collect !== undefined && collect.length > 0 ? { collect } : {}),
+	});
 
-if (!job.ok) {
-	console.error(job.error);
-	process.exit(1);
-}
-console.log(JSON.stringify(job.result, null, 2));
+	if (!job.ok) {
+		console.error(job.error);
+		process.exit(1);
+	}
+	console.log(JSON.stringify(job.result, null, 2));
 
-const result = job.result;
-const failedChecks = result.selfCheck?.checks.filter((c) => !c.ok) ?? [];
-const passed =
-	result.resultSource === "guest" &&
-	result.selfCheck !== null &&
-	result.selfCheck.ok &&
-	result.missingControl === null;
-if (!passed) {
-	if (result.missingControl !== null)
-		console.error(`missing control: ${result.missingControl}`);
-	if (result.error !== undefined) console.error(result.error);
-	for (const c of failedChecks) console.error(`${c.name}: ${c.detail}`);
-	process.exit(1);
+	const result = job.result;
+	const failedChecks = result.selfCheck?.checks.filter((c) => !c.ok) ?? [];
+	const passed =
+		result.resultSource === "guest" &&
+		result.selfCheck !== null &&
+		result.selfCheck.ok &&
+		result.missingControl === null;
+	if (!passed) {
+		if (result.missingControl !== null)
+			console.error(`missing control: ${result.missingControl}`);
+		if (result.error !== undefined) console.error(result.error);
+		for (const c of failedChecks) console.error(`${c.name}: ${c.detail}`);
+		process.exit(1);
+	}
 }

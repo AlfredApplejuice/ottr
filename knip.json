@@ -3,6 +3,7 @@
   "entry": [
     "src/worker.ts",
     "src/restore.ts",
+    "src/vmValidateSmoke.ts",
     "src/ui/app.tsx",
     "src/stryker-tap.cjs",
     "scripts/**/*.{js,mjs,ts}",

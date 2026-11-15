@@ -125,6 +125,11 @@ export function makeBaseConfig(cap) {
 			// ponytail: no unit seam, Bun.serve starts on import; covered by scripts/boot-smoke.ts (bun run check).
 			// Upgrade: start the server only under `import.meta.main`, then test the handlers.
 			"!src/server.ts",
+			// CLI entry (OTTR-973): the import.meta.main-guarded vm-runner probe. Its body runs a
+			// sandbox job and exits, so it has no unit seam and its mutants are NoCoverage noise;
+			// before the guard its top-level run killed the dry run, because the bun-runner's
+			// coverage preload imports every mutated module.
+			"!src/vmValidateSmoke.ts",
 			// Prose for the model; killing its mutants would take tests that pin wording.
 			"!src/prompts.ts",
 			// Not mutated, on purpose:
