@@ -1046,6 +1046,55 @@ describe("review prompt and draft", () => {
 		expect(missing).toContain("DIFF\n<<<DATA\n+x\nDATA>>>");
 		expect(missing).not.toContain("RANGE DIFF");
 	});
+	test("an over-budget range diff drops the RANGE DIFF block and keeps the earlier review", () => {
+		const dropped: string[][] = [];
+		const msg = reviewUserMessage({
+			repo: "o/r",
+			number: 1,
+			title: "t",
+			body: "",
+			diff: "+x",
+			earlier: {
+				review: "Earlier: bug in the loop",
+				comments: [],
+				rangeDiff: "R".repeat(400_001),
+			},
+			onDropped: (d) => dropped.push(d),
+		});
+		expect(msg).not.toContain("RANGE DIFF");
+		expect(msg).toContain(
+			"EARLIER REVIEW\n<<<DATA\nEarlier: bug in the loop\nDATA>>>",
+		);
+		expect(msg).toContain(
+			"unavailable (the branch may have been force-pushed)",
+		);
+		expect(dropped).toEqual([["RANGE DIFF"]]);
+	});
+	test("an over-budget earlier review degrades to the first-review prompt", () => {
+		const dropped: string[][] = [];
+		const msg = reviewUserMessage({
+			repo: "o/r",
+			number: 1,
+			title: "t",
+			body: "",
+			diff: "+x",
+			earlier: {
+				review: "E".repeat(400_001),
+				comments: [{ author: "a", date: "2026-01-01T00:00:00Z", body: "c" }],
+				rangeDiff: null,
+			},
+			onDropped: (d) => dropped.push(d),
+		});
+		const first = reviewUserMessage({
+			repo: "o/r",
+			number: 1,
+			title: "t",
+			body: "",
+			diff: "+x",
+		});
+		expect(msg).toBe(first);
+		expect(dropped).toEqual([["EARLIER REVIEW"]]);
+	});
 	test("a maintainer note lands before the DATA blocks and is never cleaned", () => {
 		const msg = reviewUserMessage({
 			repo: "o/r",
@@ -1403,6 +1452,86 @@ describe("createPrWatcher", () => {
 		);
 		// The re-review paragraph reached the system prompt.
 		expect(msg).toContain("re-review");
+	});
+	test("an over-budget range diff drops the block, logs it once, and still reviews", async () => {
+		const s = await setup();
+		s.setOpen([pr(22, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		await s.store.savePrReview({
+			...(await s.store.getPrReview(22))!,
+			postedHead: sha("a"),
+			postedUrl: `${prUrl("o/r", 22)}#pullrequestreview-1`,
+			postedLogin: "bot",
+		});
+		s.setOpen([pr(22, sha("c"))]);
+		s.setReviews([
+			ghReview(
+				1,
+				sha("a"),
+				"Earlier: the error panel leaks state",
+				"2026-01-01T00:00:00Z",
+			),
+		]);
+		// A rebase makes the range diff about as large as the full diff.
+		s.setCompare("R".repeat(400_001));
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const msg = s.prompts.at(-1)!;
+		expect(msg).toContain(
+			"EARLIER REVIEW\n<<<DATA\nEarlier: the error panel leaks state\nDATA>>>",
+		);
+		expect(msg).toContain(
+			"unavailable (the branch may have been force-pushed)",
+		);
+		expect(msg).not.toContain("RANGE DIFF");
+		expect(msg).toContain("re-review");
+		// The review ran: one draft saved, no skip notice, and the drop logged once per head.
+		expect(await s.cards()).toHaveLength(1);
+		expect(s.watcher.skipNotices()).toHaveLength(0);
+		expect(
+			s.logs.some((m) =>
+				m.includes("#22 re-review over budget: dropped RANGE DIFF"),
+			),
+		).toBe(true);
+		await s.watcher.tick();
+		expect(
+			s.logs.filter((m) => m.includes("re-review over budget")),
+		).toHaveLength(1);
+	});
+	test("an over-budget earlier review degrades to a first review", async () => {
+		const s = await setup();
+		s.setOpen([pr(22, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		await s.store.savePrReview({
+			...(await s.store.getPrReview(22))!,
+			postedHead: sha("a"),
+			postedUrl: `${prUrl("o/r", 22)}#pullrequestreview-1`,
+			postedLogin: "bot",
+		});
+		s.setOpen([pr(22, sha("c"))]);
+		s.setReviews([
+			ghReview(1, sha("a"), "E".repeat(400_001), "2026-01-01T00:00:00Z"),
+		]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const msg = s.prompts.at(-1)!;
+		// The whole re-review context went: the review runs like a first review.
+		expect(msg).not.toContain("EARLIER REVIEW");
+		expect(msg).not.toContain("re-review");
+		expect(msg).toContain("DIFF\n<<<DATA\n");
+		expect(await s.cards()).toHaveLength(1);
+		expect(s.watcher.skipNotices()).toHaveLength(0);
+		expect(
+			s.logs.some((m) =>
+				m.includes("#22 re-review over budget: dropped EARLIER REVIEW"),
+			),
+		).toBe(true);
 	});
 
 	test("an inline block on a diff line stays inline; one outside the diff moves into the body", async () => {

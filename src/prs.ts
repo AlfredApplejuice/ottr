@@ -488,6 +488,9 @@ export function reviewUserMessage(o: {
 	earlier?: ReReviewContext | null;
 	/** Deterministic perf-lens candidates; set only when the scan found at least one. */
 	perfCandidates?: PerfFinding[];
+	/** Called when an over-budget re-review drops a block ("RANGE DIFF", "EARLIER
+	 * REVIEW"); the watcher logs the names once per head. */
+	onDropped?: (dropped: string[]) => void;
 }): string {
 	const block = (label: string, raw: string): string =>
 		`${label}\n<<<DATA\n${clean(raw)}\nDATA>>>`;
@@ -510,46 +513,65 @@ export function reviewUserMessage(o: {
 	if (msg.length > PROMPT_CHAR_BUDGET)
 		throw new RangeError(`diff exceeds the prompt budget: ${msg.length} chars`);
 	if (o.earlier === undefined || o.earlier === null) return msg;
-	return appendReReview(parts, o.earlier, block);
+	const { text, dropped } = appendReReview(parts, o.earlier, block);
+	if (dropped.length > 0) o.onDropped?.(dropped);
+	return text;
 }
 
 /** Appends the earlier review, the range diff and the comments since it, cut to the budget:
- * whole oldest comments drop until the message fits, and an unfittable context throws. */
+ * whole oldest comments drop until the message fits. A still-oversized message drops the
+ * RANGE DIFF block first (the unavailable-range note takes its place), then the earlier
+ * review with its comments, and the review runs like a first review. It never throws here:
+ * the first-review message above already holds the budget check. */
 function appendReReview(
 	parts: string[],
 	earlier: ReReviewContext,
 	block: (label: string, raw: string) => string,
-): string {
+): { text: string; dropped: string[] } {
+	const firstReview = parts.length;
+	const rangeUnavailable =
+		"The range diff between the earlier reviewed head and this head is unavailable (the branch may have been force-pushed); judge against the full diff above.";
+	const hasRangeBlock = earlier.rangeDiff !== null && earlier.rangeDiff !== "";
 	parts.push(block("EARLIER REVIEW", earlier.review));
-	if (earlier.rangeDiff === null)
-		parts.push(
-			"The range diff between the earlier reviewed head and this head is unavailable (the branch may have been force-pushed); judge against the full diff above.",
-		);
-	else if (earlier.rangeDiff !== "")
-		parts.push(block("RANGE DIFF", earlier.rangeDiff));
+	if (earlier.rangeDiff === null) parts.push(rangeUnavailable);
+	else if (hasRangeBlock) parts.push(block("RANGE DIFF", earlier.rangeDiff));
 	else parts.push("There are no code changes since the earlier review's head.");
 	// The oldest comments go first: they carry the least news about the current head.
 	const comments = earlier.comments.map((c) =>
 		block(`COMMENT ${c.author} ${c.date}`, c.body),
 	);
-	let cut = 0;
-	while (
-		[...parts, ...comments].join("\n\n").length > PROMPT_CHAR_BUDGET &&
-		comments.length > 0
-	) {
-		comments.shift();
-		cut++;
+	const fit = (head: string[]): string => {
+		const rest = [...comments];
+		let cut = 0;
+		while (
+			[...head, ...rest].join("\n\n").length > PROMPT_CHAR_BUDGET &&
+			rest.length > 0
+		) {
+			rest.shift();
+			cut++;
+		}
+		const omitted =
+			cut > 0
+				? [
+						`${cut === 1 ? "The" : cut} oldest ${cut === 1 ? "comment was" : "comments were"} omitted to fit the prompt budget.`,
+					]
+				: [];
+		return [...head, ...omitted, ...rest].join("\n\n");
+	};
+	const dropped: string[] = [];
+	let text = fit(parts);
+	if (text.length > PROMPT_CHAR_BUDGET && hasRangeBlock) {
+		// A rebase makes the range diff about as large as the full diff: drop it and judge
+		// against the full diff, exactly like an unavailable range.
+		dropped.push("RANGE DIFF");
+		text = fit([...parts.slice(0, firstReview + 1), rangeUnavailable]);
 	}
-	if (cut > 0)
-		parts.push(
-			`${cut === 1 ? "The" : cut} oldest ${cut === 1 ? "comment was" : "comments were"} omitted to fit the prompt budget.`,
-		);
-	const full = [...parts, ...comments].join("\n\n");
-	if (full.length > PROMPT_CHAR_BUDGET)
-		throw new RangeError(
-			`re-review context exceeds the prompt budget: ${full.length} chars`,
-		);
-	return full;
+	if (text.length > PROMPT_CHAR_BUDGET) {
+		// The earlier review cannot fit either: review the full diff alone, like a first review.
+		dropped.push("EARLIER REVIEW");
+		return { text: parts.slice(0, firstReview).join("\n\n"), dropped };
+	}
+	return { text, dropped };
 }
 
 /** The model's draft: invisible characters removed, trimmed, capped; empty output throws. */
@@ -1336,6 +1358,9 @@ async function reviewOnce(
 	let earlier: ReReviewContext | null;
 	let diff: string;
 	let candidates: PerfFinding[] = [];
+	// A re-review over budget drops its range diff, then the earlier review; when the
+	// earlier review goes, the review runs like a first review, without its system paragraph.
+	let degraded = false;
 	try {
 		const data = await pullData(repo, row.number, row.head, ctx.gh);
 		if (data === null) {
@@ -1375,6 +1400,12 @@ async function reviewOnce(
 			note,
 			earlier,
 			perfCandidates: candidates.length > 0 ? candidates : undefined,
+			onDropped: (dropped) => {
+				degraded = dropped.includes("EARLIER REVIEW");
+				ctx.log(
+					`prs: ${project.name}: #${row.number} re-review over budget: dropped ${dropped.join(" and ")}`,
+				);
+			},
 		});
 	} catch (e) {
 		const reason = (e as Error).message;
@@ -1426,7 +1457,10 @@ async function reviewOnce(
 			await ctx.review([
 				{
 					role: "system",
-					content: reviewSystemPrompt(earlier !== null, candidates.length > 0),
+					content: reviewSystemPrompt(
+						earlier !== null && !degraded,
+						candidates.length > 0,
+					),
 				},
 				{ role: "user", content: user },
 			]),
