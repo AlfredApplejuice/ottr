@@ -6575,6 +6575,141 @@ describe("ProjectBoard done lane time view", () => {
 		}
 	});
 
+	test("Show more keeps advancing pages when a page holds pinned cards", async () => {
+		// The server pins starred past the window into the state (boardCards) but
+		// slices every page over all settled cards (donePage): page 2 here carries
+		// the starred card plus only 19 older ones. Counting the held cards repeats
+		// page 2 forever (OTTR-975); the counter must advance on every success.
+		const held = Array.from({ length: 20 }, (_, j) =>
+			cardFixture({ id: `d${j}`, stage: "done", state: "idle", doneAt: j + 1 }),
+		);
+		const pinned = cardFixture({
+			id: "s0",
+			stage: "done",
+			state: "idle",
+			starred: true,
+			doneAt: 0,
+		});
+		const older = Array.from({ length: 40 }, (_, j) =>
+			cardFixture({
+				id: `o${j}`,
+				stage: "done",
+				state: "idle",
+				doneAt: -(j + 1),
+			}),
+		);
+		const settled = [...held, pinned, ...older].sort(newestLanded);
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const project = {
+			name: "proj",
+			hasRules: true,
+			github: null,
+			gitless: false,
+			dirty: false,
+			archReview: null,
+			latestRelease: null,
+			latestImage: null,
+			doneTotal: settled.length,
+			settings: { setupChecklist: false },
+			sessionsDir: "/tmp/s",
+		} as unknown as ProjectView;
+		const realFetch = globalThis.fetch;
+		const fetches: string[] = [];
+		globalThis.fetch = (async (url: RequestInfo | URL) => {
+			const u = String(url);
+			const m = /^\/api\/projects\/proj\/done\?page=(\d+)$/.exec(u);
+			if (m) {
+				const page = Number(m[1]);
+				fetches.push(u);
+				// donePage slices every settled card, pinned ones included.
+				const tasks = settled.slice((page - 1) * 20, page * 20);
+				return new Response(JSON.stringify({ tasks, total: settled.length }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectBoard
+						project={project}
+						tasks={[...held, pinned]}
+						deltas={new Map()}
+						open={() => {}}
+						seenAnswers={new Set()}
+						seenDoneSince={0}
+						compose={() => {}}
+						composeDraft={() => {}}
+						act={async () => true}
+						onNotice={() => {}}
+						draining={false}
+					/>,
+				);
+			});
+			const lane = container.querySelector('[data-stage="done"]');
+			const ids = (): string[] =>
+				[...lane!.querySelectorAll("[data-task-id]")].map(
+					(el) => el.getAttribute("data-task-id") ?? "",
+				);
+			const more = lane!.querySelector<HTMLButtonElement>("button.lane-more");
+			// The state holds the window and the pinned starred card only.
+			expect([...ids()].sort()).toEqual(
+				[...held.map((t) => t.id), "s0"].sort(),
+			);
+			expect(more!.getAttribute("aria-label")).toBe(
+				"Show more, 40 older cards",
+			);
+			// Click 1: page 2 carries the starred card plus 19 older ones, so the
+			// board adds 19 and the hidden count drops 40 -> 21.
+			await act(async () => {
+				more!.click();
+			});
+			await act(async () => {});
+			expect(fetches).toEqual(["/api/projects/proj/done?page=2"]);
+			// 21 held plus 19 new: the fetched starred copy deduped away.
+			expect(ids()).toHaveLength(40);
+			expect(more!.getAttribute("aria-label")).toBe(
+				"Show more, 21 older cards",
+			);
+			// Click 2 must move on to page 3, not repeat page 2.
+			await act(async () => {
+				more!.click();
+			});
+			await act(async () => {});
+			expect(fetches).toEqual([
+				"/api/projects/proj/done?page=2",
+				"/api/projects/proj/done?page=3",
+			]);
+			expect(more!.getAttribute("aria-label")).toBe("Show more, 1 older cards");
+			// Click 3: page 4 holds the last older card.
+			await act(async () => {
+				more!.click();
+			});
+			await act(async () => {});
+			expect(fetches).toEqual([
+				"/api/projects/proj/done?page=2",
+				"/api/projects/proj/done?page=3",
+				"/api/projects/proj/done?page=4",
+			]);
+			// All 61 settled cards are on the board now: all 40 older ones revealed,
+			// the starred card still rendered once, the button gone.
+			expect([...ids()].sort()).toEqual(settled.map((t) => t.id).sort());
+			expect(lane!.querySelector("button.lane-more")).toBeNull();
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
 	test("the Starred section stays collapsible in the time view", async () => {
 		const doneCards = [
 			cardFixture({ id: "d0", stage: "done", state: "idle", doneAt: 1 }),

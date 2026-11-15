@@ -48,7 +48,6 @@ import {
 	APPROVE_REPLY,
 	type AskQuestion,
 	askAnswerLine,
-	DONE_PAGE,
 	doneReadKey,
 	type GhStatus,
 	type KeptChoice,
@@ -4278,6 +4277,10 @@ export function ProjectBoard({
 	// pages reset when the board switches project.
 	const [older, setOlder] = useState<TaskCard[]>([]);
 	const [olderBusy, setOlderBusy] = useState(false);
+	// The next page's own counter (OTTR-975): a server page may hold only pinned
+	// cards the state already carries, so counting the held cards stalls the number
+	// and "Show more" repeats one page forever. Each successful fetch advances it.
+	const [nextDonePage, setNextDonePage] = useState(2);
 	// The flat view's pinned Starred section: one collapse toggle, default expanded.
 	const [starredCollapsed, setStarredCollapsed] = useState(false);
 	// The setup wizard, opened from the checklist's Open setup button.
@@ -4338,17 +4341,19 @@ export function ProjectBoard({
 		tasks.filter(onBoard).length +
 		Math.max(0, project.doneTotal - heldDoneCount);
 	/** One older-Done-page fetch: page 1 is the state window, so the first click reads
-	 * page 2. A failure keeps the previous list and re-arms the button, with no notice. */
+	 * page 2, and a success advances the counter even when the page adds no new card.
+	 * A failure keeps the previous list and re-arms the button, with no notice. */
 	const fetchOlderDone = (): void => {
 		if (olderBusy) return;
 		setOlderBusy(true);
-		const page = 2 + Math.floor(older.length / DONE_PAGE);
+		const page = nextDonePage;
 		fetch(`/api/projects/${encodeURIComponent(project.name)}/done?page=${page}`)
 			.then(async (res) =>
 				res.ok ? ((await res.json()) as DonePageResponse) : null,
 			)
 			.then((next) => {
 				if (next === null) return;
+				setNextDonePage(page + 1);
 				const known = new Set([
 					...tasks.map((t) => t.id),
 					...older.map((t) => t.id),
