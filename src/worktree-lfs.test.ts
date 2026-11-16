@@ -457,7 +457,7 @@ describe("a file:// pinned origin stores LFS objects in the bare repo", () => {
 describe("lfsPointerOids", () => {
 	/** A repo whose main goes base < steps, each step a commit. */
 	const repoWith = async (
-		steps: ("add" | "delete" | "text")[],
+		steps: ("add" | "delete" | "text" | "big")[],
 	): Promise<{ dir: string; repo: string; base: string; tip: string }> => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-lfs-scan-"));
 		const repo = join(dir, "repo");
@@ -476,6 +476,16 @@ describe("lfsPointerOids", () => {
 					"version https://git-lfs.github.com/spec/v1\nbut no oid line\n",
 				);
 				await run(repo, "add", "readme.md");
+			} else if (step === "big") {
+				// A plain blob over the pointer size cap that looks like a pointer: the
+				// size gate must keep it out of the content pass, so its fake oid never
+				// surfaces.
+				const fakeOid = "a".repeat(64);
+				writeFileSync(
+					join(repo, "large.log"),
+					`version https://git-lfs.github.com/spec/v1\noid sha256:${fakeOid}\nsize 1\n${"x".repeat(4096)}\n`,
+				);
+				await run(repo, "add", "large.log");
 			} else {
 				await run(repo, "rm", "-q", "oak.png");
 			}
@@ -497,6 +507,30 @@ describe("lfsPointerOids", () => {
 		const r = await repoWith(["text"]);
 		try {
 			expect(await lfsPointerOids(r.repo, r.tip, r.base)).toEqual([]);
+		} finally {
+			rmSync(r.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a blob over the pointer size cap never enters the content pass", async () => {
+		// The big blob carries a syntactically valid pointer: only the size gate keeps
+		// its fake oid out. This is the unbounded-memory fix made observable (send-back
+		// on OTTR-1058): the content pass reads nothing over LFS_POINTER_MAX_BYTES.
+		const r = await repoWith(["big"]);
+		try {
+			expect(await lfsPointerOids(r.repo, r.tip, r.base)).toEqual([]);
+		} finally {
+			rmSync(r.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the size gate does not lose a real pointer next to a big blob, with base null too", async () => {
+		const r = await repoWith(["big", "add"]);
+		try {
+			const oids = await lfsPointerOids(r.repo, r.tip, null);
+			expect(oids).toHaveLength(1);
+			// The fake oid of the oversized pointer-lookalike must not appear.
+			expect(oids[0]).not.toMatch(/^a+$/);
 		} finally {
 			rmSync(r.dir, { recursive: true, force: true });
 		}

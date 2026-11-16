@@ -3344,6 +3344,7 @@ export function createTurnLoop(
 			github: e.github,
 			archReview,
 			originUrl: settings.originUrl,
+			target: head.target,
 			...(releaseToken !== undefined && { releaseToken }),
 			// Hosted: gh takes the project's minted token, never GH_TOKEN.
 			...(ops.hosted !== undefined && {

@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
 	chmodSync,
 	existsSync,
+	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
@@ -741,6 +742,7 @@ describe("against real repos", () => {
 		const log = await publishRelease({
 			mainPath: main,
 			originUrl: origin,
+			target: "origin/main",
 			reviewed: feat,
 			sha: feat,
 			version: "v0.9.0",
@@ -769,6 +771,7 @@ describe("against real repos", () => {
 		await publishRelease({
 			mainPath: main,
 			originUrl: origin,
+			target: "origin/main",
 			reviewed: feat,
 			sha: feat,
 			version: "v0.9.0",
@@ -785,6 +788,7 @@ describe("against real repos", () => {
 			publishRelease({
 				mainPath: main,
 				originUrl: origin,
+				target: "origin/main",
 				reviewed: feat,
 				sha: head,
 				version: "v0.9.0",
@@ -813,6 +817,7 @@ describe("against real repos", () => {
 			const log = await publishRelease({
 				mainPath: main,
 				originUrl: origin,
+				target: "origin/main",
 				reviewed: feat,
 				sha: head,
 				version: "v0.9.1",
@@ -862,6 +867,7 @@ describe("against real repos", () => {
 				findings: [finding],
 				github: sh ? "https://github.com/o/r" : null,
 				originUrl: origin,
+				target: "origin/main",
 			});
 			expect(log).toStartWith(
 				`tagged v9.9.9 at ${outside.slice(0, 7)} (late fixes: 2), pushed`,
@@ -888,6 +894,7 @@ describe("against real repos", () => {
 			notes: "Planned.\n\n## Changes\n\n- Planned thing",
 			github: null,
 			originUrl: origin,
+			target: "origin/main",
 		});
 		expect(log).toBe(`tagged v9.9.8 at ${head.slice(0, 7)}, pushed`);
 		const marked = await lateCommits(main, head, head, []);
@@ -939,6 +946,7 @@ describe("against real repos", () => {
 			publishRelease({
 				mainPath: main,
 				originUrl: origin,
+				target: "origin/main",
 				reviewed: side,
 				sha: head,
 				version: "v0.9.2",
@@ -964,6 +972,7 @@ describe("against real repos", () => {
 			const log = await publishRelease({
 				mainPath: main,
 				originUrl: origin,
+				target: "origin/main",
 				reviewed: feat,
 				sha: head,
 				version: "v0.9.2",
@@ -999,6 +1008,7 @@ describe("against real repos", () => {
 			const log = await publishRelease({
 				mainPath: main,
 				originUrl: origin,
+				target: "origin/main",
 				reviewed: head,
 				sha: head,
 				version: "v0.9.3",
@@ -1108,6 +1118,7 @@ describe("against real repos", () => {
 				publishRelease({
 					mainPath: main,
 					originUrl: origin,
+					target: "origin/main",
 					reviewed: feat,
 					sha: head,
 					version: "v0.9.9",
@@ -1142,6 +1153,7 @@ describe("against real repos", () => {
 			const log = await publishRelease({
 				mainPath: main,
 				originUrl: origin,
+				target: "origin/main",
 				reviewed: feat,
 				sha: head,
 				version: "v0.9.2",
@@ -1453,6 +1465,99 @@ describe("runReleaseCommand against real repos", () => {
 			target: "main",
 		});
 		expect(out).toMatch(/^release command published v2\.0\.0 at /);
+	}, 60_000);
+
+	test("a tag the origin already holds runs no git lfs command: the scan range is empty", async () => {
+		// The sprite is pushed: origin holds the pointer blob (its LFS object lives in
+		// the project's LFS store, never in the bare repo). A tag at that tip scans an
+		// empty range, so a release of any repo, LFS or not, runs no git lfs command
+		// (OTTR-1058 send-back: the release must not walk the whole history).
+		// tagReleasePart tags without an identity argument: the fixture repo carries its own.
+		must(main, "config", "user.name", "ott");
+		must(main, "config", "user.email", "ott@example.invalid");
+		must(main, "lfs", "track", "*.png");
+		const props = join(main, "sprites-pushed");
+		mkdirSync(props, { recursive: true });
+		writeFileSync(join(props, "oak.png"), "release-sprite-pushed");
+		must(main, "add", "sprites-pushed/oak.png", ".gitattributes");
+		must(main, "commit", "-q", "-m", "feat: sprite");
+		must(main, "push", "-q", "origin", "main");
+		const sha = must(main, "rev-parse", "HEAD");
+		const shim = join(root, "shim");
+		mkdirSync(shim);
+		const marker = join(root, "lfs-invocations.log");
+		writeFileSync(
+			join(shim, "git-lfs"),
+			`#!/bin/sh
+echo "git-lfs $*" >> "${marker}"
+exit 1
+`,
+		);
+		chmodSync(join(shim, "git-lfs"), 0o755);
+		const path = process.env.PATH;
+		process.env.PATH = `${shim}:${path}`;
+		try {
+			const out = await publishRelease({
+				mainPath: main,
+				reviewed: sha,
+				sha,
+				version: "v2.1.0",
+				notes: "## New features\n\n- sprite",
+				github: null,
+				originUrl: origin,
+				target: "origin/main",
+			});
+			expect(out).toContain("tagged v2.1.0 at");
+			expect(out).toContain("pushed");
+		} finally {
+			process.env.PATH = path;
+		}
+		expect(existsSync(marker)).toBe(false);
+	}, 60_000);
+
+	test("a release tag above the pushed tip uploads its LFS objects to the file origin", async () => {
+		// The sprite commit is local only: the tag adds a commit the origin lacks, the
+		// scan covers exactly that commit (base = the pushed tip), and the upload goes
+		// through git-lfs's file transfer into the bare origin's own LFS storage.
+		// tagReleasePart tags without an identity argument: the fixture repo carries its own.
+		must(main, "config", "user.name", "ott");
+		must(main, "config", "user.email", "ott@example.invalid");
+		must(main, "lfs", "track", "*.png");
+		const props = join(main, "sprites-local");
+		mkdirSync(props, { recursive: true });
+		writeFileSync(join(props, "maple.png"), "release-sprite-local");
+		must(main, "add", ".gitattributes", "sprites-local/maple.png");
+		must(main, "commit", "-q", "-m", "feat: maple sprite");
+		const sha = must(main, "rev-parse", "HEAD");
+		const out = await publishRelease({
+			mainPath: main,
+			reviewed: sha,
+			sha,
+			version: "v2.2.0",
+			notes: "## New features\n\n- maple sprite",
+			github: null,
+			originUrl: origin,
+			target: "origin/main",
+		});
+		expect(out).toContain("tagged v2.2.0 at");
+		expect(out).toContain("pushed");
+		const pointer = must(
+			main,
+			"cat-file",
+			"-p",
+			"HEAD:sprites-local/maple.png",
+		);
+		const lfsOid = /oid sha256:([0-9a-f]{64})/.exec(pointer)?.[1];
+		expect(lfsOid).toMatch(/^[0-9a-f]{64}$/);
+		const shard = join(
+			origin,
+			"lfs",
+			"objects",
+			(lfsOid as string).slice(0, 2),
+			(lfsOid as string).slice(2, 4),
+			lfsOid as string,
+		);
+		expect(readFileSync(shard).toString()).toBe("release-sprite-local");
 	}, 60_000);
 });
 

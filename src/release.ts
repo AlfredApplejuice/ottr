@@ -808,11 +808,40 @@ async function tagReleasePart(
 	return `tagged ${o.version} at ${o.sha.slice(0, 7)}${marked.length > 0 ? ` (late fixes: ${marked.length})` : ""}`;
 }
 
+/** The base for the release tag's LFS scan (OTTR-1058): the target's tracking tip when
+ * it is an ancestor of the tag — the release's normal state, the tag riding the target
+ * tip the merge push already landed — so the scan covers only what the tag adds. A tag
+ * on a commit origin does not hold, or a missing tracking ref, returns null (the whole
+ * history; the pointer size pre-pass bounds the read). */
+async function releaseLfsBase(
+	mainPath: string,
+	target: string | null,
+	tagSha: string,
+): Promise<string | null> {
+	if (target === null) return null;
+	const tracking = target.startsWith("origin/")
+		? `refs/remotes/${target}`
+		: `refs/remotes/origin/${target}`;
+	const tip = await git(
+		["rev-parse", "--verify", "--quiet", `${tracking}^{commit}`],
+		mainPath,
+	);
+	if (tip.code !== 0) return null;
+	const anc = await git(
+		["merge-base", "--is-ancestor", tip.stdout.trim(), tagSha],
+		mainPath,
+	);
+	return anc.code === 0 ? tip.stdout.trim() : null;
+}
+
 /** Pushes the tag to the pinned origin when the repo has one; "pushed" as the progress part. */
 async function pushReleaseTag(o: {
 	mainPath: string;
 	originUrl: string | null;
 	version: string;
+	/** The resolved target (`origin/<branch>`), when known: its tracking tip is the tag
+	 * scan's base. Absent, the scan covers the whole history (size-bounded). */
+	target?: string;
 	identity?: ReleaseIdentity;
 }): Promise<string> {
 	if (!(await hasOrigin(o.mainPath))) return "";
@@ -832,9 +861,10 @@ async function pushReleaseTag(o: {
 			? undefined
 			: (releasePushAuth(o.identity.token, o.originUrl) ?? undefined);
 	// The tag's LFS objects go first (OTTR-1058): the tag normally rides a tip origin
-	// already holds, but a tag on a commit origin lacks would fail the remote's
-	// unknown-object rejection. The scan covers the whole tagged history (base null),
-	// and the upload shares the push's scoped credentials.
+	// already holds, and the scan then covers only what the tag adds (a release of a
+	// large repo never reads its whole history's blobs). A tag on a commit origin does
+	// not hold, or a missing tracking ref, falls back to the full history — bounded by
+	// the pointer size pre-pass. The upload shares the push's scoped credentials.
 	const tagSha = await git(
 		["rev-parse", "--verify", "--quiet", `refs/tags/${o.version}`],
 		o.mainPath,
@@ -845,7 +875,7 @@ async function pushReleaseTag(o: {
 			o.originUrl,
 			o.version,
 			tagSha.stdout.trim(),
-			null,
+			await releaseLfsBase(o.mainPath, o.target ?? null, tagSha.stdout.trim()),
 			auth,
 		);
 		if (lfs !== null)
@@ -934,6 +964,10 @@ export async function publishRelease(o: {
 	archReview?: { delta: number } | null;
 	/** The server-pinned origin URL (docs/specs/pinned-origin-url.md); null fails the push. */
 	originUrl: string | null;
+	/** The resolved target (`origin/<branch>`), when known: its tracking tip is the tag
+	 * scan's base, so the scan covers only what the tag adds. Absent, the scan covers the
+	 * whole history, bounded by the pointer size pre-pass. */
+	target?: string;
 	/** gh runner for the release calls; hosted mode passes hostedGh's project-scoped client. */
 	gh?: typeof runGh;
 	/** The token the release runs as: GH_TOKEN in the gh process env and the tag push's credential helper; unset keeps runGh and the resolver env. */

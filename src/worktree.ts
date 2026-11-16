@@ -71,30 +71,39 @@ export function gitExe(resolved: string | null = Bun.which("git")): string {
 
 /**
  * One piped spawn, shared by git() and runGh(). `timeout` (Bun 1.4) bounds a hung child:
- * Bun kills it and `exited` resolves non-zero, so no caller can wait forever.
+ * Bun kills it and `exited` resolves non-zero, so no caller can wait forever. `input` is
+ * written to the child's stdin (then closed) before the readers run, so a command that
+ * reads stdin (git cat-file --batch-check) stays one spawn; the readers start first, so
+ * a big input and a big output cannot deadlock on full pipes.
  */
 export async function spawnPiped(
 	argv: string[],
 	cwd: string | undefined,
 	timeoutMs: number,
 	env: Record<string, string | undefined> = process.env,
+	input?: string,
 ): Promise<GitResult> {
 	const proc = Bun.spawn(argv, {
 		cwd,
 		// Explicit: the caller picks the env; Bun's default would be this process's boot env
 		// (git scopes GH_TOKEN to network subcommands via gitEnv; gh keeps it for its API).
 		env,
-		stdin: "ignore",
+		stdin: input === undefined ? "ignore" : "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
 		// Stryker disable next-line BooleanLiteral: no test can see a console window, and the mutant would flash one per git call
 		windowsHide: true,
 		timeout: timeoutMs,
 	});
-	const [stdout, stderr] = await Promise.all([
+	const read = Promise.all([
 		new Response(proc.stdout).text(),
 		new Response(proc.stderr).text(),
 	]);
+	if (input !== undefined && proc.stdin !== null && proc.stdin !== undefined) {
+		proc.stdin.write(input);
+		proc.stdin.end();
+	}
+	const [stdout, stderr] = await read;
 	const code = await proc.exited;
 	return { code, stdout, stderr };
 }
@@ -256,6 +265,7 @@ export async function git(
 	timeoutMs = 10 * 60_000,
 	authEnv?: Record<string, string>,
 	env: Record<string, string> = {},
+	input?: string,
 ): Promise<GitResult> {
 	let at = -1;
 	for (let i = 0; i < args.length; i++) {
@@ -322,6 +332,7 @@ export async function git(
 		cwd,
 		timeoutMs,
 		{ ...gitEnv(args, auth), ...env },
+		input,
 	);
 	// Network git carries host tokens, and a remote may echo one back: its output reaches task
 	// logs and API errors, so stored secrets never leave this function raw.
@@ -1876,14 +1887,23 @@ function pushFailure(r: GitResult): {
 const LFS_POINTER_RE =
 	/^version https:\/\/git-lfs\.github\.com\/spec\/v1\noid sha256:([0-9a-f]{64})\n/;
 
+/** Largest blob the content pass reads: a git-lfs pointer is the spec's three or four
+ * short lines, far under this. Blobs at or over it cannot be pointers, so the content
+ * pass never reads a big file's bytes (the whole range's content would be unbounded —
+ * a release of a large history reads every blob otherwise). */
+const LFS_POINTER_MAX_BYTES = 1024;
+
 /**
  * The oids of the Git LFS pointers among a pushed range's objects (`base..tip`, the whole
  * history of the tip when base is null). Plain git only, so a repo without LFS runs no
  * git lfs command (the upload step's gate). Every commit of the range is scanned, not
  * just the tip: a pointer added and deleted inside the range still shows, because each of
  * those commits is one the remote must accept (GitHub's GH008 checks every pushed
- * commit's pointers, OTTR-1058). Objects that git cannot read return no oids: the push
- * then fails the remote the same way it did before this step existed.
+ * commit's pointers, OTTR-1058). The read stays bounded: a cat-file --batch-check pass
+ * (metadata only, one short line per object) first keeps just the blobs under
+ * LFS_POINTER_MAX_BYTES, and the content pass reads only those, so a large history's
+ * big blobs never enter the process memory. Objects that git cannot read return no
+ * oids: the push then fails the remote the same way it did before this step existed.
  */
 export async function lfsPointerOids(
 	mainPath: string,
@@ -1904,7 +1924,30 @@ export async function lfsPointerOids(
 		if (/^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(sha)) shas.push(sha);
 	}
 	if (shas.length === 0) return [];
-	const buf = await catFileBatch(mainPath, shas);
+	const check = await git(
+		["cat-file", "--batch-check"],
+		mainPath,
+		undefined,
+		undefined,
+		{},
+		shas.join("\n") + "\n",
+	);
+	if (check.code !== 0) return [];
+	const small: string[] = [];
+	for (const line of check.stdout.split("\n")) {
+		// `<oid> blob <size>`, or `<oid> missing` for an unreadable name.
+		const m = /^([0-9a-f]{40,64}) blob (\d+)$/.exec(line);
+		const oid = m?.[1];
+		const size = m?.[2];
+		if (
+			oid !== undefined &&
+			size !== undefined &&
+			Number(size) < LFS_POINTER_MAX_BYTES
+		)
+			small.push(oid);
+	}
+	if (small.length === 0) return [];
+	const buf = await catFileBatch(mainPath, small);
 	const oids = new Set<string>();
 	let at = 0;
 	while (at < buf.length) {
@@ -1927,11 +1970,14 @@ export async function lfsPointerOids(
 }
 
 /**
- * git cat-file --batch over one range's objects. Bespoke spawn, outside git(): the
- * output is raw object bytes and the parse needs byte offsets (a blob with invalid
- * UTF-8 would shift a string decode). A plain --batch names no config-driven program —
- * filters run only behind --filters/--textconv, and cat-file runs no hook and no
- * fsmonitor — so the planted-config pins git() carries do not apply here.
+ * git cat-file --batch over the size-gated blobs lfsPointerOids kept. Bespoke spawn,
+ * outside git(): the output is raw object bytes and the parse needs byte offsets (a blob
+ * with invalid UTF-8 would shift a string decode). The candidate list holds blobs under
+ * LFS_POINTER_MAX_BYTES only, so the one output buffer is bounded by
+ * candidates x LFS_POINTER_MAX_BYTES no matter how big the range's other blobs are. A
+ * plain --batch names no config-driven program — filters run only behind
+ * --filters/--textconv, and cat-file runs no hook and no fsmonitor — so the
+ * planted-config pins git() carries do not apply here.
  */
 async function catFileBatch(
 	mainPath: string,
