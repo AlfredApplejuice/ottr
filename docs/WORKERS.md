@@ -991,8 +991,9 @@ three, so the turn writes only to its scratch disk. Files under `OTTR_VM_STATE_D
 
 - `base/base-<key>.ext4`: the base, built by `vm-runner` from its own container root
   (the `vm-runner` image with the worker toolchain). The build starts in the background
-  when `vm-runner` starts, and a turn waits for it. The key hashes the Ottr version,
-  `omp --version` and `package.json`, so a new image builds a new base.
+  when `vm-runner` starts, and a turn waits for it. The key hashes the content of the guest files
+  the base copies (`/app`, `/opt`, `/usr/local`, `/var/lib/dpkg/status`), plus the Ottr
+  version and `omp --version`, so any change to a copied guest file builds a new base.
 - `layers/<project>-<key>.ext4`: the project layer with the project's system packages,
   tools and Python packages. The runner bakes it in a VM (bake mode, layer writable). The
   board sends the project's trusted lists on the vm dispatch: it reads the raw texts from

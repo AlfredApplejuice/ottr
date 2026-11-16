@@ -1980,19 +1980,44 @@ describe("vmRootfs", () => {
 		]);
 	});
 
+	/** A tiny stand-in for the vm-runner image root: the guest trees the base key hashes. */
+	function srcRoot(): string {
+		const dir = mkdtempSync(join(root, "rsrc-"));
+		for (const d of [
+			"app",
+			"usr/local/bin",
+			"usr/local/bun/bin",
+			"opt/ottr-vm",
+			"var/lib/dpkg",
+		])
+			mkdirSync(join(dir, d), { recursive: true });
+		writeFileSync(join(dir, "app/package.json"), "{}");
+		writeFileSync(join(dir, "usr/local/bin/ottr-vm-init"), "#!/bin/sh\n");
+		writeFileSync(join(dir, "opt/ottr-vm/vmlinux"), "kernel\n");
+		writeFileSync(join(dir, "usr/local/bun/bin/bun"), "bun\n");
+		writeFileSync(join(dir, "var/lib/dpkg/status"), "Package: git\n");
+		return dir;
+	}
+
 	function rootfs(
 		home: string,
 		e2fsckCode: number | null = 0,
 	): {
 		fs: VmRootfs;
 		stateDir: string;
+		srcRoot: string;
+		/** Every exec's argv, in order: the tests filter it for mkfs.ext4. */
+		argvs: string[][];
 		e2fsckArgv: string[][];
+		/** One more VmRootfs over the same stateDir: a fresh base key computation. */
+		make: () => VmRootfs;
 	} {
 		const stateDir = mkdtempSync(join(root, "rfs-"));
-		const pkg = join(stateDir, "package.json");
-		writeFileSync(pkg, "{}");
+		const src = srcRoot();
+		const argvs: string[][] = [];
 		const e2fsckArgv: string[][] = [];
 		const exec: Exec = async (argv) => {
+			argvs.push(argv);
 			if (argv[0] === "omp")
 				return { code: 0, stdout: "omp 1.0\n", stderr: "" };
 			if (argv[0] === "du")
@@ -2007,19 +2032,38 @@ describe("vmRootfs", () => {
 			}
 			return { code: 0, stdout: "", stderr: "" };
 		};
-		return {
-			stateDir,
-			e2fsckArgv,
-			fs: new VmRootfs({
+		const make = (): VmRootfs =>
+			new VmRootfs({
 				stateDir,
 				homeRoot: home,
 				exec,
 				ottrVersion: "1.2.3",
-				packageJsonPath: pkg,
+				sourceRoot: src,
 				layerBytes: 1024 * 1024,
-			}),
-		};
+			});
+		return { stateDir, srcRoot: src, argvs, e2fsckArgv, fs: make(), make };
 	}
+
+	test("a changed guest file gets a new base key and rebuilds instead of reusing the ext4", async () => {
+		const home = mkdtempSync(join(root, "rb-"));
+		const { stateDir, srcRoot, argvs, make } = rootfs(home);
+		const first = await make().base();
+		const baseDir = join(stateDir, "base");
+		expect(readdirSync(baseDir)).toEqual([`${first.key}.ext4`]);
+		// Same omp version and the same /app tree; only the guest init's content changed.
+		writeFileSync(
+			join(srcRoot, "usr/local/bin/ottr-vm-init"),
+			"#!/bin/sh\necho second\n",
+		);
+		const second = await make().base();
+		expect(second.key).not.toBe(first.key);
+		expect(second.path).not.toBe(first.path);
+		// The second build ran mkfs again: the first ext4 was not reused.
+		expect(argvs.filter((a) => a[0] === "mkfs.ext4")).toHaveLength(2);
+		// keepOnly removed the old base.
+		expect(readdirSync(baseDir)).toEqual([`${second.key}.ext4`]);
+		expect(existsSync(first.path)).toBe(false);
+	});
 
 	test("two turns of one project bake once; a changed list re-bakes and drops the old layer", async () => {
 		const home = mkdtempSync(join(root, "rh-"));

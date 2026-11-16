@@ -1,8 +1,9 @@
 /**
  * vm-runner disk images (docs/adr/0009-microvm-workers.md):
  * - base rootfs: an ext4 copy of this container's own root (the vm-runner image ships the
- *   same bun, omp and /app as a worker), read-only vda of every VM. Keyed by OTTR_VERSION,
- *   `omp --version` and /app/package.json, so an image update rebuilds it once.
+ *   same bun, omp and /app as a worker), read-only vda of every VM. Keyed by the content
+ *   of the guest files it copies (BASE_INPUTS below) plus OTTR_VERSION and
+ *   `omp --version`, so any change to a copied guest file rebuilds it once.
  * - project layer: an ext4 holding the overlay `upper/` and `work/` dirs a bake VM fills with
  *   the project's apt/tools/pip installs (the worker's per-turn installs, done once). Keyed
  *   by the base key plus the dispatch's provisioning list texts (docs/specs/vm-list-isolation.md),
@@ -16,12 +17,15 @@ import {
 	closeSync,
 	existsSync,
 	ftruncateSync,
+	lstatSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
-	readFileSync,
+	readlinkSync,
+	readSync,
 	renameSync,
 	rmSync,
+	type Stats,
 } from "node:fs";
 import { join } from "node:path";
 import type { Exec } from "./vmNet.ts";
@@ -42,6 +46,21 @@ const BASE_EXCLUDES = [
 /** Mount points the guest init needs in the copy, which the excludes dropped. */
 const MOUNT_POINTS = ["proc", "sys", "dev", "run", "tmp", "data", "root"];
 
+/**
+ * The copied guest paths the base key hashes: everything the image build adds on top of
+ * Debian (the init at /usr/local/bin/ottr-vm-init, /app with the guest agent, the kernel
+ * at /opt/ottr-vm/vmlinux, bun and omp under /usr/local/bun, the other external tools)
+ * plus the dpkg inventory for the apt toolchain. /etc and the Debian /usr stay out on
+ * purpose: dpkg status covers them at package granularity, and the docker-written
+ * /etc/hosts and resolv.conf must never key the base (they change per container restart).
+ */
+const BASE_INPUTS = [
+	"/app",
+	"/opt",
+	"/usr/local",
+	"/var/lib/dpkg/status",
+] as const;
+
 export interface BakeResult {
 	exitCode: number | null;
 	stderrTail: string;
@@ -54,12 +73,56 @@ export type LayerResult =
 function baseKey(i: {
 	ottrVersion: string;
 	ompVersion: string;
-	packageJson: string;
+	/** Per BASE_INPUTS path: the copied content's digest, null when absent. */
+	guests: (readonly [string, string | null])[];
 }): string {
 	// JSON keeps the parts unambiguous: "a"+"bc" and "ab"+"c" must not collide.
 	return createHash("sha256")
-		.update(JSON.stringify([i.ottrVersion, i.ompVersion, i.packageJson]))
+		.update(JSON.stringify([i.ottrVersion, i.ompVersion, i.guests]))
 		.digest("hex");
+}
+
+/** sha256 of a file's content, read in chunks so a big binary never sits in the heap. */
+function fileDigest(path: string): string {
+	const hash = createHash("sha256");
+	const fd = openSync(path, "r");
+	try {
+		const buf = Buffer.allocUnsafe(HASH_CHUNK);
+		for (;;) {
+			const n = readSync(fd, buf, 0, HASH_CHUNK, null);
+			if (n === 0) break;
+			hash.update(buf.subarray(0, n));
+		}
+	} finally {
+		closeSync(fd);
+	}
+	return hash.digest("hex");
+}
+
+/**
+ * Content digest of one copied guest path under the image root `root`: a file hashes by
+ * content, a symlink by its target, a directory by its sorted children's digests; null
+ * when absent. The sorted names keep the digest stable across readdir order, and a
+ * symlink never gets followed as a directory, so there is no cycle.
+ */
+function guestDigest(root: string, rel: string): string | null {
+	const at = join(root, rel);
+	let st: Stats;
+	try {
+		st = lstatSync(at);
+	} catch {
+		return null;
+	}
+	if (st.isSymbolicLink()) return `l:${readlinkSync(at)}`;
+	if (st.isFile()) return `f:${fileDigest(at)}`;
+	const parts: string[] = [];
+	for (const entry of readdirSync(at, { withFileTypes: true }).sort((a, b) =>
+		a.name < b.name ? -1 : 1,
+	))
+		parts.push(
+			`${entry.name}\u0000${guestDigest(root, `${rel}/${entry.name}`) ?? "?"}`,
+		);
+	return `d:${createHash("sha256").update(parts.join("\n")).digest("hex")}`;
 }
 
 /**
@@ -92,14 +155,6 @@ export function listFiles(
 		});
 	return out;
 }
-
-const readOrNull = (path: string): string | null => {
-	try {
-		return readFileSync(path, "utf8");
-	} catch {
-		return null;
-	}
-};
 
 export function layerKey(base: string, lists: ProvisionLists): string {
 	// A missing list (null) and an empty one ("") install the same, but keeping them apart
@@ -148,6 +203,9 @@ function keepOnly(dir: string, keep: string): void {
 
 const MIB = 1024 * 1024;
 
+/** Hash chunk for the guest file digests (fileDigest). */
+const HASH_CHUNK = 8 * MIB;
+
 export class VmRootfs {
 	private basePromise: Promise<{ key: string; path: string }> | null = null;
 	/** Per project: the tail of its bake chain, so two turns never bake one layer twice. */
@@ -159,7 +217,6 @@ export class VmRootfs {
 			homeRoot: string;
 			exec: Exec;
 			ottrVersion: string;
-			packageJsonPath: string;
 			/** Apparent size of a fresh layer image (sparse). */
 			layerBytes: number;
 			/** The root the base copies; "/" outside tests. */
@@ -183,7 +240,9 @@ export class VmRootfs {
 		const key = baseKey({
 			ottrVersion: this.o.ottrVersion,
 			ompVersion: (await run(exec, ["omp", "--version"])).trim(),
-			packageJson: readOrNull(this.o.packageJsonPath) ?? "",
+			guests: BASE_INPUTS.map(
+				(p) => [p, guestDigest(this.o.sourceRoot ?? "/", p)] as const,
+			),
 		});
 		const dir = join(stateDir, "base");
 		const path = join(dir, `${key}.ext4`);

@@ -108,7 +108,6 @@ if (import.meta.main) {
 		homeRoot: "/root",
 		exec: defaultExec,
 		ottrVersion: process.env.OTTR_VERSION ?? "",
-		packageJsonPath: "/app/package.json",
 		layerBytes: cfg.diskBytes,
 	});
 	const server = serveVmRunner({
