@@ -2,8 +2,10 @@
  * vm-runner disk images (docs/adr/0009-microvm-workers.md):
  * - base rootfs: an ext4 copy of this container's own root (the vm-runner image ships the
  *   same bun, omp and /app as a worker), read-only vda of every VM. Keyed by the content
- *   of the guest files it copies (BASE_INPUTS below) plus OTTR_VERSION and
- *   `omp --version`, so any change to a copied guest file rebuilds it once.
+ *   of everything it copies (the source root minus the tar's excludes and the
+ *   per-container /etc files, see copiedPathSkipped) plus OTTR_VERSION and
+ *   `omp --version`, so any change to a copied guest file rebuilds it once. The digest
+ *   walk reads the whole copied tree, once per vm-runner process start.
  * - project layer: an ext4 holding the overlay `upper/` and `work/` dirs a bake VM fills with
  *   the project's apt/tools/pip installs (the worker's per-turn installs, done once). Keyed
  *   by the base key plus the dispatch's provisioning list texts (docs/specs/vm-list-isolation.md),
@@ -47,19 +49,34 @@ const BASE_EXCLUDES = [
 const MOUNT_POINTS = ["proc", "sys", "dev", "run", "tmp", "data", "root"];
 
 /**
- * The copied guest paths the base key hashes: everything the image build adds on top of
- * Debian (the init at /usr/local/bin/ottr-vm-init, /app with the guest agent, the kernel
- * at /opt/ottr-vm/vmlinux, bun and omp under /usr/local/bun, the other external tools)
- * plus the dpkg inventory for the apt toolchain. /etc and the Debian /usr stay out on
- * purpose: dpkg status covers them at package granularity, and the docker-written
- * /etc/hosts and resolv.conf must never key the base (they change per container restart).
+ * /etc files the container runtime rewrites on every start. The tar skips their bind
+ * mounts (--one-file-system), and the base key skips their content, so a container
+ * restart never churns the key.
  */
-const BASE_INPUTS = [
-	"/app",
-	"/opt",
-	"/usr/local",
-	"/var/lib/dpkg/status",
-] as const;
+const ETC_RUNTIME_FILES: Record<string, true> = {
+	hosts: true,
+	"resolv.conf": true,
+	hostname: true,
+};
+
+/**
+ * True for a path the base rootfs never copies: the tar's anchored excludes
+ * (BASE_EXCLUDES, at their exact paths — /var/lib/ottr-vm is the state dir the compose
+ * volume pins) and the per-container /etc files above. Everything else under the source
+ * root is hashed, so the key also moves when the image build writes a file no package
+ * owns (for example /etc/gitconfig from Dockerfile.worker's `git config --system`, or
+ * the root-level /ottr-entry.sh and /no-proxy.sh).
+ */
+function copiedPathSkipped(rel: string): boolean {
+	if ((BASE_EXCLUDES as readonly string[]).includes(rel)) return true;
+	const rest = rel.slice(1);
+	const slash = rest.indexOf("/");
+	return (
+		slash !== -1 &&
+		rest.slice(0, slash) === "etc" &&
+		ETC_RUNTIME_FILES[rest.slice(slash + 1)] === true
+	);
+}
 
 export interface BakeResult {
 	exitCode: number | null;
@@ -73,12 +90,12 @@ export type LayerResult =
 function baseKey(i: {
 	ottrVersion: string;
 	ompVersion: string;
-	/** Per BASE_INPUTS path: the copied content's digest, null when absent. */
-	guests: (readonly [string, string | null])[];
+	/** Content digest of the whole copied root, null when absent. */
+	guest: string | null;
 }): string {
 	// JSON keeps the parts unambiguous: "a"+"bc" and "ab"+"c" must not collide.
 	return createHash("sha256")
-		.update(JSON.stringify([i.ottrVersion, i.ompVersion, i.guests]))
+		.update(JSON.stringify([i.ottrVersion, i.ompVersion, i.guest]))
 		.digest("hex");
 }
 
@@ -102,8 +119,9 @@ function fileDigest(path: string): string {
 /**
  * Content digest of one copied guest path under the image root `root`: a file hashes by
  * content, a symlink by its target, a directory by its sorted children's digests; null
- * when absent. The sorted names keep the digest stable across readdir order, and a
- * symlink never gets followed as a directory, so there is no cycle.
+ * when absent. The sorted names keep the digest stable across readdir order, a symlink
+ * never gets followed as a directory, so there is no cycle, and paths that
+ * copiedPathSkipped names contribute nothing.
  */
 function guestDigest(root: string, rel: string): string | null {
 	const at = join(root, rel);
@@ -116,11 +134,14 @@ function guestDigest(root: string, rel: string): string | null {
 	if (st.isSymbolicLink()) return `l:${readlinkSync(at)}`;
 	if (st.isFile()) return `f:${fileDigest(at)}`;
 	const parts: string[] = [];
-	for (const entry of readdirSync(at, { withFileTypes: true }).sort((a, b) =>
-		a.name < b.name ? -1 : 1,
-	))
+	// The root call comes in as rel "/": its children must read "/name", not "//name".
+	const base = rel === "/" ? "" : rel;
+	const children = readdirSync(at, { withFileTypes: true })
+		.filter((e) => !copiedPathSkipped(`${base}/${e.name}`))
+		.sort((a, b) => (a.name < b.name ? -1 : 1));
+	for (const entry of children)
 		parts.push(
-			`${entry.name}\u0000${guestDigest(root, `${rel}/${entry.name}`) ?? "?"}`,
+			`${entry.name}\u0000${guestDigest(root, `${base}/${entry.name}`) ?? "?"}`,
 		);
 	return `d:${createHash("sha256").update(parts.join("\n")).digest("hex")}`;
 }
@@ -240,9 +261,7 @@ export class VmRootfs {
 		const key = baseKey({
 			ottrVersion: this.o.ottrVersion,
 			ompVersion: (await run(exec, ["omp", "--version"])).trim(),
-			guests: BASE_INPUTS.map(
-				(p) => [p, guestDigest(this.o.sourceRoot ?? "/", p)] as const,
-			),
+			guest: guestDigest(this.o.sourceRoot ?? "/", "/"),
 		});
 		const dir = join(stateDir, "base");
 		const path = join(dir, `${key}.ext4`);
