@@ -1768,18 +1768,22 @@ interface RunStart {
 
 /** The plugin-skills overlay for one run: the enabled plugins of the run's home
  * (docs/specs/turn-home-plugin-skills.md). A VM run scopes the overlay dir to the
- * project data dir, the only tree vm-runner copies in (resolveMemoryConfig). */
+ * project data dir, the only tree vm-runner copies in (resolveMemoryConfig). The
+ * per-project scoping takes the same value that becomes the spawn's OTTR_PROJECT
+ * (o.board.project; a stripBoard run carries none). */
 function pluginSkillsConfigFor(
 	o: StartOptions,
 	layerEnv: { HOME: string; PI_CODING_AGENT_DIR: string } | null,
 	layerHome: string,
 ): string | null {
 	const home = o.pluginSkillsHome ?? layerEnv?.HOME ?? layerHome;
+	const project = o.board && !o.stripBoard ? o.board.project : null;
 	return ensurePluginSkillsOverlay(
 		o.vm
 			? { ...process.env, OTTR_DATA_DIR: dirname(o.sessionDir) }
 			: process.env,
 		home,
+		project,
 	);
 }
 

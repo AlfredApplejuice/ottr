@@ -13,9 +13,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	ensurePluginSkillsOverlay,
+	overlaySkillDirs,
 	pluginSkillDirs,
 	pluginSkillsOverlayPath,
 	pluginSkillsOverlayYaml,
+	projectPluginNames,
 } from "./pluginSkills.ts";
 
 /** A fixture home: one enabled plugin with `pi.skills`, plus whatever the caller adds. */
@@ -301,6 +303,208 @@ describe("ensurePluginSkillsOverlay", () => {
 			expect(readFileSync(path, "utf8")).toContain("customDirectories");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("per-project scoping", () => {
+	function writeProjectSkill(
+		home: string,
+		project: string,
+		skill: string,
+	): string {
+		const dir = join(home, ".ottr", "project-skills", project, skill);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(
+			join(dir, "SKILL.md"),
+			"---\ndescription: probe\n---\nbody\n",
+		);
+		return join(home, ".ottr", "project-skills", project);
+	}
+
+	function writePluginsList(home: string, project: string, text: string): void {
+		mkdirSync(join(home, ".ottr", "plugins"), { recursive: true });
+		writeFileSync(join(home, ".ottr", "plugins", `${project}.txt`), text);
+	}
+
+	test("the project's skill folder rides after the plugin dirs in the overlay", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-plugins-proj-"));
+		const home = join(dir, "home");
+		try {
+			const pkgDir = writePlugin(home, "cool", {
+				pi: { skills: ["./skills"] },
+			});
+			mkdirSync(join(pkgDir, "skills"), { recursive: true });
+			writeLock(home, {
+				cool: { version: "1", enabledFeatures: null, enabled: true },
+			});
+			const projectDir = writeProjectSkill(home, "proj", "bundle-skill");
+			const path = ensurePluginSkillsOverlay(
+				{ OTTR_DATA_DIR: dir },
+				home,
+				"proj",
+			)!;
+			expect(readFileSync(path, "utf8")).toBe(
+				`skills:\n  enableAgentsProject: false\n  enableClaudeProject: false\n  enablePiProject: false\n  customDirectories:\n    - ${JSON.stringify(join(pkgDir, "skills"))}\n    - ${JSON.stringify(projectDir)}\n`,
+			);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("without per-project files the overlay stays byte-identical to the unscoped one", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-plugins-noproj-"));
+		const home = join(dir, "home");
+		try {
+			const pkgDir = writePlugin(home, "cool", {
+				pi: { skills: ["./skills"] },
+			});
+			mkdirSync(join(pkgDir, "skills"), { recursive: true });
+			writeLock(home, {
+				cool: { version: "1", enabledFeatures: null, enabled: true },
+			});
+			const scoped = ensurePluginSkillsOverlay(
+				{ OTTR_DATA_DIR: dir },
+				home,
+				"proj",
+			)!;
+			const unscoped = ensurePluginSkillsOverlay({ OTTR_DATA_DIR: dir }, home)!;
+			expect(readFileSync(scoped, "utf8")).toBe(readFileSync(unscoped, "utf8"));
+			expect(readFileSync(scoped, "utf8")).toBe(
+				pluginSkillsOverlayYaml(pluginSkillDirs(home)),
+			);
+			expect(overlaySkillDirs(home, null)).toEqual(pluginSkillDirs(home));
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the plugins list filters the enabled plugins' dirs; unknown names drop silently", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-plugins-filter-"));
+		const home = join(dir, "home");
+		try {
+			const coolDir = join(
+				writePlugin(home, "cool", { pi: { skills: ["./skills"] } }),
+				"skills",
+			);
+			mkdirSync(coolDir, { recursive: true });
+			const ponyDir = join(
+				writePlugin(home, "pony", { pi: { skills: ["./skills"] } }),
+				"skills",
+			);
+			mkdirSync(ponyDir, { recursive: true });
+			writeLock(home, {
+				cool: { version: "1", enabledFeatures: null, enabled: true },
+				pony: { version: "1", enabledFeatures: null, enabled: true },
+			});
+			writePluginsList(home, "proj", "# bundle\n\ncool\nghost\n");
+			const projectDir = writeProjectSkill(home, "proj", "bundle-skill");
+			const path = ensurePluginSkillsOverlay(
+				{ OTTR_DATA_DIR: dir },
+				home,
+				"proj",
+			)!;
+			const content = readFileSync(path, "utf8");
+			expect(content).toContain(JSON.stringify(coolDir));
+			expect(content).not.toContain(JSON.stringify(ponyDir));
+			expect(content).toContain(JSON.stringify(projectDir));
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("comments, blank lines and CRLF parse out of the plugins list", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-plugins-parse-"));
+		const home = join(dir, "home");
+		try {
+			writePluginsList(
+				home,
+				"proj",
+				"# head\n\n  spaced-name  \ntrailing# note\r\n@scope/pkg\r\n",
+			);
+			expect(projectPluginNames(home, "proj")).toEqual(
+				new Set(["spaced-name", "trailing", "@scope/pkg"]),
+			);
+			expect(projectPluginNames(home, null)).toBeNull();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a comment-only list filters every plugin dir out, the project dir still rides", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-plugins-empty-"));
+		const home = join(dir, "home");
+		try {
+			const pkgDir = writePlugin(home, "cool", {
+				pi: { skills: ["./skills"] },
+			});
+			mkdirSync(join(pkgDir, "skills"), { recursive: true });
+			writeLock(home, {
+				cool: { version: "1", enabledFeatures: null, enabled: true },
+			});
+			writePluginsList(home, "proj", "# nothing left\n");
+			const projectDir = writeProjectSkill(home, "proj", "bundle-skill");
+			const path = ensurePluginSkillsOverlay(
+				{ OTTR_DATA_DIR: dir },
+				home,
+				"proj",
+			)!;
+			expect(readFileSync(path, "utf8")).toBe(
+				`skills:\n  enableAgentsProject: false\n  enableClaudeProject: false\n  enablePiProject: false\n  customDirectories:\n    - ${JSON.stringify(projectDir)}\n`,
+			);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("an absent list file filters nothing", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-plugins-nofilter-"));
+		const home = join(dir, "home");
+		try {
+			const coolDir = join(
+				writePlugin(home, "cool", { pi: { skills: ["./skills"] } }),
+				"skills",
+			);
+			mkdirSync(coolDir, { recursive: true });
+			const ponyDir = join(
+				writePlugin(home, "pony", { pi: { skills: ["./skills"] } }),
+				"skills",
+			);
+			mkdirSync(ponyDir, { recursive: true });
+			writeLock(home, {
+				cool: { version: "1", enabledFeatures: null, enabled: true },
+				pony: { version: "1", enabledFeatures: null, enabled: true },
+			});
+			const content = readFileSync(
+				ensurePluginSkillsOverlay({ OTTR_DATA_DIR: dir }, home, "proj")!,
+				"utf8",
+			);
+			expect(content).toContain(JSON.stringify(coolDir));
+			expect(content).toContain(JSON.stringify(ponyDir));
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a project-skills dir that symlinks out of the home drops out", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-plugins-escape-"));
+		const outside = mkdtempSync(join(tmpdir(), "ottr-plugins-outside-"));
+		const home = join(dir, "home");
+		try {
+			mkdirSync(join(home, ".ottr", "project-skills"), { recursive: true });
+			symlinkSync(outside, join(home, ".ottr", "project-skills", "proj"));
+			const content = readFileSync(
+				ensurePluginSkillsOverlay({ OTTR_DATA_DIR: dir }, home, "proj")!,
+				"utf8",
+			);
+			expect(content).not.toContain("project-skills");
+			expect(projectPluginNames(home, "../victim")).toBeNull();
+			expect(overlaySkillDirs(home, "../victim")).toEqual(
+				pluginSkillDirs(home),
+			);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+			rmSync(outside, { recursive: true, force: true });
 		}
 	});
 });

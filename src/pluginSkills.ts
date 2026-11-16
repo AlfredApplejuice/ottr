@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { PROJECT } from "./apt.ts";
 import { readBelow, writeBelow } from "./confine.ts";
 import { overlayDirFor } from "./memory.ts";
 
@@ -13,7 +14,10 @@ import { overlayDirFor } from "./memory.ts";
  * still runs no plugin code — plus the project-level skill enables pinned off, so a
  * worker-planted `.agents` or `.omp` skill in the run's cwd never loads. The home's
  * plugins are provisioned content (alate scans them with SkillSpector before install);
- * the worktree stays untrusted and enters no path here.
+ * the worktree stays untrusted and enters no path here. Alate's per-project bundles
+ * scope the list further (docs/specs/turn-home-plugin-skills.md): a board project's
+ * own skill folder rides after the plugin dirs, and a board project's plugins list
+ * filters them when the home holds one.
  */
 
 type AnyRec = Record<string, unknown>;
@@ -32,18 +36,24 @@ const withinPkg = (pkgDir: string, dir: string): boolean => {
 	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 };
 
-/** The enabled plugins' skill directories under `home`, absolute, deduplicated, sorted.
+/** One enabled plugin's validated skill dir: the lock name with the absolute dir. */
+interface PluginSkillEntry {
+	name: string;
+	dir: string;
+}
+
+/** The enabled plugins' skill dirs as name+dir pairs, in lock order, dirs validated.
  * Fail-soft like `tools.ts readUserLayer`: a missing lock, a disabled plugin, a package
  * without `pi.skills`, a skill dir that is not a directory — each drops its entry, the
  * rest still loads. A plugin name or a `pi.skills` entry that resolves outside the
  * plugin's own package directory skips the plugin; a symlinked skill dir counts as
  * outside when its real path leaves the package. */
-export function pluginSkillDirs(home: string): string[] {
+function pluginSkillEntries(home: string): PluginSkillEntry[] {
+	const entries: PluginSkillEntry[] = [];
 	const pluginsDir = join(home, ".omp", "plugins");
 	const lock = readJsonObject(join(pluginsDir, "omp-plugins.lock.json"));
 	const plugins = lock?.plugins;
-	if (typeof plugins !== "object" || plugins === null) return [];
-	const dirs = new Set<string>();
+	if (typeof plugins !== "object" || plugins === null) return entries;
 	for (const [name, entry] of Object.entries(plugins)) {
 		if ((entry as AnyRec | null)?.enabled !== true) continue;
 		const segments = name.split("/");
@@ -67,10 +77,84 @@ export function pluginSkillDirs(home: string): string[] {
 			} catch {
 				continue;
 			}
-			dirs.add(dir);
+			entries.push({ name, dir });
 		}
 	}
-	return [...dirs].sort();
+	return entries;
+}
+
+/** The enabled plugins' skill directories under `home`, absolute, deduplicated, sorted —
+ * the unscoped list, no per-project filter (docs/specs/turn-home-plugin-skills.md). */
+export function pluginSkillDirs(home: string): string[] {
+	return overlaySkillDirs(home, null);
+}
+
+/** The per-project skill folder alate provisions for a board project under its turn
+ * home: `<home>/.ottr/project-skills/<P>`, whose immediate children are skill folders
+ * (docs/specs/turn-home-plugin-skills.md). Null without a project, an unsafe project
+ * name, a missing dir, or a real path that leaves the home — fail-soft, the same
+ * contract as the plugin enumeration. The project name passes the same rule the
+ * `.ottr/workers/<project>` list paths use. */
+function projectSkillDir(
+	home: string,
+	project: string | null | undefined,
+): string | null {
+	if (!project || !PROJECT.test(project)) return null;
+	const dir = join(home, ".ottr", "project-skills", project);
+	try {
+		if (!statSync(dir).isDirectory()) return null;
+		// A symlink at any path level must still land inside the home's own real
+		// path — the same real-vs-real guard the plugin dirs use.
+		if (!withinPkg(realpathSync(home), realpathSync(dir))) return null;
+	} catch {
+		return null;
+	}
+	return dir;
+}
+
+/** The plugin names alate's per-project plugins list for a board project names:
+ * `<home>/.ottr/plugins/<P>.txt`, one npm package name per line; `#` starts a
+ * comment and blank lines drop out. Null without a project, an unsafe project
+ * name, or an unreadable file — an absent file means "no per-project filter",
+ * so the unscoped set stays. */
+export function projectPluginNames(
+	home: string,
+	project: string | null | undefined,
+): Set<string> | null {
+	if (!project || !PROJECT.test(project)) return null;
+	let raw: string;
+	try {
+		raw = readFileSync(
+			join(home, ".ottr", "plugins", `${project}.txt`),
+			"utf8",
+		);
+	} catch {
+		return null;
+	}
+	const names = new Set<string>();
+	for (const line of raw.split(/\r?\n/)) {
+		const hash = line.indexOf("#");
+		const name = (hash === -1 ? line : line.slice(0, hash)).trim();
+		if (name !== "") names.add(name);
+	}
+	return names;
+}
+
+/** The overlay's `customDirectories` for one run: the enabled plugins' skill dirs —
+ * filtered to the names of the project's plugins list when `home` holds one — plus
+ * the project's own skill folder appended after them. Without a project, an unsafe
+ * project name, or without alate's per-project files this is exactly the unscoped
+ * `pluginSkillDirs` list. */
+export function overlaySkillDirs(
+	home: string,
+	project: string | null | undefined,
+): string[] {
+	let entries = pluginSkillEntries(home);
+	const names = projectPluginNames(home, project);
+	if (names) entries = entries.filter((entry) => names.has(entry.name));
+	const dirs = [...new Set(entries.map((entry) => entry.dir))].sort();
+	const custom = projectSkillDir(home, project);
+	return custom === null ? dirs : [...dirs, custom];
 }
 
 /** The `--config` overlay body. Two jobs (docs/specs/turn-home-plugin-skills.md):
@@ -113,14 +197,18 @@ export function pluginSkillsOverlayPath(
 
 /** Writes the overlay only when its content differs. The project-skill pins ride on
  * every run, plugin skills or none, so the worktree stays inert even when the home
- * carries no plugins. The data dir is worker-writable, so a planted file converges
+ * carries no plugins. `project` is the spawn's `OTTR_PROJECT` value (a run without
+ * one passes nothing): alate's per-project files for it under the same `home` scope
+ * the directory list (overlaySkillDirs), everything else stays as documented. The
+ * data dir is worker-writable, so a planted file converges
  * back to the computed content here, before the spawn reads it — the same accepted
  * residual as the memory overlay. A write failure fails the run loudly. */
 export function ensurePluginSkillsOverlay(
 	env: Record<string, string | undefined>,
 	home: string,
+	project?: string | null,
 ): string | null {
-	const dirs = pluginSkillDirs(home);
+	const dirs = overlaySkillDirs(home, project);
 	const anchor = overlayDirFor(env);
 	// The tmp fallback dir is the board's own (0700); the data dir is a mount point.
 	if (!env.OTTR_DATA_DIR) mkdirSync(anchor, { recursive: true, mode: 0o700 });

@@ -103,6 +103,40 @@ board-side runs (merge, retro, board check, the check runs) read the board home 
 current layer, worker and VM runs read the shared home or theirs. Each run reads only
 its own home's lock — no cross-home read.
 
+### Per-project scoping (alate bundles)
+
+Alate can provision per-project skill bundles into a turn home `H` — the same root the
+overlay reads, the pinned agent layer's dir or the flat home (alate repo,
+specs/bundles.md):
+
+- `H/.ottr/project-skills/<P>/` — skill folders for project `P`'s turns only. The
+  board adds this directory as one more `skills.customDirectories` entry, after the
+  plugin skill dirs (`overlaySkillDirs` in `src/pluginSkills.ts`).
+- `H/.ottr/plugins/<P>.txt` — the complete per-project plugin name list, one npm
+  package name per line. `#` starts a comment; blank lines drop out. When the file
+  exists, the run's plugin-skill set is the enabled plugins whose names appear in
+  it; a name that no enabled plugin owns drops out silently (alate validates known
+  names at provision time). A comment-only file filters every plugin dir out.
+
+Fallback: no `.ottr/project-skills/<P>`, or no `.ottr/plugins/<P>.txt`, means "no
+per-project scoping for `P`" — the overlay stays byte-identical to the unscoped
+one. The builder takes the project from the same value that becomes the spawn's
+`OTTR_PROJECT` (`o.board.project`); a run without board coordinates (a `stripBoard`
+run) never reads the per-project paths.
+
+Path rules: the project name passes the same rule the `.ottr/workers/<project>`
+list paths use (`PROJECT` in `src/apt.ts`); an unsafe name scopes nothing. The
+project directory enters the list only when it exists, is a directory, and its real
+path stays inside the home's real path — the same real-vs-real guard the plugin
+dirs use, so a symlink that leaves the home drops out. The list file reads like the
+plugin lock: provisioned home content, read directly.
+
+Custom skills lose name clashes to standard discovery and each other
+deterministically (omp sorts); a per-project skill never displaces a shipped home
+skill of the same name. The skill-name census for the prompt gate (`readUserLayer`
+in `src/tools.ts`) stays unscoped: a worker's reported skill list keeps today's
+shape.
+
 ### Overlay write
 
 `ensurePluginSkillsOverlay(env, home)` mirrors `ensureMemoryOverlay` (`src/memory.ts`):
@@ -207,4 +241,9 @@ change removes the cause (the skill never loaded); the reporting duty stays as i
 - On the stack, a run with the shipped argv reads `skill://ponytail-audit`, and
   planted `.omp/agent/skills` and `.agents/skills` skills in the run's cwd both stay
   unloaded (command and output in the card report).
+- A fixture home with `.ottr/project-skills/<P>` lists that directory in the
+  overlay's `customDirectories`, after the plugin dirs; a `.ottr/plugins/<P>.txt`
+  present in the same home keeps only the named enabled plugins' dirs.
+- Absent per-project files, an unsafe project name, or a run without board
+  coordinates leave the overlay byte-identical to the unscoped one.
 - The planted-extension and planted-project-MCP real-omp tests from d7cab13 stay green.
