@@ -10880,6 +10880,48 @@ describe("arch-review survivor kills", () => {
 		expect(log).not.toContain("closed with it");
 	});
 
+	test("a cancel deletes an adopted follow-up's card branch it names as source head", async () => {
+		// The adopt (source closed, follow-up targets the branch) writes the
+		// follow-up's head into sourcePrHeadRef, and that head is the card's own
+		// branch. A keep name must be a branch the card does not own, so the card
+		// branch stays off the keep list and the cancel delete goes through
+		// instead of refusing for ever.
+		const { store, record, loop } = await setup();
+		await store.setSettings({
+			prMode: true,
+			originUrl: "https://github.com/acme/widget.git",
+		});
+		const task = await store.createTask("adopted follow-up");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			state: "idle",
+			prNumber: 9,
+			sourcePrNumber: 9,
+			sourcePrHeadRef: "ott/card",
+			worktree: join(store.worktreesDir, task.id),
+			branch: "ott/card",
+			base: "abc",
+		});
+		const e = fakeProject(store);
+		e.target = "origin/main";
+
+		await loop.cancel(e, task.id, false);
+
+		expect(record.deletes).toEqual([
+			{
+				mainPath: store.path,
+				branch: "ott/card",
+				originUrl: "https://github.com/acme/widget.git",
+				keep: ["main"],
+			},
+		]);
+		// The adopted source PR is the card's own PR of record, so the log claims
+		// no PR close with the branch.
+		const log = await Bun.file(await store.logPath(task.id)).text();
+		expect(log).toContain("cancel: removed remote branch ott/card");
+		expect(log).not.toContain("closed with it");
+	});
+
 	test("the cancel log claims no PR close without an open PR on the branch", async () => {
 		const { store, loop } = await setup();
 		await store.setSettings({

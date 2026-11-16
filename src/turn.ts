@@ -11613,8 +11613,12 @@ export function createTurnLoop(
 		// The target reads origin/<branch> (resolveTarget); the keep-list refusal compares
 		// short branch names, so strip the prefix. The base is a commit sha, never a name.
 		const target = (e.target ?? "").replace(/^origin\//, "");
+		// A keep name must be a branch the card does not own (deleteRemoteBranch's
+		// contract). An adopted follow-up's head is the card's own branch, so
+		// sourcePrHeadRef can equal it — that name stays off the list and the
+		// card branch still goes at cancel.
 		const keep = [target, task.sourcePrHeadRef].filter(
-			(b): b is string => b !== "" && b !== null,
+			(b): b is string => b !== "" && b !== null && b !== branch,
 		);
 		const err = await ops
 			.deleteRemoteBranch(e.path, branch, originUrl, keep)

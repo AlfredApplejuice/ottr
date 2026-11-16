@@ -3513,7 +3513,9 @@ describe("prPass", () => {
 			originUrl: "https://github.com/acme/widget.git",
 		});
 		const t = await prCard(store);
-		await store.updateTask(t.id, { sourcePrHeadRef: "ottr/552" });
+		await store.updateTask(t.id, {
+			sourcePrHeadRef: "dependabot/npm_and_yarn/vite-7.1.2",
+		});
 		const ops = fakeOps({
 			apiResult: (url) =>
 				url.endsWith("/pulls/7")
@@ -3540,7 +3542,7 @@ describe("prPass", () => {
 				mainPath: join(root, "main"),
 				branch: "ottr/552",
 				originUrl: "https://github.com/acme/widget.git",
-				keep: ["main", "ottr/552"],
+				keep: ["main", "dependabot/npm_and_yarn/vite-7.1.2"],
 			},
 		]);
 		await store.close();
@@ -4342,7 +4344,9 @@ describe("prPass", () => {
 			originUrl: "https://github.com/acme/widget.git",
 		});
 		const t = await followUpCard(store);
-		await store.updateTask(t.id, { sourcePrHeadRef: "ottr/552" });
+		await store.updateTask(t.id, {
+			sourcePrHeadRef: "dependabot/npm_and_yarn/vite-7.1.2",
+		});
 		const ops = fakeOps({
 			apiResult: (url) =>
 				url.endsWith("/pulls/9")
@@ -4386,7 +4390,7 @@ describe("prPass", () => {
 				mainPath: join(root, "main"),
 				branch: "ottr/552",
 				originUrl: "https://github.com/acme/widget.git",
-				keep: ["main", "ottr/552"],
+				keep: ["main", "dependabot/npm_and_yarn/vite-7.1.2"],
 			},
 		]);
 		await store.close();
@@ -4848,6 +4852,17 @@ describe("prPass", () => {
 		expect(done.pushSha).toBe(MERGE_SHA);
 		const log2 = await Bun.file(await store.logPath(t.id)).text();
 		expect(log2).toContain("supervisor: PR #9 merged; card done");
+		// The follow-up's head is the card's own branch (the adopt wrote it into
+		// sourcePrHeadRef), so it is not a keep name: the OTTR-800 delete goes
+		// through instead of refusing a branch the card owns.
+		expect(ops.calls.deletes).toEqual([
+			{
+				mainPath: join(root, "main"),
+				branch: "ottr/552",
+				originUrl: "https://github.com/acme/widget.git",
+				keep: ["main"],
+			},
+		]);
 		await store.close();
 	});
 

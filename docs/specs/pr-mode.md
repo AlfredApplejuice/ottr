@@ -415,7 +415,10 @@ adopts it instead of parking: the follow-up becomes the PR of record
 (`pr_number`, `pr_url`, `pr_head_sha`), the source fields name it (its
 branch, its head sha, `source_pr_dependabot` false, so a later fix turn
 ships to the follow-up's branch), the follow-up fields clear, the card
-stays `merging`/`idle`, and one log line records the shift. The next
+stays `merging`/`idle`, and one log line records the shift. The
+follow-up's head is the card's own branch, so a keep list never holds it:
+the finish and the cancel delete the branch (OTTR-800), and a foreign
+source-PR head stays refused. The next
 window settles the follow-up alone, and a merged follow-up finishes the
 card with its own merge commit. A park reason that names the follow-up
 (its conflict or feedback) stays; any other reason clears to idle. On the
