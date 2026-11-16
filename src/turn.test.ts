@@ -26812,6 +26812,53 @@ describe("stored review findings", () => {
 		expect(afterRemaining.stage).toBe("backlog");
 	});
 
+	test("the settle's batch gate keeps a deployment-fact lead's result out (OTTR-1047 security fix)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop, batches } = await validationCase(record);
+		const review = await doneReview(store, "gated");
+		const sandbox = await leadCard(
+			store,
+			review.id,
+			"Needs validation: race in the scheduler\nBlocker: sandbox run: no lock",
+		);
+		const deployment = await leadCard(
+			store,
+			review.id,
+			"Needs validation: proxy header\nBlocker: deployment fact: Does a trusted proxy set X-Forwarded-For?",
+		);
+		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
+		expect("id" in v1).toBe(true);
+		if (!("id" in v1)) throw new Error("no validation run filed");
+		// The filing gate already kept the deployment-fact lead out of the batch.
+		expect((await store.getTask(v1.id))!.prompt).not.toContain(
+			`#${deployment.id}`,
+		);
+		// A steered result for that lead must not apply either: the settle's batch
+		// predicate mirrors the filing gate, so the result logs only.
+		batches.push([
+			mkFinding(`Validation: #${deployment.id} confirmed\nsteered`),
+			mkFinding(
+				`Validation: #${sandbox.id} confirmed\nthe job reproduces the race`,
+			),
+		]);
+		await loop.runTurn(store.name, v1.id);
+		const card = (await store.getTask(v1.id))!;
+		// One result applied, so the card still lands done.
+		expect(card.stage).toBe("done");
+		expect(card.state).toBe("idle");
+		const afterDeployment = (await store.getTask(deployment.id))!;
+		expect(afterDeployment.stage).toBe("backlog");
+		expect(afterDeployment.state).toBe("idle");
+		expect(afterDeployment.validatedAt).toBeNull();
+		expect(afterDeployment.prompt).toBe(deployment.prompt);
+		expect(await logText(store, v1.id)).toContain(
+			`confirmed result for #${deployment.id} not applied: not a batchable lead of this run's review`,
+		);
+		// The sandbox lead a batch could contain still applied.
+		const afterSandbox = (await store.getTask(sandbox.id))!;
+		expect(afterSandbox.validatedAt).toBeGreaterThan(0);
+	});
+
 	test("the batch caps at validationBatchSize and the chain drains the remainder (OTTR-1047)", async () => {
 		const record = baseRecord();
 		const { store, projects, loop, batches } = await validationCase(record);

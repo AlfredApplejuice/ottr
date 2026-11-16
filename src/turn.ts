@@ -8777,8 +8777,10 @@ export function createTurnLoop(
 	 * the card's stored findings unioned with this run's recorded set, dedupe by prompt,
 	 * stored first (the review check's union rule) — and apply the first result per lead,
 	 * in order. A result applies only when its lead is a direct child of the card's review,
-	 * not cancelled, never validated, and still a backlog card; a lead the user already
-	 * started keeps its state and records the outcome in its details only. Every other
+	 * not cancelled, never validated, still a backlog card, and a batchable lead (the
+	 * filing predicate: the lead tag plus a sandbox blocker); a deployment-fact lead or
+	 * another backlog child logs only, and a lead the user already started keeps its
+	 * state and records the outcome in its details only. Every other
 	 * result lands in the card log. Zero parsed results park the card at needs_you and
 	 * touch no lead; otherwise the done Next passes through unchanged and the chain
 	 * trigger files the review's remainder. */
@@ -8825,11 +8827,14 @@ export function createTurnLoop(
 			const why =
 				lead.followUpOf !== reviewId
 					? "not a lead of this run's review"
-					: lead.cancelledAt !== null
-						? "the lead is cancelled"
-						: lead.validatedAt !== null
-							? "the lead is already validated"
-							: null;
+					: !lead.prompt.startsWith("Needs validation") ||
+							leadBlocker(lead.prompt).kind !== "sandbox"
+						? "not a batchable lead of this run's review"
+						: lead.cancelledAt !== null
+							? "the lead is cancelled"
+							: lead.validatedAt !== null
+								? "the lead is already validated"
+								: null;
 			if (why !== null || full === null) {
 				await st.log(
 					`- ${result.outcome} result for #${leadId} not applied: ${why ?? "the card is gone"}`,
