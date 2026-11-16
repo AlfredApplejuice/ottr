@@ -14601,12 +14601,16 @@ export function warningLinks(
 /** True for a whitespace-delimited token whose shape is host detail the collapsed
  * line must not carry (OTTR-1084): a path (holds "/", but an http(s) link stays),
  * a CLI flag ("-d", "--no-deps"), or a container-style name ("ottr-worker-1").
- * Card refs ("OTTR-1071", "ottr#OTTR-1071") match no shape. */
+ * Card refs ("OTTR-1071", "ottr#OTTR-1071") match no shape. The tests run on the
+ * token's bare core: sentence punctuation and brackets ride on the token
+ * ("ottr-worker-1.", "(alate-seed-2)") and must not hide the shape from the
+ * anchored tests. */
 function isNoticeDetailToken(token: string): boolean {
-	if (/^https?:\/\//i.test(token)) return false;
-	if (token.includes("/")) return true;
-	if (/^-{1,2}[a-zA-Z0-9]/.test(token)) return true;
-	return /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*-\d+$/.test(token);
+	const core = token.replace(/^[^\w/@#-]+/, "").replace(/[^\w/@#-]+$/, "");
+	if (/^https?:\/\//i.test(core)) return false;
+	if (core.includes("/")) return true;
+	if (/^-{1,2}[a-zA-Z0-9]/.test(core)) return true;
+	return /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*-\d+$/.test(core);
 }
 
 /** A notice line's collapsed copy: detail tokens gone, repeated spaces

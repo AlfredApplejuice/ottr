@@ -1978,6 +1978,19 @@ describe("card links in bell text", () => {
 		).toBe("bun install failed (exit 1).");
 	});
 
+	test("shortNoticeText strips container names that carry punctuation", () => {
+		// The shape test runs on the token's bare core, so a sentence period or
+		// a bracket pair riding on the name cannot keep the name in the pane.
+		expect(
+			shortNoticeText(
+				"bun install failed (exit 1) in container ottr-worker-1. Run node sync.mjs to repair.",
+			),
+		).toBe("bun install failed (exit 1) in container.");
+		expect(
+			shortNoticeText("container (ottr-worker-1) and (alate-seed-2) exited"),
+		).toBe("container and exited");
+	});
+
 	test("shortNoticeText caps a flattened single-line record to one short clean line", () => {
 		const record =
 			"bun install failed (exit 1) in /opt/agent-data container ottr-worker-1 exited before the seed finished temp tree /tmp/ottr-seed-3182 left in place alate snapshot import stopped at step 3 of 5 repair: run node sync.mjs from the alate checkout repair: clear /tmp/ottr-seed-3182 and re-run the update";
