@@ -1271,23 +1271,24 @@ release tag's scan base is the target's tracking tip when it is an ancestor of
 the tag — the release's normal state, the tag riding the tip the merge push
 landed — so a release of any repo scans an empty range and runs no LFS step at
 all; a tag on a commit the origin does not hold scans only what the tag adds.
-The upload pins what the command line can pin: for an http(s) origin the
-server passes `-c lfs.url=<originUrl>/info/lfs`, which outranks a planted
-`lfs.url` (an empty `-c lfs.url=` fails the push, verified against git-lfs
-3.6.1), and the URL argument means `remote.<name>.lfsurl` is never read; a
-local-path origin becomes a `file://` URL and git-lfs's built-in standalone
-file transfer stores the objects in the bare repo itself. An upload failure
-fails the card before the git push, the same shape as any push failure.
-Residuals: a planted `lfs.url` still wins for an ssh origin (the https
-endpoint git-lfs authenticates over ssh cannot be derived offline); an
-endpoint whose batch response names a custom transfer adapter runs the adapter
-repo config registers (verified with git-lfs 3.6.1: a planted
-`lfs.customtransfer.*` never runs against a basic-protocol endpoint, but a
-hostile endpoint can name one — the endpoint is already trust-rooted by the
-pin); and the `credential.helper` / `core.sshCommand` residual of every
-network git call applies to the LFS upload the same way. The delete push
-(`deleteRemoteBranch`) carries no objects and runs no LFS step, and a worker
-VM's branch sync pushes into the board's own clone, never the origin.
+The upload runs only for origins whose endpoint can be pinned: an http(s) origin
+gets `-c lfs.url=<originUrl>/info/lfs` on the command line, which outranks a
+planted `lfs.url` (an empty `-c lfs.url=` fails the push, verified against
+git-lfs 3.6.1) and the URL argument means `remote.<name>.lfsurl` is never
+read; a local-path origin becomes a `file://` URL and git-lfs's built-in
+standalone file transfer ignores endpoint config entirely, storing the objects
+in the bare repo itself. Any other scheme runs no LFS step: for `ssh://` the
+https endpoint git-lfs authenticates over ssh cannot be derived offline, so no
+pin exists, and a planted `lfs.url` or `.lfsconfig` could move the endpoint to
+a hostile server whose batch response names a custom transfer adapter — and an
+adapter the planted config registers would then run next to the push's
+credentials (verified with git-lfs 3.6.1). An ssh-origin board therefore keeps
+the pre-OTTR-1058 behavior for LFS merges: the push itself fails the remote's
+unknown-object rejection, and the card shows the remote's error. An upload
+failure fails the card before the git push, the same shape as any push
+failure. The delete push (`deleteRemoteBranch`) carries no objects and runs no
+LFS step, and a worker VM's branch sync pushes into the board's own clone,
+never the origin.
 
 The card of the dev-only **Check the board** button also runs in the server container.
 Only loopback there reaches the full board API. On the turns' host (`OTTR_BOARD_URL`), a

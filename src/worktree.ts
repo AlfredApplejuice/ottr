@@ -2024,16 +2024,20 @@ function lfsEndpointPin(originUrl: string): readonly string[] {
  * origin's token and self-hosted mode passes its resolver env) and pins the LFS
  * endpoint for an http(s) origin, so repo config a work turn planted (R5-1) cannot
  * move it; the URL argument means `remote.<name>.lfsurl` is never read. A local-path
- * origin becomes a file:// URL: git-lfs's standalone file transfer stores the objects
- * in the bare repo itself. Residuals, documented in docs/WORKERS.md: for an ssh origin
- * a planted `lfs.url` still wins (the https endpoint git-lfs authenticates over ssh
- * cannot be derived offline), and an endpoint whose batch response names a custom
- * transfer adapter runs the adapter its config names. `refName` is the ref the push
- * carries (a branch, or a release's tag), `tip` the commit it names and `base` the
- * commit the remote already holds (null: everything). `authEnv` re-uses a caller's
- * scoped push credentials (the release identity). Returns null on success;
- * `{ error, output }` puts the git-lfs failure on the card like any push failure and
- * the caller stops before its git push.
+ * origin becomes a file:// URL: git-lfs's standalone file transfer ignores endpoint
+ * config entirely and stores the objects in the bare repo itself. Any other scheme —
+ * `ssh://` in particular — runs no LFS step at all: there the https endpoint git-lfs
+ * authenticates over ssh cannot be derived offline, so no command-line pin exists, and
+ * a planted `lfs.url` (or `.lfsconfig`) would move the endpoint to a hostile server
+ * whose batch response can name a planted custom transfer adapter and run it next to
+ * the push's credentials (review finding on OTTR-1058). Those origins keep the
+ * pre-1058 behavior — the push itself fails the remote's unknown-object rejection,
+ * which the card shows (docs/WORKERS.md). `refName` is the ref the push carries (a
+ * branch, or a release's tag), `tip` the commit it names and `base` the commit the
+ * remote already holds (null: everything). `authEnv` re-uses a caller's scoped push
+ * credentials (the release identity). Returns null on success or when the step does
+ * not apply; `{ error, output }` puts the git-lfs failure on the card like any push
+ * failure and the caller stops before its git push.
  */
 export async function pushLfsObjects(
 	mainPath: string,
@@ -2044,17 +2048,27 @@ export async function pushLfsObjects(
 	authEnv?: Record<string, string>,
 ): Promise<{ error: string; output?: string } | null> {
 	if ((await lfsPointerOids(mainPath, tip, base)).length === 0) return null;
-	const remote = /^[a-z][a-z0-9+.-]*:\/\//i.test(originUrl)
-		? originUrl
-		: `file://${originUrl}`;
-	const r = await git(
-		[...lfsEndpointPin(originUrl), "lfs", "push", remote, refName],
-		mainPath,
-		undefined,
-		authEnv,
-	);
-	if (r.code === 0) return null;
-	return pushFailure(r);
+	if (/^https?:\/\//i.test(originUrl)) {
+		const r = await git(
+			[...lfsEndpointPin(originUrl), "lfs", "push", originUrl, refName],
+			mainPath,
+			undefined,
+			authEnv,
+		);
+		if (r.code !== 0) return pushFailure(r);
+		return null;
+	}
+	// A local path: the standalone file transfer (no endpoint config to plant).
+	if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(originUrl)) {
+		const r = await git(
+			["lfs", "push", `file://${originUrl}`, refName],
+			mainPath,
+			undefined,
+			authEnv,
+		);
+		if (r.code !== 0) return pushFailure(r);
+	}
+	return null;
 }
 
 /**

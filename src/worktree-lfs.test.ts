@@ -15,6 +15,7 @@ import { join } from "node:path";
 import {
 	lfsPointerOids,
 	pushBranch,
+	pushLfsObjects,
 	serverMergePush,
 	setHostedGitAuth,
 	setNetworkGitAuth,
@@ -532,6 +533,64 @@ describe("lfsPointerOids", () => {
 			// The fake oid of the oversized pointer-lookalike must not appear.
 			expect(oids[0]).not.toMatch(/^a+$/);
 		} finally {
+			rmSync(r.dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("pushLfsObjects origin schemes", () => {
+	/** A repo whose main adds one LFS pointer on top of base. */
+	const repoWithPointer = async (): Promise<{
+		dir: string;
+		repo: string;
+		base: string;
+		tip: string;
+	}> => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-lfs-scheme-"));
+		const repo = join(dir, "repo");
+		await run(dir, "init", "-q", "-b", "main", repo);
+		await run(repo, ...id, "commit", "-q", "--allow-empty", "-m", "base");
+		const base = await run(repo, "rev-parse", "HEAD");
+		await run(repo, "lfs", "track", "*.png");
+		writeFileSync(join(repo, "oak.png"), "scheme-bytes");
+		await run(repo, "add", "oak.png", ".gitattributes");
+		await run(repo, ...id, "commit", "-q", "-m", "sprites");
+		return { dir, repo, base, tip: await run(repo, "rev-parse", "HEAD") };
+	};
+
+	test("no git lfs command runs for an ssh origin: the upload cannot be pinned there", async () => {
+		// Security review on OTTR-1058: for a non-http(s) origin no command-line pin
+		// exists, so a planted lfs.url or .lfsconfig would move the endpoint to a
+		// hostile server whose batch response can name a planted custom transfer
+		// adapter. The LFS step must not run at all; the push keeps the pre-1058
+		// behavior (the remote's unknown-object rejection lands on the card).
+		const r = await repoWithPointer();
+		const shim = join(r.dir, "shim");
+		mkdirSync(shim);
+		const marker = join(r.dir, "lfs-invocations.log");
+		writeFileSync(
+			join(shim, "git-lfs"),
+			`#!/bin/sh
+echo "git-lfs $*" >> "${marker}"
+exit 1
+`,
+		);
+		chmodSync(join(shim, "git-lfs"), 0o755);
+		const path = process.env.PATH;
+		process.env.PATH = `${shim}:${path}`;
+		try {
+			expect(
+				await pushLfsObjects(
+					r.repo,
+					"ssh://git@github.com/octo/repo",
+					"main",
+					r.tip,
+					r.base,
+				),
+			).toBeNull();
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			process.env.PATH = path;
 			rmSync(r.dir, { recursive: true, force: true });
 		}
 	});
