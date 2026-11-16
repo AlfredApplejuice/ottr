@@ -271,7 +271,7 @@ describe("upstreamToken", () => {
 		).toBe("t");
 	});
 
-	test("another board lends the stored github.com token first", () => {
+	test("another board lends only the stored github.com token", () => {
 		expect(
 			upstreamToken(
 				{ GH_TOKEN: "env", OTTR_GITHUB_HOST: "acme.ghe.com" },
@@ -283,10 +283,10 @@ describe("upstreamToken", () => {
 		).toBe("stored");
 	});
 
-	test("without a stored token, GH_TOKEN falls back on another board", () => {
+	test("GH_TOKEN on another board is that host's token and never serves github.com", () => {
 		expect(
 			upstreamToken({ GH_TOKEN: "env", OTTR_GITHUB_HOST: "acme.ghe.com" }),
-		).toBe("env");
+		).toBeUndefined();
 		expect(upstreamToken({ OTTR_GITHUB_HOST: "acme.ghe.com" })).toBeUndefined();
 	});
 });

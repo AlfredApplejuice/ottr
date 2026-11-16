@@ -116,17 +116,18 @@ export function ghEnvFor(
 /**
  * The token for fetches of public github.com data (trending repos, omp's upstream
  * releases): those fetches always go to api.github.com, on every board. A github.com
- * board lends GH_TOKEN. Another board lends the stored github.com token from
- * Settings -> Git hosts first (`storedGithubCom`), GH_TOKEN second — GH_TOKEN
- * authenticates github.com, so it raises that endpoint's limit there too. The
- * configured host's own token never serves these fetches.
+ * board lends GH_TOKEN. Another board lends only the stored github.com token from
+ * Settings -> Git hosts (`storedGithubCom`): GH_TOKEN there is the board host's own
+ * token — applyGithubToken writes the board token to it, and ghEnvFor and
+ * branchRulesToken read it as the configured host's credential — so it never serves
+ * these fetches.
  */
 export function upstreamToken(
 	env: Record<string, string | undefined> = process.env,
 	storedGithubCom?: string,
 ): string | undefined {
 	if (githubHost(env).isDefault) return env.GH_TOKEN;
-	return storedGithubCom || env.GH_TOKEN || undefined;
+	return storedGithubCom || undefined;
 }
 
 /**

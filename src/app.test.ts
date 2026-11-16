@@ -3839,13 +3839,15 @@ describe("trending scan host", () => {
 		return { m, calls };
 	};
 
-	test("an enterprise board without a stored github.com token falls back to GH_TOKEN", async () => {
+	test("an enterprise board sends its own GH_TOKEN nowhere: no stored github.com token means no token", async () => {
 		const saved = {
 			host: process.env.OTTR_GITHUB_HOST,
 			token: process.env.GH_TOKEN,
 		};
 		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
-		process.env.GH_TOKEN = "env-fallback";
+		// applyGithubToken writes the board token to GH_TOKEN: on this board that is the
+		// enterprise host's own credential, never an api.github.com token.
+		process.env.GH_TOKEN = "enterprise-token";
 		try {
 			const { m, calls } = await setup();
 			const res = await m.call("/api/trending/scan", {});
@@ -3853,41 +3855,12 @@ describe("trending scan host", () => {
 			// The scan filed one scout card: every fixture repo resolved.
 			const body = (await res.json()) as { filed: string[] };
 			expect(body.filed).toHaveLength(1);
-			// Every REST lookup hit exactly its public URL, and GH_TOKEN — which
-			// authenticates api.github.com — rode exactly those calls.
+			// Every REST lookup hit exactly its public URL, and no call carried a token:
+			// the enterprise token never authenticates an api.github.com request.
 			const rest = calls.filter((c) => PAGES[c.url] === undefined);
 			expect(new Set(rest.map((c) => c.url))).toEqual(expectedRestUrls());
-			for (const c of calls)
-				expect(c.auth).toBe(
-					c.url.startsWith("https://api.github.com/")
-						? "Bearer env-fallback"
-						: null,
-				);
-			// The status names the token present, so the Settings hint stays off.
-			const state = (await (await m.call("/api/state")).json()) as {
-				trendingStatus: { tokenPresent: boolean };
-			};
-			expect(state.trendingStatus.tokenPresent).toBe(true);
-		} finally {
-			if (saved.host === undefined) delete process.env.OTTR_GITHUB_HOST;
-			else process.env.OTTR_GITHUB_HOST = saved.host;
-			if (saved.token === undefined) delete process.env.GH_TOKEN;
-			else process.env.GH_TOKEN = saved.token;
-		}
-	});
-
-	test("an enterprise board with no github.com token scans unauthenticated and reports it", async () => {
-		const saved = {
-			host: process.env.OTTR_GITHUB_HOST,
-			token: process.env.GH_TOKEN,
-		};
-		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
-		delete process.env.GH_TOKEN;
-		try {
-			const { m, calls } = await setup();
-			const res = await m.call("/api/trending/scan", {});
-			expect(res.status).toBe(200);
 			for (const c of calls) expect(c.auth).toBeNull();
+			// The status names the token absent, so the Settings hint shows.
 			const state = (await (await m.call("/api/state")).json()) as {
 				trendingStatus: { tokenPresent: boolean };
 			};
@@ -3906,7 +3879,9 @@ describe("trending scan host", () => {
 			token: process.env.GH_TOKEN,
 		};
 		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
-		process.env.GH_TOKEN = "env-fallback";
+		// applyGithubToken writes the board token to GH_TOKEN: on this board it is the
+		// enterprise host's own credential, and the stored github.com token outranks it.
+		process.env.GH_TOKEN = "enterprise-token";
 		try {
 			const g = await GlobalStore.open(join(root, "g-trending-stored"));
 			mountStores.push(g);

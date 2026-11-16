@@ -2972,8 +2972,8 @@ export async function createApp(deps: AppDeps) {
 			return next;
 		},
 		// The scan reads api.github.com on every board (trending is a github.com feature):
-		// a github.com board lends GH_TOKEN, another board lends the stored github.com
-		// token from Settings -> Git hosts first (upstreamToken via upstreamGithubToken).
+		// a github.com board lends GH_TOKEN, another board lends only the stored github.com
+		// token from Settings -> Git hosts (upstreamToken via upstreamGithubToken).
 		token: upstreamGithubToken,
 		fetch: deps.trendingFetch,
 		now,
@@ -4339,7 +4339,8 @@ export async function createApp(deps: AppDeps) {
 	/**
 	 * The token the trending scan and the omp releases watch lend to their api.github.com
 	 * fetches (upstreamToken): GH_TOKEN on a github.com board, the stored github.com
-	 * token from Settings -> Git hosts first on any other board.
+	 * token from Settings -> Git hosts on any other board (GH_TOKEN there is the board
+	 * host's own token, never an api.github.com credential).
 	 */
 	function upstreamGithubToken(): string | undefined {
 		return upstreamToken(process.env, storedGithubComToken(gitTokens));
