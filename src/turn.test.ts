@@ -1192,10 +1192,6 @@ describe("turn loop", () => {
 	async function prInterviewSetup(overrides: FixtureOps = {}) {
 		const setup = await setupWith(baseRecord(), {
 			commitsAhead: async () => 0,
-			targetSha: async (_m: string, ref: string) =>
-				// origin/main holds no AGENTS.md yet (the AWSI-1 case): the ship's
-				// subject is "add"; a non-null blob would make it "update".
-				ref.endsWith(":AGENTS.md") ? null : "sha-origin-tip",
 			...overrides,
 		});
 		const e = setup.projects.get(setup.store.name)!;
@@ -1257,7 +1253,10 @@ describe("turn loop", () => {
 				"AGENTS.md",
 				"origin/main",
 				branch,
-				"docs: add AGENTS.md for tracker agents",
+				{
+					add: "docs: add AGENTS.md for tracker agents",
+					update: "docs: update AGENTS.md for tracker agents",
+				},
 				null,
 			],
 		]);

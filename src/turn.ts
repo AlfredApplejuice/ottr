@@ -6964,18 +6964,17 @@ export function createTurnLoop(
 			return;
 		}
 		const branch = `ott/${st.id.toLowerCase()}-${slugify(st.task.title)}`;
-		const onTarget =
-			(await ops
-				.targetSha(st.e.path, `${st.header.target}:AGENTS.md`)
-				.catch(() => null)) !== null;
 		const built = await commitFileOp(
 			st.e.path,
 			"AGENTS.md",
 			st.header.target,
 			branch,
-			onTarget
-				? "docs: update AGENTS.md for tracker agents"
-				: "docs: add AGENTS.md for tracker agents",
+			// The op picks the subject from what the base tree holds: "update" when
+			// the target already carries AGENTS.md, "add" for the fresh AWSI-1 case.
+			{
+				add: "docs: add AGENTS.md for tracker agents",
+				update: "docs: update AGENTS.md for tracker agents",
+			},
 			(await ops.commitIdentity?.()) ?? null,
 		).catch((err: unknown) => {
 			st.prNext = {

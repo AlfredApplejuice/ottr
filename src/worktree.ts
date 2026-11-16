@@ -2937,15 +2937,17 @@ export async function cleanMergeTree(
  * `commit-tree`, `update-ref`), so the main checkout's HEAD, index and working tree never
  * move and a failed ship leaves no partial state beyond a board-owned branch. "same" when
  * the file is git-ignored (the interview's local-only decision), missing, or identical to
- * the base ref's blob. Git trouble throws; the caller parks the card with the reason.
- * `identity === null` keeps the built-in Ottr identity (gitIdentity.ts).
+ * the base ref's blob. The commit subject is `messages.update` when the base tree
+ * already held the file, else `messages.add`. Git trouble throws; the caller parks the
+ * card with the reason. `identity === null` keeps the built-in Ottr identity
+ * (gitIdentity.ts).
  */
 export async function commitFileOnBranch(
 	mainPath: string,
 	file: string,
 	baseRef: string,
 	branch: string,
-	message: string,
+	messages: { add: string; update: string },
 	identity: CommitIdentity | null = null,
 ): Promise<{ kind: "same" } | { kind: "committed"; sha: string }> {
 	const ignore = await git(["check-ignore", "-q", "--", file], mainPath);
@@ -3009,7 +3011,7 @@ export async function commitFileOnBranch(
 			"-p",
 			parent.stdout.trim(),
 			"-m",
-			message,
+			existingSha !== null ? messages.update : messages.add,
 		],
 		mainPath,
 	);

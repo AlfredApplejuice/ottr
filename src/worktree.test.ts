@@ -4829,13 +4829,10 @@ describe("commitFileOnBranch (OTTR-1064)", () => {
 		const { main, base } = await baseRepo();
 		writeFileSync(join(main, "AGENTS.md"), "rules v1");
 
-		const r = await commitFileOnBranch(
-			main,
-			"AGENTS.md",
-			"main",
-			"ott/rules",
-			"docs: add AGENTS.md for tracker agents",
-		);
+		const r = await commitFileOnBranch(main, "AGENTS.md", "main", "ott/rules", {
+			add: "docs: add AGENTS.md for tracker agents",
+			update: "docs: update AGENTS.md for tracker agents",
+		});
 
 		expect(r).toEqual({ kind: "committed", sha: expect.any(String) });
 		if (r.kind !== "committed") return;
@@ -4872,13 +4869,10 @@ describe("commitFileOnBranch (OTTR-1064)", () => {
 		await must(main, "add", ".");
 		await must(main, "commit", "-q", "-m", "rules");
 
-		const r = await commitFileOnBranch(
-			main,
-			"AGENTS.md",
-			"main",
-			"ott/rules",
-			"docs: x",
-		);
+		const r = await commitFileOnBranch(main, "AGENTS.md", "main", "ott/rules", {
+			add: "docs: add",
+			update: "docs: update",
+		});
 
 		expect(r).toEqual({ kind: "same" });
 		expect(
@@ -4898,13 +4892,10 @@ describe("commitFileOnBranch (OTTR-1064)", () => {
 		appendFileSync(join(main, ".git", "info", "exclude"), "AGENTS.md\n");
 		writeFileSync(join(main, "AGENTS.md"), "local-only rules");
 
-		const r = await commitFileOnBranch(
-			main,
-			"AGENTS.md",
-			"main",
-			"ott/rules",
-			"docs: x",
-		);
+		const r = await commitFileOnBranch(main, "AGENTS.md", "main", "ott/rules", {
+			add: "docs: add",
+			update: "docs: update",
+		});
 
 		expect(r).toEqual({ kind: "same" });
 		expect(
@@ -4920,13 +4911,10 @@ describe("commitFileOnBranch (OTTR-1064)", () => {
 	test("reports same when the file is missing", async () => {
 		const { main } = await baseRepo();
 		expect(
-			await commitFileOnBranch(
-				main,
-				"AGENTS.md",
-				"main",
-				"ott/rules",
-				"docs: x",
-			),
+			await commitFileOnBranch(main, "AGENTS.md", "main", "ott/rules", {
+				add: "docs: add",
+				update: "docs: update",
+			}),
 		).toEqual({
 			kind: "same",
 		});
@@ -4940,16 +4928,17 @@ describe("commitFileOnBranch (OTTR-1064)", () => {
 		const tracked = (await must(main, "rev-parse", "HEAD")).trim();
 		writeFileSync(join(main, "AGENTS.md"), "rules v2");
 
-		const r = await commitFileOnBranch(
-			main,
-			"AGENTS.md",
-			"main",
-			"ott/rules",
-			"docs: update AGENTS.md for tracker agents",
-		);
+		const r = await commitFileOnBranch(main, "AGENTS.md", "main", "ott/rules", {
+			add: "docs: add AGENTS.md for tracker agents",
+			update: "docs: update AGENTS.md for tracker agents",
+		});
 
 		expect(r).toEqual({ kind: "committed", sha: expect.any(String) });
 		if (r.kind !== "committed") return;
+		// The base tree held the file: the subject is the update one.
+		expect((await must(main, "log", "-1", "--format=%s", r.sha)).trim()).toBe(
+			"docs: update AGENTS.md for tracker agents",
+		);
 		expect((await must(main, "rev-parse", `${r.sha}^`)).trim()).toBe(tracked);
 		expect((await must(main, "rev-parse", `${r.sha}:AGENTS.md`)).trim()).toBe(
 			(await must(main, "hash-object", join(main, "AGENTS.md"))).trim(),
