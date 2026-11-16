@@ -558,6 +558,8 @@ async function mount(
 		>[0]["releaseSummarySpawn"];
 		/** Gateway spawn seam for the PR-review model call; defaults to the real spawn. */
 		prReviewSpawn?: Parameters<typeof createApp>[0]["prReviewSpawn"];
+		/** OTTR-1071: the server wiring's next regular PR poll for the state payload. */
+		prPollNextAt?: Parameters<typeof createApp>[0]["prPollNextAt"];
 		/** Fetch seam for the weekly trending scan; passed through to createApp. */
 		trendingFetch?: typeof fetch;
 		/** Fetch seam for the re-run-failed-jobs GitHub call; passed through to createApp. */
@@ -635,6 +637,7 @@ async function mount(
 		latestRelease: input.latestRelease,
 		releaseSummarySpawn: input.releaseSummarySpawn,
 		prReviewSpawn: input.prReviewSpawn,
+		prPollNextAt: input.prPollNextAt,
 		trendingFetch: input.trendingFetch,
 		rerunFetch: input.rerunFetch,
 		turnTokenFetch: input.turnTokenFetch,
@@ -16817,7 +16820,7 @@ describe(
 	await (async () => {
 		const H1 = "a".repeat(40);
 		const H2 = "b".repeat(40);
-		const prDir = join(root, "p-pr");
+		const prDir = join(root, "pg"); // Store name doubles as the state payload's project name.
 		mkdirSync(prDir, { recursive: true });
 		const prStore = await ProjectStore.open(prDir);
 		const prProjects = new Map<string, Entry>();
@@ -16892,6 +16895,9 @@ describe(
 		};
 		const m = await mount({
 			projects: prProjects,
+			// OTTR-1071: the state payload's nextPollAt reads the server wiring's grid;
+			// the test pins it to a known value.
+			prPollNextAt: () => 1234567890,
 			gh: async (args) => {
 				ghCalls.push(args);
 				const input = args.indexOf("--input");
@@ -17370,6 +17376,55 @@ describe(
 				expect(await errorOf(res)).toBe("project has no GitHub remote");
 				const unknown = await post("/api/projects/nope/prs/check", {});
 				expect(unknown.status).toBe(404);
+			});
+
+			test("the state payload carries the PR watch's poll facts", async () => {
+				await prStore.setSettings({ prReviews: true });
+				try {
+					const prWatchOf = async () => {
+						const state = (await (await m.call("/api/state")).json()) as {
+							projects: {
+								name: string;
+								prWatch: {
+									lastPollAt: number | null;
+									lastError: string | null;
+									nextPollAt: number | null;
+								};
+							}[];
+						};
+						return state.projects.find((p) => p.name === "pg")!.prWatch;
+					};
+					// One open PR: the poll records it and starts no review (the quiet
+					// gate holds); the state payload shows a clean poll and the grid.
+					ghResult = {
+						code: 0,
+						stdout: JSON.stringify([
+							{
+								number: 5,
+								head: { sha: H1 },
+								draft: false,
+								state: "open",
+								title: "Fix it",
+							},
+						]),
+						stderr: "",
+					};
+					const res = await m.call("/api/projects/pg/prs/check", {});
+					expect(res.status).toBe(200);
+					const first = await prWatchOf();
+					expect(first.lastError).toBe(null);
+					expect(first.nextPollAt).toBe(1234567890);
+					expect(first.lastPollAt).toBeGreaterThan(0);
+					// A failed poll carries the failure text and still moves the stamp.
+					ghResult = { code: 1, stdout: "", stderr: "HTTP 401" };
+					const failed = await m.call("/api/projects/pg/prs/check", {});
+					expect(failed.status).toBe(200);
+					const second = await prWatchOf();
+					expect(second.lastError).toBe("gh pulls failed (1): HTTP 401");
+					expect(second.lastPollAt).toBeGreaterThanOrEqual(first.lastPollAt!);
+				} finally {
+					await prStore.setSettings({ prReviews: false });
+				}
 			});
 
 			test("post appends the AI footer and keeps the whole body inside GitHub's 65536 characters", async () => {

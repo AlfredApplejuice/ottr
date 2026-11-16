@@ -8575,6 +8575,36 @@ function ProjectWatchesCard({
 	privateNote: (what: string) => string;
 	act: Act;
 }) {
+	// Check PRs now: the reply lands inline, the server's error text as is.
+	const [prsResult, setPrsResult] = useState<
+		{ ok: true } | { ok: false; error: string } | null
+	>(null);
+	const checkPrs = async (): Promise<boolean> => {
+		setPrsResult(null);
+		try {
+			await post(
+				`/api/projects/${encodeURIComponent(project.name)}/prs/check`,
+				{},
+			);
+			setPrsResult({ ok: true });
+			return true;
+		} catch (err) {
+			setPrsResult({
+				ok: false,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return false;
+		}
+	};
+	const prWatch = project.prWatch;
+	const lastCheck =
+		prWatch?.lastError != null && prWatch?.lastPollAt != null
+			? `Failed: ${prWatch.lastError}`
+			: prWatch?.lastPollAt != null
+				? stamp(prWatch.lastPollAt)
+				: "Never";
+	const nextCheck =
+		prWatch?.nextPollAt != null ? stamp(prWatch.nextPollAt) : "unknown";
 	return (
 		<SettingsCard
 			id="project-watches-section"
@@ -8599,12 +8629,30 @@ function ProjectWatchesCard({
 				/>
 				<CheckRow
 					name="PR reviews"
-					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("pull requests to review")}Hourly watch of open pull requests on GitHub; each new head gets a read-only review draft you can post as a comment`}
+					desc={
+						<>
+							{project.github === null ? "Needs a GitHub remote. " : ""}
+							{privateNote("pull requests to review")}
+							Hourly watch of open pull requests on GitHub; each new head gets a
+							read-only review draft you can post as a comment.{" "}
+							{st.prReviews
+								? `Last check: ${lastCheck}. Next regular check: ${nextCheck}.`
+								: "PR reviews are off: no checks run."}{" "}
+							<span role="status">
+								{prsResult?.ok === true ? "Check started." : ""}
+							</span>
+						</>
+					}
 					tag={privateTag}
 					checked={st.prReviews}
 					disabled={project.github === null && !st.prReviews}
 					save={(v) => send({ prReviews: v })}
 					act={act}
+					action={
+						<BusyButton run={checkPrs} disabled={!st.prReviews}>
+							Check PRs now
+						</BusyButton>
+					}
 				/>
 				<CheckRow
 					sub
@@ -8648,6 +8696,11 @@ function ProjectWatchesCard({
 					act={act}
 				/>
 			</div>
+			{prsResult?.ok === false && (
+				<p className="auth-error" role="alert">
+					{prsResult.error}
+				</p>
+			)}
 		</SettingsCard>
 	);
 }

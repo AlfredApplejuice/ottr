@@ -333,6 +333,19 @@ export interface TrendingStatus {
 	tokenPresent: boolean;
 }
 
+/** One project's PR watch poll facts, shipped in the project's view for the Settings
+ * Watches card (OTTR-1071). In-memory only: a restart clears the times and the next
+ * polls refill them. */
+export interface PrWatchStatus {
+	/** Clock value when the project's last poll completed; null before the first. */
+	lastPollAt: number | null;
+	/** The last poll's failure reason; null when it completed clean or never ran. */
+	lastError: string | null;
+	/** Clock value of the next regular hourly poll (the server's interval grid);
+	 * null when the wiring names no grid. */
+	nextPollAt: number | null;
+}
+
 /** U7: an update card parked by holdUpdateMerges; the reply recognizes it by this reason. Shared by the turn loop and the drawer's hold action bar. */
 export const UPDATE_HOLD_REASON =
 	"Update card: read the summary, then reply to approve the merge.";
@@ -1021,6 +1034,9 @@ export interface ProjectView {
 	/** Open pull requests on the GitHub repo, newest first; null with no GitHub remote,
 	 * before the first probe, or when gh fails. */
 	openPrs: OpenPrsView | null;
+	/** OTTR-1071: the PR watch's poll facts (last check, its error, next regular check),
+	 * shown by the Settings Watches card's PR reviews row. */
+	prWatch: PrWatchStatus;
 	settings: ProjectSettings;
 	/** Effective task id handle: the taskIdPrefix override or the folder-derived default. */
 	taskPrefix: string;

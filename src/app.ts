@@ -635,6 +635,10 @@ interface AppDeps {
 	/** Node env style clock for the idle-review logic only; tests inject a fixed clock.
 	 * Defaults to Date.now. */
 	now?: () => number;
+	/** OTTR-1071: the server wiring's next regular hourly PR poll (its grid), for the
+	 * Settings watches row. Absent in narrow test mounts, so the state payload then
+	 * reports null. */
+	prPollNextAt?: () => number | null;
 	serverVersion: string;
 	port: number;
 	publicHosts: string[];
@@ -5106,6 +5110,7 @@ export async function createApp(deps: AppDeps) {
 			? statSync(file, { throwIfNoEntry: false })?.mtimeMs
 			: undefined;
 		const settings = await e.store.getSettings();
+		const poll = prWatcher.pollStatus(e.name);
 		// OTTR-965: the Done lane's first "Show more" needs the settled count before any
 		// fetch. One list read counting rows, no card build.
 		const doneTotal = (await e.store.listTasks()).filter(
@@ -5135,6 +5140,13 @@ export async function createApp(deps: AppDeps) {
 			latestImage: e.latestImage,
 			archReview: e.archReview,
 			openPrs: e.openPrs ?? null,
+			// OTTR-1071: the PR watch's poll facts for the Settings watches row; null
+			// until this process polled the project (a restart starts empty).
+			prWatch: {
+				lastPollAt: poll?.at ?? null,
+				lastError: poll?.error ?? null,
+				nextPollAt: deps.prPollNextAt?.() ?? null,
+			},
 			settings,
 			taskPrefix: settings.taskIdPrefix ?? derivedTaskPrefix(e.name),
 			doneTotal,

@@ -35,6 +35,10 @@ export const PR_GATES = {
 	DAY_MS: 24 * 60 * 60 * 1000,
 } as const;
 
+/** OTTR-1071: the few extra seconds a quiet-time run waits past the quiet gate, so
+ * the timer never fires a tick before the gate the last poll recorded is over. */
+export const QUIET_RUN_SLACK_MS = 10_000;
+
 /** OTTR-942: most skip notices the watcher keeps; one broken repo cannot flood the bell. */
 const PR_SKIP_NOTICE_MAX = 20;
 
@@ -966,6 +970,11 @@ interface PrWatcherCtx {
 		head: string,
 		dropped: string[],
 	) => void;
+	/** OTTR-1071: (re)arms the project's one quiet-time run at `at`; null clears a
+	 * pending one. Optional: the factory always sets it, tests may not. */
+	scheduleQuietRun?: (project: string, at: number | null) => void;
+	/** OTTR-1071: records a finished poll's clock value and error for the state payload. */
+	recordPoll?: (project: string, at: number, error: string | null) => void;
 }
 
 /** The repo id of a project's GitHub remote; throws on a malformed id. */
@@ -1124,6 +1133,41 @@ async function dueReviewRows(
 	return due;
 }
 
+/** OTTR-1071: the earliest quiet-gate end among the rows a review still waits for;
+ * null when no row waits. Mirrors dueReviewRows' filters, but selects the rows the
+ * quiet period has not released yet. */
+async function nextQuietDueAt(
+	store: ForkProject["store"],
+	t: number,
+	pulls: PullInfo[],
+): Promise<number | null> {
+	const byNumber = new Map(pulls.map((p) => [p.number, p]));
+	const own = await ownPulls(store);
+	let next: number | null = null;
+	for (const row of await store.listPrReviews()) {
+		if (
+			row.state !== "open" ||
+			row.draft ||
+			(await store.prHeadReviewed(row.number, row.head)) ||
+			row.firstSeenAt + PR_GATES.QUIET_MS <= t
+		)
+			continue;
+		const card = row.taskId ? await store.getTask(row.taskId) : null;
+		// A cancelled card is the user's "never review this PR".
+		if (card?.cancelledAt != null) continue;
+		const info = byNumber.get(row.number);
+		if (
+			own.numbers.has(row.number) ||
+			own.sourcePrNumbers.has(row.number) ||
+			(info?.headRef != null && own.branches.has(info.headRef))
+		)
+			continue;
+		const due = row.firstSeenAt + PR_GATES.QUIET_MS;
+		if (next === null || due < next) next = due;
+	}
+	return next;
+}
+
 /** The comment watch: every posted open PR reads the comments since its cutoff. */
 async function sweepNotifiedRows(
 	ctx: PrWatcherCtx,
@@ -1179,19 +1223,18 @@ async function scanProject(
 	const source = new Map(
 		(await store.listPrReviews()).map((row) => [row.number, row]),
 	);
-	let pulls: PullInfo[];
-	try {
-		pulls = await listPulls(repo, ctx.gh);
-	} catch (e) {
-		ctx.log(`prs: ${project.name}: ${(e as Error).message}`);
-		return;
-	}
+	// A failure here propagates: scanTick logs it and records the poll error.
+	const pulls = await listPulls(repo, ctx.gh);
 	const t = ctx.now();
 	const seen = await store.transaction(async () => {
 		if ((await store.getSettings()).prReviews !== true) return null;
 		return syncSeenPulls(store, pulls, t, source);
 	});
-	if (seen === null) return;
+	if (seen === null) {
+		// The watch turned off between polls: a pending timer must not fire.
+		ctx.scheduleQuietRun?.(project.name, null);
+		return;
+	}
 	await closeGonePulls(ctx, project, repo, seen, source);
 	// Converges every card to its row: a reopened PR, or a card an older build left in Done.
 	await store.transaction(async () => {
@@ -1202,6 +1245,8 @@ async function scanProject(
 	if ((await store.getSettings()).prReviewNotify === true)
 		await sweepNotifiedRows(ctx, project, repo);
 	await runDueReviews(ctx, project, repo, store, t, pulls);
+	// OTTR-1071: arm the next quiet-time run at the earliest gate that still waits.
+	ctx.scheduleQuietRun?.(project.name, await nextQuietDueAt(store, t, pulls));
 }
 
 /**
@@ -1525,12 +1570,18 @@ async function scanTick(
 		if (
 			(await project.store.getSettings()).prReviews !== true ||
 			github === null
-		)
+		) {
+			// OTTR-1071: a stale timer must not fire against a watch that is off.
+			ctx.scheduleQuietRun?.(project.name, null);
 			continue;
+		}
 		try {
 			await scanProject(ctx, project, github);
+			ctx.recordPoll?.(project.name, ctx.now(), null);
 		} catch (e) {
-			ctx.log(`prs: ${project.name}: ${(e as Error).message}`);
+			const message = (e as Error).message;
+			ctx.log(`prs: ${project.name}: ${message}`);
+			ctx.recordPoll?.(project.name, ctx.now(), message);
 		}
 	}
 }
@@ -1659,6 +1710,9 @@ export function createPrWatcher(deps: {
 	spawn?: SpawnFn;
 	/** The deterministic perf lens over one PR diff; defaults to perfFindings. */
 	perfScan?: (diff: string, labels: string[]) => PerfFinding[];
+	/** OTTR-1071: timer seam for the quiet-time runs; defaults to setTimeout. Tests inject
+	 * a fake clock, so no test waits on a real timer. */
+	schedule?: (fn: () => void, ms: number) => () => void;
 }): {
 	tick(opts?: { manual?: string }): Promise<void>;
 	reviewNow(o: {
@@ -1667,6 +1721,8 @@ export function createPrWatcher(deps: {
 		note: string;
 	}): Promise<void>;
 	reviewIdle(): Promise<void>;
+	/** OTTR-1071: the project's last finished poll; null before this process polled it. */
+	pollStatus(project: string): { at: number; error: string | null } | null;
 	/** OTTR-942: the board's notice lines for skipped PR reviews, one per PR and
 	 * head ("p: PR #N review skipped: <reason>"), oldest first. */
 	skipNotices(): string[];
@@ -1727,6 +1783,43 @@ export function createPrWatcher(deps: {
 		recordSkipNotice,
 		logDropped,
 	};
+	// OTTR-1071: in-memory quiet-run timers and last-poll facts, keyed by project
+	// name. A restart loses both; the start-up poll (server.ts runs one tick at
+	// boot) refills them.
+	const quietTimers = new Map<string, { at: number; cancel: () => void }>();
+	const polls = new Map<string, { at: number; error: string | null }>();
+	const schedule =
+		deps.schedule ??
+		((fn: () => void, ms: number) => {
+			const h = setTimeout(fn, ms);
+			return () => clearTimeout(h);
+		});
+	// The quiet-time run reuses the same single-flight tick as the hourly poll and
+	// the check route, so every gate holds at fire time: prReviews on, daily cap,
+	// cancelled card, head already reviewed.
+	const tick = singleFlightTick((opts) => scanTick(ctx, opts));
+	const scheduleQuietRun = (project: string, at: number | null): void => {
+		const pending = quietTimers.get(project);
+		if (pending && pending.at === at) return;
+		if (pending) {
+			pending.cancel();
+			quietTimers.delete(project);
+		}
+		if (at === null) return;
+		const cancel = schedule(
+			() => {
+				// Delete first: a scan that runs inside the handler must not see a stale entry.
+				quietTimers.delete(project);
+				void tick({ manual: project }).catch(() => {});
+			},
+			Math.max(0, at + QUIET_RUN_SLACK_MS - now()),
+		);
+		quietTimers.set(project, { at, cancel });
+	};
+	ctx.scheduleQuietRun = scheduleQuietRun;
+	ctx.recordPoll = (project, at, error) => {
+		polls.set(project, { at, error });
+	};
 	// Review requests serialize through one chain per watcher; reviewIdle resolves when it drains.
 	let tail: Promise<void> = Promise.resolve();
 	const enqueue = (job: () => Promise<void>): Promise<void> => {
@@ -1735,10 +1828,15 @@ export function createPrWatcher(deps: {
 		return run;
 	};
 	return {
-		tick: singleFlightTick((opts) => scanTick(ctx, opts)),
+		tick,
 		// An explicit request never rejects: requestReview logs every failure and swallows it.
 		reviewNow: (o) => enqueue(() => requestReview(ctx, o).catch(() => {})),
 		reviewIdle: () => tail,
+		/** OTTR-1071: the Settings row's poll facts; a copy, so callers cannot mutate the map. */
+		pollStatus: (project) => {
+			const poll = polls.get(project);
+			return poll ? { ...poll } : null;
+		},
 		/** The bell's notice lines for skipped PR reviews, oldest first. */
 		skipNotices: () => skipNotices.map((n) => n.text),
 	};

@@ -28,6 +28,7 @@ import {
 	parsePullPage,
 	prUrl,
 	pullState,
+	QUIET_RUN_SLACK_MS,
 	reviewUserMessage,
 } from "./prs.ts";
 import { ProjectStore } from "./store.ts";
@@ -258,6 +259,24 @@ async function setup(
 		const routed = reviewRoute(state, path);
 		return routed ?? ghJson(state.open);
 	};
+	// OTTR-1071 fake clock: schedule records one entry per quiet-time timer. fire
+	// runs the handler (and marks the entry gone, as the factory's map delete does);
+	// cancel marks it cleared without firing.
+	const timers: { fire: () => void; delay: number; cancelled: boolean }[] = [];
+	const schedule = (fn: () => void, ms: number) => {
+		const entry = {
+			fire: () => {
+				entry.cancelled = true;
+				fn();
+			},
+			delay: ms,
+			cancelled: false,
+		};
+		timers.push(entry);
+		return () => {
+			entry.cancelled = true;
+		};
+	};
 	const watcher = createPrWatcher({
 		projects: () => [
 			{
@@ -275,6 +294,7 @@ async function setup(
 		now: () => t,
 		spawn: opts.spawn,
 		perfScan: opts.perfScan,
+		schedule,
 		review: opts.spawn
 			? undefined
 			: async (messages) => {
@@ -292,6 +312,9 @@ async function setup(
 		logs,
 		prompts,
 		forgotten,
+		timers,
+		/** The quiet-time timers still pending. */
+		pendingTimers: () => timers.filter((x) => !x.cancelled),
 		closed: state.closed,
 		diffs: state.diffs,
 		setOpen: (v: { number: number; head: { sha: string } }[]) => {
@@ -1112,6 +1135,110 @@ describe("review prompt and draft", () => {
 });
 
 describe("createPrWatcher", () => {
+	test("a quiet-time timer starts the review when the quiet gate ends, without a poll", async () => {
+		const s = await setup();
+		s.setOpen([pr(1, sha("a"))]);
+		await s.watcher.tick();
+		// The scan only recorded the PR; no hourly tick ran the review.
+		expect(s.prompts).toHaveLength(0);
+		expect((await s.cards()).length).toBe(0);
+		// Exactly one timer is pending, at the quiet gate plus the slack.
+		const pending = s.pendingTimers();
+		expect(pending).toHaveLength(1);
+		expect(
+			Math.abs(pending[0]!.delay - (PR_GATES.QUIET_MS + QUIET_RUN_SLACK_MS)),
+		).toBeLessThanOrEqual(100);
+		// The timer fires; the review starts on its own.
+		s.advance(PR_GATES.QUIET_MS + QUIET_RUN_SLACK_MS);
+		pending[0]!.fire();
+		// Joins the fired tick's in-flight promise; it is the await, not a second scan trigger.
+		await s.watcher.tick({ manual: "p" });
+		expect(s.prompts).toHaveLength(1);
+		expect((await s.cards()).length).toBe(1);
+		// Nothing waits anymore: the head is reviewed.
+		expect(s.pendingTimers()).toHaveLength(0);
+	});
+
+	test("a watch that is off schedules nothing, and turning it off clears a pending timer", async () => {
+		const s = await setup({ on: false });
+		s.setOpen([pr(1, sha("a"))]);
+		await s.watcher.tick();
+		expect(s.pendingTimers()).toHaveLength(0);
+		expect(s.prompts).toHaveLength(0);
+		// On, a timer pends; off between polls clears it, and firing it starts no review.
+		await s.store.setSettings({ prReviews: true });
+		await s.watcher.tick();
+		const pending = s.pendingTimers();
+		expect(pending).toHaveLength(1);
+		await s.store.setSettings({ prReviews: false });
+		await s.watcher.tick();
+		expect(s.pendingTimers()).toHaveLength(0);
+		pending[0]!.fire();
+		await s.watcher.tick({ manual: "p" });
+		expect(s.prompts).toHaveLength(0);
+		expect((await s.cards()).length).toBe(0);
+	});
+
+	test("the daily cap holds when the quiet-time timer fires", async () => {
+		const s = await setup();
+		s.setOpen([pr(1, sha("a"))]);
+		await s.watcher.tick();
+		// The day's slots are spent before the timer fires.
+		for (let i = 0; i < PR_GATES.PROJECT_DAILY_RUNS; i++)
+			await s.store.startPrRun(99, sha("f"), s.now());
+		const pending = s.pendingTimers();
+		expect(pending).toHaveLength(1);
+		s.advance(PR_GATES.QUIET_MS + QUIET_RUN_SLACK_MS);
+		pending[0]!.fire();
+		await s.watcher.tick({ manual: "p" });
+		// The gate held: no run landed and no card exists.
+		expect(s.prompts).toHaveLength(0);
+		expect((await s.cards()).length).toBe(0);
+		expect(await s.store.prReviewRunsSince(0)).toBe(
+			PR_GATES.PROJECT_DAILY_RUNS,
+		);
+		expect(
+			s.logs.some((m) => m.includes("daily cap of 5 reviews reached")),
+		).toBe(true);
+	});
+
+	test("one timer waits for the earliest PR, and a later poll re-arms it at the new earliest", async () => {
+		const s = await setup();
+		s.setOpen([pr(1, sha("a")), pr(2, sha("b"))]);
+		await s.watcher.tick();
+		// Both PRs are fresh: one timer waits at the shared gate.
+		const first = s.pendingTimers();
+		expect(first).toHaveLength(1);
+		// PR 1 was seen ten minutes earlier than PR 2; the next poll re-arms earlier.
+		await s.store.savePrReview({
+			...(await s.store.getPrReview(1))!,
+			firstSeenAt: s.now() - 10 * 60_000,
+		});
+		await s.watcher.tick();
+		const second = s.pendingTimers();
+		expect(second).toHaveLength(1);
+		expect(first[0]!.cancelled).toBe(true);
+		expect(second[0]).not.toBe(first[0]);
+		expect(second[0]!.delay).toBe(
+			PR_GATES.QUIET_MS - 10 * 60_000 + QUIET_RUN_SLACK_MS,
+		);
+		// The first PR's head gets reviewed; the next poll re-arms at PR 2's later gate.
+		await s.store.savePrDraft({
+			run: await s.store.startPrRun(1, sha("a"), s.now()),
+			number: 1,
+			head: sha("a"),
+			draft: "draft",
+			prompt: "review",
+			blocking: true,
+		});
+		await s.watcher.tick();
+		const third = s.pendingTimers();
+		expect(third).toHaveLength(1);
+		expect(second[0]!.cancelled).toBe(true);
+		expect(third[0]).not.toBe(second[0]);
+		expect(third[0]!.delay).toBe(PR_GATES.QUIET_MS + QUIET_RUN_SLACK_MS);
+	});
+
 	test("concurrent review requests share the final daily slot", async () => {
 		const s = await setup();
 		s.setOpen([pr(1, sha("a")), pr(2, sha("a"))]);

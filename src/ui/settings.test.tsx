@@ -1838,6 +1838,231 @@ describe("Project switch cards", () => {
 	});
 });
 
+describe("PR reviews watch facts and Check PRs now", () => {
+	const settings = (prReviews: boolean): ProjectView["settings"] =>
+		({
+			holdUpdateMerges: false,
+			retroSince: null,
+			retroFilter: false,
+			forkResearch: false,
+			trendingScout: false,
+			prReviews,
+			prMode: false,
+			issueWatch: false,
+			ompWatch: false,
+			dependabotWarn: true,
+			microVm: false,
+			pushSyncCommits: false,
+			maxParallel: 2,
+			copyExtra: [],
+			displayName: null,
+			releaseCommand: null,
+			archReviewCap: 30,
+			maxImages: 4,
+			keptWorktreeDays: 7,
+			autoTend: false,
+			autoTendLimit: 5,
+			tendChurnGlobs: [],
+			setupChecklist: false,
+			targetBranch: null,
+			originUrl: null,
+		}) as unknown as ProjectView["settings"];
+
+	const project = (prReviews: boolean, prWatch: unknown): ProjectView =>
+		({
+			name: "proj",
+			icon: null,
+			remote: null,
+			github: "octo/repo",
+			vmRunner: { configured: false, ok: false, reason: "not set" },
+			hasRules: true,
+			gitless: false,
+			archReview: null,
+			prWatch,
+			settings: settings(prReviews),
+		}) as unknown as ProjectView;
+
+	const json = (status: number, body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status,
+			headers: { "Content-Type": "application/json" },
+		});
+
+	const watchRow = (container: Element): Element => {
+		const row = [
+			...container.querySelectorAll("#project-watches-section .check-row"),
+		].find((r) => r.querySelector("label")?.textContent === "PR reviews");
+		return row as Element;
+	};
+
+	const checkButton = (container: Element): HTMLButtonElement =>
+		Array.from(container.querySelectorAll("button")).find(
+			(b) => b.textContent?.trim() === "Check PRs now",
+		) as HTMLButtonElement;
+
+	/** Renders the form with the check route answering `checks` in order; returns the
+	 *  container and the recorded check calls. The fetch stub answers the two mount
+	 *  calls, same as above. */
+	async function prForm(
+		p: ProjectView,
+		checks: Response[],
+	): Promise<{
+		container: HTMLDivElement;
+		checkCalls: { url: string; method: string }[];
+		unmount: () => Promise<void>;
+	}> {
+		const checkCalls: { url: string; method: string }[] = [];
+		const answers = [...checks];
+		const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = String(input);
+			if (url.endsWith("/api/projects/proj/prs/check")) {
+				checkCalls.push({ url, method: init?.method ?? "GET" });
+				const answer = answers.shift();
+				if (answer === undefined) throw new Error(`unexpected fetch ${url}`);
+				return answer;
+			}
+			if (url.endsWith("/api/projects/proj/github/visibility"))
+				return json(200, { private: false });
+			if (url.endsWith("/api/projects/proj/ssh-key"))
+				return json(200, { own: null, expiresAt: null });
+			throw new Error(`unexpected fetch ${url}`);
+		}) as typeof fetch;
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(
+				<ProjectSettingsForm
+					project={p}
+					tasks={[]}
+					trendingScan={true}
+					act={async (fn) => {
+						await fn();
+						return true;
+					}}
+					openTask={() => {}}
+				/>,
+			);
+		});
+		return {
+			container,
+			checkCalls,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+			},
+		};
+	}
+
+	const LAST = 1_730_634_000_000;
+	const NEXT = LAST + 3_600_000;
+
+	test("the on row shows the last and next check and an enabled button", async () => {
+		const { container, unmount } = await prForm(
+			project(true, { lastPollAt: LAST, lastError: null, nextPollAt: NEXT }),
+			[],
+		);
+		try {
+			const row = watchRow(container);
+			expect(row.textContent).toContain(`Last check: ${stamp(LAST)}`);
+			expect(row.textContent).toContain(`Next regular check: ${stamp(NEXT)}`);
+			expect(checkButton(container)?.disabled).toBe(false);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("Check PRs now posts once and reports Check started", async () => {
+		const { container, checkCalls, unmount } = await prForm(
+			project(true, { lastPollAt: LAST, lastError: null, nextPollAt: NEXT }),
+			[json(200, { ok: true })],
+		);
+		try {
+			await act(async () => checkButton(container).click());
+			expect(checkCalls).toEqual([
+				{ url: "/api/projects/proj/prs/check", method: "POST" },
+			]);
+			const status = watchRow(container).querySelector(
+				'[id$="-desc"] [role="status"]',
+			);
+			expect(status?.textContent).toBe("Check started.");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a failed check shows the server's error below the rows", async () => {
+		const { container, checkCalls, unmount } = await prForm(
+			project(true, { lastPollAt: LAST, lastError: null, nextPollAt: NEXT }),
+			[json(500, { error: "gh boom" })],
+		);
+		try {
+			await act(async () => checkButton(container).click());
+			expect(checkCalls.length).toBe(1);
+			const alert = container.querySelector(
+				'#project-watches-section [role="alert"]',
+			);
+			expect(alert?.textContent).toContain("gh boom");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a failed last check replaces the time with its reason", async () => {
+		const { container, unmount } = await prForm(
+			project(true, {
+				lastPollAt: LAST,
+				lastError: "GitHub answered 502",
+				nextPollAt: null,
+			}),
+			[],
+		);
+		try {
+			expect(watchRow(container).textContent).toContain(
+				"Last check: Failed: GitHub answered 502",
+			);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the off row says checks do not run and the button is disabled", async () => {
+		const { container, unmount } = await prForm(
+			project(false, { lastPollAt: LAST, lastError: null, nextPollAt: NEXT }),
+			[],
+		);
+		try {
+			expect(watchRow(container).textContent).toContain(
+				"PR reviews are off: no checks run.",
+			);
+			expect(checkButton(container)?.disabled).toBe(true);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a never-checked watch shows Never and an unknown next check", async () => {
+		const { container, unmount } = await prForm(
+			project(true, { lastPollAt: null, lastError: null, nextPollAt: null }),
+			[],
+		);
+		try {
+			const row = watchRow(container);
+			expect(row.textContent).toContain("Last check: Never");
+			expect(row.textContent).toContain("Next regular check: unknown");
+		} finally {
+			await unmount();
+		}
+	});
+});
+
 describe("Trending scout depends on the general weekly scan", () => {
 	const project = (trendingScout: boolean): ProjectView =>
 		({
