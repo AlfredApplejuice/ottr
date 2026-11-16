@@ -7458,6 +7458,20 @@ describe("ReleaseDialog consolidation", () => {
 		if (node === undefined) throw new Error(`no ${name} button`);
 		return node as HTMLButtonElement;
 	};
+	// The production onChange React rendered onto the node; the textarea is typed by
+	// calling it with a minimal event object, since happy-dom's dispatched input
+	// event never reaches React's ChangeEventPlugin.
+	const onChangeOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onChange?: (e: unknown) => void;
+		};
+		if (props.onChange === undefined) throw new Error("node has no onChange");
+		return props.onChange;
+	};
 	const notesValue = (box: ParentNode): string =>
 		(box.querySelector("#release-notes-proposal") as HTMLTextAreaElement).value;
 	const notes = "- add the thing\n- fix the bug";
@@ -7593,6 +7607,32 @@ describe("ReleaseDialog consolidation", () => {
 			// The proposal is a review, not a replacement: the draft still holds
 			// the deterministic notes until the user accepts.
 			expect(notesValue(h.container)).toBe(notes);
+		} finally {
+			await h.done();
+		}
+	});
+
+	test("the diff bases on the live draft, so Use cannot silently drop the user's edits", async () => {
+		const h = await mount(() => json({ summary: consolidated, reason: null }));
+		try {
+			// The user edits the deterministic notes before asking for a proposal.
+			const box = h.container.querySelector(
+				"#release-notes-proposal",
+			) as HTMLTextAreaElement;
+			await act(async () => {
+				onChangeOf(box)({ target: { value: `${notes}\n- my own edit line` } });
+			});
+			await click(h, "Consolidate notes");
+			// The review diffs the edited draft against the proposal, so the edit
+			// the Use action would remove shows as a removed line.
+			const diff = h.container.querySelector(".deepen-diff");
+			expect(diff).not.toBeNull();
+			expect(diff?.textContent).toContain("my own edit line");
+			expect(diff?.textContent).toContain("the thing landed");
+			expect(notesValue(h.container)).toContain("my own edit line");
+			// Use replaces the whole draft with the proposal, as the diff showed.
+			await click(h, "Use consolidated notes");
+			expect(notesValue(h.container)).toBe(consolidated);
 		} finally {
 			await h.done();
 		}

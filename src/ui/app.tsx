@@ -3606,9 +3606,12 @@ export function ReleaseDialog({
 	}, [open, project.name]);
 	// The consolidation runs only on this button: opening the dialog never asks the
 	// model anything, and the deterministic notes stay in the editor until the user
-	// accepts a proposal.
+	// accepts a proposal. The diff bases on the live draft (the deepen pattern), so
+	// an accepted proposal can never drop the user's own edits without showing the
+	// removal in the review first.
 	const consolidate = (): void => {
 		if (plan === null || plan.from === null || summaryBusy) return;
+		const base = notesDraft ?? plan.notes;
 		setSummaryReason(null);
 		setSummaryBusy(true);
 		setSummarySince(Date.now());
@@ -3619,7 +3622,7 @@ export function ReleaseDialog({
 			.then((res) => {
 				if (!summaryAlive.current) return;
 				if (res.summary !== null)
-					setReview({ original: plan.notes, consolidated: res.summary });
+					setReview({ original: base, consolidated: res.summary });
 				else setSummaryReason(res.reason);
 			})
 			.catch((e) => {
