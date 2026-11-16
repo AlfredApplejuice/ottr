@@ -21,7 +21,10 @@ type Result = {
 	boards: Extract<Trace, { kind: "board-spawn" }>[];
 };
 
-async function run(scenario: Scenario): Promise<Result> {
+async function run(
+	scenario: Scenario,
+	inheritedEnv: Record<string, string> = {},
+): Promise<Result> {
 	const root = mkdtempSync(join(tmpdir(), "readme-screenshot-test-"));
 	const inheritedRoot = join(root, "inherited-demo");
 	const inheritedState = join(root, "inherited-state");
@@ -42,6 +45,7 @@ async function run(scenario: Scenario): Promise<Result> {
 				OTTR_STATE_DIR: inheritedState,
 				README_SHOT_FIXTURE_ROOT: root,
 				README_SHOT_SCENARIO: JSON.stringify(scenario),
+				...inheritedEnv,
 			},
 			stdout: "pipe",
 			stderr: "pipe",
@@ -106,6 +110,15 @@ describe("readme screenshot board readiness", () => {
 		const result = await run({ readyAttempt: 1, failure: "reject" });
 		expect(result.boards).toHaveLength(1);
 		expectCapture(result, result.boards[0]!.port);
+	});
+
+	test("a host VM runner URL without a token cannot block either demo attempt", async () => {
+		const result = await run(
+			{ readyAttempt: 2, failure: "reject" },
+			{ OTTR_VM_RUNNER_URL: "http://vm-runner.invalid:8787" },
+		);
+		expect(result.boards).toHaveLength(2);
+		expectCapture(result, result.boards[1]!.port);
 	});
 
 	test("one timeout stops only the first board before a fresh replacement captures", async () => {

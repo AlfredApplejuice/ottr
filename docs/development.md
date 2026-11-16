@@ -69,7 +69,8 @@ If the demo board misses the 30 s readiness deadline, the script stops that chil
 The second attempt uses a free port and fresh temporary demo and state directories.
 A second timeout exits 1 with the same readiness error.
 `bash scripts/readme-screenshot.ts` runs the same capture through Bun.
-If the host sets `OTTR_VM_RUNNER_URL` without `OTTR_WORKER_TOKEN`, use `env -u OTTR_VM_RUNNER_URL bash scripts/readme-screenshot.ts`.
+Demo board environments omit `OTTR_VM_RUNNER_URL`, so host VM runner settings cannot block the capture.
+This prevents the missing-token startup error. The retry handles only readiness timeouts.
 
 Card views have a one-command path too: `bun scripts/card-shot.ts --view card --pr 53`. The script plants a parked PR-mode card (`stage` merging, PR #53 open, never "done") and a normal done card into a fresh demo pool. It boots its own board on a free port and writes the requested views to `shots/`. The views are `card` (the PR card's drawer), `done` (the contrast card), and `board` (the Lumen project face); `--view` can repeat. The script writes its fixture rows with direct sqlite before the board boots, so no write touches a live board's database. It bounds every wait with a watchdog, verifies each PNG signature, and stops only the children it started. It calls `process.exit` once the artifacts verify, so it cannot hang after success. Use it instead of a throwaway shot script. Spec: `docs/specs/card-shot.md`.
 

@@ -1,5 +1,6 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { vmRunnerFromEnv } from "../src/runner.ts";
 
 export type Scenario = {
 	readyAttempt: number | null;
@@ -117,6 +118,8 @@ Bun.spawn = ((cmd: string[], options: { env?: Record<string, string> }) => {
 			devRoot: env.OTTR_DEV_ROOT,
 			stateDir: env.OTTR_STATE_DIR,
 		});
+		if (vmRunnerFromEnv(env) !== null)
+			throw new Error("the demo board must not use a microVM runner");
 		return child("board", attempt);
 	}
 	if (cmd[0] !== "fixture-chrome") throw new Error("unexpected child command");

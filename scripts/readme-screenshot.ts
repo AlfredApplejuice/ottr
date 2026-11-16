@@ -54,6 +54,8 @@ function spawnBoard() {
 		cwd: REPO,
 		env: {
 			...process.env,
+			// Demo boards never use the host's microVM runner.
+			OTTR_VM_RUNNER_URL: undefined,
 			NODE_ENV: "production",
 			PORT: String(port),
 			OTTR_DEV_ROOT: root,
