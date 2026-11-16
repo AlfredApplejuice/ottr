@@ -42,7 +42,7 @@ export function probeArgv(opts: ProbeOptions = {}): string[] {
 	const script = [
 		`v=$(bun -e 'const net=require("node:net");const s=net.connect({host:"${host}",port:${port}},()=>{console.log("allowed");process.exit(0)});s.on("error",(e)=>{console.log("blocked:"+(e.code||e.name||"unknown"));process.exit(2)});' 2>/dev/null)`,
 		'case "$v" in',
-		'allowed) echo "ATTEMPT network allowed tcp/' + host + ":" + port + '";;',
+		`allowed) echo "ATTEMPT network allowed tcp/${host}:${port}";;`,
 		'blocked:*) echo "ATTEMPT network blocked tcp/' +
 			host +
 			":" +

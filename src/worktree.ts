@@ -2942,6 +2942,34 @@ export async function cleanMergeTree(
  * card with the reason. `identity === null` keeps the built-in Ottr identity
  * (gitIdentity.ts).
  */
+/** The base tree's rows with `file` at `blob`: the existing row keeps its mode, a new
+ * file's row sorts in by name. `existingSha` is the sha the file already carries at
+ * the base tree, null when the file is new. */
+function rowsWithFile(
+	lsOut: string,
+	file: string,
+	blob: string,
+): { existingSha: string | null; rows: string[] } {
+	// `ls-tree -z` rows: "mode SP type SP sha TAB name\0".
+	const entries = lsOut.split("\0").filter((row) => row !== "");
+	const nameOf = (row: string) => row.slice(row.indexOf("\t") + 1);
+	const existing = entries.find((row) => nameOf(row) === file);
+	const existingSha =
+		existing === undefined
+			? null
+			: (existing.slice(0, existing.indexOf("\t")).split(" ")[2] ?? null);
+	const mode = existing?.split(" ")[0] ?? "100644";
+	const rows =
+		existing !== undefined
+			? entries.map((row) =>
+					row === existing ? `${mode} blob ${blob}\t${file}` : row,
+				)
+			: [...entries, `100644 blob ${blob}\t${file}`].sort((a, b) =>
+					nameOf(a) < nameOf(b) ? -1 : 1,
+				);
+	return { existingSha, rows };
+}
+
 export async function commitFileOnBranch(
 	mainPath: string,
 	file: string,
@@ -2975,24 +3003,8 @@ export async function commitFileOnBranch(
 		);
 	const ls = await git(["ls-tree", "-z", baseTree.stdout.trim()], mainPath);
 	if (ls.code !== 0) throw new Error(`git ls-tree failed: ${ls.stderr.trim()}`);
-	// `ls-tree -z` rows: "mode SP type SP sha TAB name\0".
-	const entries = ls.stdout.split("\0").filter((row) => row !== "");
-	const nameOf = (row: string) => row.slice(row.indexOf("\t") + 1);
-	const existing = entries.find((row) => nameOf(row) === file);
-	const existingSha =
-		existing === undefined
-			? null
-			: (existing.slice(0, existing.indexOf("\t")).split(" ")[2] ?? null);
+	const { existingSha, rows } = rowsWithFile(ls.stdout, file, blob);
 	if (existingSha === blob) return { kind: "same" };
-	const mode = existing?.split(" ")[0] ?? "100644";
-	const rows =
-		existing !== undefined
-			? entries.map((row) =>
-					row === existing ? `${mode} blob ${blob}\t${file}` : row,
-				)
-			: [...entries, `100644 blob ${blob}\t${file}`].sort((a, b) =>
-					nameOf(a) < nameOf(b) ? -1 : 1,
-				);
 	const tree = await git(
 		["mktree", "-z"],
 		mainPath,
