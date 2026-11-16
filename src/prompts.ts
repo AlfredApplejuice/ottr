@@ -97,7 +97,7 @@ If the rebase pulled in commits that touch dependencies, install again in locked
 Before you integrate, run the diff-security-review skill on the branch diff against the target (docs-only diffs skip it); a confirmed high or medium finding blocks the merge: fix it on the branch and re-run the gates, or call report_outcome with needs_you. If this runner lacks the skill, report needs_you: Alate provisioning installs it.
 ${
 	prMode
-		? `Do not merge and do not push: after you report integrated, the server pushes ${o.branch} and opens the pull request (base ${targetBranch}, head ${o.branch}) on GitHub.`
+		? `Do not merge and do not push: after you report integrated, the server pushes ${o.branch} and opens the pull request (base ${targetBranch}, head ${o.branch}) on GitHub. Put the pull request body in report_outcome's prBody field: write it from the repo's pull request template (.github/pull_request_template.md) when one exists, and describe the change, never the push.`
 		: `Then, in the main checkout, fast-forward ${targetBranch} to ${o.target} if it is behind, and run git merge --ff-only ${o.branch}, so ${targetBranch} holds the head of ${o.branch}. A project rule in AGENTS.md wins when it names a different integration.
 Do not push: the server pushes ${o.branch}'s head with its stored credentials after you report integrated.`
 } If a project rule or hook forbids an integration step, do not finish silently: call report_outcome with needs_you and the exact rule that blocks it.

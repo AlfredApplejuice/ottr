@@ -105,9 +105,21 @@ describe("mergePrompt PR variant", () => {
 		expect(p).toContain("Do not merge and do not push");
 	});
 
+	test("the PR variant sends the body to prBody from the repo's template", () => {
+		const p = mergePrompt({
+			branch: "ott/x",
+			target: "origin/main",
+			pr: true,
+		});
+		expect(p).toContain(
+			"Put the pull request body in report_outcome's prBody field: write it from the repo's pull request template (.github/pull_request_template.md) when one exists, and describe the change, never the push.",
+		);
+	});
+
 	test("the default path (pr falsy) still names the ff-merge", () => {
 		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
 		expect(p).not.toContain("opens the pull request");
+		expect(p).not.toContain("prBody");
 		expect(p).toContain("git merge --ff-only ott/x");
 	});
 });
