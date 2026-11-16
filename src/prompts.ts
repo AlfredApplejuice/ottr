@@ -679,6 +679,7 @@ AGENTS.md must cover:
 - what the merge turn does to integrate (merge and push, never tag or release) and how a release is cut (I start it from the board's Create release button; a review turn runs first; the tracker tags and publishes);
 - the review rules: what a review runs (the full verification plus this file's review gates) and that a review never edits code, tests or thresholds and never commits, merges, tags, pushes or releases;
 - hard stops that must wait for me (with the question to ask);
+- code ownership: a rule that the agent owns and maintains this codebase for the long term, so it fixes bugs it finds and consolidates duplicate code instead of adding copies or only reporting problems; keep the measured cost next to it (Anthropic measured more unrequested changes and about 70 to 80 percent more output tokens);
 - commit conventions;
 - whether AGENTS.md is committed or kept local-only (if local-only, add /AGENTS.md to .git/info/exclude).
 

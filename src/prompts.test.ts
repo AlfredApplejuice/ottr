@@ -424,6 +424,16 @@ describe("rulesInterviewPrompt", () => {
 			expect(prompt).not.toContain("merge/push/tag/release");
 		}
 	});
+
+	test("both modes cover code ownership with its measured cost", () => {
+		for (const existing of [false, true]) {
+			const prompt = rulesInterviewPrompt({ projectName: "demo", existing });
+			expect(prompt).toContain("code ownership");
+			expect(prompt).toContain("owns and maintains this codebase");
+			expect(prompt).toContain("consolidates duplicate code");
+			expect(prompt).toContain("70 to 80 percent more output tokens");
+		}
+	});
 });
 
 describe("reviewPrompt", () => {
