@@ -7499,6 +7499,8 @@ describe("ReleaseDialog consolidation", () => {
 	type Harness = {
 		calls: Call[];
 		container: HTMLDivElement;
+		/** Re-renders the same root with a new `open` value, for close/reopen tests. */
+		render: (open: boolean) => Promise<void>;
 		done: () => Promise<void>;
 	};
 	const json = (body: unknown): Response =>
@@ -7510,7 +7512,9 @@ describe("ReleaseDialog consolidation", () => {
 	 *  GET /release answers the plan, POST /release answers {} (Start); the
 	 *  release-summary POST goes to `summary`, and every other URL 404s (the
 	 *  model catalog reads its failure and stays null). */
-	const mount = async (summary?: () => Response): Promise<Harness> => {
+	const mount = async (
+		summary?: () => Response | Promise<Response>,
+	): Promise<Harness> => {
 		const calls: Call[] = [];
 		const realFetch = globalThis.fetch;
 		globalThis.fetch = (async (
@@ -7540,17 +7544,19 @@ describe("ReleaseDialog consolidation", () => {
 		) as unknown as HTMLDivElement;
 		window.document.body.appendChild(container as unknown as HappyNode);
 		const root = createRoot(container);
-		try {
-			await act(async () => {
+		const render = (open: boolean): Promise<void> =>
+			act(async () => {
 				root.render(
 					<ReleaseDialog
 						project={project}
-						open
+						open={open}
 						onClose={() => {}}
 						act={runAct}
 					/>,
 				);
 			});
+		try {
+			await render(true);
 			// One more act lets the plan fetch land.
 			await act(async () => {});
 		} catch (e) {
@@ -7560,6 +7566,7 @@ describe("ReleaseDialog consolidation", () => {
 		return {
 			calls,
 			container,
+			render,
 			done: async () => {
 				await act(async () => {
 					root.unmount();
@@ -7633,6 +7640,37 @@ describe("ReleaseDialog consolidation", () => {
 			// Use replaces the whole draft with the proposal, as the diff showed.
 			await click(h, "Use consolidated notes");
 			expect(notesValue(h.container)).toBe(consolidated);
+		} finally {
+			await h.done();
+		}
+	});
+
+	test("a consolidation reply that lands after a close and reopen never fills the new dialog", async () => {
+		const { promise: pending, resolve } = Promise.withResolvers<Response>();
+		let asked = 0;
+		const h = await mount(() => {
+			asked += 1;
+			return asked === 1
+				? pending
+				: json({ summary: consolidated, reason: null });
+		});
+		try {
+			await click(h, "Consolidate notes");
+			// Close and reopen (the plan refetches) while the first request is
+			// still unanswered; the reopen must invalidate the in-flight reply.
+			await h.render(false);
+			await h.render(true);
+			expect(
+				h.calls.filter((c) => c.url.endsWith("/release-summary")),
+			).toHaveLength(1);
+			resolve(json({ summary: consolidated, reason: null }));
+			await act(async () => {});
+			await act(async () => {});
+			// The stale reply belongs to the closed session: no review, no busy
+			// state, and the notes editor keeps the deterministic notes.
+			expect(h.container.textContent).not.toContain("Proposed notes");
+			expect(notesValue(h.container)).toBe(notes);
+			expect(button(h.container, "Consolidate notes").disabled).toBe(false);
 		} finally {
 			await h.done();
 		}

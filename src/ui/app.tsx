@@ -3562,8 +3562,9 @@ export function ReleaseDialog({
 		original: string;
 		consolidated: string;
 	} | null>(null);
-	/** True while the dialog is open; a consolidation reply that lands after close must not set state. */
-	const summaryAlive = useRef(false);
+	/** Bumped on every dialog open; a consolidation reply whose captured epoch differs
+	 *  belongs to an earlier open (maybe another project) and must not set state. */
+	const summaryEpoch = useRef(0);
 	const [showCommits, setShowCommits] = useState(false);
 	const edited = useRef(false);
 	const catalog = useModels();
@@ -3586,7 +3587,7 @@ export function ReleaseDialog({
 		setReview(null);
 		setShowCommits(false);
 		edited.current = false;
-		summaryAlive.current = true;
+		summaryEpoch.current += 1;
 		setLoading(true);
 		let alive = true;
 		// unwrap: a non-JSON 200 must surface as a load error, not an empty dialog.
@@ -3601,7 +3602,8 @@ export function ReleaseDialog({
 			.finally(() => setLoading(false));
 		return () => {
 			alive = false;
-			summaryAlive.current = false;
+			// A reply landing in the closed window belongs to no open session.
+			summaryEpoch.current += 1;
 		};
 	}, [open, project.name]);
 	// The consolidation runs only on this button: opening the dialog never asks the
@@ -3612,6 +3614,7 @@ export function ReleaseDialog({
 	const consolidate = (): void => {
 		if (plan === null || plan.from === null || summaryBusy) return;
 		const base = notesDraft ?? plan.notes;
+		const epoch = summaryEpoch.current;
 		setSummaryReason(null);
 		setSummaryBusy(true);
 		setSummarySince(Date.now());
@@ -3620,17 +3623,17 @@ export function ReleaseDialog({
 			{ sha: plan.sha },
 		)
 			.then((res) => {
-				if (!summaryAlive.current) return;
+				if (summaryEpoch.current !== epoch) return;
 				if (res.summary !== null)
 					setReview({ original: base, consolidated: res.summary });
 				else setSummaryReason(res.reason);
 			})
 			.catch((e) => {
-				if (summaryAlive.current)
+				if (summaryEpoch.current === epoch)
 					setSummaryReason(e instanceof Error ? e.message : String(e));
 			})
 			.finally(() => {
-				if (summaryAlive.current) setSummaryBusy(false);
+				if (summaryEpoch.current === epoch) setSummaryBusy(false);
 			});
 	};
 	// Through the draft path: the textarea holds the proposal, still editable. Discard
