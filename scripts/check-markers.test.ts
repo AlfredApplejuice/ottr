@@ -68,6 +68,19 @@ describe("check-markers (live spawns)", () => {
 		expect(r.stderr).toContain(CLOSE);
 	});
 
+	test("skips a binary file whose bytes embed a marker line", () => {
+		const f = join(root, "blob.png");
+		writeFileSync(
+			f,
+			Buffer.concat([
+				Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x00]),
+				Buffer.from(`\n${OPEN}\n`),
+			]),
+		);
+		const r = run([f]);
+		expect(r.code).toBe(0);
+	});
+
 	test("fails when an explicitly named path is unreadable", () => {
 		const r = run([join(root, "absent.md")]);
 		expect(r.code).toBe(1);

@@ -1,16 +1,17 @@
 /**
- * Fails when a tracked Markdown or source file holds an edit-tool marker or
- * a git conflict marker (OTTR-1059): commit 1f3017d wrote the literal line
+ * Fails when a tracked text file holds an edit-tool marker or a git
+ * conflict marker (OTTR-1059): commit 1f3017d wrote the literal line
  * `10: @ours` over the README "How it works" table header, and GitHub
  * rendered the whole table as one paragraph of pipes. Runs inside
- * `bun run check`. Extra path arguments scan those files instead of the
- * tracked tree, so the test drives the real script against throwaway
- * fixtures. A fixture that must hold marker lines is exempted here by exact
- * tracked path, never by weakening the patterns.
+ * `bun run check`. Every tracked file is read; a file with a NUL byte in
+ * its first 8 KiB counts as binary (git's heuristic) and is skipped, so
+ * Markdown, source, config, data and shell files are all covered with no
+ * extension allowlist to drift. Extra path arguments scan those files
+ * instead of the tracked tree, so the test drives the real script against
+ * throwaway fixtures. A fixture that must hold marker lines is exempted
+ * here by exact tracked path, never by weakening the patterns.
  */
 import { readFileSync } from "node:fs";
-
-const EXTENSIONS = /\.(md|ts|tsx|mts|cts|js|mjs|cjs|jsx|html)$/;
 
 /** Tracked paths that may hold marker lines (fixtures that copy real
  * conflict output). Exact paths, sorted; the empty list is the default. */
@@ -41,16 +42,23 @@ export function markerLines(
 	return hits;
 }
 
-function scanFile(path: string): Array<string> {
+/** Decodes a file as text, or returns null when it is binary: a NUL byte
+ * in the first 8 KiB (git's heuristic) means no whole-line marker scan. */
+function textOf(bytes: Buffer): string | null {
+	if (bytes.subarray(0, 8192).includes(0)) return null;
+	return bytes.toString("utf8");
+}
+
+function scanFile(path: string): Array<string> | null {
 	try {
-		return markerLines(readFileSync(path, "utf8")).map(
-			(hit) => `${path}:${hit.line}: ${hit.text}`,
-		);
+		const text = textOf(readFileSync(path));
+		if (text === null) return null;
+		return markerLines(text).map((hit) => `${path}:${hit.line}: ${hit.text}`);
 	} catch (error) {
 		// A tracked path may be absent from the worktree (deleted, staged);
 		// an explicitly named path must exist, so only the tree scan skips.
 		if (process.argv.length > 2) throw error;
-		return [];
+		return null;
 	}
 }
 
@@ -71,14 +79,16 @@ function main(): number {
 		files = out.stdout
 			.toString()
 			.split("\n")
-			.filter((f) => EXTENSIONS.test(f));
+			.filter((f) => f.length > 0);
 	}
 	const exempt = new Set(EXEMPT);
 	const bad: string[] = [];
 	let scanned = 0;
 	for (const file of files) {
 		if (exempt.has(file)) continue;
-		for (const hit of scanFile(file)) bad.push(hit);
+		const hits = scanFile(file);
+		if (hits === null) continue;
+		for (const hit of hits) bad.push(hit);
 		scanned++;
 	}
 	if (bad.length > 0) {
