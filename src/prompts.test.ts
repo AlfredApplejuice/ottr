@@ -415,6 +415,32 @@ describe("rulesInterviewPrompt", () => {
 		expect(fresh).toContain("Show me the final text before writing the file");
 	});
 
+	test("a PR-shipped interview never commits: the board opens the pull request", () => {
+		for (const existing of [false, true]) {
+			const prompt = rulesInterviewPrompt({
+				projectName: "demo",
+				existing,
+				shipsThroughPr: true,
+			});
+			expect(prompt).not.toContain("commit the fix");
+			expect(prompt).not.toContain("commit it only if we agreed");
+			expect(prompt).toContain("never commit");
+			expect(prompt).toContain(
+				"the board commits it on a card branch and opens the pull request",
+			);
+			expect(prompt).toContain("call report_outcome with status answered");
+		}
+		const fresh = rulesInterviewPrompt({ projectName: "demo" });
+		expect(fresh).toContain("commit it only if we agreed");
+		const aligned = rulesInterviewPrompt({
+			projectName: "demo",
+			existing: true,
+		});
+		expect(aligned).toContain(
+			"commit the fix with a conventional docs: message",
+		);
+	});
+
 	test("both modes describe the current pipeline: the merge push and read-only reviews", () => {
 		for (const existing of [false, true]) {
 			const prompt = rulesInterviewPrompt({ projectName: "demo", existing });

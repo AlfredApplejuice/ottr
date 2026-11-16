@@ -5918,11 +5918,17 @@ export async function createApp(deps: AppDeps) {
 	}> {
 		const has = hasRules(e.path, e.targetRules === true);
 		if (has && !fix) return { interview: "not-needed", id: null };
+		const settings = await e.store.getSettings();
 		return e.store.transaction(async () => {
 			const live = liveCardOf(await e.store.listTasks(), "interview");
 			if (live !== null) return { interview: "running", id: live.id };
 			const t = await e.store.createTask(
-				rulesInterviewPrompt({ projectName: e.store.name, existing: has }),
+				rulesInterviewPrompt({
+					projectName: e.store.name,
+					existing: has,
+					shipsThroughPr:
+						settings.prMode === true || e.protectedTarget === true,
+				}),
 				null,
 				"interview",
 			);

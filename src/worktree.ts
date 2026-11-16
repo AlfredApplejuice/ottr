@@ -2929,6 +2929,99 @@ export async function cleanMergeTree(
 	return /^[0-9a-f]{40}$/.test(tree) ? tree : null;
 }
 
+/**
+ * OTTR-1064, PR mode's rules interview: the agent was told to never commit on a project
+ * whose target takes pull requests, so the board ships the written file itself. Builds one
+ * commit on `branch` from `baseRef`'s tree holding `file`'s working-tree content, with
+ * `baseRef`'s tip as the parent — pure plumbing (`hash-object`, `ls-tree`, `mktree`,
+ * `commit-tree`, `update-ref`), so the main checkout's HEAD, index and working tree never
+ * move and a failed ship leaves no partial state beyond a board-owned branch. "same" when
+ * the file is git-ignored (the interview's local-only decision), missing, or identical to
+ * the base ref's blob. Git trouble throws; the caller parks the card with the reason.
+ * `identity === null` keeps the built-in Ottr identity (gitIdentity.ts).
+ */
+export async function commitFileOnBranch(
+	mainPath: string,
+	file: string,
+	baseRef: string,
+	branch: string,
+	message: string,
+	identity: CommitIdentity | null = null,
+): Promise<{ kind: "same" } | { kind: "committed"; sha: string }> {
+	const ignore = await git(["check-ignore", "-q", "--", file], mainPath);
+	if (ignore.code !== 0 && ignore.code !== 1)
+		throw new Error(`git check-ignore failed: ${ignore.stderr.trim()}`);
+	if (ignore.code === 0) return { kind: "same" };
+	if (!existsSync(path.join(mainPath, file))) return { kind: "same" };
+	const hash = await git(["hash-object", "-w", "--", file], mainPath);
+	if (hash.code !== 0)
+		throw new Error(`git hash-object failed: ${hash.stderr.trim()}`);
+	const blob = hash.stdout.trim();
+	const parent = await git(
+		["rev-parse", "--verify", `${baseRef}^{commit}`],
+		mainPath,
+	);
+	if (parent.code !== 0)
+		throw new Error(`cannot resolve ${baseRef}: ${parent.stderr.trim()}`);
+	const baseTree = await git(
+		["rev-parse", "--verify", `${baseRef}^{tree}`],
+		mainPath,
+	);
+	if (baseTree.code !== 0)
+		throw new Error(
+			`cannot read the tree of ${baseRef}: ${baseTree.stderr.trim()}`,
+		);
+	const ls = await git(["ls-tree", "-z", baseTree.stdout.trim()], mainPath);
+	if (ls.code !== 0) throw new Error(`git ls-tree failed: ${ls.stderr.trim()}`);
+	// `ls-tree -z` rows: "mode SP type SP sha TAB name\0".
+	const entries = ls.stdout.split("\0").filter((row) => row !== "");
+	const nameOf = (row: string) => row.slice(row.indexOf("\t") + 1);
+	const existing = entries.find((row) => nameOf(row) === file);
+	const existingSha =
+		existing === undefined
+			? null
+			: (existing.slice(0, existing.indexOf("\t")).split(" ")[2] ?? null);
+	if (existingSha === blob) return { kind: "same" };
+	const mode = existing?.split(" ")[0] ?? "100644";
+	const rows =
+		existing !== undefined
+			? entries.map((row) =>
+					row === existing ? `${mode} blob ${blob}\t${file}` : row,
+				)
+			: [...entries, `100644 blob ${blob}\t${file}`].sort((a, b) =>
+					nameOf(a) < nameOf(b) ? -1 : 1,
+				);
+	const tree = await git(
+		["mktree", "-z"],
+		mainPath,
+		undefined,
+		undefined,
+		undefined,
+		`${rows.join("\0")}\0`,
+	);
+	if (tree.code !== 0)
+		throw new Error(`git mktree failed: ${tree.stderr.trim()}`);
+	const commit = await git(
+		[
+			...identityArgs(identity),
+			"commit-tree",
+			tree.stdout.trim(),
+			"-p",
+			parent.stdout.trim(),
+			"-m",
+			message,
+		],
+		mainPath,
+	);
+	if (commit.code !== 0)
+		throw new Error(`git commit-tree failed: ${commit.stderr.trim()}`);
+	const sha = commit.stdout.trim();
+	const ref = await git(["update-ref", `refs/heads/${branch}`, sha], mainPath);
+	if (ref.code !== 0)
+		throw new Error(`git update-ref failed: ${ref.stderr.trim()}`);
+	return { kind: "committed", sha };
+}
+
 /** The branch's unified diff (same base as diffStat), or null when git fails. */
 export async function diffText(
 	worktreePath: string,

@@ -2527,6 +2527,29 @@ describe("interview routes", () => {
 			rmSync(agents);
 		}
 	});
+
+	test("a PR-mode project queues an interview whose prompt forbids commits", async () => {
+		// Retire the live interview card from the test above, as a finished interview would be.
+		for (const t of (await store.listTasks()).filter((t) =>
+			t.prompt.startsWith(RULES_INTERVIEW_MARKER),
+		))
+			await store.updateTask(t.id, { cancelledAt: Date.now(), stage: "done" });
+		await store.setSettings({ prMode: true });
+		try {
+			const res = await post("/api/projects/p1/interview", {});
+			expect(res.status).toBe(200);
+			const task = (await store.listTasks()).find((t) =>
+				t.prompt.startsWith(RULES_INTERVIEW_MARKER),
+			);
+			expect(task).toBeDefined();
+			expect(task!.prompt).toContain("never commit");
+			expect(task!.prompt).toContain("opens the pull request");
+			expect(task!.prompt).not.toContain("commit the fix");
+			expect(task!.prompt).not.toContain("commit it only if we agreed");
+		} finally {
+			await store.setSettings({ prMode: false });
+		}
+	});
 });
 
 describe("board check route", () => {

@@ -29,6 +29,7 @@ import {
 	branchUnpushed,
 	changedFiles,
 	checkedOutBranch,
+	commitFileOnBranch,
 	commitMeta,
 	createWorktree,
 	deleteFailureText,
@@ -4807,6 +4808,155 @@ describe("fetchPrHead (OTTR-755)", () => {
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
+	});
+});
+
+// OTTR-1064: the rules-interview ship step's plumbing commit. Real git throughout: the
+// helper must leave HEAD, the index and the working tree alone while it builds the branch.
+describe("commitFileOnBranch (OTTR-1064)", () => {
+	async function baseRepo(): Promise<{ main: string; base: string }> {
+		const main = repo();
+		await must(main, "init", "-q", "-b", "main");
+		writeFileSync(join(main, "src.txt"), "s");
+		mkdirSync(join(main, "sub"));
+		writeFileSync(join(main, "sub", "nested.txt"), "n");
+		await must(main, "add", ".");
+		await must(main, "commit", "-q", "-m", "init");
+		return { main, base: (await must(main, "rev-parse", "HEAD")).trim() };
+	}
+
+	test("adds the untracked file on a new branch and leaves the checkout alone", async () => {
+		const { main, base } = await baseRepo();
+		writeFileSync(join(main, "AGENTS.md"), "rules v1");
+
+		const r = await commitFileOnBranch(
+			main,
+			"AGENTS.md",
+			"main",
+			"ott/rules",
+			"docs: add AGENTS.md for tracker agents",
+		);
+
+		expect(r).toEqual({ kind: "committed", sha: expect.any(String) });
+		if (r.kind !== "committed") return;
+		// The main checkout never moved: HEAD, index and working tree untouched.
+		expect((await must(main, "rev-parse", "HEAD")).trim()).toBe(base);
+		expect(await must(main, "status", "--porcelain")).toContain("?? AGENTS.md");
+		// The branch holds exactly one commit on top of the base, with the file.
+		expect(
+			(await must(main, "rev-parse", `refs/heads/ott/rules^{commit}`)).trim(),
+		).toBe(r.sha);
+		expect((await must(main, "rev-parse", `${r.sha}^`)).trim()).toBe(base);
+		expect((await must(main, "log", "-1", "--format=%s", r.sha)).trim()).toBe(
+			"docs: add AGENTS.md for tracker agents",
+		);
+		expect(
+			(await must(main, "log", "-1", "--format=%an <%ae>", r.sha)).trim(),
+		).toBe("Ottr <ottr@localhost>");
+		const blob = (await must(main, "rev-parse", `${r.sha}:AGENTS.md`)).trim();
+		expect(blob).toBe(
+			(await must(main, "hash-object", join(main, "AGENTS.md"))).trim(),
+		);
+		// The rest of the base tree survives the mktree rebuild.
+		expect((await must(main, "rev-parse", `${r.sha}:src.txt`)).trim()).toBe(
+			(await must(main, "rev-parse", `${base}:src.txt`)).trim(),
+		);
+		expect(
+			(await must(main, "rev-parse", `${r.sha}:sub/nested.txt`)).trim(),
+		).toBe((await must(main, "rev-parse", `${base}:sub/nested.txt`)).trim());
+	});
+
+	test("reports same when the base already holds the identical blob, without a branch", async () => {
+		const { main, base } = await baseRepo();
+		writeFileSync(join(main, "AGENTS.md"), "rules v1");
+		await must(main, "add", ".");
+		await must(main, "commit", "-q", "-m", "rules");
+
+		const r = await commitFileOnBranch(
+			main,
+			"AGENTS.md",
+			"main",
+			"ott/rules",
+			"docs: x",
+		);
+
+		expect(r).toEqual({ kind: "same" });
+		expect(
+			(
+				await git(
+					["rev-parse", "--verify", "--quiet", "refs/heads/ott/rules"],
+					main,
+				)
+			).code,
+		).not.toBe(0);
+		expect((await must(main, "rev-parse", "HEAD")).trim()).not.toBe(base); // the fixture's own commit
+	});
+
+	test("reports same when the file is git-ignored (the local-only decision)", async () => {
+		const { main } = await baseRepo();
+		await must(main, "config", "core.excludesFile", "");
+		appendFileSync(join(main, ".git", "info", "exclude"), "AGENTS.md\n");
+		writeFileSync(join(main, "AGENTS.md"), "local-only rules");
+
+		const r = await commitFileOnBranch(
+			main,
+			"AGENTS.md",
+			"main",
+			"ott/rules",
+			"docs: x",
+		);
+
+		expect(r).toEqual({ kind: "same" });
+		expect(
+			(
+				await git(
+					["rev-parse", "--verify", "--quiet", "refs/heads/ott/rules"],
+					main,
+				)
+			).code,
+		).not.toBe(0);
+	});
+
+	test("reports same when the file is missing", async () => {
+		const { main } = await baseRepo();
+		expect(
+			await commitFileOnBranch(
+				main,
+				"AGENTS.md",
+				"main",
+				"ott/rules",
+				"docs: x",
+			),
+		).toEqual({
+			kind: "same",
+		});
+	});
+
+	test("replaces an existing base copy and keeps the other entries", async () => {
+		const { main, base } = await baseRepo();
+		writeFileSync(join(main, "AGENTS.md"), "old rules");
+		await must(main, "add", ".");
+		await must(main, "commit", "-q", "-m", "rules");
+		const tracked = (await must(main, "rev-parse", "HEAD")).trim();
+		writeFileSync(join(main, "AGENTS.md"), "rules v2");
+
+		const r = await commitFileOnBranch(
+			main,
+			"AGENTS.md",
+			"main",
+			"ott/rules",
+			"docs: update AGENTS.md for tracker agents",
+		);
+
+		expect(r).toEqual({ kind: "committed", sha: expect.any(String) });
+		if (r.kind !== "committed") return;
+		expect((await must(main, "rev-parse", `${r.sha}^`)).trim()).toBe(tracked);
+		expect((await must(main, "rev-parse", `${r.sha}:AGENTS.md`)).trim()).toBe(
+			(await must(main, "hash-object", join(main, "AGENTS.md"))).trim(),
+		);
+		expect((await must(main, "rev-parse", `${r.sha}:src.txt`)).trim()).toBe(
+			(await must(main, "rev-parse", `${base}:src.txt`)).trim(),
+		);
 	});
 });
 

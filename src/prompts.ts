@@ -651,15 +651,22 @@ export function rulesInterviewPrompt(o: {
 	projectName: string;
 	/** Alignment mode: AGENTS.md exists and contradicting rules must be fixed in place. */
 	existing?: boolean;
+	/** The project ships through pull requests (PR mode on, or the target's branch rule
+	 * requires them): the interview never commits on the main checkout; the board ships
+	 * the written file itself on a card branch and opens the pull request. */
+	shipsThroughPr?: boolean;
 }): string {
 	const mission = o.existing
 		? `This project already has an AGENTS.md. Read it, then fix every rule that contradicts the pipeline below so that autonomous agents can never integrate or release on their own. Change only the contradicting rules and keep the rest of the file. Show me each contradicting rule and your replacement wording with the ask tool (a few questions per round, each with a recommended answer) before changing the file, and look up facts in the repository yourself (build/test commands, CI workflows, release process) instead of asking.`
 		: `This project has no AGENTS.md. The local task tracker (omp-task-tracker) will run autonomous omp agents on it without human review, so the rules must be strict and self-verifying.
 
 Interview me with the ask tool (a few questions per round, each with a recommended answer), and look up facts in the repository yourself (build/test commands, CI workflows, release process) instead of asking.`;
-	const closing = o.existing
-		? `This interview runs as a tracker card in the project's main checkout (no worktree, no merge turn): edit AGENTS.md at the repository root in place. If the file is tracked, commit the fix with a conventional docs: message; if it is untracked, just save it. When the file is in place, call report_outcome with status answered.`
-		: `This interview runs as a tracker card in the project's main checkout (no worktree, no merge turn): write AGENTS.md at the repository root, and commit it only if we agreed it should be tracked. When the file is in place, call report_outcome with status answered.`;
+	const closing =
+		o.shipsThroughPr === true
+			? `This interview runs as a tracker card in the project's main checkout (no worktree, no merge turn): ${o.existing ? "edit AGENTS.md at the repository root in place" : "write AGENTS.md at the repository root"}. The project ships through pull requests, so never commit: save the file only. If we agree the file stays local-only, add /AGENTS.md to .git/info/exclude; otherwise leave it untracked, and the board commits it on a card branch and opens the pull request itself. When the file is in place, call report_outcome with status answered.`
+			: o.existing
+				? `This interview runs as a tracker card in the project's main checkout (no worktree, no merge turn): edit AGENTS.md at the repository root in place. If the file is tracked, commit the fix with a conventional docs: message; if it is untracked, just save it. When the file is in place, call report_outcome with status answered.`
+				: `This interview runs as a tracker card in the project's main checkout (no worktree, no merge turn): write AGENTS.md at the repository root, and commit it only if we agreed it should be tracked. When the file is in place, call report_outcome with status answered.`;
 	return `${RULES_INTERVIEW_MARKER}${o.projectName}
 
 ${mission}

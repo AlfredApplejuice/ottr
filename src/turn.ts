@@ -209,6 +209,7 @@ import type {
 	checkedOutBranch,
 	checkoutState,
 	cleanMergeTree,
+	commitFileOnBranch,
 	commitsAhead,
 	createWorktree,
 	deleteRemoteBranch,
@@ -963,6 +964,12 @@ export interface TurnOps {
 	pushAuthKind?: (url: string) => string | null;
 	/** PR mode: pushes the card branch to the pinned origin from the main checkout (same plumbing as serverMergePush). */
 	pushBranch?: typeof pushBranch;
+	/** OTTR-1064, PR mode's rules interview: builds the board's one-file commit on a card
+	 * branch from the fetched target without touching the main checkout's HEAD, index or
+	 * working tree; "same" when the file is ignored (local-only), missing, or identical to
+	 * the target's copy. Optional like the other PR-mode ops: absent parks with the
+	 * not-wired reason. */
+	commitFileOnBranch?: typeof commitFileOnBranch;
 	/** OTTR-800: deletes the pushed remote card branch when a PR-mode card ends (git() adds the host auth). */
 	deleteRemoteBranch?: typeof deleteRemoteBranch;
 	/** PR mode: adopts or opens the pull request for the card branch (gh via runGh). */
@@ -6879,15 +6886,118 @@ export function createTurnLoop(
 	 * the agent reported. A removed worktree (fromMain) still pushes: its merge is on the
 	 * local branch, and only this push moves it to origin. */
 	async function shipMergeTurn(st: TurnSettle): Promise<void> {
-		if (
-			st.kind !== "merge" ||
-			st.idn.interview ||
-			st.idn.grill ||
-			st.idn.releaseCard
-		)
+		if (st.idn.interview) {
+			await shipInterviewCard(st);
 			return;
+		}
+		if (st.kind !== "merge" || st.idn.grill || st.idn.releaseCard) return;
 		if (st.header.settings.prMode === true) await shipPrCard(st);
 		else await auditMergeHold(st);
+	}
+
+	/** OTTR-1064: a rules interview on a project that ships through pull requests (PR mode
+	 * on, or the target's GitHub branch rule) must not leave a commit on the local main —
+	 * the board never pushes the main checkout there, and the unpushed commits stop every
+	 * later merge (the AWSI-1 incident). The prompt forbids the commit; this settle step
+	 * ships the written file itself: one plumbing commit on a card branch from the fetched
+	 * target (commitFileOnBranch), pushed from the server, then the pull request — the same
+	 * delivery every PR-mode card gets, so the merge watch finishes the card when GitHub
+	 * merges it. An interview that ignored the prompt and committed on the main checkout
+	 * never settles: the card parks with the repair. A protected target without PR mode
+	 * parks too: the board holds no PR to open until the setting is on. A non-PR project
+	 * keeps the old flow: the interview commits on main (classify stays exempt) and the
+	 * next merge turn pushes it. */
+	async function shipInterviewCard(st: TurnSettle): Promise<void> {
+		if (st.header.settings.prMode !== true && st.e.protectedTarget !== true)
+			return;
+		const outcome = st.result.outcome;
+		// An ask-pause keeps prNext null: classify parks the card on the agent's question.
+		if (outcome?.status !== "answered") return;
+		if (!(await canShipPr(st))) return;
+		if (st.task.prNumber !== null) {
+			// A reply on a shipped interview must not re-open the PR; the watch owns the card.
+			st.prNext = { stage: "merging", state: "idle", needsReason: null };
+			return;
+		}
+		const ahead = await ops
+			.commitsAhead(st.loc.wt, st.header.target)
+			.catch((err: unknown) => {
+				st.prNext = {
+					stage: "merging",
+					state: "needs_you",
+					needsReason: `The board could not read how far the main checkout is ahead of ${st.header.target}: ${errmsg(err)}. The rules file ships only when the checkout holds no unpushed commit; repair the checkout and reply.`,
+				};
+				return null;
+			});
+		if (ahead === null) return;
+		if (ahead > 0) {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason: `The interview left the main checkout ${ahead} commit(s) ahead of ${st.header.target}; the board never pushes the main checkout on this project, and the unpushed commits stop every later merge. Undo them (git reset --soft ${st.header.target} keeps the files) or land them another way, then reply.`,
+			};
+			return;
+		}
+		if (st.header.settings.prMode !== true) {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason:
+					"The target branch requires pull requests; turn PR mode on in Settings, then reply, so the board can open the pull request with the rules file.",
+			};
+			return;
+		}
+		const pushBranchOp = ops.pushBranch;
+		const openPrOp = ops.openPr;
+		const commitFileOp = ops.commitFileOnBranch;
+		if (
+			commitFileOp === undefined ||
+			pushBranchOp === undefined ||
+			openPrOp === undefined
+		) {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason:
+					"PR mode is on but the server's ship step is not wired; restart the board",
+			};
+			return;
+		}
+		const branch = `ott/${st.id.toLowerCase()}-${slugify(st.task.title)}`;
+		const onTarget =
+			(await ops
+				.targetSha(st.e.path, `${st.header.target}:AGENTS.md`)
+				.catch(() => null)) !== null;
+		const built = await commitFileOp(
+			st.e.path,
+			"AGENTS.md",
+			st.header.target,
+			branch,
+			onTarget
+				? "docs: update AGENTS.md for tracker agents"
+				: "docs: add AGENTS.md for tracker agents",
+			(await ops.commitIdentity?.()) ?? null,
+		).catch((err: unknown) => {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason: `Building the rules-file commit failed: ${errmsg(err)}`,
+			};
+			return null;
+		});
+		if (!(await canShipPr(st))) return;
+		if (built === null) return;
+		// Local-only (ignored), missing, or already the target's content: nothing to ship,
+		// classify settles the answered report done.
+		if (built.kind === "same") return;
+		await st.store.transaction(async () => {
+			if (!(await canShipPr(st))) return;
+			await st.store.updateTask(st.id, { branch });
+		});
+		await st.log(
+			`- built ${branch} at ${built.sha.slice(0, 7)} with the rules file`,
+		);
+		await pushPrBranch(st, branch, built.sha, pushBranchOp, openPrOp);
 	}
 
 	/** Appends the GitHub-API hint under a bare 401/403; the git error stands alone

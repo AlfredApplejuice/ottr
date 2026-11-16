@@ -146,6 +146,7 @@ import {
 	unsavedWork as realUnsavedWork,
 	worktreeHusk as realWorktreeHusk,
 	setNetworkGitAuth,
+	slugify,
 } from "./worktree.ts";
 
 // ---- fakes -----------------------------------------------------------------
@@ -1185,6 +1186,179 @@ describe("turn loop", () => {
 
 		expect((await store.getTask(task.id))!.stage).toBe("done");
 		expect((await store.listTurns(task.id))[0]!.outcome).toBe("answered");
+	});
+
+	/** A PR-shipped rules interview: prMode on, a GitHub repo, the default answered run. */
+	async function prInterviewSetup(overrides: FixtureOps = {}) {
+		const setup = await setupWith(baseRecord(), {
+			commitsAhead: async () => 0,
+			targetSha: async (_m: string, ref: string) =>
+				// origin/main holds no AGENTS.md yet (the AWSI-1 case): the ship's
+				// subject is "add"; a non-null blob would make it "update".
+				ref.endsWith(":AGENTS.md") ? null : "sha-origin-tip",
+			...overrides,
+		});
+		const e = setup.projects.get(setup.store.name)!;
+		e.github = "https://github.com/acme/repo.git";
+		await setup.store.setSettings({
+			prMode: true,
+			originUrl: "https://github.com/acme/repo.git",
+		});
+		const task = await setup.store.createTask(
+			`${RULES_INTERVIEW_MARKER}demo`,
+			null,
+			"interview",
+		);
+		return { ...setup, e, task };
+	}
+
+	test("a PR-mode interview ships the rules file: the board commits it on a card branch and opens the PR", async () => {
+		const checked: unknown[][] = [];
+		const built: unknown[][] = [];
+		const pushes: unknown[][] = [];
+		const opens: Record<string, unknown>[] = [];
+		const { store, loop, task } = await prInterviewSetup({
+			commitsAhead: async (...args: unknown[]) => {
+				checked.push(args);
+				return 0;
+			},
+			commitFileOnBranch: async (...args: unknown[]) => {
+				built.push(args);
+				return { kind: "committed" as const, sha: "sha-file-commit" };
+			},
+			pushBranch: async (...args: unknown[]) => {
+				pushes.push(args);
+				return { status: "pushed" as const, output: "" };
+			},
+			openPr: async (o) => {
+				opens.push(o as Record<string, unknown>);
+				return {
+					ok: true as const,
+					pr: { number: 7, url: "https://github.com/acme/repo/pull/7" },
+				};
+			},
+		});
+		const branch = `ott/${task.id.toLowerCase()}-${slugify(task.title)}`;
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		// The ship step owns the state: the card waits on its PR like any PR-mode card.
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.prNumber).toBe(7);
+		expect(after.prUrl).toBe("https://github.com/acme/repo/pull/7");
+		expect(after.branch).toBe(branch);
+		// The board proved the main checkout holds no unpushed commit before it shipped.
+		expect(checked).toEqual([[store.path, "origin/main"]]);
+		expect(built).toEqual([
+			[
+				store.path,
+				"AGENTS.md",
+				"origin/main",
+				branch,
+				"docs: add AGENTS.md for tracker agents",
+				null,
+			],
+		]);
+		expect(pushes).toEqual([
+			[store.path, branch, "https://github.com/acme/repo.git"],
+		]);
+		expect(opens).toHaveLength(1);
+		expect(opens[0]).toMatchObject({
+			repo: "acme/repo",
+			owner: "acme",
+			branch,
+			base: "main",
+		});
+	});
+
+	test("an interview that left the main checkout ahead of origin parks instead of settling", async () => {
+		const { store, loop, task } = await prInterviewSetup({
+			commitsAhead: async () => 1,
+			commitFileOnBranch: async () => {
+				throw new Error(
+					"commitFileOnBranch must not run while main sits ahead",
+				);
+			},
+			pushBranch: async () => {
+				throw new Error("pushBranch must not run while main sits ahead");
+			},
+			openPr: async () => {
+				throw new Error("openPr must not run while main sits ahead");
+			},
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("ahead of origin/main");
+		expect(after.prNumber).toBeNull();
+	});
+
+	test("a protected target without PR mode parks the interview until PR mode is on", async () => {
+		const { store, e, loop, task } = await prInterviewSetup({
+			commitFileOnBranch: async () => {
+				throw new Error("commitFileOnBranch must not run without PR mode");
+			},
+		});
+		e.protectedTarget = true;
+		await store.setSettings({ prMode: false });
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("turn PR mode on");
+		expect(after.prNumber).toBeNull();
+	});
+
+	test("an interview with nothing to ship settles done (local-only or already on the target)", async () => {
+		const { store, loop, task } = await prInterviewSetup({
+			commitFileOnBranch: async () => ({ kind: "same" as const }),
+			pushBranch: async () => {
+				throw new Error("pushBranch must not run when nothing ships");
+			},
+			openPr: async () => {
+				throw new Error("openPr must not run when nothing ships");
+			},
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.prNumber).toBeNull();
+	});
+
+	test("a reply on a shipped interview stays merging: the watch owns the open PR", async () => {
+		const { store, loop, task } = await prInterviewSetup({
+			commitFileOnBranch: async () => {
+				throw new Error("commitFileOnBranch must not re-ship an open PR");
+			},
+			pushBranch: async () => {
+				throw new Error("pushBranch must not re-ship an open PR");
+			},
+			openPr: async () => {
+				throw new Error("openPr must not run twice");
+			},
+		});
+		await store.updateTask(task.id, {
+			stage: "merging",
+			prNumber: 7,
+			prUrl: "https://github.com/acme/repo/pull/7",
+			branch: "ott/rules",
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.prNumber).toBe(7);
 	});
 
 	test("the turn row records the agent layer the run pinned", async () => {
