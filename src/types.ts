@@ -419,6 +419,17 @@ export interface PrReviewRow {
 	commentsUnseen: boolean;
 }
 
+/** The watcher's in-memory record of a PR's last draft run; a restart drops it. */
+export interface PrRunState {
+	startedAt: number;
+	/** null while the run is in flight. */
+	endedAt: number | null;
+	/** The skip reason or error text; null when the run saved a draft. */
+	error: string | null;
+	/** The review model the watcher ran: `@plan` on the default path, `custom` when injected. */
+	model: string;
+}
+
 /** The PR facts a pr_review card's drawer shows. */
 export interface PrReviewView {
 	number: number;
@@ -431,6 +442,8 @@ export interface PrReviewView {
 	/** GitHub login the review was posted as (app bot or person); null when unknown. */
 	postedLogin: string | null;
 	postError: string | null;
+	/** The PR's last draft run; null when none ran since the server started. */
+	run: PrRunState | null;
 }
 
 export interface Task {
@@ -1064,6 +1077,8 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	prReview?: PrReviewView;
 	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and the unseen comment stamp that key the bell occurrences. */
 	prOccurrence?: { draft: number | null; comments: number | null };
+	/** OTTR-1073: set only for kind "pr_review". The watcher's last draft run; its start and end change the board row, so an open drawer refetches the detail and the composer's run status moves. */
+	prRun?: PrRunState | null;
 	/** Present on the drawer detail of a release card waiting for approval; commits between the reviewed base and the target head. */
 	lateCommits?: LateCommit[];
 	/** The retro card filed after this card (kind "retro", followUpOf this card); this card's

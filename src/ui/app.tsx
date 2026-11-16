@@ -8832,13 +8832,23 @@ export function PrReviewSection({
 }) {
 	const [body, setBody] = useState(draft ?? "");
 	const [error, setError] = useState<string | null>(null);
-	// Second composer: a note asking for a fresh draft of the current head. `noteFor` holds
-	// what was sent plus the draft at send time, so the hint disappears once new text is
-	// typed or a new draft lands on the card.
+	// A landed draft rewrites the card's details: an unedited box follows the new
+	// draft, an edited one keeps the user's text. Render-phase reset with the guard
+	// React documents for adjusting state on a prop change.
+	const lastDraft = useRef(draft);
+	if (draft !== lastDraft.current) {
+		if (body === lastDraft.current) setBody(draft ?? "");
+		lastDraft.current = draft;
+	}
+	// Second composer: a note asking for a fresh draft of the current head. On success the
+	// field clears and `noteFor` holds the cleared text plus the draft at send time, so the
+	// run status disappears once new text is typed or a new draft lands on the card.
 	const [note, setNote] = useState("");
 	const [noteFor, setNoteFor] = useState<{
 		text: string;
 		draft: string | null;
+		/** The run record the ask started from: its startedAt, or -1 with none. A record newer than this is this ask's run. */
+		runAt: number;
 	} | null>(null);
 	const taskUrl = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}`;
 	const { postedLabel, blocked } = prPostState(
@@ -8849,6 +8859,29 @@ export function PrReviewSection({
 	);
 	const inlineCount = parseReviewDraft(body).comments.length;
 	const shownError = error ?? pr.postError;
+	// The ask composer mirrors the card's last draft run (docs/specs/pr-reviews.md,
+	// "Draft runs"). An ask waits until a run record newer than the one it started
+	// from arrives; that record's end is the result. Without an ask, an in-flight
+	// run (a watcher re-review, say) shows the spinner line, and a clean end that
+	// landed a new draft after an ask shows "New draft ready."; a failed run shows
+	// its error.
+	const run = pr.run;
+	const asked = noteFor !== null && note === noteFor.text;
+	const askedRun =
+		asked && run !== null && noteFor !== null && run.startedAt > noteFor.runAt;
+	const waiting = asked
+		? !askedRun || run.endedAt === null
+		: run !== null && run.endedAt === null;
+	const freshDraft =
+		asked &&
+		askedRun &&
+		run.endedAt !== null &&
+		run.error === null &&
+		draft !== noteFor.draft;
+	const runError =
+		run !== null && run.endedAt !== null && run.error !== null
+			? run.error
+			: null;
 	return (
 		<>
 			<p>
@@ -8923,13 +8956,18 @@ export function PrReviewSection({
 						onChange={(e) => setNote(e.target.value)}
 					/>
 					<div className="reply-actions">
-						{noteFor !== null &&
-							note === noteFor.text &&
-							draft === noteFor.draft && (
-								<span className="dim">
-									The new draft will appear here when it is ready.
-								</span>
-							)}
+						{waiting && (
+							<span className="dim">
+								<span className="spinner" aria-hidden="true" /> Writing a new
+								draft...
+							</span>
+						)}
+						{freshDraft && <span className="dim">New draft ready.</span>}
+						{runError !== null && (
+							<span className="auth-error" role="alert">
+								{runError}
+							</span>
+						)}
 						<BusyButton
 							// Plain, not primary: a done drawer keeps exactly one primary (Post review).
 							disabled={note.trim() === ""}
@@ -8937,8 +8975,13 @@ export function PrReviewSection({
 								act(async () => {
 									setError(null);
 									await post(`${taskUrl}/reply`, { text: note });
-									setNoteFor({ text: note, draft });
 									setNote("");
+									// noteFor.text stays the cleared field: the run status lives
+									// while nothing new is typed, and noteFor.draft pins the
+									// draft at send time so a landed draft ends it. runAt is the
+									// record this ask started from: only a newer record ends the
+									// wait, so a stale ended run never swallows the status.
+									setNoteFor({ text: "", draft, runAt: run?.startedAt ?? -1 });
 								}, setError)
 							}
 						>
@@ -11427,7 +11470,19 @@ function DrawerSteps(p: {
 				{detail === null ? (
 					<DrawerLoading label="Loading the steps" />
 				) : (
-					steps.length === 0 && <p className="dim">No turns yet.</p>
+					steps.length === 0 &&
+					// A pr_review card never runs turns: its Work steps are the card log
+					// itself (the draft-run lines), through the same log view turns use.
+					(task.prReview !== undefined ? (
+						<LogView
+							project={project}
+							taskId={task.id}
+							startedAt={task.createdAt}
+							logOffset={0}
+						/>
+					) : (
+						<p className="dim">No turns yet.</p>
+					))
 				)}
 				<ul className="turns">
 					{steps.map((s, idx) => (

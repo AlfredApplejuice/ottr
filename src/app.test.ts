@@ -17048,6 +17048,8 @@ describe(
 				archReview: null,
 			});
 			const replyPrompts: string[] = [];
+			/** Flipped by the failing-model test; the canned gateway exits nonzero once. */
+			let replyFailGateway = false;
 			/** Same canned read-only GETs as prApiStub, but against the fresh store. */
 			const replyApiStub = async (
 				args: string[],
@@ -17089,6 +17091,8 @@ describe(
 				gh: async (args) =>
 					(await replyApiStub(args)) ?? { code: 0, stdout: "{}", stderr: "" },
 				prReviewSpawn: async (_argv, o) => {
+					if (replyFailGateway)
+						return { code: 1, stdout: "", stderr: "gateway down" };
 					replyPrompts.push(String(o.stdin));
 					return {
 						code: 0,
@@ -17113,7 +17117,11 @@ describe(
 				if (r === null) throw new Error(`no pr_review row ${n}`);
 				return r;
 			};
-			const replyReviewed = async (n: number, head: string): Promise<Task> => {
+			const replyReviewed = async (
+				n: number,
+				head: string,
+				runAt: number = Date.now(),
+			): Promise<Task> => {
 				const prev = await replyStore.getPrReview(n);
 				await replyStore.savePrReview({
 					number: n,
@@ -17133,7 +17141,7 @@ describe(
 					commentsUnseen: false,
 				});
 				return await replyStore.savePrDraft({
-					run: await replyStore.startPrRun(n, head, Date.now()),
+					run: await replyStore.startPrRun(n, head, runAt),
 					number: n,
 					head,
 					draft: "draft",
@@ -17163,6 +17171,71 @@ describe(
 					expect(
 						replyPrompts.some((p) => p.includes("look at ErrorPanel")),
 					).toBe(true);
+				});
+
+				test("a successful reply records the run and writes the card log", async () => {
+					// The fixture run sits 25 h back: outside the cap window, so the reply
+					// itself is the suite's only in-window attempt besides the first test's.
+					const t = await replyReviewed(35, H1, Date.now() - 25 * 3_600_000);
+					const res = await reply(t.id, { text: "look at ErrorPanel" });
+					expect(res.status).toBe(200);
+					await rm.app.prReviewIdle();
+					const view = (await (
+						await rm.call(`/api/projects/pg/tasks/${t.id}`)
+					).json()) as {
+						prReview?: {
+							run?: {
+								startedAt: number;
+								endedAt: number | null;
+								error: string | null;
+								model: string;
+							};
+						};
+					};
+					expect(view.prReview?.run).not.toBeNull();
+					expect(view.prReview!.run!.endedAt).not.toBeNull();
+					expect(view.prReview!.run!.error).toBeNull();
+					// The app never injects a review fn, so the run's model is @plan.
+					const log = readFileSync(await replyStore.logPath(t.id), "utf8");
+					expect(log).toContain("== pr review draft ");
+					expect(log).toContain("(model @plan)");
+					expect(log).toContain("- draft saved ");
+				});
+
+				test("a failing model reply records the error and the failure log line", async () => {
+					const t = await replyReviewed(36, H1, Date.now() - 25 * 3_600_000);
+					replyFailGateway = true;
+					const res = await reply(t.id, { text: "break it" });
+					expect(res.status).toBe(200);
+					await rm.app.prReviewIdle();
+					replyFailGateway = false;
+					const view = (await (
+						await rm.call(`/api/projects/pg/tasks/${t.id}`)
+					).json()) as {
+						prReview?: { run?: { error: string | null } };
+					};
+					// runGateway's nonzero-exit message, stderr included.
+					expect(view.prReview!.run!.error).toContain(
+						"gateway exited with code 1: gateway down",
+					);
+					const log = readFileSync(await replyStore.logPath(t.id), "utf8");
+					expect(log).toContain("! failed ");
+					expect(log).toContain("gateway exited with code 1");
+					// The run state also rides the board row (OTTR-1073): its start and
+					// end are the row change an open drawer refetches its detail on.
+					const state = (await (await rm.call("/api/state")).json()) as {
+						tasks?: Array<{
+							id?: string;
+							prRun?: { endedAt: number | null; error: string | null };
+						}>;
+					};
+					const row = state.tasks?.find((c) => c.id === t.id);
+					expect(row).toBeDefined();
+					// A pr_review row must carry the stamp: the drawer's rowKey compare
+					// needs it to notice the run's start and end.
+					expect(row!.prRun).toBeDefined();
+					expect(row!.prRun!.endedAt).not.toBeNull();
+					expect(row!.prRun!.error).toContain("gateway exited with code 1");
 				});
 
 				test("a pr_review reply respects the daily cap", async () => {
@@ -17733,6 +17806,7 @@ describe(
 					postedUrl: null,
 					postedLogin: null,
 					postError: null,
+					run: null,
 				});
 			});
 

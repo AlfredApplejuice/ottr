@@ -19,7 +19,7 @@ import {
 } from "./prInline.ts";
 import { ownerRepo, runGh } from "./release.ts";
 import { singleFlightTick } from "./singleFlight.ts";
-import type { OpenPrsView, PrReviewRow } from "./types.ts";
+import type { OpenPrsView, PrReviewRow, PrRunState } from "./types.ts";
 
 export type ReviewFn = (
 	messages: Array<{ role: "system" | "user"; content: string }>,
@@ -444,7 +444,7 @@ export interface PrComment {
 
 /** What the model needs to re-review a PR it already reviewed at an earlier head. */
 export interface ReReviewContext {
-	/** The board's earlier review body (posted on GitHub, or the saved draft when never posted). */
+	/** The board's posted earlier review body. */
 	review: string;
 	/** Conversation and review comments newer than the earlier review, oldest first. */
 	comments: PrComment[];
@@ -752,13 +752,11 @@ interface ReReviewInput {
 	postedLogin: string | null;
 	reviewedHead: string | null;
 	head: string;
-	draftBody: string | null;
-	draftAt: number | null;
 }
 
 /** The earlier review a re-review checks the diff against. */
 interface EarlierReview {
-	/** The posted review's body with its inline comments, or the saved draft. */
+	/** The posted review's body with its inline comments. */
 	review: string;
 	/** Comments at or before this timestamp are already answered; null keeps every comment. */
 	cutoff: number | null;
@@ -843,19 +841,11 @@ async function postedReview(
 	};
 }
 
-/** The board's earlier review, or null on a first review (and on a first draft-less one). */
+/** The board's posted earlier review, or null on a first review: an unposted draft never
+ * re-enters the prompt, so a reply to an unposted draft runs like a first review. */
 async function earlierReview(o: ReReviewInput): Promise<EarlierReview | null> {
-	if (o.postedHead !== null)
-		return postedReview(o.gh, o.repo, o.number, o.postedHead, o.postedUrl);
-	if (o.reviewedHead !== null && o.draftBody !== null && o.draftBody !== "") {
-		return {
-			review: o.draftBody,
-			cutoff: o.draftAt,
-			reviewId: null,
-			head: o.reviewedHead,
-		};
-	}
-	return null;
+	if (o.postedHead === null) return null;
+	return postedReview(o.gh, o.repo, o.number, o.postedHead, o.postedUrl);
 }
 
 /** One usable comment, or null when the entry is malformed, already answered, or the posted
@@ -912,10 +902,9 @@ async function commentsAfter(
 }
 
 /**
- * What a re-review of `head` needs: the board's earlier review (the posted GitHub review, or the
- * saved draft when the first review was never posted), the comments newer than it, and the code
- * range between the earlier and the current head. null on a first review, or when the posted
- * review cannot be found on GitHub anymore.
+ * What a re-review of `head` needs: the board's posted earlier review, the comments newer
+ * than it, and the code range between the earlier and the current head. null on a first
+ * review, or when the posted review cannot be found on GitHub anymore.
  */
 export async function fetchReReviewContext(
 	o: ReReviewInput,
@@ -959,6 +948,25 @@ interface PrWatcherCtx {
 	gh: GhFn;
 	now: () => number;
 	review: ReviewFn;
+	/** The review model name for the run records: "custom" on an injected review, else "@plan". */
+	model: string;
+	/** Starts the PR's run record when none is active; an active record keeps its start. */
+	prRunStart: (project: string, number: number) => void;
+	/** Ends the active run record and returns it; a later end is a no-op and returns null. */
+	prRunEnd: (
+		project: string,
+		number: number,
+		error: string | null,
+	) => PrRunState | null;
+	/** The PR's last run record, or null when none ran since the watcher started. */
+	prRun: (project: string, number: number) => PrRunState | null;
+	/** Appends one run line to the PR card's log; optional (absent in bare watchers). */
+	cardLog?: (o: {
+		project: string;
+		taskId: string;
+		number: number;
+		line: string;
+	}) => void | Promise<void>;
 	/** The deterministic lens over one PR diff; defaults to perfFindings. */
 	perfScan: (diff: string, labels: string[]) => PerfFinding[];
 	/** Called with the card id when a re-review rewrites a draft the user may have read. */
@@ -1391,6 +1399,27 @@ async function reviewOnce(
 	reviewsEnabled = true,
 ): Promise<void> {
 	const store = project.store;
+	// The scan flow starts the run record here; an explicit request already started
+	// it, and that record's start time stands.
+	ctx.prRunStart(project.name, row.number);
+	const iso = (): string => new Date(ctx.now()).toISOString();
+	// The card-log lines ride on the row's card. A first review has no card yet and
+	// writes none; the [pr] server log keeps its lines.
+	const runLine = async (line: string): Promise<void> => {
+		if (row.taskId === null || ctx.cardLog === undefined) return;
+		await ctx.cardLog({
+			project: project.name,
+			taskId: row.taskId,
+			number: row.number,
+			line,
+		});
+	};
+	/** Ends the run record and writes its one card-log end line. */
+	const endRun = async (error: string | null, line: string): Promise<void> => {
+		ctx.prRunEnd(project.name, row.number, error);
+		await runLine(line);
+	};
+	await runLine(`== pr review draft ${iso()} (model ${ctx.model})`);
 	const source = await store.transaction(async () => {
 		const current = await store.getPrReview(row.number);
 		const card = row.taskId === null ? null : await store.getTask(row.taskId);
@@ -1405,12 +1434,15 @@ async function reviewOnce(
 			card?.cancelledAt != null
 		)
 			return null;
-		return {
-			card,
-			draftAt: await store.lastPrRunAt(row.number, row.reviewedHead),
-		};
+		return { card };
 	});
-	if (source === null) return;
+	if (source === null) {
+		await endRun(
+			"the pull request or the card changed",
+			`- skipped ${iso()}: the pull request or the card changed`,
+		);
+		return;
+	}
 	// Diff fetch and prompt budget fail the same way for the same head on
 	// every tick: run them before the attempt takes a cap slot, so one such PR cannot
 	// starve the others of the project.
@@ -1425,6 +1457,10 @@ async function reviewOnce(
 		const data = await pullData(repo, row.number, row.head, ctx.gh);
 		if (data === null) {
 			ctx.log(`prs: ${project.name}: #${row.number} moved; next tick`);
+			await endRun(
+				"the head moved on GitHub",
+				`- skipped ${iso()}: the head moved on GitHub`,
+			);
 			return;
 		}
 		diff = data.diff;
@@ -1448,8 +1484,6 @@ async function reviewOnce(
 			postedLogin: row.postedLogin,
 			reviewedHead: row.reviewedHead,
 			head: row.head,
-			draftBody: source.card?.details ?? null,
-			draftAt: source.draftAt,
 		});
 		user = reviewUserMessage({
 			repo,
@@ -1470,10 +1504,12 @@ async function reviewOnce(
 		// OTTR-942: the skip shows on the board, not only in this log line.
 		ctx.recordSkipNotice(project.name, row.number, row.head, reason);
 		ctx.log(`prs: ${project.name}: #${row.number} review skipped: ${reason}`);
+		await endRun(reason, `- skipped ${iso()}: ${reason}`);
 		return;
 	}
 	// The model attempt counts against the cap before the slow call; only a saved draft
 	// marks the head reviewed, so a failed attempt retries on a later tick.
+	let capReached = false;
 	const claim = await store.transaction(async () => {
 		const t = ctx.now();
 		const current = await store.getPrReview(row.number);
@@ -1496,6 +1532,7 @@ async function reviewOnce(
 			(await store.prReviewRunsSince(t - PR_GATES.DAY_MS)) >=
 			PR_GATES.PROJECT_DAILY_RUNS
 		) {
+			capReached = true;
 			ctx.log(
 				`prs: ${project.name}: daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
 			);
@@ -1506,7 +1543,18 @@ async function reviewOnce(
 			revision: card?.revision,
 		};
 	});
-	if (claim === null) return;
+	if (claim === null) {
+		if (capReached) {
+			const cap = `daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`;
+			await endRun(cap, `- stopped ${iso()}: ${cap}`);
+		} else {
+			await endRun(
+				"the pull request or the card changed",
+				`- skipped ${iso()}: the pull request or the card changed`,
+			);
+		}
+		return;
+	}
 	const { run } = claim;
 	try {
 		// The verdict comes out before the fit, so a block the fit moves can never carry
@@ -1556,13 +1604,26 @@ async function reviewOnce(
 			});
 			return true;
 		});
-		if (!saved) return;
+		if (!saved) {
+			await endRun(
+				"the pull request or the card changed",
+				`- skipped ${iso()}: the pull request or the card changed`,
+			);
+			return;
+		}
 		// Notify only after the guarded draft transaction succeeds.
 		if (row.taskId !== null) await ctx.forgetSeen?.(row.taskId);
-	} catch (e) {
-		ctx.log(
-			`prs: ${project.name}: #${row.number} review failed: ${(e as Error).message}`,
+		ctx.prRunEnd(project.name, row.number, null);
+		const startedAt = ctx.prRun(project.name, row.number)?.startedAt;
+		const took = Math.max(
+			0,
+			Math.round((ctx.now() - (startedAt ?? ctx.now())) / 1000),
 		);
+		await runLine(`- draft saved ${iso()} (took ${took}s)`);
+	} catch (e) {
+		const error = (e as Error).message;
+		ctx.log(`prs: ${project.name}: #${row.number} review failed: ${error}`);
+		await endRun(error, `! failed ${iso()}: ${error}`);
 	}
 }
 
@@ -1629,8 +1690,12 @@ async function requestReview(
 	o: { project: string; number: number; note: string },
 ): Promise<void> {
 	const project = [...ctx.projects()].find((p) => p.name === o.project);
+	// The explicit request is one run from here on: the record ends as a skip on
+	// every early exit below, and reviewOnce carries it to the end.
+	ctx.prRunStart(o.project, o.number);
 	if (!project || project.github === null) {
 		ctx.log(`prs: ${o.project}: no such project with GitHub reviews`);
+		ctx.prRunEnd(o.project, o.number, "no such project with GitHub reviews");
 		return;
 	}
 	let repo: string;
@@ -1638,6 +1703,7 @@ async function requestReview(
 		repo = repoForProject(project.github);
 	} catch (e) {
 		ctx.log(`prs: ${project.name}: ${(e as Error).message}`);
+		ctx.prRunEnd(o.project, o.number, (e as Error).message);
 		return;
 	}
 	const store = project.store;
@@ -1651,6 +1717,11 @@ async function requestReview(
 		ctx.log(
 			`prs: ${project.name}: #${o.number} failed (${r.code}): ${r.stderr.slice(0, 300)}`,
 		);
+		ctx.prRunEnd(
+			o.project,
+			o.number,
+			`failed (${r.code}): ${r.stderr.slice(0, 300)}`,
+		);
 		return;
 	}
 	let head: string;
@@ -1661,10 +1732,12 @@ async function requestReview(
 		({ head, draft, title, ref } = prHeadInfo(r.stdout));
 	} catch (e) {
 		ctx.log(`prs: ${project.name}: #${o.number}: ${(e as Error).message}`);
+		ctx.prRunEnd(o.project, o.number, (e as Error).message);
 		return;
 	}
 	if (original === null) {
 		ctx.log(`prs: ${project.name}: #${o.number} is not watched`);
+		ctx.prRunEnd(o.project, o.number, "is not watched");
 		return;
 	}
 	// The project's own PR-mode work: a review here would answer the board itself.
@@ -1673,8 +1746,10 @@ async function requestReview(
 		ctx.log(
 			`prs: ${project.name}: #${o.number} is this project's own PR; not reviewed`,
 		);
+		ctx.prRunEnd(o.project, o.number, "is this project's own PR; not reviewed");
 		return;
 	}
+	let cancelled = false;
 	const updated = await store.transaction(async () => {
 		const row = await store.getPrReview(o.number);
 		if (
@@ -1687,6 +1762,7 @@ async function requestReview(
 			return null;
 		const card = row.taskId === null ? null : await store.getTask(row.taskId);
 		if (card?.cancelledAt != null) {
+			cancelled = true;
 			ctx.log(`prs: ${project.name}: #${o.number} card is cancelled`);
 			return null;
 		}
@@ -1701,7 +1777,14 @@ async function requestReview(
 		await store.savePrReview(next);
 		return next;
 	});
-	if (updated === null) return;
+	if (updated === null) {
+		ctx.prRunEnd(
+			o.project,
+			o.number,
+			cancelled ? "card is cancelled" : "the pull request or the card changed",
+		);
+		return;
+	}
 	await reviewOnce(ctx, project, repo, updated, o.note, reviewsEnabled);
 }
 
@@ -1726,6 +1809,15 @@ export function createPrWatcher(deps: {
 	 * drains it, rejections are logged). Defaults to a direct tick whose rejection the
 	 * watcher logs. */
 	runQuiet?: (project: string) => Promise<void> | void;
+	/** Appends one draft-run line to the card's log so the drawer live-updates; the card exists only when the row has a task. */
+	cardLog?: (o: {
+		project: string;
+		taskId: string;
+		number: number;
+		line: string;
+	}) => void | Promise<void>;
+	/** OTTR-1073: called when a run record actually starts or ends. The record is in-memory state, so a quiet board needs this edge to rebuild the frame the drawer compares. */
+	runEdge?: () => void;
 }): {
 	tick(opts?: { manual?: string }): Promise<void>;
 	reviewNow(o: {
@@ -1739,12 +1831,46 @@ export function createPrWatcher(deps: {
 	/** OTTR-942: the board's notice lines for skipped PR reviews, one per PR and
 	 * head ("p: PR #N review skipped: <reason>"), oldest first. */
 	skipNotices(): string[];
+	/** The PR's last draft run in memory, or null when none ran since the watcher started. */
+	prRun(project: string, number: number): PrRunState | null;
 } {
 	const gh = deps.gh ?? runGh;
 	const log = deps.log;
 	const now = deps.now ?? Date.now;
 	const review: ReviewFn =
 		deps.review ?? ((m) => runGateway(m, deps.spawn, undefined, "@plan"));
+	// The run records name the review model: "custom" only on an injected review.
+	const model = deps.review !== undefined ? "custom" : "@plan";
+	// The in-memory record of each PR's last draft run: a start keeps an active
+	// record's start time, the first end wins, and a later start overwrites the
+	// ended record. A restart drops every record; the card log keeps the history.
+	const prRuns = new Map<string, PrRunState>();
+	const prRunStart = (project: string, number: number): void => {
+		const key = `${project}/${number}`;
+		const active = prRuns.get(key);
+		if (active !== undefined && active.endedAt === null) return;
+		prRuns.set(key, {
+			startedAt: now(),
+			endedAt: null,
+			error: null,
+			model,
+		});
+		deps.runEdge?.();
+	};
+	const prRunEnd = (
+		project: string,
+		number: number,
+		error: string | null,
+	): PrRunState | null => {
+		const active = prRuns.get(`${project}/${number}`);
+		if (active === undefined || active.endedAt !== null) return null;
+		active.endedAt = now();
+		active.error = error;
+		deps.runEdge?.();
+		return active;
+	};
+	const prRun = (project: string, number: number): PrRunState | null =>
+		prRuns.get(`${project}/${number}`) ?? null;
 	// OTTR-942: one board notice per skipped PR review, keyed by project, number and
 	// head, so a second scan of the same head writes no second notice. The list is
 	// bounded and holds no TTL: the notice stays while the same head keeps skipping,
@@ -1791,6 +1917,11 @@ export function createPrWatcher(deps: {
 		gh,
 		now,
 		review,
+		model,
+		prRunStart,
+		prRunEnd,
+		prRun,
+		cardLog: deps.cardLog,
 		perfScan: deps.perfScan ?? perfFindings,
 		forgetSeen: deps.forgetSeen,
 		recordSkipNotice,
@@ -1861,5 +1992,6 @@ export function createPrWatcher(deps: {
 		},
 		/** The bell's notice lines for skipped PR reviews, oldest first. */
 		skipNotices: () => skipNotices.map((n) => n.text),
+		prRun,
 	};
 }

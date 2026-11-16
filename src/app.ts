@@ -360,6 +360,7 @@ import {
 	type TrendingState,
 } from "./trending.ts";
 import {
+	appendLog,
 	type CancelOutcome,
 	type FinishKeptOutcome,
 	FORK_HOLD_REASON,
@@ -3038,6 +3039,16 @@ export async function createApp(deps: AppDeps) {
 				ids.filter((id) => id !== taskId && !id.startsWith(`${taskId}@`)),
 			);
 		},
+		// Draft-run lines land on the card log, so the drawer's log view live-updates
+		// while a run is in flight; a run with no card yet writes nothing here.
+		cardLog: async ({ project, taskId, line }) => {
+			const store = deps.projects.get(project)?.store;
+			if (store === undefined) return;
+			await appendLog(store, taskId, line);
+		},
+		// A run's start and end are in-memory state: without this edge a quiet board
+		// never rebuilds the frame, and the composer's status would hang on stale data.
+		runEdge: () => publishSoon(),
 	});
 
 	// Issue watcher: same live project Map; files new open GitHub issues as backlog cards.
@@ -5413,6 +5424,17 @@ export async function createApp(deps: AppDeps) {
 			ctx.facts.pr.has(t.id)
 				? { prOccurrence: ctx.facts.pr.get(t.id) }
 				: {}),
+			// OTTR-1073: the draft-run record rides the row, so a run's start and end
+			// change the row an open drawer compares: the drawer refetches its detail
+			// and the composer's run status moves without a store write.
+			...(t.kind === "pr_review"
+				? {
+						prRun: await (async () => {
+							const pr = await e.store.getPrReviewByTask(t.id);
+							return pr === null ? null : prWatcher.prRun(e.name, pr.number);
+						})(),
+					}
+				: {}),
 		};
 	}
 	/** Names the queued merges each open release holds on the release card, so the board
@@ -5863,6 +5885,7 @@ export async function createApp(deps: AppDeps) {
 							postedUrl: pr.postedUrl,
 							postedLogin: pr.postedLogin,
 							postError: pr.postError,
+							run: prWatcher.prRun(e.name, pr.number),
 						},
 					}
 				: {}),

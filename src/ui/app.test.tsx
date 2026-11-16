@@ -12,6 +12,7 @@ import type {
 	ProjectView,
 	ProposalSummary,
 	PrReviewView,
+	PrRunState,
 	ReleasePlan,
 	StateResponse,
 	Task,
@@ -4278,6 +4279,7 @@ describe("Drawer approve button", () => {
 				postedLogin: null,
 				postedUrl: null,
 				postError: null,
+				run: null,
 			},
 		} as Partial<TaskCard>);
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
@@ -5517,6 +5519,7 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		postedUrl: null,
 		postedLogin: null,
 		postError: null,
+		run: null,
 	});
 
 	test("an open pr_review drawer shows the ask-for-draft composer", () => {
@@ -5650,6 +5653,559 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		expect(two).toContain('aria-describedby="pr-review-inline"');
 		const none = section(waitingReview(), "## Summary\nfine");
 		expect(none).toMatch(/id="pr-review-inline"[^>]*>No inline comments/);
+	});
+
+	// The ask composer mirrors the card's last draft run (docs/specs/pr-reviews.md,
+	// "Draft runs"): in flight shows the spinner line, a failed run shows its error,
+	// and a clean end without an ask renders no stale status.
+	test("a draft run in flight shows Writing a new draft beside the composer", () => {
+		const html = section(waitingReview(), "## Summary\nreview", {
+			...prView("open"),
+			run: { startedAt: 1_000, endedAt: null, error: null, model: "@plan" },
+		});
+		expect(html).toContain("Writing a new draft...");
+		expect(html).toMatch(
+			/class="dim"><span class="spinner" aria-hidden="true"><\/span> Writing/,
+		);
+		expect(html).not.toContain("New draft ready.");
+	});
+
+	test("a failed draft run shows its error with role alert", () => {
+		const html = section(waitingReview(), "## Summary\nreview", {
+			...prView("open"),
+			run: {
+				startedAt: 1_000,
+				endedAt: 1_500,
+				error: "gateway down",
+				model: "@plan",
+			},
+		});
+		expect(html).toContain('role="alert"');
+		expect(html).toContain("gateway down");
+		expect(html).not.toContain("Writing a new draft...");
+		expect(html).not.toContain("New draft ready.");
+	});
+
+	test("a clean ended run without an ask renders no stale status", () => {
+		const html = section(waitingReview(), "## Summary\nreview", {
+			...prView("open"),
+			run: {
+				startedAt: 1_000,
+				endedAt: 1_500,
+				error: null,
+				model: "@plan",
+			},
+		});
+		expect(html).not.toContain("Writing a new draft...");
+		expect(html).not.toContain("New draft ready.");
+	});
+});
+
+// The run status after a real ask needs the noteFor state, so these tests mount
+// PrReviewSection on happy-dom (the same swap as the drawer mount tests above).
+describe("PR review draft-run status on a mounted ask composer", () => {
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	const project = {
+		name: "proj",
+		hasRules: true,
+		github: null,
+		sessionsDir: "/tmp/sessions",
+		settings: { maxParallel: 1 },
+	} as unknown as ProjectView;
+	const drawerBase = {
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		projects: [],
+		read: true,
+		onMarkUnread: () => {},
+		onMarkSeen: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+	const prView = (run: PrRunState | null): PrReviewView => ({
+		number: 7,
+		url: "https://github.com/acme/widget/pull/7",
+		state: "open",
+		reviewedHead: "c".repeat(40),
+		postedHead: null,
+		postedUrl: null,
+		postedLogin: null,
+		postError: null,
+		run,
+	});
+	const draft = "## Summary\nreview";
+	const card = (): TaskCard =>
+		cardFixture({
+			...({
+				kind: "pr_review",
+				report: null,
+				details: draft,
+				branch: null,
+				model: null,
+				worktree: null,
+				sessionId: null,
+				images: [],
+				pendingImages: [],
+				shots: [],
+				keptFiles: [],
+				workCheckLog: [],
+			} as unknown as Partial<TaskCard>),
+			id: "P-5",
+			stage: "in_progress",
+			state: "needs_you",
+			prReview: prView(null),
+		});
+	const view = (cardRow: TaskCard): TaskView => ({
+		...cardRow,
+		turns: [],
+		details: draft,
+		report: null,
+		diffFiles: null,
+		prompt: "review the draft",
+		summary: null,
+		gate: null,
+		workCheckLog: [],
+		workCheckReport: null,
+	});
+	/** The React prop handler on a node; happy-dom events never reach React's plugins. */
+	const propOf = (
+		node: Element,
+		name: "onClick" | "onChange",
+	): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const fn = (
+			(node as unknown as Record<string, unknown>)[key] as Record<
+				string,
+				((e: unknown) => void) | undefined
+			>
+		)[name];
+		if (fn === undefined) throw new Error(`node has no ${name}`);
+		return fn;
+	};
+	// Minimal Act: run the work, hand a failure to the composer's inline error.
+	const actProp = async (
+		fn: () => Promise<void>,
+		onError?: (message: string) => void,
+	): Promise<boolean> => {
+		try {
+			await fn();
+		} catch (e) {
+			onError?.(e instanceof Error ? e.message : String(e));
+			return false;
+		}
+		return true;
+	};
+
+	test("an ask shows Writing a new draft, then the failed run's error", async () => {
+		const realFetch = globalThis.fetch;
+		const posts: { url: string; body: string }[] = [];
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			if (url.endsWith("/tasks/P-5/reply") && init?.method === "POST") {
+				posts.push({ url, body: String(init.body) });
+				return new Response(JSON.stringify({ ok: true }));
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView(null)}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			const note = container.querySelector(
+				"#pr-review-note",
+			) as unknown as HTMLTextAreaElement;
+			expect(note).not.toBeNull();
+			await act(async () => {
+				propOf(note, "onChange")({ target: { value: "Cover the retry path" } });
+			});
+			const ask = [...container.querySelectorAll("button")].find(
+				(b) => b.textContent === "Ask for draft",
+			);
+			expect(ask).toBeDefined();
+			await act(async () => {
+				propOf(ask as unknown as Element, "onClick")({});
+			});
+			// The POST answered and no run record reached the view yet: the spinner
+			// line shows, the field is cleared, and the note went out as the reply.
+			expect(container.textContent).toContain("Writing a new draft...");
+			expect(note.value).toBe("");
+			expect(posts).toHaveLength(1);
+			expect(JSON.parse(posts[0]!.body)).toEqual({
+				text: "Cover the retry path",
+			});
+			// The run record arrives ended with an error: the spinner line gives way
+			// to the error, still keyed to the untouched field.
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 1_000,
+							endedAt: 1_500,
+							error: "gateway down",
+							model: "@plan",
+						})}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			expect(container.textContent).toContain("gateway down");
+			expect(container.textContent).not.toContain("Writing a new draft...");
+			const alert = container.querySelector('[role="alert"]');
+			expect(alert?.textContent).toBe("gateway down");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("a landed draft flips the status to New draft ready, typing hides it", async () => {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ ok: true }))) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView(null)}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			const note = container.querySelector(
+				"#pr-review-note",
+			) as unknown as HTMLTextAreaElement;
+			await act(async () => {
+				propOf(note, "onChange")({ target: { value: "Look at the loop" } });
+			});
+			const ask = [...container.querySelectorAll("button")].find(
+				(b) => b.textContent === "Ask for draft",
+			);
+			await act(async () => {
+				propOf(ask as unknown as Element, "onClick")({});
+			});
+			// The run ended clean and its draft landed on the card: the new draft is
+			// the one the drawer now holds, so the status names it ready.
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 2_000,
+							endedAt: 2_400,
+							error: null,
+							model: "@plan",
+						})}
+						draft={"## Summary\nrewritten review"}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			expect(container.textContent).toContain("New draft ready.");
+			expect(container.textContent).not.toContain("Writing a new draft...");
+			// The unedited review box follows the landed draft.
+			const box = container.querySelector(
+				"#pr-review-text",
+			) as unknown as HTMLTextAreaElement;
+			expect(box.value).toBe("## Summary\nrewritten review");
+			// Typing the next ask hides the landed status again.
+			await act(async () => {
+				propOf(note, "onChange")({ target: { value: "One more pass" } });
+			});
+			expect(container.textContent).not.toContain("New draft ready.");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("an edited review box keeps the user's text when a draft lands", async () => {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ ok: true }))) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView(null)}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			const box = container.querySelector(
+				"#pr-review-text",
+			) as unknown as HTMLTextAreaElement;
+			await act(async () => {
+				propOf(box, "onChange")({ target: { value: "my own edit" } });
+			});
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 2_000,
+							endedAt: 2_400,
+							error: null,
+							model: "@plan",
+						})}
+						draft="## Summary\nrewritten review"
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			// The user's edit wins over the landed draft. No status shows: this flow
+			// never asked for a draft, and a clean run without an ask is no news.
+			expect(
+				(
+					container.querySelector(
+						"#pr-review-text",
+					) as unknown as HTMLTextAreaElement
+				).value,
+			).toBe("my own edit");
+			expect(container.textContent).not.toContain("New draft ready.");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("a second ask waits past the stale ended record and shows the new run", async () => {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ ok: true }))) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			// The card already holds a clean ended run from an earlier ask.
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 1_000,
+							endedAt: 1_400,
+							error: null,
+							model: "@plan",
+						})}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			const note = container.querySelector(
+				"#pr-review-note",
+			) as unknown as HTMLTextAreaElement;
+			await act(async () => {
+				propOf(note, "onChange")({ target: { value: "Second pass" } });
+			});
+			const ask = [...container.querySelectorAll("button")].find(
+				(b) => b.textContent === "Ask for draft",
+			);
+			await act(async () => {
+				propOf(ask as unknown as Element, "onClick")({});
+			});
+			// The stale ended record must not end the wait before the new run lands.
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 1_000,
+							endedAt: 1_400,
+							error: null,
+							model: "@plan",
+						})}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			expect(container.textContent).toContain("Writing a new draft...");
+			// The ask's own run arrives, still in flight: the spinner stays.
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 2_000,
+							endedAt: null,
+							error: null,
+							model: "@plan",
+						})}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			expect(container.textContent).toContain("Writing a new draft...");
+			// It ends failed: the error replaces the spinner.
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 2_000,
+							endedAt: 2_400,
+							error: "gateway down",
+							model: "@plan",
+						})}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			expect(container.textContent).toContain("gateway down");
+			expect(container.textContent).not.toContain("Writing a new draft...");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	// A pr_review card has no turns: its Work steps section shows the card log
+	// through LogView, so the draft-run lines live-update like a turn's output.
+	test("a pr_review drawer's Work steps show the card log, not No turns yet", async () => {
+		const realFetch = globalThis.fetch;
+		const logText =
+			"== pr review draft 2026-11-16T10:00:00.000Z (model @plan)\n" +
+			"- draft saved 2026-11-16T10:00:30.000Z (took 30s)\n";
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.endsWith("/tasks/P-5")) {
+				return new Response(JSON.stringify(view(card())), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			if (url.endsWith("/tasks/P-5/context")) {
+				return new Response(JSON.stringify({ context: null }));
+			}
+			if (url.includes("/tasks/P-5/log?")) {
+				return new Response(logText, {
+					headers: {
+						"X-Log-Size": String(new TextEncoder().encode(logText).length),
+					},
+				});
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(<Drawer {...drawerBase} task={card()} />);
+			});
+			await act(async () => {
+				await Bun.sleep(10);
+			});
+			const log = container.querySelector("#drawer-steps pre.log");
+			expect(log).not.toBeNull();
+			expect(log?.textContent).toContain("== pr review draft");
+			expect(log?.textContent).toContain("draft saved");
+			expect(container.textContent).not.toContain("No turns yet.");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
 	});
 });
 

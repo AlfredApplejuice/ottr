@@ -3681,28 +3681,6 @@ export class ProjectStore {
 		});
 	}
 
-	/**
-	 * The latest done run's start for this number+head: a never-posted draft's re-review cutoff.
-	 * null when none (a null head was never reviewed); undone runs count as no review yet.
-	 */
-	async lastPrRunAt(
-		number: number,
-		head: string | null,
-	): Promise<number | null> {
-		return this.queue.run(async () => {
-			if (head === null) return null;
-			return (
-				(
-					await this.db
-						.query<{ started_at: number }, [number, string]>(
-							"SELECT started_at FROM pr_review_runs WHERE number = ? AND head = ? AND done = 1 ORDER BY started_at DESC LIMIT 1",
-						)
-						.get(number, head)
-				)?.started_at ?? null
-			);
-		});
-	}
-
 	/** Counts one review attempt (the daily cap) before the model call; returns its run id. */
 	async startPrRun(number: number, head: string, at: number): Promise<number> {
 		return this.queue.transaction(async () => {
