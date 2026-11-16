@@ -8862,17 +8862,19 @@ export function PrReviewSection({
 	// "Draft runs"). The run record alone drives the result: an in-flight run shows
 	// the spinner line (asked or watcher-run), a clean end names the draft ready,
 	// a failed end shows its error. `noteFor` only bridges the gap between the ask
-	// click and the record's arrival, and a stale ended record never masks a new
-	// ask's wait.
+	// click and the record's arrival. The wait is exclusive: while this ask waits
+	// for its own run — the run record may still be an older run's, and explicit
+	// requests serialize — the stale result of that earlier run stays hidden.
 	const run = pr.run;
 	const waiting =
 		(run !== null && run.endedAt === null) ||
 		(noteFor !== null &&
 			note === noteFor.text &&
 			(run === null || run.startedAt <= noteFor.runAt));
-	const freshDraft = run !== null && run.endedAt !== null && run.error === null;
+	const freshDraft =
+		!waiting && run !== null && run.endedAt !== null && run.error === null;
 	const runError =
-		run !== null && run.endedAt !== null && run.error !== null
+		!waiting && run !== null && run.endedAt !== null && run.error !== null
 			? run.error
 			: null;
 	return (

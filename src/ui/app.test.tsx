@@ -6156,6 +6156,9 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 				);
 			});
 			expect(container.textContent).toContain("Writing a new draft...");
+			// The wait is exclusive: the stale record's result must not show beside
+			// the spinner while this ask waits for its own run.
+			expect(container.textContent).not.toContain("New draft ready.");
 			// The ask's own run arrives, still in flight: the spinner stays.
 			await act(async () => {
 				root.render(
