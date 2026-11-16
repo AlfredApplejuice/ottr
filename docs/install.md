@@ -186,6 +186,26 @@ Podman Desktop shows no containers, or the board times out after you recreate th
 
 ### After the first start
 
+After the server binds successfully, foreground `docker compose up` shows a
+**Startup access** banner with the Ottr URL (including a custom `OTTR_PORT`), the
+bundled Alate dashboard URL, and login instructions. At the operator's request,
+the self-hosted banner also prints the Compose `ALATE_API_KEY` for Alate login.
+Keep startup logs private; anyone with that key can use the Alate API. Ottr uses
+the admin name/password created on first visit, not an API key; passwords and
+worker/provider tokens are not printed. Detached `up -d` hides application logs;
+read the banner with `docker compose logs --tail 30 server`. The bundled Alate
+service is available when the `alate` profile runs; external servers use their
+own dashboard URL and key.
+
+With the bundled profile enabled, Compose waits for Alate's `/health` endpoint
+before starting Ottr. This prevents the boot-time `GET http://alate:4570/api/updates`
+pull from racing Alate's listener. With the profile off, Ottr can still use an
+external Alate server configured in **Settings → Alate**.
+
+For source deployments, wait until no turns run, then rebuild and recreate with
+`docker compose up --build --force-recreate` after updating the checkout. Existing
+named volumes remain intact; do not use `down -v` to refresh an image.
+
 The `VACUUM INTO` line copies the host omp `agent.db` only when the snapshot does not exist yet. The server and the workers write to the snapshot, so the host db stays unchanged. Do not copy the host db over the snapshot again: sign the stack in under **Settings → Provider sign-in** ([docs/WORKERS.md](WORKERS.md#env-settings) tells why).
 
 No data repo yet? Alate's `create-data-repo` skill builds a private one from the omp setup on your machine: install it with `npx skills add ottr-ai/alate --skill create-data-repo`, then ask your agent to run it. It scans for secrets first and asks before every step that leaves your machine (see [Alate, Start from your current setup](https://github.com/ottr-ai/alate#start-from-your-current-setup)).
