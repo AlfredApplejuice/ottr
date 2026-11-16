@@ -479,14 +479,25 @@ async function heldMergeOnBranchTip(
 		: `card #${parked.id} parks a held merge that is still the local tip of refs/heads/${branch} (its park could not reset the branch); resolve that card and reset the branch to origin first`;
 }
 
-/** PR mode: the pull request body — the integrated report's summary/details (whichever
- * non-empty), the task id, and a footer naming Ottr as the opener. */
-function prBody(task: Task, outcome: Outcome | null): string {
+/** PR mode: the pull request body — the merge turn's prBody field when the agent set one,
+ * else the integrated report's summary/details (whichever non-empty); both carry the task
+ * id and a footer naming Ottr as the opener. fallback=true names the summary/details
+ * source, so the call site can log the fallback on the card. */
+function prBody(
+	task: Task,
+	outcome: Outcome | null,
+): { body: string; fallback: boolean } {
+	const footer = `\n\nTask: ${task.id}\n\n---\n<sub>Opened by [Ottr](https://github.com/ottr-ai/ottr), an AI coding-agent tracker.</sub>`;
+	const agent = outcome?.prBody?.trim() ?? "";
+	if (agent !== "") return { body: `${agent}${footer}`, fallback: false };
 	const report = [outcome?.summary ?? "", outcome?.details ?? ""]
 		.map((s) => s.trim())
 		.filter((s) => s !== "")
 		.join("\n\n");
-	return `${report !== "" ? report : "Integrated the card branch."}\n\nTask: ${task.id}\n\n---\n<sub>Opened by [Ottr](https://github.com/ottr-ai/ottr), an AI coding-agent tracker.</sub>`;
+	return {
+		body: `${report !== "" ? report : "Integrated the card branch."}${footer}`,
+		fallback: true,
+	};
 }
 
 /** The ready report text a work check judges: the outcome's summary and details, else the
@@ -7535,6 +7546,11 @@ export function createTurnLoop(
 			};
 			return;
 		}
+		const prBodyInfo = prBody(st.task, st.result.outcome);
+		if (prBodyInfo.fallback)
+			await st.log(
+				"- the merge turn sent no prBody: the follow-up pull request body falls back to the report's summary and details",
+			);
 		const opened = await ops
 			.openPr?.({
 				repo,
@@ -7542,7 +7558,7 @@ export function createTurnLoop(
 				branch: prBranch,
 				base,
 				title: st.task.title,
-				body: `${prBody(st.task, st.result.outcome)}\n\nFixes beyond source PR #${n} (${src.url ?? "URL unknown"}); base ${base} so they land ${withBump ? "with the bump" : "after the bump merges"}.`,
+				body: `${prBodyInfo.body}\n\nFixes beyond source PR #${n} (${src.url ?? "URL unknown"}); base ${base} so they land ${withBump ? "with the bump" : "after the bump merges"}.`,
 				// Hosted: gh takes the project's minted token, never GH_TOKEN.
 				...(ops.hosted !== undefined && {
 					gh: await hostedGh(st.e.path, st.header.settings.originUrl),
@@ -7829,13 +7845,18 @@ export function createTurnLoop(
 				? await hostedGh(st.e.path, st.header.settings.originUrl)
 				: undefined;
 		if (!(await canShipPr(st))) return;
+		const prBodyInfo = prBody(st.task, st.result.outcome);
+		if (prBodyInfo.fallback)
+			await st.log(
+				"- the merge turn sent no prBody: the pull request body falls back to the report's summary and details",
+			);
 		const opened = await openPr({
 			repo,
 			owner: repo.slice(0, slash),
 			branch: prBranch,
 			base: st.header.target.replace(/^origin\//, ""),
 			title: st.task.title,
-			body: prBody(st.task, st.result.outcome),
+			body: prBodyInfo.body,
 			// Hosted: gh takes the project's minted token, never GH_TOKEN.
 			...(gh !== undefined && { gh }),
 		}).catch((err: unknown) => ({

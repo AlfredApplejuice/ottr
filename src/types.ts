@@ -174,6 +174,8 @@ export interface Outcome {
 	shots?: string[];
 	/** Cards this turn waits for (report_outcome dependsOn): the tracker restarts the card when each is done or cancelled. */
 	dependsOn?: string[];
+	/** PR mode only: the pull request body the merge turn wrote for the PR the server opens; missing or blank = the PR body falls back to the report text. */
+	prBody?: string;
 }
 
 /** Repo facts for the onboarding fork panel; built by forkSummary (src/forks.ts). */

@@ -944,7 +944,8 @@ function isOutcome(v: unknown): v is Outcome {
 				o.shots.every((s: unknown) => typeof s === "string"))) &&
 		(o.dependsOn === undefined ||
 			(Array.isArray(o.dependsOn) &&
-				o.dependsOn.every((d: unknown) => typeof d === "string")))
+				o.dependsOn.every((d: unknown) => typeof d === "string"))) &&
+		(o.prBody === undefined || typeof o.prBody === "string")
 	);
 }
 

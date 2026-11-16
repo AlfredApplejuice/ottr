@@ -1032,6 +1032,7 @@ describe("arch-review changed-line coverage", () => {
 			"question",
 			"shots",
 			"dependsOn",
+			"prBody",
 		]);
 	});
 

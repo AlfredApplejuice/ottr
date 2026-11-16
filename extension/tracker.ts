@@ -637,6 +637,13 @@ export default function (pi: Pi) {
 				.describe(
 					"Ids of cards that must be done (or cancelled) before this card's next turn starts: this project's task ids, or another project's PROJECT-N id (its task-id prefix). A needs_you outcome with dependsOn requeues the card in its current stage instead of parking at needs_you; the tracker restarts the turn when they finish. A turn that must wait for a card it filed with create_task passes that id here.",
 				),
+			// PR mode merge turns only: the server opens the PR with this body after the report.
+			prBody: z
+				.string()
+				.optional()
+				.describe(
+					"PR mode merge turns only: the pull request body for the pull request the server opens after this report. Write it from the repo's pull request template (.github/pull_request_template.md) when one exists; describe the change, never the push. Missing or blank: the pull request body falls back to this report's summary and details.",
+				),
 		}),
 		loadMode: "essential",
 		approval: "read",
