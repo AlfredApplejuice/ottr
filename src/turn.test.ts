@@ -27010,6 +27010,15 @@ describe("stored review findings", () => {
 		);
 		await store.updateTask(review.id, { base: "shaR" });
 		await store.updateTask(review.id, { stage: "done", state: "idle" });
+		// The done stamp freezes doneAt, and the findings closure reads
+		// `createdAt <= doneAt`: a child this test files in the SAME millisecond
+		// counts as an open finding and holds every queued merge (CI 43875479904:
+		// the OTTR-1047 assertions read mergeHold/reviewBlocked/findingsHold, and
+		// a fast runner filed the validation card within doneAt's millisecond).
+		// Fake timers cannot drive this: runTaskUpdate stamps the real clock
+		// internally. Cross the boundary so every child below is strictly
+		// younger than doneAt.
+		await Bun.sleep(2);
 		return review;
 	};
 

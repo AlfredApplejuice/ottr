@@ -1336,6 +1336,70 @@ describe("findingsHold", () => {
 	});
 });
 
+describe("the doneAt cutoff is inclusive at the same millisecond (CI 43875479904)", () => {
+	test("a follow-up filed in the review's done millisecond holds a queued merge", () => {
+		// OTTR-1047's one CI failure, deterministic: the board files a validation
+		// run as a followUpOf child of the done review. When the filing lands in
+		// the SAME millisecond as the review's done stamp (a fast runner),
+		// `createdAt <= doneAt` counts it as a finding. It is stage todo — an
+		// open finding whose leadAtDone is false, because it did not exist when
+		// the review landed done (the stamp records the stage AT doneAt,
+		// OTTR-963) — so a queued merge waits. Fail-closed by design; the flaky
+		// fixture that tripped this (turn.test.ts's doneReview) now sleeps
+		// across the millisecond boundary instead of assuming the clock advanced.
+		const review = task({
+			kind: "review",
+			stage: "done",
+			state: "idle",
+			createdAt: 100,
+			doneAt: 5_000,
+		});
+		const validation = task({
+			kind: "validation",
+			followUpOf: review.id,
+			createdAt: 5_000,
+		});
+		const merge = task({ stage: "merging", state: "queued" });
+		expect(mergeHold([review, validation, merge], merge)).toBe(FINDINGS_HOLD);
+	});
+
+	test("a lead filed in the same millisecond never holds: backlog is not open", () => {
+		const review = task({
+			kind: "review",
+			stage: "done",
+			state: "idle",
+			createdAt: 100,
+			doneAt: 5_000,
+		});
+		const lead = task({
+			followUpOf: review.id,
+			createdAt: 5_000,
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+		});
+		const merge = task({ stage: "merging", state: "queued" });
+		expect(mergeHold([review, lead, merge], merge)).toBeNull();
+	});
+
+	test("a child filed after the done millisecond is no finding at all", () => {
+		const review = task({
+			kind: "review",
+			stage: "done",
+			state: "idle",
+			createdAt: 100,
+			doneAt: 5_000,
+		});
+		const validation = task({
+			kind: "validation",
+			followUpOf: review.id,
+			createdAt: 5_001,
+		});
+		const merge = task({ stage: "merging", state: "queued" });
+		expect(mergeHold([review, validation, merge], merge)).toBeNull();
+	});
+});
+
 describe("reviewBlocked", () => {
 	test("one review at a time: an open review or release blocks a new one", () => {
 		const review = task({
