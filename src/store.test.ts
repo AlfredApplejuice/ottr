@@ -5046,7 +5046,6 @@ describe("pr review store methods", () => {
 		expect(await store.prReviewRunsSince(1000)).toBe(2);
 	});
 
-
 	test("savePrDraft files one waiting card, then updates the same card; only saved heads count as reviewed", async () => {
 		const store = await open(join(root, "pr-draft"));
 		await expect(
