@@ -3426,6 +3426,48 @@ describe("prPass", () => {
 		await store.close();
 	});
 
+	test("an in_progress card with prNumber settles when the PR merges", async () => {
+		const store = await prModeProject("pr-inprogress-merged");
+		await store.setSettings({
+			originUrl: "https://github.com/acme/widget.git",
+		});
+		mkdirSync(join(root, "pr-inprogress-merged", ".wt"), { recursive: true });
+		const t = await prCard(store);
+		// OTTR-1056: a CI-fix work turn parked on the card (in_progress) still
+		// settles done like a merging card once its PR merges.
+		await store.updateTask(t.id, {
+			stage: "in_progress",
+			state: "needs_you",
+			worktree: join(root, "pr-inprogress-merged", ".wt"),
+		});
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? {
+							code: 0,
+							stdout: pullBody({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: MERGE_SHA,
+							}),
+							stderr: "",
+						}
+					: openList([]),
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
+		const after = (await store.getTask(t.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(after.pushSha).toBe(MERGE_SHA);
+		const log = await Bun.file(await store.logPath(t.id)).text();
+		expect(log).toContain("PR #7 merged; card done");
+		await store.close();
+	});
+
 	test("a failed remote branch delete logs one line and leaves the card done", async () => {
 		const store = await prModeProject("pr-merged-del-fail");
 		await store.setSettings({
@@ -3625,6 +3667,21 @@ describe("prPass", () => {
 		const after = (await store.getTask(t.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("running");
+		expect(after.pushSha).toBe("abc1234567890");
+		expect(after.needsReason).toBeNull();
+		await store.close();
+	});
+
+	test("OTTR-1056: prPass skips an in_progress card whose fix turn is queued", async () => {
+		const store = await prModeProject("pr-inprogress-queued");
+		const t = await prCard(store);
+		await store.updateTask(t.id, { stage: "in_progress", state: "queued" });
+		const ops = fakeOps({ apiResult: () => openList([]) });
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = (await store.getTask(t.id))!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("queued");
+		expect(after.prNumber).toBe(7);
 		expect(after.pushSha).toBe("abc1234567890");
 		expect(after.needsReason).toBeNull();
 		await store.close();
@@ -4535,9 +4592,9 @@ describe("prPass", () => {
 
 	test("a closed source parks the card out of the merging watch, idempotently", async () => {
 		// The follow-up settled (merged) and the source closed unmerged: the park
-		// moves the card out of the merging watch — stage in_progress, follow-up
-		// fields kept — so no later window re-reads the PRs or rewrites the park
-		// until a reply re-queues it.
+		// moves the card to stage in_progress with the follow-up fields kept.
+		// OTTR-1056 keeps such a card on the PR watch, so later windows re-read
+		// the PRs — the exact-reason guard is what keeps the park written once.
 		const store = await prModeProject("pr-fu-src-closed-settled");
 		const t = await followUpCard(store);
 		await store.updateTask(t.id, { sourcePrHeadRef: "ottr/552" });
@@ -4582,19 +4639,25 @@ describe("prPass", () => {
 		const listReadsAfterFirstWindow = listReads();
 
 		// A second window runs its poll (the clock advances past PR_POLL_MS): the
-		// card left the merging watch, so the PRs are not re-read and the park does
-		// not rewrite the row or the log.
+		// list is re-read, and OTTR-1056 keeps the parked card on the watch, so the
+		// PRs are re-read too. The exact-reason guard keeps the park write silent:
+		// no second log line, no row rewrite.
 		ops.time += 6 * 60_000; // past the PR poll window
 		await tick(
 			new Map([["proj", entry(store, { target: "origin/main" })]]),
 			ops,
 		);
 		expect(listReads()).toBeGreaterThan(listReadsAfterFirstWindow);
-		expect(perPrReads()).toBe(perPrAfterFirstWindow);
+		expect(perPrReads()).toBeGreaterThan(perPrAfterFirstWindow);
 		const log2 = await Bun.file(await store.logPath(t.id)).text();
 		expect(
 			log2.split("\n").filter((l) => l.includes("closed without merging")),
 		).toHaveLength(1);
+		const after2 = (await store.getTask(t.id))!;
+		expect(after2.stage).toBe("in_progress");
+		expect(after2.state).toBe("needs_you");
+		expect(after2.needsReason).toBe("PR #7 closed without merging");
+		expect(after2.revision).toBe(after.revision);
 		await store.close();
 	});
 
@@ -5312,6 +5375,127 @@ describe("CI on the PR head", () => {
 		await tick(new Map([["proj", entry(store)]]), ops);
 		expect((await store.getTask(t.id))!.pendingPrompt).toBe(prompt);
 		expect(ops.calls.scheduled).toBe(scheduled);
+		await store.close();
+	});
+
+	test("the same head and run after a re-ship gets no second reply", async () => {
+		const dir = join(root, "ci-pr-head-rededupe");
+		const store = await ProjectStore.open(dir);
+		const t = await prCard(store);
+		const ops = fakeOps({
+			ghResult: {
+				code: 0,
+				stdout: runsJson([
+					{
+						id: 42,
+						status: "completed",
+						conclusion: "failure",
+						name: "build",
+						html_url: "https://example.com/run/42",
+					},
+				]),
+				stderr: "",
+			},
+		});
+		const scheduledBefore = ops.calls.scheduled;
+		await tick(new Map([["proj", entry(store)]]), ops);
+		// OTTR-1056: the reply lands once and stores the answered key on the row.
+		const after = (await store.getTask(t.id))!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.pendingBy).toBe("supervisor");
+		expect(after.pushSha).toBeNull();
+		const countReplies = async (): Promise<number> => {
+			const log = await Bun.file(await store.logPath(t.id)).text();
+			const line = "CI failed on the PR head abc1234; replied for a fix";
+			return log.split(line).length - 1;
+		};
+		expect(await countReplies()).toBe(1);
+		expect(ops.calls.scheduled).toBe(scheduledBefore + 1);
+		// The fix turn shipped: the settle re-pins the same head and consumes the
+		// prompt. The stored answered key keeps the second pass off the card.
+		await store.updateTask(t.id, {
+			stage: "merging",
+			state: "idle",
+			pendingPrompt: null,
+			pushSha: "abc1234567890",
+		});
+		const rePinned = (await store.getTask(t.id))!;
+		const scheduled = ops.calls.scheduled;
+		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(await countReplies()).toBe(1);
+		expect(ops.calls.scheduled).toBe(scheduled);
+		const final = (await store.getTask(t.id))!;
+		expect(final.pendingPrompt).toBe(rePinned.pendingPrompt);
+		expect(final.ciPrAnsweredKey).toBe(rePinned.ciPrAnsweredKey);
+		expect(rePinned.ciPrAnsweredKey).toBe("abc1234567890:42#1");
+		expect(rePinned.ciPrAnsweredInfo).toBe(
+			"- build: failure - https://example.com/run/42",
+		);
+		expect((await store.listTasks()).map((c) => c.id)).toEqual([t.id]);
+		await store.close();
+	});
+
+	test("a new attempt of the same run, or a new head, gets one reply", async () => {
+		const dir = join(root, "ci-pr-head-new-attempt");
+		const store = await ProjectStore.open(dir);
+		const t = await prCard(store);
+		const failedRun = (attempt?: number) => ({
+			id: 42,
+			status: "completed",
+			conclusion: "failure",
+			name: "build",
+			html_url: "https://example.com/run/42",
+			...(attempt === undefined ? {} : { run_attempt: attempt }),
+		});
+		const ops = fakeOps({
+			ghResult: { code: 0, stdout: runsJson([failedRun()]), stderr: "" },
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		let after = (await store.getTask(t.id))!;
+		expect(after.ciPrAnsweredKey).toBe("abc1234567890:42#1");
+		// The fix turn ships, the settle re-pins the same head, and the re-run of
+		// the same workflow carries a new attempt number: one fresh reply.
+		await store.updateTask(t.id, {
+			stage: "merging",
+			state: "idle",
+			pendingPrompt: null,
+			pushSha: "abc1234567890",
+		});
+		ops.ghResult = { code: 0, stdout: runsJson([failedRun(2)]), stderr: "" };
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const log = await Bun.file(await store.logPath(t.id)).text();
+		const line = "CI failed on the PR head abc1234; replied for a fix";
+		expect(log.split(line).length - 1).toBe(2);
+		after = (await store.getTask(t.id))!;
+		expect(after.ciPrAnsweredKey).toBe("abc1234567890:42#2");
+		// A new head answers once under its own key.
+		await store.updateTask(t.id, {
+			stage: "merging",
+			state: "idle",
+			pendingPrompt: null,
+			pushSha: "def5678901234",
+			prHeadSha: "def5678901234",
+		});
+		ops.ghResult = {
+			code: 0,
+			stdout: runsJson([
+				{
+					id: 43,
+					status: "completed",
+					conclusion: "failure",
+					name: "build",
+					html_url: "https://example.com/run/43",
+				},
+			]),
+			stderr: "",
+		};
+		await tick(new Map([["proj", entry(store)]]), ops);
+		after = (await store.getTask(t.id))!;
+		expect(after.ciPrAnsweredKey).toBe("def5678901234:43#1");
+		const log2 = await Bun.file(await store.logPath(t.id)).text();
+		expect(log2.split(line).length - 1).toBe(2);
+		const line2 = "CI failed on the PR head def5678; replied for a fix";
+		expect(log2.split(line2).length - 1).toBe(1);
 		await store.close();
 	});
 

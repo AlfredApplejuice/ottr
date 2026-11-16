@@ -1746,6 +1746,9 @@ type TurnSettle = {
 	remoteLanded: boolean;
 	refused: string | null;
 	prNext: Next | null;
+	/** OTTR-1056: the CI idle divert fired — the worktree tip still is the answered PR
+	 * head, so the settle writes merging/idle and re-pins the CI watch's pushSha. */
+	ciIdleSha: string | null;
 	// classify and post-classify state
 	research: boolean;
 	steered: boolean;
@@ -6374,6 +6377,7 @@ export function createTurnLoop(
 			remoteLanded: false,
 			refused: null,
 			prNext: null,
+			ciIdleSha: null,
 			research: false,
 			steered: false,
 			now: 0,
@@ -8034,6 +8038,39 @@ export function createTurnLoop(
 					dir: ops.http400Dir,
 				}),
 		});
+		// OTTR-1056: without this divert, classify queues a merge turn whose ship
+		// pins the same head and the CI watch re-answers the same failure. The tree
+		// is the already-verified shipped tree, so the card settles merging/idle:
+		// no ship and no gate re-run happens. A turn that moved the tip, or an
+		// answered report, takes today's path.
+		if (
+			st.kind === "work" &&
+			next.stage === "merging" &&
+			next.state === "queued" &&
+			st.task.prNumber !== null &&
+			st.task.prHeadSha !== null &&
+			st.task.ciPrAnsweredKey !== null &&
+			st.task.ciPrAnsweredKey.startsWith(`${st.task.prHeadSha}:`)
+		) {
+			const tip = await ops.targetSha(st.loc.wt, "HEAD").catch(() => null);
+			if (tip === st.task.prHeadSha) {
+				st.ciIdleSha = tip;
+				const failed = st.task.ciPrAnsweredInfo ?? "the run failed";
+				const summary = (st.result.outcome?.summary ?? "").trim();
+				const answered =
+					summary !== ""
+						? `\n\nThe turn answered: ${summary.slice(0, 140)}`
+						: "";
+				next = {
+					stage: "merging",
+					state: "idle",
+					needsReason: `CI failed on the PR head ${tip.slice(0, 7)}:\n${failed}${answered}`,
+				};
+				await st.log(
+					`- PR head ${tip.slice(0, 7)} unchanged since the CI reply; the card waits on GitHub again (no re-ship)`,
+				);
+			}
+		}
 		// The PR-mode ship step owns the card's next state: it never lands, so the done
 		// write below (pushSha pinning, worktree removal, release stamping) is skipped.
 		if (st.prNext !== null) next = st.prNext;
@@ -9491,8 +9528,12 @@ export function createTurnLoop(
 					),
 			);
 		}
+		// OTTR-1056: a diverted CI idle settle has nothing new to check — the settle wrote
+		// the final state directly, and the second-model work check skips.
 		st.checkWillRun =
-			st.reviewFindings.length > 0 || (st.workCard && next.stage === "merging");
+			st.ciIdleSha === null &&
+			(st.reviewFindings.length > 0 ||
+				(st.workCard && next.stage === "merging"));
 	}
 
 	/** The stage/state columns ride the card write only when no second-model check runs: the
@@ -9561,6 +9602,9 @@ export function createTurnLoop(
 	async function writeSettledCard(st: TurnSettle, next: Next): Promise<void> {
 		await st.store.updateTask(st.id, {
 			...settledCardState(st, next),
+			// OTTR-1056: the CI idle divert re-pins the CI watch's head, so the watch
+			// stays on the PR head and a new run attempt can get a fresh reply.
+			...(st.ciIdleSha !== null ? { pushSha: st.ciIdleSha } : {}),
 			shots: st.shots,
 			pendingPrompt: next.pendingPrompt, // undefined keeps the column: only classify's automatic continue sets it
 			// Authorship rides only when the prompt is actually written; classify's

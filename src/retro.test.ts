@@ -92,6 +92,8 @@ function retroTask(p: Partial<Task> = {}): Task {
 		prUrl: null,
 		prHeadSha: null,
 		prWatchAt: null,
+		ciPrAnsweredKey: null,
+		ciPrAnsweredInfo: null,
 		pendingFeedback: false,
 		sourcePrNumber: null,
 		sourcePrUrl: null,

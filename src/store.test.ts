@@ -1821,6 +1821,70 @@ describe("keptFiles", () => {
 		await store.close();
 	});
 
+	test("a database from before OTTR-1056 converges to the answered-CI columns", async () => {
+		const dir = join(root, "pre-ottr-1056-columns");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		db.exec(`CREATE TABLE tasks (
+			id TEXT PRIMARY KEY,
+			title TEXT,
+			prompt TEXT,
+			stage TEXT NOT NULL CHECK (stage IN ('todo','in_progress','merging','done')),
+			state TEXT NOT NULL CHECK (state IN ('queued','running','needs_you','idle')),
+			needs_reason TEXT,
+			pending_prompt TEXT,
+			branch TEXT,
+			base TEXT,
+			worktree TEXT,
+			session_id TEXT,
+			summary TEXT,
+			details TEXT,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			queued_at INTEGER,
+			cancelled_at INTEGER,
+			images TEXT NOT NULL DEFAULT '[]',
+			pending_images TEXT NOT NULL DEFAULT '[]',
+			release_version TEXT,
+			release_notes TEXT,
+			session_title TEXT,
+			asked TEXT,
+			model TEXT,
+			kept_files TEXT NOT NULL DEFAULT '[]',
+			follow_up_of TEXT,
+			commits INTEGER,
+			done_at INTEGER
+		)`);
+		db.exec(
+			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at) VALUES ('t1', 'old', 'p', 'merging', 'idle', 1, 1)",
+		);
+		db.close();
+		const store = await open(dir);
+		const back = (await store.getTask("t1"))!;
+		expect(back.ciPrAnsweredKey).toBe(null);
+		expect(back.ciPrAnsweredInfo).toBe(null);
+		await store.updateTask("t1", {
+			ciPrAnsweredKey: "abc1234:42#1",
+			ciPrAnsweredInfo: "- build: failure - https://example.com/run/42",
+		});
+		const updated = (await store.getTask("t1"))!;
+		expect(updated.ciPrAnsweredKey).toBe("abc1234:42#1");
+		expect(updated.ciPrAnsweredInfo).toBe(
+			"- build: failure - https://example.com/run/42",
+		);
+		await store.close();
+		const reopened = await open(dir);
+		const again = (await reopened.getTask("t1"))!;
+		expect(again.ciPrAnsweredKey).toBe("abc1234:42#1");
+		expect(again.ciPrAnsweredInfo).toBe(
+			"- build: failure - https://example.com/run/42",
+		);
+		// A clear rides the null-clears patch rule like the other nullable columns.
+		await reopened.updateTask("t1", { ciPrAnsweredKey: null });
+		expect((await reopened.getTask("t1"))!.ciPrAnsweredKey).toBe(null);
+		await reopened.close();
+	});
+
 	test("updateTask stores mergeHead and it survives a reopen", async () => {
 		const store = await open(join(root, "merge-head-link"));
 		const task = await store.createTask("merge me");

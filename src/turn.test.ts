@@ -23999,6 +23999,123 @@ describe("turn PR-mode merge settle", () => {
 	});
 });
 
+describe("turn PR-mode CI idle divert (OTTR-1056)", () => {
+	/** A prMode work card whose CI failure reply the head "pr-head" already answered,
+	 * with the ship spies the divert must keep silent and a ready work run. The `tip`
+	 * argument is what the worktree HEAD read returns: the answered head keeps the
+	 * divert, a moved tip takes today's merge queue path. */
+	async function ciRepliedSetup(overrides: FixtureOps = {}, tip = "pr-head") {
+		const pushes: unknown[][] = [];
+		let openPrCalls = 0;
+		const record = baseRecord();
+		const setup = await setupWith(record, {
+			holdFollowUps: true, // hold the chained merge turn; each test asserts the settle instant
+			targetSha: async (_m: string, ref: string) =>
+				ref === "HEAD" ? tip : null,
+			pushBranch: async (...args: unknown[]) => {
+				pushes.push(args);
+				return { status: "pushed" as const, output: "" };
+			},
+			openPr: async () => {
+				openPrCalls += 1;
+				return {
+					ok: true as const,
+					pr: { number: 12, url: "https://github.com/acme/repo/pull/12" },
+				};
+			},
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o as never);
+				await o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "ready",
+								summary: "calmed the flaky board check",
+								details: "the retry loop now waits for the settle",
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+			...overrides,
+		});
+		await setup.store.setSettings({
+			prMode: true,
+			originUrl: "https://github.com/acme/widget.git",
+		});
+		const task = await setup.store.createTask("pr work");
+		await setup.store.updateTask(task.id, {
+			prNumber: 12,
+			prHeadSha: "pr-head",
+			ciPrAnsweredKey: "pr-head:42#1",
+			ciPrAnsweredInfo: "- build: failure - https://example.com/run/42",
+			worktree: join(setup.store.worktreesDir, task.id),
+			branch: "ott/card",
+			base: "abc",
+		});
+		return { ...setup, task, pushes, openPrCalls: () => openPrCalls };
+	}
+
+	test("a ready work turn after a CI reply settles merging/idle and ships nothing", async () => {
+		const s = await ciRepliedSetup();
+		await s.loop.runTurn(s.store.name, s.task.id);
+		const after = (await s.store.getTask(s.task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.prNumber).toBe(12);
+		expect(after.needsReason).toContain("CI failed on the PR head pr-head:");
+		expect(after.needsReason).toContain(
+			"- build: failure - https://example.com/run/42",
+		);
+		expect(after.needsReason).toContain(
+			"The turn answered: calmed the flaky board check",
+		);
+		// The settle re-pins the CI watch's head, so a new run attempt gets a fresh reply.
+		expect(after.pushSha).toBe("pr-head");
+		// No merge turn dispatched: one run, one turn row, and the ship spies stayed silent.
+		expect(s.record.runs).toHaveLength(1);
+		expect(await s.store.listTurns(s.task.id)).toHaveLength(1);
+		expect(s.pushes).toEqual([]);
+		expect(s.openPrCalls()).toBe(0);
+		expect(await logText(s.store, s.task.id)).toContain(
+			"unchanged since the CI reply; the card waits on GitHub again (no re-ship)",
+		);
+	});
+
+	test("a turn that moved the tip queues the merge turn on today's path", async () => {
+		const s = await ciRepliedSetup({}, "new-head");
+		await s.loop.runTurn(s.store.name, s.task.id);
+		const after = (await s.store.getTask(s.task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.needsReason).toBeNull();
+		// Only the divert re-pins pushSha on a work settle, and it did not fire.
+		expect(after.pushSha).toBeNull();
+		expect(await logText(s.store, s.task.id)).not.toContain(
+			"unchanged since the CI reply",
+		);
+		// One run: the merge turn queued behind the fixture's held dispatch.
+		expect(s.record.runs).toHaveLength(1);
+	});
+
+	test("the diverted settle skips the work check and writes the state itself", async () => {
+		// checkWillRun's observable: the state write came from writeSettledCard, whose
+		// settledCardState patch clears the probe count. The deferred writePostCheckState
+		// path a would-be check settle takes keeps the stored count.
+		const s = await ciRepliedSetup();
+		await s.store.updateTask(s.task.id, { holdAttempts: 7 });
+		await s.loop.runTurn(s.store.name, s.task.id);
+		const after = (await s.store.getTask(s.task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.holdAttempts).toBe(0);
+		expect(s.record.runs).toHaveLength(1);
+	});
+});
+
 describe("worker OOM kill: one automatic continue, then a park", () => {
 	const oomResult = (): RunResult =>
 		runResult({

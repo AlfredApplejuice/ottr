@@ -192,7 +192,10 @@ The paths that reach the second merge turn (each was stuck before
 OTTR-799):
 
 - CI failed on the PR head: the `ciPrHeadReply` requeue runs a work turn,
-  then the merge turn re-ships; the push updates the same PR.
+  then the merge turn re-ships; the push updates the same PR. One failure
+  gets one reply, not one per window: the stored answered key ("One reply
+  per PR head and run (OTTR-1056)" below) stops a repeat reply for the
+  same head and run.
 - PR closed without merge: the reply's merge turn pushes the branch and
   opens a fresh PR; the card stores the new number, and `prPass` watches
   only the new PR.
@@ -365,8 +368,9 @@ untrusted-data rules; a tracked PR that is not in the open list gets one
 per-PR `gh api repos/{repo}/pulls/N` call to read its state. The list is one
 page of 100 pull requests, so that read can also say that the PR is open. A
 tracked PR that is in the open list gets the same per-PR call when its card
-waits `idle` or holds the conflict reason (see "Open PR that cannot
-merge").
+waits `idle` or holds the conflict reason, and since OTTR-1056 also when
+the card sits in stage `in_progress` with a `prNumber` (see "Open PR that
+cannot merge").
 
 - `merged_at` set: the tracker fetches the target and finishes the card with
   the today-shaped done write — `pushSha` pinned to the PR's merge commit
@@ -380,6 +384,10 @@ merge").
   PR is closed). Cancelling the card ends it as today and deletes the remote
   card branch (the delete section below); with a still-open PR, GitHub closes
   the PR when its head branch goes.
+
+The two rules settle the OTTR-1056 widening in the same way: an
+`in_progress` card with a `prNumber` finishes when its PR merges, and it
+takes the closed reason when its PR closes.
 
 ## The follow-up PR and the rebase answer (OTTR-809)
 
@@ -477,8 +485,17 @@ one of these conditions is true:
 - The state of the card is `idle`.
 - The state of the card is `needs_you` and its reason is exactly the
   conflict reason.
+- The stage of the card is `in_progress` and the card carries a
+  `prNumber` (OTTR-1056): a closed park, a follow-up park or an answered
+  CI failure can leave a PR card at this stage, and no pass settled it
+  before. The verdicts stay the same, and the conflict write keeps its
+  state guards, so a card whose PR is merely open and mergeable gets no
+  write.
 
-A card in any other state gets no read. The cost is one more read for each
+The skips stay: a cancelled card, a card in `queued` state, and a card
+with a live turn (`running`/`preparing`) get no read. A `needs_you` card
+without the conflict reason gets its read only through the OTTR-1056
+stage condition above. The cost is one more read for each
 such card in each 5-minute window.
 
 The open list is one page of 100 pull requests. A tracked PR that is not in
@@ -557,7 +574,14 @@ Non-goals of this section:
   write does not move their deadline.
 - A failed run on the PR head does not file a separate card: the tracker
   replies on the same card with the failed-check list and the failed
-  steps' log (OTTR-915). The log is fetched on the server with the board
+  steps' log (OTTR-915). The reply is one per head and run (OTTR-1056):
+  before it replies, `ciPrHeadReply` compares the card's stored
+  `ci_pr_answered_key` with the key of the failure just polled. An equal
+  key sends no reply, fetches no logs, and reports the failure as
+  answered, so `ciPass` does nothing and files no follow-up card. A new
+  attempt of the same run, or a new head SHA, yields a new key and gets
+  exactly one reply, and the reply write stores the key and the info on
+  the card. The log is fetched on the server with the board
   token, one `gh run view <run-id> --log-failed --repo <repo>` per failed
   run, and lands in the reply as an untrusted data block — the same
   `ciLogSection` fetch and fence the follow-up handoff uses; a failed
@@ -568,6 +592,70 @@ Non-goals of this section:
   same PR.
 - A failed run on the merged target commit after `done` reopens the card
   when the run matches exactly one; see the next section.
+
+### One reply per PR head and run (OTTR-1056)
+
+The PR-head reply had no memory of the failures it already answered. The
+report install is the install of the Problem section: Windows 11, WSL,
+rootful Podman 6.1.4 behind a corporate proxy, repos on GitHub Enterprise
+Cloud. On 2026-11-16 one CI failure on one PR head produced three replies
+on the card. The fix turn ran slowly on that install, the head stayed at
+the failed commit, and each poll window saw the same failed run again.
+Each window replied and fetched the failed logs again.
+
+The fix stores the answer on the card row:
+
+- Two new nullable TEXT columns, `ci_pr_answered_key` and
+  `ci_pr_answered_info`. The migration is additive in `ProjectStore.open`
+  and follows the AGENTS.md hard stop 2 pattern, like the `pr_number`
+  family: no `TASKS_DDL` entry, and one `ALTER TABLE tasks ADD COLUMN`
+  per column. The columns sit in the ALTER-only chain after both CHECK
+  rebuilds, so a rebuild's explicit column list never drops them and a
+  fresh or upgraded database converges to the same column set. `Task`
+  and `ListedTask` carry `ciPrAnsweredKey`/`ciPrAnsweredInfo`
+  (`string | null`), and `TaskPatch` takes them as optional fields where
+  a null clears the column.
+- The key names the answered failure:
+  `<pushSha>:<runId>#<attempt>[,<runId>#<attempt>...]` — one sorted entry
+  per failed run of the poll. The attempt is the run's `run_attempt`
+  GitHub field, and it is 1 when the field is absent. The info holds one
+  line per failed run, `- name: conclusion - html_url`, capped at 300
+  characters.
+- `ciPrHeadReply` compares the stored key with the key of the failure
+  just polled. An equal key sends no reply, fetches no logs, and reports
+  the failure as answered. `ciPass` then does nothing and files no
+  follow-up card. A new attempt of the same run, or a new head SHA, yields
+  a new key and gets exactly one reply. The reply write stores the key
+  and the info on the card.
+- The no-new-commit settle (`classifyTurnEnd` in src/turn.ts): a work
+  turn on a card with a `prNumber` meets three conditions. The outcome
+  classifies to merging/queued. The stored key starts with
+  `<prHeadSha>:`. The branch tip still equals `prHeadSha`. The card then
+  settles `merging`/`idle` and queues no merge turn. It ships nothing and
+  re-runs no gate, because the tree is the already-verified shipped tree.
+  The settle re-pins `pushSha` to the tip, so the CI watch stays on the
+  head. `needsReason` shows the failed check lines plus the report
+  summary, and the summary part is capped at 140 characters. The
+  second-model work check: this settle skips it. A turn that moved
+  the tip, or an answered report, follows today's paths unchanged.
+- The `prPass` widening (`prSettleMerging` in src/supervisor.ts): the
+  per-project PR pass also settles cards in stage `in_progress` that
+  carry a `prNumber`. The existing skips stay: a cancelled card, a
+  `running`/`preparing` turn, and a `queued` card. The verdicts do not
+  change: a merged PR finishes the card done, a closed unmerged PR parks
+  `in_progress`/`needs_you`, and an open PR gets the conflict verdict and
+  the review feedback watch.
+
+Non-goals of this section: the follow-up-card flow for CI failures after
+the merge stays unchanged, and nothing re-runs CI automatically.
+
+Acceptance:
+
+- A test: the same head and run fail again after a re-ship; the supervisor sends no second reply. It fails before the fix.
+- A test: a new attempt of the same run, or a new head, gets one reply.
+- A test: a ready work turn with no new commit after a CI reply returns the card to merging/idle and does not ship again.
+- A test: an in_progress card with an open prNumber settles when the PR merges.
+- bun run check and bun test exit 0.
 
 ## CI failure after the merge (OTTR-915)
 

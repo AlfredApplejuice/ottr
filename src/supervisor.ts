@@ -120,6 +120,16 @@ interface WorkflowRun {
 	name: string;
 	html_url: string;
 	id: number;
+	/** GitHub's re-run counter; absent in older payloads. Untrusted JSON — read it through runAttempt. */
+	run_attempt?: number;
+}
+
+/** The run's re-run counter for the answered-CI key: 1 when GitHub omits run_attempt or
+ * sends a value that is not a finite number. Pure. */
+function runAttempt(r: WorkflowRun): number {
+	return typeof r.run_attempt === "number" && Number.isFinite(r.run_attempt)
+		? r.run_attempt
+		: 1;
 }
 
 interface CleanupState {
@@ -1692,9 +1702,11 @@ export function createSupervisor(
 	}
 
 	/** OTTR-552: a PR-mode card in Merging watches its PR head, not a merge push; a failed
-	 * run replies on the same card instead of filing a follow-up. Clearing pushSha here is
-	 * the one-fix-per-head dedupe — the next push re-pins pushSha at settle. True = the
-	 * failure was answered on the card. */
+	 * run replies on the same card instead of filing a follow-up. The dedupe is the stored
+	 * answered key (`<pushSha>:<runId>#<attempt>[,...]`, one entry per failed run of the
+	 * poll): the same head and failed runs never reply twice, while a re-run (new attempt)
+	 * or a new head changes the key and answers again. Clearing pushSha still stops the
+	 * watch until the next ship re-pins it. True = the failure was answered on the card. */
 	async function ciPrHeadReply(
 		e: SupervisorEntry,
 		t: ListedTask,
@@ -1704,8 +1716,17 @@ export function createSupervisor(
 		refetch: string,
 	): Promise<boolean> {
 		if (!(t.stage === "merging" && t.prNumber !== null)) return false;
+		const key = `${pushSha}:${failed
+			.map((r) => `${r.id}#${runAttempt(r)}`)
+			.sort()
+			.join(",")}`;
+		if (t.ciPrAnsweredKey === key) return true;
 		const short = pushSha.slice(0, 7);
 		const logs = await ciLogSection(e, t, failed, repo);
+		const info = failed
+			.map((r) => `- ${r.name}: ${r.conclusion ?? "failed"} - ${r.html_url}`)
+			.join("\n")
+			.slice(0, 300);
 		const text = [
 			[
 				`CI failed on the PR head of this card (${short} on ${t.branch ?? "the branch"}):`,
@@ -1731,6 +1752,8 @@ export function createSupervisor(
 				pendingBy: "supervisor",
 				pendingFeedback: feedback,
 				pushSha: null,
+				ciPrAnsweredKey: key,
+				ciPrAnsweredInfo: info,
 			}))
 		)
 			return true;
@@ -1747,7 +1770,9 @@ export function createSupervisor(
 	 * pushSha pins instead of filing a follow-up: fresh worktree from the current target at
 	 * the next dispatch (cleared worktree and branch take the create path), the same session
 	 * (sessionId untouched), the failed-check list plus the fetched log in the prompt, and
-	 * pushSha cleared — the same one-fix-per-head dedupe as ciPrHeadReply. The fallback that
+	 * pushSha cleared — the clear still stops the watch until the next ship re-pins it
+	 * (ciPrHeadReply's dedupe is its stored answered key; this reopen clears that key with
+	 * the PR fields, so the second life answers its own failures fresh). The fallback that
 	 * files the follow-up card as before: no single matching card, a cancelled match, or an
 	 * open follow-up already covering this head. True = the failure was answered on the card. */
 	async function ciReopenDoneCard(
@@ -1829,6 +1854,10 @@ export function createSupervisor(
 				prUrl: null,
 				prHeadSha: null,
 				prWatchAt: null,
+				// OTTR-1056: the stored CI answer names the first life's head; the reopened
+				// card has no PR of record and answers its own failures fresh.
+				ciPrAnsweredKey: null,
+				ciPrAnsweredInfo: null,
 				followUpPrNumber: null,
 				followUpPrUrl: null,
 				sourcePrNumber: null,
@@ -2472,11 +2501,16 @@ export function createSupervisor(
 			return;
 		}
 		if (await wentStale(e.store, t)) return;
+		// The widening (OTTR-1056) keeps an in_progress PR card on the watch, so this
+		// park repeats in every window: the exact-reason guard, the same defense in
+		// depth the follow-up parks carry, keeps the rewrite and the log line to one.
+		const closed = `PR #${t.prNumber} closed without merging`;
+		if (t.state === "needs_you" && t.needsReason === closed) return;
 		if (
 			!(await applyTask(e, t, {
 				stage: "in_progress",
 				state: "needs_you",
-				needsReason: `PR #${t.prNumber} closed without merging`,
+				needsReason: closed,
 				pushSha: null,
 			}))
 		)
@@ -2945,9 +2979,11 @@ export function createSupervisor(
 		);
 	}
 
-	/** Every tracked Merging card: settle the card whose PR is not in the open list, and check
-	 * the card whose PR is in it for a merge conflict. A Dependabot carry card parked for a
-	 * rebase reads Dependabot's answer instead; a follow-up card watches both its PRs. */
+	/** Every tracked Merging card, plus an in_progress card with a PR of record: settle the
+	 * card whose PR is not in the open list, and check the card whose PR is in it for a
+	 * merge conflict. An in_progress PR card — a live CI-fix work turn, or a parked work
+	 * turn — settles merged/closed/open like a merging card. A Dependabot carry card parked
+	 * for a rebase reads Dependabot's answer instead; a follow-up card watches both its PRs. */
 	async function prSettleMerging(
 		e: SupervisorEntry,
 		settings: ProjectSettings,
@@ -2955,7 +2991,12 @@ export function createSupervisor(
 		open: Set<number>,
 	): Promise<void> {
 		for (const t of await e.store.listTasks()) {
-			if (t.stage !== "merging" || t.cancelledAt !== null) continue;
+			// OTTR-1056: an in_progress card with a PR of record is tracked too, so a
+			// CI-fix work turn's PR settles or parks like a merging card's.
+			const tracked =
+				t.stage === "merging" ||
+				(t.stage === "in_progress" && t.prNumber !== null);
+			if (!tracked || t.cancelledAt !== null) continue;
 			// OTTR-799: a live merge turn settles its own card; a mid-turn settle would
 			// fight the ship step. wentStale cannot catch this: the snapshot and the row
 			// read the same state.

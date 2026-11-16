@@ -345,6 +345,8 @@ interface TaskRow {
 	pr_url: string | null;
 	pr_head_sha: string | null;
 	pr_watch_at: number | null;
+	ci_pr_answered_key: string | null;
+	ci_pr_answered_info: string | null;
 	pending_feedback: number;
 	source_pr_number: number | null;
 	source_pr_url: string | null;
@@ -574,6 +576,8 @@ function toListedTask(
 		prUrl: r.pr_url,
 		prHeadSha: r.pr_head_sha,
 		prWatchAt: r.pr_watch_at,
+		ciPrAnsweredKey: r.ci_pr_answered_key,
+		ciPrAnsweredInfo: r.ci_pr_answered_info,
 		pendingFeedback: r.pending_feedback === 1,
 		sourcePrNumber: r.source_pr_number,
 		sourcePrUrl: r.source_pr_url,
@@ -930,6 +934,8 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	prUrl: "pr_url",
 	prHeadSha: "pr_head_sha",
 	prWatchAt: "pr_watch_at",
+	ciPrAnsweredKey: "ci_pr_answered_key",
+	ciPrAnsweredInfo: "ci_pr_answered_info",
 	pendingFeedback: "pending_feedback",
 	sourcePrNumber: "source_pr_number",
 	sourcePrUrl: "source_pr_url",
@@ -2365,6 +2371,24 @@ export class ProjectStore {
 					cols,
 					"validated_at",
 					"ALTER TABLE tasks ADD COLUMN validated_at INTEGER",
+				);
+				// OTTR-1056: the answered PR-head CI failure. The key is
+				// `<pushSha>:<runId>#<attempt>[,...]`; a matching key keeps ciPrHeadReply from
+				// replying again to the same head and run, also after the same head ships
+				// again. The info holds the failed-check lines a no-change settle shows.
+				// ALTER-only after both CHECK rebuilds, same reason as pr_number above — a
+				// rebuild's explicit column list would drop them.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"ci_pr_answered_key",
+					"ALTER TABLE tasks ADD COLUMN ci_pr_answered_key TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"ci_pr_answered_info",
+					"ALTER TABLE tasks ADD COLUMN ci_pr_answered_info TEXT",
 				);
 				await ProjectStore.convergeProposalReasons(db, store.queue);
 				// posted_url landed after the first pr_review release: CREATE TABLE IF NOT EXISTS never

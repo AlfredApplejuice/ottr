@@ -1038,6 +1038,8 @@ describe("handoffMarkdown research report", () => {
 		prUrl: null,
 		prHeadSha: null,
 		prWatchAt: null,
+		ciPrAnsweredKey: null,
+		ciPrAnsweredInfo: null,
 		pendingFeedback: false,
 		sourcePrNumber: null,
 		sourcePrUrl: null,

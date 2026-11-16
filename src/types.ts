@@ -501,6 +501,10 @@ export interface Task {
 	prHeadSha: string | null;
 	/** OTTR-877: the review feedback watch's cutoff (epoch ms); null = never swept, the first sweep initializes silently. */
 	prWatchAt: number | null;
+	/** OTTR-1056: the answered PR-head CI failure as `<pushSha>:<runId>#<attempt>[,...]`; null = nothing answered on the card. A matching key keeps ciPrHeadReply from replying again to the same head and run. */
+	ciPrAnsweredKey: string | null;
+	/** OTTR-1056: that failure's failed-check lines (`- name: conclusion - url`, capped at 300 chars); a CI-reply work turn that changes nothing shows them on the card. */
+	ciPrAnsweredInfo: string | null;
 	/** OTTR-877: true when pending_prompt is supervisor-written reviewer feedback; passes settle through it, replies clear it. */
 	pendingFeedback: boolean;
 	/** OTTR-760: the pull request this card was filed from (a Dependabot PR); null for every other card. The ship step adopts it instead of opening a second PR. */
