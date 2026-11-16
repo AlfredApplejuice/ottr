@@ -507,4 +507,49 @@ describe("per-project scoping", () => {
 			rmSync(outside, { recursive: true, force: true });
 		}
 	});
+
+	test("two projects on one home write two distinct overlay files", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-plugins-two-"));
+		const home = join(dir, "home");
+		try {
+			const dirA = writeProjectSkill(home, "a", "skill-a");
+			const dirB = writeProjectSkill(home, "b", "skill-b");
+			const env = { OTTR_DATA_DIR: dir };
+			const pathA = ensurePluginSkillsOverlay(env, home, "a")!;
+			const pathB = ensurePluginSkillsOverlay(env, home, "b")!;
+			// One file per home and project: B's spawn can never overwrite A's
+			// directory list between A's write and A's omp read.
+			expect(pathA).not.toBe(pathB);
+			const contentA = readFileSync(pathA, "utf8");
+			const contentB = readFileSync(pathB, "utf8");
+			expect(contentA).toContain(JSON.stringify(dirA));
+			expect(contentA).not.toContain(JSON.stringify(dirB));
+			expect(contentB).toContain(JSON.stringify(dirB));
+			expect(contentB).not.toContain(JSON.stringify(dirA));
+			// Stable per home and project: a re-write lands on the same file.
+			expect(ensurePluginSkillsOverlay(env, home, "a")).toBe(pathA);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the overlay file name separates projects, the no-project name stays", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-plugins-name-"));
+		const home = join(dir, "home");
+		try {
+			const env = { OTTR_DATA_DIR: dir };
+			expect(pluginSkillsOverlayPath(env, home, "a")).not.toBe(
+				pluginSkillsOverlayPath(env, home, "b"),
+			);
+			expect(pluginSkillsOverlayPath(env, home, "a")).not.toBe(
+				pluginSkillsOverlayPath(env, home),
+			);
+			// A run without a project keeps today's name: the home path alone.
+			expect(pluginSkillsOverlayPath(env, home)).toBe(
+				pluginSkillsOverlayPath(env, home, null),
+			);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });

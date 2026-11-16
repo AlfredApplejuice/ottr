@@ -182,16 +182,21 @@ export function pluginSkillsOverlayYaml(dirs: readonly string[]): string {
 	return [...lines, ""].join("\n");
 }
 
-/** One file per home, named by the home path's sha256: a board-side run (board home)
- * and a worker run (shared home or its layer) share the data dir but never share a
- * file, so the two homes cannot overwrite each other's directory list and a pinned run
- * keeps its own home's content for its whole life
- * (docs/specs/turn-home-plugin-skills.md). */
+/** One file per home and project, named by the sha256 of the home path — plus the
+ * project, `\0`-joined, when one is set: a board-side run (board home) and a worker
+ * run (shared home or its layer) share the data dir but never share a file, and two
+ * projects on one home write two files, so no spawn can overwrite another's
+ * directory list between its write and its omp read. A pinned run keeps its own
+ * file's content for its whole life (docs/specs/turn-home-plugin-skills.md). */
 export function pluginSkillsOverlayPath(
 	env: Record<string, string | undefined>,
 	home: string,
+	project?: string | null,
 ): string {
-	const hash = createHash("sha256").update(home).digest("hex").slice(0, 16);
+	const hash = createHash("sha256")
+		.update(project ? `${home}\0${project}` : home)
+		.digest("hex")
+		.slice(0, 16);
 	return join(overlayDirFor(env), `omp-plugin-skills-${hash}.yml`);
 }
 
@@ -212,7 +217,7 @@ export function ensurePluginSkillsOverlay(
 	const anchor = overlayDirFor(env);
 	// The tmp fallback dir is the board's own (0700); the data dir is a mount point.
 	if (!env.OTTR_DATA_DIR) mkdirSync(anchor, { recursive: true, mode: 0o700 });
-	const path = pluginSkillsOverlayPath(env, home);
+	const path = pluginSkillsOverlayPath(env, home, project);
 	const content = pluginSkillsOverlayYaml(dirs);
 	try {
 		const cur = readBelow(anchor, path, 65536);

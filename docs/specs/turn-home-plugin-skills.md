@@ -129,7 +129,9 @@ list paths use (`PROJECT` in `src/apt.ts`); an unsafe name scopes nothing. The
 project directory enters the list only when it exists, is a directory, and its real
 path stays inside the home's real path — the same real-vs-real guard the plugin
 dirs use, so a symlink that leaves the home drops out. The list file reads like the
-plugin lock: provisioned home content, read directly.
+plugin lock: provisioned home content, read directly. The overlay file name includes
+the project (one file per home and project), so two projects sharing one home write
+different files and one project's spawn can never overwrite another's.
 
 Custom skills lose name clashes to standard discovery and each other
 deterministically (omp sorts); a per-project skill never displaces a shipped home
@@ -139,15 +141,18 @@ shape.
 
 ### Overlay write
 
-`ensurePluginSkillsOverlay(env, home)` mirrors `ensureMemoryOverlay` (`src/memory.ts`):
+`ensurePluginSkillsOverlay(env, home, project)` mirrors `ensureMemoryOverlay`
+(`src/memory.ts`):
 
-- Path: `<overlayDirFor(env)>/omp-plugin-skills-<sha256(home).slice(0, 16)>.yml`
-  (`OTTR_DATA_DIR`, else `tmpdir()/ottr-omp-memory`, dir 0700). One file per home: a
-  board-side run and a worker run share the data dir but never share a file, so the
-  two homes cannot overwrite each other's directory list, and a pinned run keeps its
-  own home's content for its whole life. Stale files of retired layers stay behind
-  (each under 400 bytes, written only on content change) — accepted, the data dir
-  already holds per-project trees.
+- Path: `<overlayDirFor(env)>/omp-plugin-skills-<hash>.yml` where the hash is the
+  sha256 of the home path — plus the project, `\0`-joined, when one is set — cut to
+  16 hex chars (`OTTR_DATA_DIR`, else `tmpdir()/ottr-omp-memory`, dir 0700). One file
+  per home and project: a board-side run and a worker run share the data dir but
+  never share a file, and two projects on one home write two files, so no spawn can
+  overwrite another's directory list between its write and its omp read. A pinned
+  run keeps its own file's content for its whole life. Stale files of retired layers
+  stay behind (each under 400 bytes, written only on content change) — accepted, the
+  data dir already holds per-project trees.
 - Content (`pluginSkillsOverlayYaml`) — the three project pins ride on every run, the
   plugin directories only when the home has them:
 
@@ -175,8 +180,9 @@ shape.
 The overlay files live in the data dir, which the server, the workers and the VM copy
 mount at the same absolute path, so the argv path resolves in every container
 (docs/WORKERS.md, "Server: `OTTR_DATA_DIR=/data` …"). Content is deterministic per
-home, so concurrent runs of the same home write identical bytes; different homes write
-different files; `writeBelow` gives the atomicity.
+home and project, so concurrent runs of the same home and project write identical
+bytes; different homes and different projects write different files; `writeBelow`
+gives the atomicity.
 
 ### Spawn wiring (`src/runner.ts`)
 

@@ -3353,14 +3353,21 @@ describe("startRun", () => {
 			};
 			// The run's project resolves its bundle: the overlay lists the dir.
 			await (await startRun({ ...base, board })).done;
-			expect(readFileSync(overlayOf(), "utf8")).toContain(
+			const projOverlay = overlayOf();
+			expect(readFileSync(projOverlay, "utf8")).toContain(
 				JSON.stringify(bundleDir),
 			);
-			// A project without a bundle keeps the unscoped overlay.
+			// A project without a bundle keeps the unscoped overlay, in its own
+			// file: two projects on one home write two files, so the second run
+			// cannot overwrite the first run's list between write and omp read.
 			seen.length = 0;
 			await (await startRun({ ...base, board: { ...board, project: "other" } }))
 				.done;
-			expect(readFileSync(overlayOf(), "utf8")).not.toContain("project-skills");
+			const otherOverlay = overlayOf();
+			expect(otherOverlay).not.toBe(projOverlay);
+			expect(readFileSync(otherOverlay, "utf8")).not.toContain(
+				"project-skills",
+			);
 			// A stripBoard run carries no OTTR_PROJECT: no scoping either.
 			seen.length = 0;
 			await (await startRun({ ...base, board, stripBoard: true })).done;
