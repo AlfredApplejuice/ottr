@@ -6584,16 +6584,10 @@ export async function createApp(deps: AppDeps) {
 				taskIdPrefix: prefix === "" ? null : prefix,
 			});
 		});
-		// A gitless project has no HEAD to create a worktree from; the turn machinery would
-		// crash, so the rules interview waits for POST /init.
-		if (e.gitless)
-			return json({
-				project: await projectView(e),
-				interview: "gitless",
-				id: null,
-			});
-		const interview = await startInterview(e);
-		return json({ project: await projectView(e), ...interview });
+		// The rules interview waits for the wizard's last step: the settings saves land
+		// first, so PR mode and the target branch hold for the interview's first commit
+		// (docs/specs/add-project-wizard.md). POST /interview starts it.
+		return json({ project: await projectView(e) });
 	}
 
 	async function addProject(body: Record<string, unknown>): Promise<Response> {
@@ -9241,8 +9235,10 @@ export async function createApp(deps: AppDeps) {
 		if (err !== null) return json({ error: err }, 400);
 		e.gitless = false;
 		await refreshRemote(e);
-		const interview = await startInterview(e);
-		return json({ project: await projectView(e), ...interview });
+		// The interview stays with POST /interview: the wizard's last step and the
+		// checklist call it after the settings steps saved
+		// (docs/specs/add-project-wizard.md).
+		return json({ project: await projectView(e) });
 	}
 
 	async function handlePOSTProjects(req: Request): Promise<Response> {

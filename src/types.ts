@@ -1427,13 +1427,11 @@ export interface SessionContext {
 	at: number;
 }
 
+/** POST /api/projects and POST /api/projects/:project/init: the fresh project view. The
+ *  rules interview starts through POST /api/projects/:project/interview after the wizard's
+ *  settings steps (docs/specs/add-project-wizard.md). */
 export interface AddProjectResponse {
 	project: ProjectView;
-	/** "queued" | "not-needed" | "gitless" */
-	interview: string;
-	/** The rules interview card's id when the answer queued one; null when no card exists
-	 * ("not-needed", "gitless"). The setup wizard turns it into an "Open rules task" action. */
-	id: string | null;
 }
 
 /** GET /api/gh-status: gh auth facts for the Add project form's New tab. */

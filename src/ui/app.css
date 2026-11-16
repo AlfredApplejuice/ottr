@@ -6404,6 +6404,17 @@ dialog.confirm-dialog {
 	margin: 0;
 	padding: 0;
 }
+/* Five steps overflow a 375 px dialog: scroll the strip there, never wrap it
+ * (the stage-tabs rule). Scoping the scroll keeps the wide underline merge. */
+@media (max-width: 440px) {
+	.setup-steps {
+		overflow-x: auto;
+		scrollbar-width: thin;
+	}
+	.setup-steps li {
+		margin-bottom: 0;
+	}
+}
 .setup-steps li {
 	display: inline-flex;
 	align-items: center;

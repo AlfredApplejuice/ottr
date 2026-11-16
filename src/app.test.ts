@@ -3278,7 +3278,15 @@ describe("settings routes", () => {
 		// Our own API's documented response shape; no runtime validator exists in this suite.
 		const added = (await add.json()) as AddProjectResponse;
 		expect(added.project.gitless).toBe(true);
-		expect(added.interview).toBe("gitless");
+		// OTTR-1065: the add no longer starts the interview, so the response carries no
+		// verdict and no card exists — the wizard's settings steps come first.
+		expect("interview" in added).toBe(false);
+		const gs0 = projects.get("gitless-proj")!.store;
+		expect(
+			(await gs0.listTasks()).some((t) =>
+				t.prompt.startsWith(RULES_INTERVIEW_MARKER),
+			),
+		).toBe(false);
 
 		// Actions are blocked while gitless: one write route, one read route.
 		const task = await post("/api/projects/gitless-proj/tasks", {
@@ -3293,13 +3301,19 @@ describe("settings routes", () => {
 		const iv = await post("/api/projects/gitless-proj/interview", {});
 		expect(iv.status).toBe(409);
 
-		// Init: git-inits, commits, and queues the interview.
+		// Init: git-inits and commits; the interview still waits for POST /interview.
 		const init = await post("/api/projects/gitless-proj/init", {});
 		expect(init.status).toBe(200);
 		// Our own API's documented response shape; no runtime validator exists in this suite.
 		const inited = (await init.json()) as AddProjectResponse;
 		expect(inited.project.gitless).toBe(false);
-		expect(inited.interview).toBe("queued");
+		expect("interview" in inited).toBe(false);
+		const gs1 = projects.get("gitless-proj")!.store;
+		expect(
+			(await gs1.listTasks()).some((t) =>
+				t.prompt.startsWith(RULES_INTERVIEW_MARKER),
+			),
+		).toBe(false);
 		const head = execSync("git rev-parse HEAD", {
 			cwd: dir,
 			encoding: "utf8",
@@ -3311,12 +3325,16 @@ describe("settings routes", () => {
 		expect(again.status).toBe(409);
 		expect(await errorOf(again)).toBe("already a git repository");
 
-		// The init queued the rules interview; settle it so remove's active-task guard passes.
-		// The entry's own store: a second open would fight the exclusive instance lock.
-		const gs = projects.get("gitless-proj")!.store;
-		const interviewTask = (await gs.listTasks()).at(-1);
-		expect(interviewTask?.prompt.startsWith(RULES_INTERVIEW_MARKER)).toBe(true);
-		await gs.updateTask(interviewTask!.id, {
+		// The wizard's last step: the explicit interview call queues the card after init.
+		const iv2 = await post("/api/projects/gitless-proj/interview", {});
+		expect(iv2.status).toBe(200);
+		const gs2 = projects.get("gitless-proj")!.store;
+		const cards = (await gs2.listTasks()).filter((t) =>
+			t.prompt.startsWith(RULES_INTERVIEW_MARKER),
+		);
+		expect(cards).toHaveLength(1);
+		// Settle the card so remove's active-task guard passes.
+		await gs2.updateTask(cards[0]!.id, {
 			cancelledAt: Date.now(),
 			state: "idle",
 			stage: "done",
@@ -3324,6 +3342,39 @@ describe("settings routes", () => {
 
 		const rm2 = await post("/api/projects/gitless-proj/remove", {});
 		expect(rm2.status).toBe(200);
+	});
+
+	// OTTR-1065: the settings the wizard saves between add and interview must be live
+	// when the interview card exists — add queues no card, the settings save lands,
+	// and only the explicit interview call files one.
+	test("a settings save lands before the interview starts", async () => {
+		makeFixture("wizard-order");
+		const res = await post("/api/projects", {
+			url: "https://github.com/octo/wizard-order",
+		});
+		expect(res.status).toBe(200);
+		const s = projects.get("wizard-order")!.store;
+		expect(
+			(await s.listTasks()).some((t) =>
+				t.prompt.startsWith(RULES_INTERVIEW_MARKER),
+			),
+		).toBe(false);
+
+		// The wizard's settings step: a project setting that shapes the first turns.
+		const save = await post("/api/projects/wizard-order/settings", {
+			retro: true,
+		});
+		expect(save.status).toBe(200);
+		expect((await s.getSettings()).retroSince).not.toBeNull();
+
+		// The wizard's last step: only now does a card exist.
+		const iv = await post("/api/projects/wizard-order/interview", {});
+		expect(iv.status).toBe(200);
+		const cards = (await s.listTasks()).filter((t) =>
+			t.prompt.startsWith(RULES_INTERVIEW_MARKER),
+		);
+		expect(cards).toHaveLength(1);
+		expect((await s.getSettings()).retroSince).not.toBeNull();
 	});
 
 	// OTTR-624: a repo Ottr itself creates starts at its own watermark. The init commit is
@@ -3363,15 +3414,14 @@ describe("settings routes", () => {
 		expect(d).toEqual({ delta: 1, reviewed: true, anchor: base });
 		expect(archReviewDue(d!.delta, 150, d!.reviewed)).toBe(false);
 
-		// Settle the interview the init queued, so remove's active-task guard passes.
+		// The init no longer queues the interview (OTTR-1065), so remove's active-task
+		// guard passes without settling a card.
 		const ws = projects.get("watermark-proj")!.store;
-		const interviewTask = (await ws.listTasks()).at(-1);
-		expect(interviewTask?.prompt.startsWith(RULES_INTERVIEW_MARKER)).toBe(true);
-		await ws.updateTask(interviewTask!.id, {
-			cancelledAt: Date.now(),
-			state: "idle",
-			stage: "done",
-		});
+		expect(
+			(await ws.listTasks()).some((t) =>
+				t.prompt.startsWith(RULES_INTERVIEW_MARKER),
+			),
+		).toBe(false);
 		const rm = await post("/api/projects/watermark-proj/remove", {});
 		expect(rm.status).toBe(200);
 	});

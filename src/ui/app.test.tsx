@@ -75,6 +75,7 @@ const {
 	OrphanNotice,
 	SeedFailedLine,
 	ProvisionErrorLine,
+	SetupChecklist,
 	ranOnLabel,
 	AuthPage,
 	PrReviewSection,
@@ -8986,6 +8987,27 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		settings: { maxParallel: 1, copyExtra: [] },
 	} as unknown as ProjectView;
 
+	// The wizard's fresh project: retro off keeps the board step first, and the GitHub
+	// remote enables the PR mode row (docs/specs/add-project-wizard.md).
+	const wizardProject = {
+		name: "wiz",
+		hasRules: false,
+		gitless: false,
+		github: "https://github.com/o/wiz",
+		sessionsDir: "/tmp/sessions",
+		settings: {
+			retroSince: null,
+			retroFilter: false,
+			forkResearch: false,
+			holdUpdateMerges: false,
+			forkMergeHold: false,
+			prMode: false,
+			targetBranch: null,
+			maxParallel: null,
+			copyExtra: [],
+		},
+	} as unknown as ProjectView;
+
 	const hostsView = (githubTokenSet: boolean): Record<string, unknown> => ({
 		tokens: githubTokenSet
 			? [{ host: "github.com", username: "x-access-token", tokenSet: true }]
@@ -9033,7 +9055,7 @@ describe("AddProjectModal board GitHub token reuse", () => {
 					{ status: 400 },
 				);
 			}
-			return new Response(JSON.stringify({ project, interview: "i1" }), {
+			return new Response(JSON.stringify({ project }), {
 				status: 200,
 			});
 		}
@@ -9044,21 +9066,44 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			});
 			return new Response(JSON.stringify(hostsView(true)), { status: 200 });
 		}
+		// The wizard's calls once it replaced the form: settings saves return the view,
+		// the interview call files a card, the fork facts answer empty.
+		if (url.endsWith("/settings") && method === "POST") {
+			posts.push({
+				url,
+				body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+			});
+			return new Response(JSON.stringify(project), { status: 200 });
+		}
+		if (url.endsWith("/interview") && method === "POST") {
+			posts.push({
+				url,
+				body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+			});
+			return new Response(
+				JSON.stringify({ interview: "queued", id: "WIZ-1" }),
+				{ status: 200 },
+			);
+		}
+		if (url.endsWith("/github")) {
+			return new Response(JSON.stringify({ forks: 0, active: 0, recent: [] }), {
+				status: 200,
+			});
+		}
 		return new Response("{}", { status: 404 });
 	}
 
 	async function mountAdd(
 		githubTokenSet: boolean,
 		projects: ProjectView[] = [],
+		wizardProject?: ProjectView,
 	): Promise<{
 		container: HTMLDivElement;
 		root: ReturnType<typeof createRoot>;
 		posts: { url: string; body: Record<string, unknown> }[];
-		added: string[];
 		restore: () => void;
 	}> {
 		const posts: { url: string; body: Record<string, unknown> }[] = [];
-		const added: string[] = [];
 		const calls = { project: 0 };
 		const realFetch = globalThis.fetch;
 		globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
@@ -9066,7 +9111,7 @@ describe("AddProjectModal board GitHub token reuse", () => {
 				hostsView,
 				posts,
 				calls,
-				project,
+				wizardProject ?? project,
 				githubTokenSet,
 				input,
 				init,
@@ -9097,7 +9142,6 @@ describe("AddProjectModal board GitHub token reuse", () => {
 						act={actProp}
 						projects={projects}
 						onClose={() => {}}
-						onAdded={(interview: string) => added.push(interview)}
 						openTask={() => {}}
 					/>,
 				);
@@ -9110,7 +9154,6 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			container,
 			root,
 			posts,
-			added,
 			restore: () => {
 				globalThis.fetch = realFetch;
 			},
@@ -9118,7 +9161,7 @@ describe("AddProjectModal board GitHub token reuse", () => {
 	}
 
 	test("the board token button retries Add with the prefilled x-access-token", async () => {
-		const { container, root, posts, added, restore } = await mountAdd(true);
+		const { container, root, posts, restore } = await mountAdd(true);
 		try {
 			const urlInput = container.querySelector(
 				"input[data-autofocus]",
@@ -9156,7 +9199,9 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			expect(posts.filter((p) => p.url.endsWith("/api/projects")).length).toBe(
 				2,
 			);
-			expect(added).toEqual(["i1"]);
+			// The add response carries no interview verdict: the wizard replaced the form
+			// and the interview waits for its last step (OTTR-1065).
+			expect(container.textContent).toContain("Set up proj");
 		} finally {
 			await act(async () => {
 				root.unmount();
@@ -9339,6 +9384,179 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			container.remove();
 			restore();
 		}
+	});
+
+	// OTTR-1065: one guided flow — add, board step, Project step, then the interview.
+	/** Types the wizard fixture's URL and submits; the 400's token step retries through
+	 *  the board token button, leaving the wizard in the dialog. */
+	const addThroughDialog = async (container: HTMLDivElement): Promise<void> => {
+		const urlInput = container.querySelector(
+			"input[data-autofocus]",
+		) as unknown as HTMLInputElement;
+		await act(async () => {
+			typeInto(urlInput, "https://github.com/o/wiz.git");
+			onChangeOf(urlInput)({
+				target: urlInput,
+				currentTarget: urlInput,
+			});
+		});
+		const form = container.querySelector("form") as unknown as HTMLFormElement;
+		await act(async () => {
+			form.dispatchEvent(submitEvent());
+		});
+		const boardButton = [...container.querySelectorAll("button")].find(
+			(b) => b.textContent === "Use the board GitHub token",
+		);
+		await act(async () => {
+			onClickOf(boardButton as unknown as Element)({});
+		});
+	};
+
+	const buttonOf = (container: HTMLDivElement, label: string): Element => {
+		const b = [...container.querySelectorAll("button")].find(
+			(x) => x.textContent === label,
+		);
+		if (b === undefined) throw new Error(`no ${label} button`);
+		return b;
+	};
+
+	test("PR mode saves before the interview starts", async () => {
+		const { container, root, posts, restore } = await mountAdd(
+			true,
+			[],
+			wizardProject,
+		);
+		try {
+			await addThroughDialog(container);
+			// The fresh project opens at the board step: retro is off.
+			expect(container.textContent).toContain("Retro");
+			// Skip the board and runner steps: their defaults stay.
+			await act(async () => {
+				onClickOf(buttonOf(container, "Skip, use defaults"))({});
+			});
+			await act(async () => {
+				onClickOf(buttonOf(container, "Skip, use defaults"))({});
+			});
+			// The Project step: PR mode is the step's only checkbox.
+			const pr = container.querySelector(
+				'input[type="checkbox"]',
+			) as unknown as HTMLInputElement;
+			expect(pr).not.toBeNull();
+			await act(async () => {
+				onChangeOf(pr)({ target: { checked: true }, currentTarget: pr });
+			});
+			// Next keeps the target branch at its default; Done starts the interview.
+			await act(async () => {
+				onClickOf(buttonOf(container, "Next"))({});
+			});
+			await act(async () => {
+				onClickOf(buttonOf(container, "Done"))({});
+			});
+			const prSave = posts.findIndex(
+				(p) => p.url.endsWith("/settings") && p.body.prMode === true,
+			);
+			const interview = posts.findIndex((p) => p.url.endsWith("/interview"));
+			expect(prSave).toBeGreaterThanOrEqual(0);
+			// The interview call exists and only follows the PR mode save.
+			expect(interview).toBeGreaterThan(prSave);
+			expect(posts[interview]?.body).toEqual({});
+			// The wizard finished: the checklist flag cleared.
+			expect(
+				posts.some(
+					(p) => p.url.endsWith("/settings") && p.body.setupChecklist === false,
+				),
+			).toBe(true);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+	});
+
+	test("closing the dialog after the add queues no interview", async () => {
+		const { container, root, posts, restore } = await mountAdd(
+			true,
+			[],
+			wizardProject,
+		);
+		try {
+			await addThroughDialog(container);
+			// The wizard replaced the form and no card is filed yet.
+			expect(container.textContent).toContain("Skip, use defaults");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+		expect(posts.some((p) => p.url.endsWith("/api/projects"))).toBe(true);
+		expect(posts.some((p) => p.url.endsWith("/interview"))).toBe(false);
+	});
+});
+
+describe("SetupChecklist rules item", () => {
+	// Retro and fork research are settled, so the checklist's only possible item is the
+	// rules one the add wizard's last step normally settles (docs/specs/add-project-wizard.md).
+	const base = {
+		name: "proj",
+		hasRules: false,
+		gitless: false,
+		github: null,
+		settings: {
+			retroSince: 1,
+			retroFilter: false,
+			forkResearch: true,
+			setupChecklist: true,
+		},
+	} as unknown as ProjectView;
+
+	const renderChecklist = (
+		project: ProjectView,
+		rulesTask: string | null,
+	): string =>
+		renderToStaticMarkup(
+			<SetupChecklist
+				project={project}
+				save={async () => true}
+				rulesTask={rulesTask === null ? null : ({ id: rulesTask } as TaskCard)}
+				openTask={() => {}}
+				interview={async () => true}
+				initGit={async () => true}
+				onOpenSetup={() => {}}
+			/>,
+		);
+
+	test("a project without rules shows the way to start the interview", () => {
+		const html = renderChecklist(base, null);
+		expect(html).toContain("No AGENTS.md yet");
+		expect(html).toContain("Start rules interview");
+	});
+
+	test("a live rules card turns the item into an open action", () => {
+		const html = renderChecklist(base, "PROJ-7");
+		expect(html).toContain("Open rules task");
+		expect(html).not.toContain("Start rules interview");
+	});
+
+	test("a gitless project offers Create git repo first", () => {
+		const html = renderChecklist(
+			{ ...base, gitless: true } as unknown as ProjectView,
+			null,
+		);
+		expect(html).toContain("Create git repo");
+		expect(html).not.toContain("Start rules interview");
+	});
+
+	test("a project with rules shows no rules item", () => {
+		const html = renderChecklist(
+			{ ...base, hasRules: true } as unknown as ProjectView,
+			null,
+		);
+		expect(html).not.toContain("No AGENTS.md yet");
+		expect(html).not.toContain("Start rules interview");
 	});
 });
 
@@ -10649,7 +10867,7 @@ describe("AddProjectModal Git URL field error", () => {
 			const method = init?.method ?? "GET";
 			if (url.endsWith("/api/projects") && method === "POST") {
 				posts.push({ url });
-				return new Response(JSON.stringify({ project, interview: "i1" }), {
+				return new Response(JSON.stringify({ project }), {
 					status: 200,
 				});
 			}
@@ -10669,7 +10887,6 @@ describe("AddProjectModal Git URL field error", () => {
 							return true;
 						}}
 						onClose={() => {}}
-						onAdded={() => {}}
 						openTask={() => {}}
 						projects={[]}
 					/>,

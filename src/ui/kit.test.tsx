@@ -306,9 +306,7 @@ describe("interviewMsg", () => {
 		expect(interviewMsg("not-needed")).toBe(
 			"AGENTS.md found - no interview needed.",
 		);
-		expect(interviewMsg("gitless")).toBe(
-			"Init a git repository first - actions wait until then.",
-		);
+		// OTTR-1065 removed the "gitless" verdict: no route answers with it any more.
 		expect(interviewMsg("standalone")).toBe("standalone");
 	});
 });

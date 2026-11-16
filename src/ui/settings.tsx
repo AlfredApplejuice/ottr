@@ -3,6 +3,7 @@ import {
 	createContext,
 	Fragment,
 	useCallback,
+	useContext,
 	useEffect,
 	useId,
 	useRef,
@@ -118,8 +119,21 @@ function SaveLabel({ saved }: { saved: boolean }) {
 	);
 }
 
-/** The four wizard steps; the Source step lives in the Add project form, the rest here. */
-const SETUP_STEPS = ["Source", "Rules", "Automation", "Runners"] as const;
+/** The five wizard steps; the Source step lives in the Add project form, the rest here.
+ *  The rules interview is last: the settings steps save first, so PR mode and the target
+ *  branch hold for the interview's first commit (docs/specs/add-project-wizard.md). */
+const SETUP_STEPS = [
+	"Source",
+	"Automation",
+	"Runners",
+	"Project",
+	"Rules",
+] as const;
+
+/** PR mode's description, shared by the settings page's Merging card and the wizard's
+ *  Project step (docs/specs/add-project-wizard.md). */
+const PR_MODE_DESC =
+	"Push finished card branches and open a pull request to the target branch instead of merging; the card waits in Merging until the pull request merges on GitHub";
 
 /** Step strip styled like .add-tabs: steel underline on the current step, a check on done ones. */
 function SetupStepsNav({ step }: { step: number }) {
@@ -156,8 +170,8 @@ function pushedAge(pushedAt: number, now: number): string {
 	return `${Math.trunc(hours / 24)}d`;
 }
 
-/** Step 2's rules block: git init for a bare folder, align or interview, or open the queued card. */
-function SetupRulesSection({
+/** Step 5's rules block: git init for a bare folder, align or interview, or open the queued card. */
+export function SetupRulesSection({
 	gitless,
 	hasRules,
 	rulesTask,
@@ -316,11 +330,13 @@ function SetupForkSection({
 	);
 }
 
-/** The wizard body after the project exists: Rules, Automation, Runners. Saves land at once,
- *  so a closed dialog never loses a choice. Opens at step 2 both after Add and standalone. */
+/** The wizard body after the project exists: Automation, Runners, Project, Rules. Saves land
+ *  at once, so a closed dialog never loses a choice. It opens at the first unsettled step:
+ *  Automation while the board settings are still missing (the setup checklist's facts),
+ *  else Project. The rules interview starts only at the last step's Done
+ *  (docs/specs/add-project-wizard.md). */
 export function ProjectSetupSteps({
 	project,
-	interview = "standalone",
 	rulesTask: rulesTaskProp = null,
 	openTask,
 	act,
@@ -328,8 +344,6 @@ export function ProjectSetupSteps({
 	onClose,
 }: {
 	project: ProjectView;
-	/** Add response verdict for a fresh project: "queued" means the rules card is already filed. */
-	interview?: string;
 	/** The live rules interview card's id, when the caller knows one: the Rules section then
 	 * offers "Open rules task" instead of a second "Discuss rules" that would only queue. */
 	rulesTask?: string | null;
@@ -339,27 +353,38 @@ export function ProjectSetupSteps({
 	onNotice?: (message: string) => void;
 	onClose: () => void;
 }) {
-	const [step, setStep] = useState(2);
+	// Board settings still missing? The facts the setup checklist reads — no new flag:
+	// retro off, or fork research off on a GitHub project. When both are settled the
+	// wizard starts at the Project step and the strip marks the skipped ones done.
+	const boardMissing =
+		project.settings.retroSince === null ||
+		(project.github !== null && !project.settings.forkResearch);
+	// A gitless project cannot save settings yet (the routes 409), so it opens at the
+	// rules step's init panel; the interview still starts only on this step's action.
+	const [step, setStep] = useState(project.gitless ? 5 : boardMissing ? 2 : 4);
 	// The latest ProjectView: every settings save returns one, so the checkboxes follow the server.
 	const [view, setView] = useState(project);
 	const [err, setErr] = useState<string | null>(null);
 	const [gitless, setGitless] = useState(project.gitless);
-	const [rulesQueued, setRulesQueued] = useState(interview === "queued");
+	const [rulesQueued, setRulesQueued] = useState(false);
 	// The rules card the wizard can open: seeded from the caller, then set from every
 	// interview answer's id, so a queued or running card turns the button into an open.
 	const [rulesTask, setRulesTask] = useState<string | null>(rulesTaskProp);
 	// Fork pre-check draft: shown before the user touches the checkbox, persisted only on Next.
 	const [forkDraft, setForkDraft] = useState(false);
 	const forkTouched = useRef(false);
-	// GitHub facts for the fork panel, fetched once on entering step 3; null while loading.
+	// GitHub facts for the fork panel, fetched once on entering step 2; null while loading.
 	const [facts, setFacts] = useState<GithubFactsState>(null);
-	// Step 4 drafts.
+	// Runners drafts: persisted on Next, dropped by "Skip, use defaults".
 	const [mp, setMp] = useState(
 		project.settings.maxParallel === null
 			? ""
 			: String(project.settings.maxParallel),
 	);
 	const [extra, setExtra] = useState(project.settings.copyExtra.join("\n"));
+	// Project step's target branch draft: persisted on Next.
+	const [tb, setTb] = useState(project.settings.targetBranch ?? "");
+	const hosted = useContext(HostedContext);
 
 	/** Saves one settings patch, refreshes the board's project state, and shows errors inline. */
 	const patch = (body: Record<string, unknown>): Promise<boolean> =>
@@ -395,7 +420,7 @@ export function ProjectSetupSteps({
 		}, setErr);
 
 	useEffect(() => {
-		if (step !== 3 || view.github === null || facts !== null) return;
+		if (step !== 2 || view.github === null || facts !== null) return;
 		// No "loading" state write here: changing `facts` would rerun this effect and cancel the fetch.
 		let live = true;
 		const run = async (): Promise<void> => {
@@ -424,15 +449,70 @@ export function ProjectSetupSteps({
 		: view.settings.forkResearch ||
 			(facts?.kind === "ok" && facts.facts.active > 0);
 
-	/** Step 3's Next: persist the pre-check (only that) before moving on. */
+	/** Next: persist the step's drafts (only what changed) before moving on. */
 	const next = (): void => {
-		if (step === 3 && forkEffective !== view.settings.forkResearch) {
+		if (step === 2 && forkEffective !== view.settings.forkResearch) {
 			void patch({ forkResearch: forkEffective }).then((ok) => {
+				if (ok) setStep(3);
+			});
+			return;
+		}
+		if (step === 3) {
+			const parallel =
+				mp.trim() === "" ? null : clamp(Math.trunc(Number(mp)) || 1, 1, 8);
+			const paths = extra
+				.split("\n")
+				.map((s) => s.trim())
+				.filter((s) => s.length > 0);
+			const unchanged =
+				parallel === view.settings.maxParallel &&
+				paths.length === view.settings.copyExtra.length &&
+				paths.every((p, i) => p === view.settings.copyExtra[i]);
+			if (unchanged) {
+				setStep(4);
+				return;
+			}
+			void patch({ maxParallel: parallel, copyExtra: paths }).then((ok) => {
 				if (ok) setStep(4);
 			});
-		} else {
-			setStep(step + 1);
+			return;
 		}
+		if (step === 4 && tb.trim() !== (view.settings.targetBranch ?? "")) {
+			void patch({ targetBranch: tb.trim() || null }).then((ok) => {
+				if (ok) setStep(5);
+			});
+			return;
+		}
+		setStep(step + 1);
+	};
+
+	/** "Skip, use defaults": drop the step's unsaved drafts and move on. Choices already
+	 *  saved stay — the checkbox rows save at once. */
+	const skip = (): void => {
+		if (step === 2) {
+			forkTouched.current = false;
+			setForkDraft(false);
+		} else if (step === 3) {
+			setMp(
+				view.settings.maxParallel === null
+					? ""
+					: String(view.settings.maxParallel),
+			);
+			setExtra(view.settings.copyExtra.join("\n"));
+		} else if (step === 4) {
+			setTb(view.settings.targetBranch ?? "");
+		}
+		setStep(step + 1);
+	};
+
+	/** The final Done: start the rules interview (init first when gitless), then finish.
+	 *  The settings steps saved first, so they hold for the interview's first commit. */
+	const finish = async (): Promise<boolean> => {
+		if (gitless && !(await initRepo())) return false;
+		if (!(await runInterview({}, () => setRulesQueued(true)))) return false;
+		const ok = await patch({ setupChecklist: false });
+		if (ok) onClose();
+		return ok;
 	};
 
 	return (
@@ -444,19 +524,6 @@ export function ProjectSetupSteps({
 				</p>
 			)}
 			{step === 2 && (
-				<SetupRulesSection
-					gitless={gitless}
-					hasRules={view.hasRules}
-					rulesTask={rulesTask}
-					rulesQueued={rulesQueued}
-					openTask={openTask}
-					onClose={onClose}
-					initRepo={initRepo}
-					alignRules={() => runInterview({ fix: true })}
-					discussRules={() => runInterview({}, () => setRulesQueued(true))}
-				/>
-			)}
-			{step === 3 && (
 				<>
 					<section className="setup-sec">
 						<label className="add-check">
@@ -532,7 +599,7 @@ export function ProjectSetupSteps({
 					</section>
 				</>
 			)}
-			{step === 4 && (
+			{step === 3 && (
 				<section className="setup-sec">
 					<h3>Runners</h3>
 					<label className="settings-field">
@@ -560,6 +627,51 @@ export function ProjectSetupSteps({
 					</label>
 				</section>
 			)}
+			{step === 4 && (
+				<section className="setup-sec settings-sec">
+					<h3>Project</h3>
+					{!hostedHidden(hosted, "project-merging-section") && (
+						<div className="alate-def-rows">
+							<CheckRow
+								name="PR mode"
+								desc={`${view.github === null ? "Needs a GitHub remote. " : ""}${PR_MODE_DESC}`}
+								checked={view.settings.prMode}
+								disabled={view.github === null && !view.settings.prMode}
+								save={(v) => patch({ prMode: v })}
+								act={act}
+							/>
+						</div>
+					)}
+					<label className="settings-field">
+						Target branch
+						<span className="hint">
+							the branch on origin that finished cards merge into; empty = the
+							repo's default branch. Saved on Next.
+						</span>
+						<input
+							type="text"
+							maxLength={200}
+							placeholder="main"
+							aria-label="Target branch for merges"
+							value={tb}
+							onChange={(e) => setTb(e.target.value)}
+						/>
+					</label>
+				</section>
+			)}
+			{step === 5 && (
+				<SetupRulesSection
+					gitless={gitless}
+					hasRules={view.hasRules}
+					rulesTask={rulesTask}
+					rulesQueued={rulesQueued}
+					openTask={openTask}
+					onClose={onClose}
+					initRepo={initRepo}
+					alignRules={() => runInterview({ fix: true })}
+					discussRules={() => runInterview({}, () => setRulesQueued(true))}
+				/>
+			)}
 			<div className="dialog-actions setup-actions">
 				<BusyButton
 					className="ghost"
@@ -571,36 +683,22 @@ export function ProjectSetupSteps({
 				>
 					Finish later
 				</BusyButton>
+				{step >= 2 && step < 5 && (
+					<button type="button" className="ghost" onClick={skip}>
+						Skip, use defaults
+					</button>
+				)}
 				{step > 2 && (
 					<button type="button" onClick={() => setStep(step - 1)}>
 						Back
 					</button>
 				)}
-				{step < 4 ? (
+				{step < 5 ? (
 					<button type="button" className="primary" onClick={next}>
 						Next
 					</button>
 				) : (
-					<BusyButton
-						className="primary"
-						run={async () => {
-							const parallel =
-								mp.trim() === ""
-									? null
-									: clamp(Math.trunc(Number(mp)) || 1, 1, 8);
-							const paths = extra
-								.split("\n")
-								.map((s) => s.trim())
-								.filter((s) => s.length > 0);
-							const ok = await patch({
-								maxParallel: parallel,
-								copyExtra: paths,
-								setupChecklist: false,
-							});
-							if (ok) onClose();
-							return ok;
-						}}
-					>
+					<BusyButton className="primary" run={finish}>
 						Done
 					</BusyButton>
 				)}
@@ -8403,7 +8501,7 @@ function ProjectMergingCard({
 			<div className="alate-def-rows">
 				<CheckRow
 					name="PR mode"
-					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Push finished card branches and open a pull request to the target branch instead of merging; the card waits in Merging until the pull request merges on GitHub`}
+					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${PR_MODE_DESC}`}
 					checked={st.prMode}
 					disabled={project.github === null && !st.prMode}
 					save={(v) => send({ prMode: v })}

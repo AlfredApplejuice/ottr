@@ -3999,6 +3999,9 @@ function ProjectAdvisories(p: {
 	pushMain: () => Promise<boolean>;
 	saveCheck: (patchBody: Record<string, unknown>) => Promise<boolean>;
 	interview: (path: string, body: Record<string, unknown>) => Promise<boolean>;
+	/** Creates the git repository (POST /init); no interview verdict to report since
+	 *  OTTR-1065 — the interview starts from the rules advisory or the wizard. */
+	initGit: () => Promise<boolean>;
 	rulesTask: TaskCard | null;
 	openTask: (id: string) => void;
 }) {
@@ -4110,9 +4113,7 @@ function ProjectAdvisories(p: {
 				<p className="advisory">
 					<Icon name="info" size={14} />
 					Not a git repository yet, so every action waits.
-					<BusyButton run={() => p.interview("/init", {})}>
-						Create git repo
-					</BusyButton>
+					<BusyButton run={p.initGit}>Create git repo</BusyButton>
 				</p>
 			)}
 			{q !== "" && p.shown.length === 0 && (
@@ -4291,6 +4292,13 @@ export function ProjectBoard({
 			);
 			onNotice(interviewMsg(r.interview));
 		});
+	/** Creates the git repository; no interview starts here since OTTR-1065 — the
+	 *  wizard's last step and the checklist's rules item call POST /interview. */
+	const initGit = () =>
+		act(async () => {
+			await post(`/api/projects/${encodeURIComponent(project.name)}/init`, {});
+			refreshState();
+		});
 	// The live rules interview card, if any: the no-rules advisory then offers opening it
 	// instead of a second "Discuss rules" that would only answer "queued".
 	const rulesTask = liveCardOf(tasks, "interview");
@@ -4446,6 +4454,7 @@ export function ProjectBoard({
 				pushMain={pushMain}
 				saveCheck={saveCheck}
 				interview={interview}
+				initGit={initGit}
 				rulesTask={rulesTask}
 				openTask={open}
 			/>
@@ -4453,6 +4462,10 @@ export function ProjectBoard({
 				<SetupChecklist
 					project={project}
 					save={saveCheck}
+					rulesTask={rulesTask}
+					openTask={open}
+					interview={interview}
+					initGit={initGit}
 					onOpenSetup={() => setSetupOpen(true)}
 				/>
 			)}
@@ -7197,21 +7210,11 @@ function addGitProjectRequest(req: {
 function reportAddedProject(
 	data: unknown,
 	hooks: {
-		onAdded: (interview: string) => void;
-		setAdded: (v: {
-			project: ProjectView;
-			interview: string;
-			id: string | null;
-		}) => void;
+		setAdded: (v: { project: ProjectView }) => void;
 	},
 ): void {
 	const r = data as unknown as AddProjectResponse; // unchecked cast: the server's documented answer shape
-	hooks.onAdded(r.interview);
-	hooks.setAdded({
-		project: r.project,
-		interview: r.interview,
-		id: r.id ?? null,
-	});
+	hooks.setAdded({ project: r.project });
 }
 
 /** The Add submit from the form: success reports the project, otherwise it raises
@@ -7225,12 +7228,7 @@ async function addGitProject(
 		trust: string[] | undefined;
 	},
 	hooks: {
-		onAdded: (interview: string) => void;
-		setAdded: (v: {
-			project: ProjectView;
-			interview: string;
-			id: string | null;
-		}) => void;
+		setAdded: (v: { project: ProjectView }) => void;
 		setAddTrust: (t: TrustNeeded) => void;
 		setNeedsTokenHost: (h: string) => void;
 	},
@@ -7262,12 +7260,7 @@ async function addGitProjectTrusted(
 		trust: string[] | undefined;
 	},
 	hooks: {
-		onAdded: (interview: string) => void;
-		setAdded: (v: {
-			project: ProjectView;
-			interview: string;
-			id: string | null;
-		}) => void;
+		setAdded: (v: { project: ProjectView }) => void;
 		setAddTrust: (t: TrustNeeded | null) => void;
 	},
 ): Promise<TestAnswer> {
@@ -7472,13 +7465,11 @@ function AddNewPanel({
 export function AddProjectModal({
 	act,
 	onClose,
-	onAdded,
 	openTask,
 	projects,
 }: {
 	act: Act;
 	onClose: () => void;
-	onAdded: (interview: string) => void;
 	/** Opens the rules interview card in the board drawer: the wizard's "Open rules task". */
 	openTask: (id: string) => void;
 	projects: ProjectView[];
@@ -7587,7 +7578,6 @@ export function AddProjectModal({
 							trust,
 						},
 						{
-							onAdded,
 							setAdded,
 							setAddTrust: (t) => setAddTrust(t),
 							setNeedsTokenHost: (h) => setNeedsTokenHost(h),
@@ -7598,11 +7588,8 @@ export function AddProjectModal({
 		);
 	};
 	// The created project: once set, the dialog shows the setup wizard instead of the form.
-	const [added, setAdded] = useState<{
-		project: ProjectView;
-		interview: string;
-		id: string | null;
-	} | null>(null);
+	// The rules interview waits for the wizard's last step (docs/specs/add-project-wizard.md).
+	const [added, setAdded] = useState<{ project: ProjectView } | null>(null);
 	// A token save for the host the server named, then the retry of Add.
 	const saveToken = (): void => {
 		void act(async () => {
@@ -7729,12 +7716,7 @@ export function AddProjectModal({
 										taskIdPrefix: prefixOut,
 										github: ghRepo,
 									});
-									onAdded(r.interview);
-									setAdded({
-										project: r.project,
-										interview: r.interview,
-										id: r.id ?? null,
-									});
+									setAdded({ project: r.project });
 								}, setErr),
 							);
 						}}
@@ -7810,7 +7792,6 @@ export function AddProjectModal({
 											trust,
 										},
 										{
-											onAdded,
 											setAdded,
 											setAddTrust: (t) => setAddTrust(t),
 										},
@@ -7830,8 +7811,6 @@ export function AddProjectModal({
 				) : (
 					<ProjectSetupSteps
 						project={added.project}
-						interview={added.interview}
-						rulesTask={added.id}
 						openTask={openTask}
 						act={act}
 						onClose={onClose}
@@ -7962,16 +7941,49 @@ function customChosen(q: AskQuestion, selected: string | null): boolean {
 }
 
 /** Board panel above the lanes while setupChecklist is set: only the still-open items. */
-function SetupChecklist({
+export function SetupChecklist({
 	project,
 	save,
+	rulesTask,
+	openTask,
+	interview,
+	initGit,
 	onOpenSetup,
 }: {
 	project: ProjectView;
 	save: (patch: Record<string, unknown>) => Promise<boolean>;
+	/** The live rules interview card, when one runs: the rules item then opens it. */
+	rulesTask: TaskCard | null;
+	openTask: (id: string) => void;
+	interview: (path: string, body: Record<string, unknown>) => Promise<boolean>;
+	initGit: () => Promise<boolean>;
 	onOpenSetup: () => void;
 }) {
 	const items: ReactNode[] = [];
+	// The rules interview first: tasks wait on AGENTS.md. The add wizard queues it only
+	// on its last step, so a project closed mid-way finds its way back here (OTTR-1065).
+	if (!project.hasRules)
+		items.push(
+			<li key="rules">
+				<span>No AGENTS.md yet, so tasks wait in Todo</span>
+				{project.gitless ? (
+					<BusyButton run={initGit}>Create git repo</BusyButton>
+				) : rulesTask !== null ? (
+					<BusyButton
+						run={async () => {
+							openTask(rulesTask.id);
+							return true;
+						}}
+					>
+						Open rules task
+					</BusyButton>
+				) : (
+					<BusyButton run={() => interview("/interview", {})}>
+						Start rules interview
+					</BusyButton>
+				)}
+			</li>,
+		);
 	if (project.settings.retroSince === null)
 		items.push(
 			<li key="retro">
@@ -16061,7 +16073,6 @@ function AppOverlays(p: {
 	openTask: (id: string) => void;
 	setShowAdd: (v: boolean) => void;
 	setShowUpdates: (v: boolean) => void;
-	setNotice: (v: string | null) => void;
 }) {
 	const {
 		showAdd,
@@ -16076,7 +16087,6 @@ function AppOverlays(p: {
 		openTask,
 		setShowAdd,
 		setShowUpdates,
-		setNotice,
 	} = p;
 	// The retry countdown recounts every second while the banner shows.
 	const [, setRetryTick] = useState(0);
@@ -16098,7 +16108,6 @@ function AppOverlays(p: {
 					act={act}
 					projects={state?.projects ?? []}
 					onClose={() => setShowAdd(false)}
-					onAdded={(i) => setNotice(interviewMsg(i))}
 					openTask={openTask}
 				/>
 			)}
@@ -17178,7 +17187,6 @@ export function App() {
 				openTask={openTask}
 				setShowAdd={setShowAdd}
 				setShowUpdates={setShowUpdates}
-				setNotice={setNotice}
 			/>
 		</HostedContext.Provider>
 	);

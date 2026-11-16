@@ -23,6 +23,7 @@ import {
 	fmtPct,
 	GitHostsSection,
 	HindsightSection,
+	HostedContext,
 	hostedHidden,
 	ModelRolesSection,
 	NotificationsSection,
@@ -39,6 +40,7 @@ import {
 	SETTINGS_TOC,
 	SessionSection,
 	SettingsPage,
+	SetupRulesSection,
 	shortProvisionLines,
 	userLayerEmpty,
 	userLayerLine,
@@ -5367,48 +5369,125 @@ describe("AlateSection stored API key", () => {
 	});
 });
 
-describe("ProjectSetupSteps rules action", () => {
-	// A minimal ProjectView at step 2: the Rules section reads hasRules, gitless and the
-	// settings the step's drafts seed from.
-	const project = {
-		name: "proj",
-		hasRules: false,
-		gitless: false,
-		github: null,
-		settings: {
-			maxParallel: null,
-			copyExtra: [],
-			forkResearch: false,
-		},
-	} as unknown as ProjectView;
-
-	const renderSteps = (props: {
+describe("SetupRulesSection rules action", () => {
+	// The rules section is a pure component: it reads hasRules, gitless and the caller's
+	// rules card, so the action choice renders without a wizard around it.
+	const renderSection = (props: {
 		rulesTask?: string | null;
 		openTask?: (id: string) => void;
+		gitless?: boolean;
 	}): string =>
 		renderToStaticMarkup(
-			<ProjectSetupSteps
-				project={project}
-				rulesTask={props.rulesTask}
+			<SetupRulesSection
+				gitless={props.gitless ?? false}
+				hasRules={false}
+				rulesTask={props.rulesTask ?? null}
+				rulesQueued={false}
 				openTask={props.openTask}
-				act={async (fn) => {
-					await fn();
-					return true;
-				}}
 				onClose={() => {}}
+				initRepo={async () => true}
+				alignRules={async () => true}
+				discussRules={async () => true}
 			/>,
 		);
 
 	test("a live rules card offers Open rules task instead of Discuss rules", () => {
-		const html = renderSteps({ rulesTask: "PROJ-7", openTask: () => {} });
+		const html = renderSection({ rulesTask: "PROJ-7", openTask: () => {} });
 		expect(html).toContain("Open rules task");
 		expect(html).not.toContain("Discuss rules");
 	});
 
 	test("without a rules card or opener the Discuss rules button stays", () => {
-		const html = renderSteps({});
+		const html = renderSection({});
 		expect(html).toContain("Discuss rules");
 		expect(html).not.toContain("Open rules task");
+	});
+
+	test("a gitless folder offers Create git repo before any interview", () => {
+		const html = renderSection({ gitless: true, openTask: () => {} });
+		expect(html).toContain("Create git repo");
+		expect(html).not.toContain("Discuss rules");
+	});
+});
+
+describe("ProjectSetupSteps step order", () => {
+	// The wizard's fixtures: a fresh project whose board settings are missing, and one
+	// whose retro and fork research are already on. The settings the wizard reads.
+	const base = {
+		name: "proj",
+		hasRules: false,
+		gitless: false,
+	};
+	const fresh = {
+		...base,
+		github: null,
+		settings: {
+			retroSince: null,
+			retroFilter: false,
+			forkResearch: false,
+			holdUpdateMerges: false,
+			forkMergeHold: false,
+			prMode: false,
+			targetBranch: null,
+			maxParallel: null,
+			copyExtra: [],
+		},
+	} as unknown as ProjectView;
+	const settled = {
+		...base,
+		github: "https://github.com/o/r",
+		settings: {
+			...fresh.settings,
+			retroSince: 1,
+			forkResearch: true,
+		},
+	} as unknown as ProjectView;
+
+	const renderSteps = (project: ProjectView, hosted = false): string =>
+		renderToStaticMarkup(
+			<HostedContext.Provider value={hosted}>
+				<ProjectSetupSteps
+					project={project}
+					act={async (fn) => {
+						await fn();
+						return true;
+					}}
+					onClose={() => {}}
+				/>
+			</HostedContext.Provider>,
+		);
+
+	test("a fresh project opens at the board step: Automation first, no Project fields", () => {
+		const html = renderSteps(fresh);
+		expect(html).toContain("2 of 5");
+		expect(html).toContain("Retro");
+		expect(html).toContain("Skip, use defaults");
+		expect(html).not.toContain("PR mode");
+		expect(html).not.toContain("Target branch");
+	});
+
+	test("a project with retro and fork research done opens at the Project step", () => {
+		const html = renderSteps(settled);
+		expect(html).toContain("4 of 5");
+		expect(html).toContain("PR mode");
+		expect(html).toContain("Target branch");
+		expect(html).toContain("Skip, use defaults");
+		expect(html).not.toContain("Retro");
+	});
+
+	test("hosted mode hides the PR mode row and keeps the target branch", () => {
+		const html = renderSteps(settled, true);
+		expect(html).toContain("Target branch");
+		expect(html).not.toContain("PR mode");
+	});
+
+	test("a gitless project opens at the rules step's init panel", () => {
+		const html = renderSteps({
+			...fresh,
+			gitless: true,
+		} as unknown as ProjectView);
+		expect(html).toContain("5 of 5");
+		expect(html).toContain("Create git repo");
 	});
 });
 
