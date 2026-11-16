@@ -391,7 +391,10 @@ describe("runSelfCheck", () => {
 		expect(readback.nprocLimit).toBe(String(VM_VALIDATE.maxProcesses));
 		expect(readback.cpus).not.toBeNull();
 		expect(readback.memKb).not.toBeNull();
-		expect(readback.scratchKb).not.toBeNull();
+		// scratchKb is deliberately not asserted here: a host's /tmp can sit on the
+		// overlay root, whose df data line names no /dev/ device, so the parser's
+		// null is correct there. The guest's /tmp is the /dev/vdc scratch ext4, and
+		// the fixture tests cover that line's parsing.
 	});
 });
 
