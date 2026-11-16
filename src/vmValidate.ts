@@ -46,6 +46,18 @@ const NET_PROBE_MS = 2000;
 /** The probe cwd: a scratch bind that always exists, never the target. */
 const PROBE_CWD = "/tmp";
 
+/**
+ * The limits probe: the same reads as before, with the process limit read from
+ * /proc/self/limits. The guest's /bin/sh is dash, and dash has no `ulimit -u`;
+ * the table read works in every POSIX sh, bash included. Exported so a test can
+ * run this exact command line under the real shell.
+ */
+export const LIMITS_PROBE_ARGV: string[] = [
+	"sh",
+	"-c",
+	"head -30 /proc/self/limits && nproc && head -1 /proc/meminfo && df -k /tmp",
+];
+
 /** The collect name's first component selects one of the scratch roots. */
 const SCRATCH_ROOTS: Record<string, string> = {
 	tmp: "/tmp",
@@ -335,6 +347,51 @@ interface SelfCheckStep {
 	run: (deps: ValidateDeps) => Promise<{ ok: boolean; detail: string }>;
 }
 
+/** What the limits check reads out of the probe's stdout; null means the read failed. */
+export interface LimitsReadback {
+	/** RLIMIT_NPROC's soft limit, from the /proc/self/limits table row. */
+	nprocLimit: string | null;
+	/** The vCPU count `nproc` printed; its output is one bare number. */
+	cpus: string | null;
+	/** MemTotal in kB. */
+	memKb: number | null;
+	/** The scratch filesystem total in 1K blocks. */
+	scratchKb: number | null;
+}
+
+/**
+ * Parses the limits probe's stdout. Each field is found by its own shape, never by
+ * line position: the limits table's row count is kernel-dependent, so fixed indexes
+ * would break when the kernel grows the table. A probe that died early (dash's
+ * `ulimit -u` failure) leaves every field null.
+ */
+export function parseLimitsReadback(stdoutTail: string): LimitsReadback {
+	const lines = stdoutTail
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line !== "");
+	// The table row is "Max processes <soft> <hard> processes"; the first number is
+	// the soft limit. "unlimited" reads as null, and so does an absent row.
+	const nprocLimit =
+		/^Max processes\s+(\d+)\s/.exec(
+			lines.find((line) => line.startsWith("Max processes")) ?? "",
+		)?.[1] ?? null;
+	// No limits-table row is a bare number, so the bare number is nproc's output.
+	const cpus = lines.find((line) => /^\d+$/.test(line)) ?? null;
+	const mem = /^MemTotal:\s+(\d+) kB$/.exec(
+		lines.find((line) => line.startsWith("MemTotal:")) ?? "",
+	);
+	// The df data line starts with the device path; its second field is the total in 1K blocks.
+	const df = lines.find((line) => line.startsWith("/dev/"))?.split(/\s+/);
+	const dfTotal = Number(df?.[1]);
+	return {
+		nprocLimit,
+		cpus,
+		memKb: mem === null ? null : Number(mem[1]),
+		scratchKb: Number.isFinite(dfTotal) ? dfTotal : null,
+	};
+}
+
 /**
  * The self-check catalog, in the spec table's order. Every check runs even after a
  * failure: the result keeps each check's own evidence, and the first failure alone
@@ -480,36 +537,19 @@ const steps: readonly SelfCheckStep[] = [
 		name: "limits read back",
 		control: MISSING_CONTROL.limits,
 		run: async (deps) => {
-			const run = await runProcess(
-				[
-					"sh",
-					"-c",
-					"ulimit -u && nproc && head -1 /proc/meminfo && df -k /tmp",
-				],
-				PROBE_CWD,
-				deps,
-			);
-			const lines = run.stdoutTail
-				.split("\n")
-				.map((line) => line.trim())
-				.filter((line) => line !== "");
-			const nprocLimit = lines[0];
-			const cpus = lines[1];
-			const mem = /^MemTotal:\s+(\d+) kB$/.exec(lines[2] ?? "");
-			// The df data line starts with the device path; its second field is the total in 1K blocks.
-			const df = lines.find((line) => line.startsWith("/dev/"))?.split(/\s+/);
-			const dfTotal = Number(df?.[1]);
+			const run = await runProcess(LIMITS_PROBE_ARGV, PROBE_CWD, deps);
+			const readback = parseLimitsReadback(run.stdoutTail);
 			const ok =
-				nprocLimit === String(VM_VALIDATE.maxProcesses) &&
-				cpus === String(VM_VALIDATE.vcpus) &&
-				mem !== null &&
-				Number(mem[1]) > 0 &&
-				Number.isFinite(dfTotal) &&
-				dfTotal > 0 &&
-				dfTotal <= VM_VALIDATE.diskBytes / 1024;
+				readback.nprocLimit === String(VM_VALIDATE.maxProcesses) &&
+				readback.cpus === String(VM_VALIDATE.vcpus) &&
+				readback.memKb !== null &&
+				readback.memKb > 0 &&
+				readback.scratchKb !== null &&
+				readback.scratchKb > 0 &&
+				readback.scratchKb <= VM_VALIDATE.diskBytes / 1024;
 			return {
 				ok,
-				detail: `ulimit -u ${nprocLimit ?? "(none)"}, nproc ${cpus ?? "(none)"}, MemTotal ${mem?.[1] ?? "(none)"} kB, scratch ${Number.isFinite(dfTotal) ? dfTotal : "(none)"} 1K blocks`,
+				detail: `nproc limit ${readback.nprocLimit ?? "(none)"}, nproc ${readback.cpus ?? "(none)"}, MemTotal ${readback.memKb ?? "(none)"} kB, scratch ${readback.scratchKb ?? "(none)"} 1K blocks`,
 			};
 		},
 	},
