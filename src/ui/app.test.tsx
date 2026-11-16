@@ -65,6 +65,7 @@ const {
 	pollTransportDiag,
 	setupHints,
 	reportHtml,
+	shortNoticeText,
 	Drawer,
 	LogView,
 	ProjectBoard,
@@ -1728,6 +1729,214 @@ describe("WarningLines", () => {
 		expect(html).not.toContain("<a ");
 		expect(html).toContain(
 			"Settings - Bogus is not a card, and the word Settings alone stays text too.",
+		);
+	});
+});
+
+describe("card links in bell text", () => {
+	// Mirrors the panel's resolver: only ottr's ids resolve, foreign projects
+	// and unknown ids stay text.
+	const cardsCtx = {
+		resolve: (id: string, project: string | null) => {
+			if (project !== null && project !== "ottr") return null;
+			return id === "OTTR-1071" || id === "OTTR-1070"
+				? { project: "ottr", id }
+				: null;
+		},
+		open: () => {},
+	};
+	const advisory =
+		"agent-data main checkout changed while several cards were running (ottr#OTTR-1071, alate#ALAT-180): new commits abc1234 sync: add parallel-work check. No card was parked.";
+
+	test("a project#id reference in a warning links; a foreign project's stays text", () => {
+		const html = renderToStaticMarkup(
+			<WarningLines warnings={[advisory]} cards={cardsCtx} />,
+		);
+		expect(html).toContain(
+			'<a class="notif-link" data-card-link="1" href="/projects/ottr/tasks/OTTR-1071" title="Open card OTTR-1071">ottr#OTTR-1071</a>',
+		);
+		// alate is not a project the resolver knows: the reference stays text.
+		expect(html).toContain("alate#ALAT-180");
+		expect(html).not.toContain("alate#ALAT-180</a>");
+	});
+
+	test("project-prefixed, hash-only, and bare id forms all link", () => {
+		const html = renderToStaticMarkup(
+			<WarningLines
+				warnings={[
+					"Refs: ottr#OTTR-1071, #OTTR-1072 and OTTR-1073 were running",
+				]}
+				cards={{
+					resolve: (id: string) => ({ project: "ottr", id }),
+					open: () => {},
+				}}
+			/>,
+		);
+		expect(html).toContain('href="/projects/ottr/tasks/OTTR-1071"');
+		expect(html).toContain('href="/projects/ottr/tasks/OTTR-1072"');
+		expect(html).toContain('href="/projects/ottr/tasks/OTTR-1073"');
+		// The anchor text keeps each form as written.
+		expect(html).toContain(">ottr#OTTR-1071</a>");
+		expect(html).toContain(">#OTTR-1072</a>");
+		expect(html).toContain(">OTTR-1073</a>");
+	});
+
+	test("a commit sha after project# stays text", () => {
+		const html = renderToStaticMarkup(
+			<WarningLines
+				warnings={["The image holds ottr#7f78beca while the board runs."]}
+				cards={cardsCtx}
+			/>,
+		);
+		expect(html).not.toContain("<a ");
+		expect(html).toContain("ottr#7f78beca");
+	});
+
+	test("an unknown card id stays text", () => {
+		const html = renderToStaticMarkup(
+			<WarningLines
+				warnings={["The run waits for ottr#OTTR-9999 to finish."]}
+				cards={cardsCtx}
+			/>,
+		);
+		expect(html).not.toContain("<a ");
+		expect(html).toContain("ottr#OTTR-9999");
+	});
+
+	test("a bare known id in the restart line links; without cards the same text stays plain", () => {
+		const wait = {
+			running: "a".repeat(40),
+			commit: "b".repeat(40),
+			commits: 2,
+			since: 1730990000000,
+			turns: ["OTTR-1070"],
+			command:
+				"docker compose -f /srv/ottr/compose.yaml up -d --no-deps --wait server",
+		};
+		const linked = renderToStaticMarkup(
+			<RestartWaitLine
+				wait={wait}
+				inboxKey="restart-wait:1730990000000"
+				fresh={false}
+				cards={cardsCtx}
+			/>,
+		);
+		expect(linked).toContain(
+			'<a class="notif-link" data-card-link="1" href="/projects/ottr/tasks/OTTR-1070" title="Open card OTTR-1070">OTTR-1070</a>',
+		);
+		const plain = renderToStaticMarkup(
+			<RestartWaitLine
+				wait={wait}
+				inboxKey="restart-wait:1730990000000"
+				fresh={false}
+			/>,
+		);
+		expect(plain).not.toContain("data-card-link");
+		expect(plain).toContain("The restart waits for: OTTR-1070.");
+	});
+
+	test("the restart host command lives behind the Details disclosure", () => {
+		const html = renderToStaticMarkup(
+			<RestartWaitLine
+				wait={{
+					running: "a".repeat(40),
+					commit: "b".repeat(40),
+					commits: 2,
+					since: 1730990000000,
+					turns: [],
+					command:
+						"docker compose -f /srv/ottr/compose.yaml up -d --no-deps --wait server",
+				}}
+				inboxKey="restart-wait:1730990000000"
+				fresh={false}
+			/>,
+		);
+		const { window } = new Window({ url: "http://localhost/" });
+		const doc = window.document;
+		doc.body.innerHTML = html;
+		const details = doc.querySelector(".notif-details");
+		expect(details?.querySelector("summary")?.textContent).toBe("Details");
+		expect(details?.textContent).toContain(
+			"docker compose -f /srv/ottr/compose.yaml up -d --no-deps --wait server",
+		);
+		// The collapsed line carries no piece of the host command.
+		doc.querySelectorAll(".notif-details").forEach((d) => {
+			d.remove();
+		});
+		expect(doc.body.textContent).not.toContain("docker compose");
+	});
+
+	test("the seed failure's multi-line tail hides behind Details", () => {
+		const fail = {
+			since: 1730990000000,
+			commit: "c".repeat(40),
+			text: "Seed pull failed for the agent layer image.\ncontainer ottr-worker-1 exited with code 1\nrepair steps live in /tmp/ottr-seed-9912/repair.sh",
+		};
+		const html = renderToStaticMarkup(
+			<SeedFailedLine
+				fail={fail}
+				inboxKey="seed-failed:1730990000000"
+				fresh={false}
+			/>,
+		);
+		const { window } = new Window({ url: "http://localhost/" });
+		const doc = window.document;
+		doc.body.innerHTML = html;
+		// The collapsed line keeps only the first line of the recorded text.
+		expect(doc.body.textContent).toContain(
+			"Seed pull failed for the agent layer image.",
+		);
+		const details = doc.querySelector(".notif-details");
+		expect(details?.querySelector("summary")?.textContent).toBe("Details");
+		expect(details?.textContent).toContain("ottr-worker-1");
+		expect(details?.textContent).toContain("/tmp/ottr-seed-9912/repair.sh");
+		doc.querySelectorAll(".notif-details").forEach((d) => {
+			d.remove();
+		});
+		expect(doc.body.textContent).not.toContain("ottr-worker-1");
+		expect(doc.body.textContent).not.toContain("/tmp/ottr-seed-9912");
+	});
+
+	test("five card references clamp to three anchors and a +2 more control", () => {
+		const ids = ["OTTR-1", "OTTR-2", "OTTR-3", "OTTR-4", "OTTR-5"];
+		const html = renderToStaticMarkup(
+			<WarningLines
+				warnings={[
+					"Cards running across the checkout change (ottr#OTTR-1, ottr#OTTR-2, ottr#OTTR-3, ottr#OTTR-4, ottr#OTTR-5) kept their worktrees.",
+				]}
+				cards={{
+					resolve: (id: string) =>
+						ids.includes(id) ? { project: "ottr", id } : null,
+					open: () => {},
+				}}
+			/>,
+		);
+		expect(html.match(/data-card-link="1"/g)?.length).toBe(3);
+		expect(html).toContain("+2 more");
+		expect(html).toContain('aria-label="Show 2 more cards"');
+		expect(html).toContain('aria-expanded="false"');
+		// The clamp keeps the separator after the third reference and moves the
+		// line's closing punctuation behind the button, so it reads
+		// "...OTTR-3, +2 more." instead of "OTTR-3+2 more".
+		expect(html).toContain("</a>, <button");
+		expect(html).toContain("+2 more</button>.");
+		// The 4th and 5th references only come back after expansion.
+		expect(html).not.toContain("OTTR-4");
+		expect(html).not.toContain("OTTR-5");
+	});
+
+	test("shortNoticeText keeps the first line and first sentence", () => {
+		expect(shortNoticeText("First sentence. Second one follows.")).toBe(
+			"First sentence.",
+		);
+		expect(shortNoticeText("Head: tail stays out of the collapsed line.")).toBe(
+			"Head:",
+		);
+		expect(shortNoticeText("No sentence end here\nsecond line\nthird")).toBe(
+			"No sentence end here",
+		);
+		expect(shortNoticeText("Trailing end is the whole line.")).toBe(
+			"Trailing end is the whole line.",
 		);
 	});
 });

@@ -1212,3 +1212,134 @@ test("a running card's session context re-polls on the 5 s interval", async () =
 		await unmountApp();
 	}
 });
+
+// --- OTTR-1084: card references in bell notices ------------------------------
+
+const advisoryText =
+	"agent-data main checkout changed while several cards were running (ottr#OTTR-1071, ottr#OTTR-1070): new commits abc1234 sync: add parallel-work check. No card was parked.";
+
+/** Seeds the ottr project and its cards into the shared state frame and returns
+ * the restore pair for the fields the bell tests overwrite. */
+function seedOttr(ids: string[]): () => void {
+	const baseProjects = state.projects;
+	const baseWarnings = state.warnings;
+	const baseRestart = state.restartWait;
+	const taskLen = state.tasks.length;
+	state.projects = [...baseProjects, project("ottr", "Ottr")];
+	state.tasks.push(
+		...ids.map((id, i) =>
+			card({
+				id,
+				title: `Card ${id}`,
+				sessionTitle: `Card ${id}`,
+				project: "ottr",
+				createdAt: 5000 + i,
+			}),
+		),
+	);
+	state.warnings = [];
+	state.restartWait = null;
+	return () => {
+		state.projects = baseProjects;
+		state.warnings = baseWarnings;
+		state.restartWait = baseRestart;
+		state.tasks.length = taskLen;
+	};
+}
+
+const warnRow = (needle: string): Element | undefined =>
+	[...document.querySelectorAll('#inbox [role="note"]')].find((r) =>
+		r.textContent?.includes(needle),
+	);
+
+test("a card reference in a warning opens the card drawer", async () => {
+	const restore = seedOttr(["OTTR-1070", "OTTR-1071"]);
+	state.warnings = [advisoryText];
+	state.restartWait = {
+		running: "aaa1111",
+		commit: "bbb2222",
+		commits: 2,
+		since: 1730990000000,
+		turns: ["OTTR-1070"],
+		command: "docker compose -f compose.yaml up -d --no-deps --wait server",
+	};
+	try {
+		await mountAt("/projects/alpha");
+		const ref = document.querySelector<HTMLAnchorElement>(
+			'#inbox a.notif-link[data-card-link="1"][href="/projects/ottr/tasks/OTTR-1071"]',
+		);
+		expect(ref).not.toBeNull();
+		await click(ref!);
+		await waitFor(drawerOpen);
+		// The warning row's reference opens the card drawer like an alarm row does.
+		expect(window.location.pathname).toBe("/projects/ottr/tasks/OTTR-1071");
+		expect(header()).toBe("Ottr");
+		expect(drawer()?.querySelector("h2")?.textContent).toBe("Card OTTR-1071");
+		// The restart line's bare id links too and opens its own card.
+		const restart = document.querySelector<HTMLAnchorElement>(
+			'[data-inbox-key="restart-wait:1730990000000"] a[href="/projects/ottr/tasks/OTTR-1070"]',
+		);
+		expect(restart).not.toBeNull();
+		await click(restart!);
+		await waitFor(
+			() => window.location.pathname === "/projects/ottr/tasks/OTTR-1070",
+		);
+		expect(drawer()?.querySelector("h2")?.textContent).toBe("Card OTTR-1070");
+	} finally {
+		restore();
+		await unmountApp();
+	}
+});
+
+test("a foreign project reference and a commit sha stay text in the bell", async () => {
+	const restore = seedOttr(["OTTR-1070", "OTTR-1071"]);
+	state.warnings = [
+		"While the checkout moved, alate#ALAT-180 stayed parked and ottr#7f78beca named the image commit.",
+	];
+	try {
+		await mountAt("/projects/alpha");
+		const row = warnRow("alate#ALAT-180");
+		expect(row).toBeDefined();
+		expect(row!.querySelector("a")).toBeNull();
+		expect(row!.querySelector("button.notif-more")).toBeNull();
+		expect(row!.textContent).toContain("ottr#7f78beca");
+	} finally {
+		restore();
+		await unmountApp();
+	}
+});
+
+test("five card references clamp to three links and expand in place", async () => {
+	const restore = seedOttr([
+		"OTTR-1070",
+		"OTTR-1071",
+		"OTTR-1072",
+		"OTTR-1073",
+		"OTTR-1074",
+	]);
+	state.warnings = [
+		"Cards running across the checkout change (ottr#OTTR-1070, ottr#OTTR-1071, ottr#OTTR-1072, ottr#OTTR-1073, ottr#OTTR-1074) kept their worktrees.",
+	];
+	try {
+		await mountAt("/projects/alpha");
+		const row = warnRow("ottr#OTTR-1070");
+		expect(row).toBeDefined();
+		expect(row!.querySelectorAll("a[data-card-link]").length).toBe(3);
+		// The clamp keeps the separator and the closing punctuation:
+		// "...OTTR-1072, +2 more." instead of a glued "OTTR-1072+2 more".
+		expect(row!.textContent).toContain("OTTR-1072, +2 more.");
+		expect(row!.textContent).not.toContain("ottr#OTTR-1074");
+		const more = row!.querySelector<HTMLButtonElement>("button.notif-more");
+		expect(more?.textContent).toBe("+2 more");
+		expect(more?.getAttribute("aria-label")).toBe("Show 2 more cards");
+		await click(more!);
+		// Expansion re-renders the row in place: all five references and no button.
+		const expanded = warnRow("ottr#OTTR-1070");
+		expect(expanded!.querySelectorAll("a[data-card-link]").length).toBe(5);
+		expect(expanded!.textContent).toContain("ottr#OTTR-1074");
+		expect(expanded!.querySelector("button.notif-more")).toBeNull();
+	} finally {
+		restore();
+		await unmountApp();
+	}
+});

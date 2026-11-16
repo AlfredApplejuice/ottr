@@ -7,6 +7,7 @@ import type {
 } from "react";
 import {
 	Fragment,
+	isValidElement,
 	memo,
 	useCallback,
 	useContext,
@@ -14476,12 +14477,15 @@ const SETTINGS_LABELS = [...SETTINGS_LABEL_IDS.keys()]
 	.sort((a, b) => b.length - a.length)
 	.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
 	.join("|");
-/** One scan for both link rules: a https:// URL, or a settings phrase — the word
- * plus one or more `<separator> <label>` steps. The trailing lookahead keeps a
- * longer word ("Settings - Envelope") from matching the "Env" label, and sentence
- * punctuation can never join a label, so it stays outside the anchor naturally. */
+/** A card reference id: an optional uppercase prefix, then digits — "OTTR-1071"
+ * or a legacy "748", never the sha in "ottr#7f78beca". */
+const CARD_REF_ID = String.raw`(?:[A-Z][A-Z0-9]*-)?\d+`;
+/** One scan for all link rules: a https:// URL (m[1]), a settings phrase (m[2]),
+ * or a card reference — `project#ID` (m[3]/m[4]), a lone `#ID` (m[5]), or a bare
+ * `PREFIX-N` (m[6]). The trailing lookaheads keep sentence punctuation outside
+ * the match and reject a sha like "ottr#7f78beca". */
 const WARNING_LINK_RE = new RegExp(
-	`(https://\\S+)|(\\bSettings(?:${SETTINGS_SEP}(?:${SETTINGS_LABELS}))+)(?![A-Za-z0-9])`,
+	`(https://\\S+)|(\\bSettings(?:${SETTINGS_SEP}(?:${SETTINGS_LABELS}))+)(?![A-Za-z0-9])|([A-Za-z][A-Za-z0-9_-]{0,40})#(${CARD_REF_ID})(?![A-Za-z0-9-])|#(${CARD_REF_ID})(?![A-Za-z0-9-])|\\b([A-Z][A-Z0-9]*-\\d+)(?![A-Za-z0-9-])`,
 	"g",
 );
 /** The label steps of a matched settings phrase, for the deepest-id walk. */
@@ -14504,12 +14508,30 @@ function settingsPhraseId(phrase: string): string {
 	return "";
 }
 
+/** Resolver and opener the bell lines hand to warningLinks: resolve turns a card
+ * reference into the card's wire ref — null when no card carries the id, or the
+ * named project is not one the board knows — and open moves to the card. */
+export type CardLinkCtx = {
+	resolve(
+		id: string,
+		project: string | null,
+	): { project: string; id: string } | null;
+	open(id: string): void;
+};
+
 /** Links inside a server warning: https:// URLs open in a new tab, and a
  * `Settings <sep> <label>` phrase opens that General settings section in-tab (a
  * chain like `Settings → GitHub → GitHub token` anchors the whole phrase to
  * the deepest step). A trailing sentence period stays outside the anchor so the
- * href stays valid. In hosted mode a phrase that names a hidden card stays plain text. */
-export function warningLinks(text: string, hosted = false): ReactNode {
+ * href stays valid. In hosted mode a phrase that names a hidden card stays plain text.
+ * A card reference — `project#ID`, `#ID`, or a bare `PREFIX-N` — becomes a drawer
+ * link through `cards`; an unknown id, a foreign project, or a sha keeps its text.
+ * Without `cards` every reference stays text, so existing callers render as before. */
+export function warningLinks(
+	text: string,
+	hosted = false,
+	cards?: CardLinkCtx | null,
+): ReactNode {
 	const out: ReactNode[] = [];
 	let last = 0;
 	for (const m of text.matchAll(WARNING_LINK_RE)) {
@@ -14532,7 +14554,7 @@ export function warningLinks(text: string, hosted = false): ReactNode {
 					{url.slice(link.length)}
 				</Fragment>,
 			);
-		} else {
+		} else if (m[2] !== undefined) {
 			const id = settingsPhraseId(phrase);
 			if (hostedHidden(hosted, id)) out.push(phrase);
 			else
@@ -14549,26 +14571,164 @@ export function warningLinks(text: string, hosted = false): ReactNode {
 						{phrase}
 					</a>,
 				);
-		}
+		} else if (cards != null) {
+			// The resolver decides; the regex only shaped the reference.
+			const id = m[4] ?? m[5] ?? m[6] ?? "";
+			const ref = cards.resolve(id, m[3] ?? null);
+			if (ref === null) out.push(m[0]);
+			else
+				out.push(
+					<a
+						key={out.length}
+						className="notif-link"
+						data-card-link="1"
+						href={taskPath(ref.project, ref.id)}
+						title={`Open card ${ref.id}`}
+						onClick={(e) => {
+							navClick(e, () => cards.open(ref.id));
+						}}
+					>
+						{m[0]}
+					</a>,
+				);
+		} else out.push(m[0]);
 		last = index + m[0].length;
 	}
 	if (last < text.length) out.push(text.slice(last));
 	return out;
 }
 
+/** The collapsed form of a bell entry's text: the first line, cut at the end of
+ * its first sentence when more sentence follows. Whatever this drops, the entry's
+ * Details disclosure must carry. */
+export function shortNoticeText(text: string): string {
+	const nl = text.indexOf("\n");
+	const line = nl < 0 ? text : text.slice(0, nl);
+	for (let i = 0; i < line.length - 1; i++) {
+		const ch = line[i];
+		if (
+			ch !== undefined &&
+			".!?;:".includes(ch) &&
+			line[i + 1] === " " &&
+			line.slice(i + 2).trim() !== ""
+		)
+			return line.slice(0, i + 1);
+	}
+	return line;
+}
+
+/** A collapsed bell line shows at most this many card links; the rest hide behind
+ * a "+N more" control until it expands. */
+const MAX_CARD_LINKS = 3;
+
+/** True for the card anchors warningLinks builds above: they alone carry the
+ * data-card-link marker. React's element type loses the props shape, and the
+ * anchors are module-internal, so this one cast sees only our own output. */
+function isCardLink(node: ReactNode | undefined): boolean {
+	if (!isValidElement(node)) return false;
+	const props = node.props as { "data-card-link"?: string };
+	return props["data-card-link"] === "1";
+}
+
+/** Bell text, linkified. With clampLinks, a run of more than MAX_CARD_LINKS card
+ * links renders only the nodes up to the third link plus a "+N more" button, and
+ * expanding it swaps in the full node list in place. */
+function NotifText({
+	text,
+	hosted,
+	cards,
+	clampLinks = false,
+}: {
+	text: string;
+	hosted: boolean;
+	cards?: CardLinkCtx | null;
+	clampLinks?: boolean;
+}) {
+	const [expanded, setExpanded] = useState(false);
+	// warningLinks always returns its node array; the declared ReactNode type is the
+	// public one existing callers see.
+	const nodes = warningLinks(text, hosted, cards) as ReactNode[];
+	if (clampLinks && !expanded) {
+		let cardCount = 0;
+		// The node the third card link ends at; the slice then keeps the text
+		// between the links, which belongs with them.
+		let cut = -1;
+		for (let i = 0; i < nodes.length; i++) {
+			if (!isCardLink(nodes[i])) continue;
+			cardCount++;
+			if (cardCount === MAX_CARD_LINKS) cut = i;
+		}
+		if (cardCount > MAX_CARD_LINKS && cut >= 0) {
+			const rest = cardCount - MAX_CARD_LINKS;
+			// The text between the last kept link and the next one is the list
+			// separator; without it the button glues onto the third reference.
+			let sepEnd = cut + 1;
+			while (sepEnd < nodes.length && !isValidElement(nodes[sepEnd])) sepEnd++;
+			// The unclamped line's trailing punctuation closes the sentence even
+			// though the words it belongs to stay hidden behind the button.
+			const last = nodes[nodes.length - 1];
+			const tail =
+				typeof last === "string"
+					? (last.match(/[\s)\].,;:!?]+$/)?.[0] ?? "")
+					: "";
+			return (
+				<>
+					{nodes.slice(0, sepEnd)}
+					<button
+						type="button"
+						className="notif-more"
+						aria-expanded={false}
+						aria-label={`Show ${rest} more cards`}
+						onClick={() => setExpanded(true)}
+					>
+						+{rest} more
+					</button>
+					{tail}
+				</>
+			);
+		}
+	}
+	return <>{nodes}</>;
+}
+
 /** Server warnings (unseeded agent layer, provider without an active sign-in), one line each.
- * No dismiss: state recomputes per poll, so a fixed condition drops its own line. */
-export function WarningLines({ warnings }: { warnings: string[] }) {
+ * No dismiss: state recomputes per poll, so a fixed condition drops its own line. A long
+ * warning keeps its first line and sentence in the row and moves the tail into a Details
+ * disclosure; the card references link through `cards` when given. */
+export function WarningLines({
+	warnings,
+	cards,
+}: {
+	warnings: string[];
+	cards?: CardLinkCtx | null;
+}) {
 	const hosted = useContext(HostedContext);
 	if (warnings.length === 0) return null;
 	return (
 		<>
-			{warnings.map((w, i) => (
-				<p className="notif-line" role="note" key={`warn:${i}`}>
-					<Mark kind="warn" />
-					<span>{warningLinks(w, hosted)}</span>
-				</p>
-			))}
+			{warnings.map((w, i) => {
+				const short = shortNoticeText(w);
+				return (
+					// A div: the Details disclosure is flow content, which a <p> cannot hold.
+					<div className="notif-line" role="note" key={`warn:${i}`}>
+						<Mark kind="warn" />
+						<span>
+							<NotifText
+								text={short}
+								hosted={hosted}
+								cards={cards}
+								clampLinks
+							/>
+							{short !== w && (
+								<details className="notif-details">
+									<summary>Details</summary>
+									<NotifText text={w} hosted={hosted} cards={cards} />
+								</details>
+							)}
+						</span>
+					</div>
+				);
+			})}
 		</>
 	);
 }
@@ -14576,31 +14736,43 @@ export function WarningLines({ warnings }: { warnings: string[] }) {
 /** OTTR-625: the update task defers the restart while the board runs an older commit than
  * the image it built. One amber line: the user can act (restart on the host), and the board
  * cannot restart itself (no docker in the image), so the notice names the exact command —
- * that naming is the danger confirmation, it says what dies. Null renders nothing. */
+ * that naming is the danger confirmation, it says what dies. The command lives behind the
+ * Details disclosure so the collapsed line stays short; the held turns link through `cards`
+ * when given. Null renders nothing. */
 export function RestartWaitLine({
 	wait,
 	inboxKey,
 	fresh,
+	cards,
 }: {
 	wait: RestartWaitView | null;
 	inboxKey?: string;
 	fresh: boolean;
+	cards?: CardLinkCtx | null;
 }) {
+	const hosted = useContext(HostedContext);
 	if (wait === null) return null;
+	const turns =
+		wait.turns.length > 0
+			? `The restart waits for: ${wait.turns.join(", ")}. Restarting now stops those turns.`
+			: "Restarting now stops the running turns.";
 	return (
-		<p className="notif-line" role="note" data-inbox-key={inboxKey}>
+		// A div: the Details disclosure is flow content, which a <p> cannot hold.
+		<div className="notif-line" role="note" data-inbox-key={inboxKey}>
 			<Mark kind="warn" />
 			<span>
 				The board runs {wait.running.slice(0, 7)}; the image holds{" "}
 				{wait.commit.slice(0, 7)} ({wait.commits} commit
 				{wait.commits === 1 ? "" : "s"} newer).{" "}
-				{wait.turns.length > 0
-					? `The restart waits for: ${wait.turns.join(", ")}. Restarting now stops those turns.`
-					: "Restarting now stops the running turns."}{" "}
-				On the host, run <code>{wait.command}</code> from the stack's checkout.
+				<NotifText text={turns} hosted={hosted} cards={cards} clampLinks />{" "}
+				<details className="notif-details">
+					<summary>Details</summary>
+					On the host, run <code>{wait.command}</code> from the stack's
+					checkout.
+				</details>
 			</span>
 			{fresh && <span className="new-tag">New</span>}
-		</p>
+		</div>
 	);
 }
 
@@ -14613,17 +14785,21 @@ export function seedFailSkill(text: string): string | null {
 
 /** OTTR-753: the update script's hourly seed of the agent layer failed (the record it
  *  writes next to the board home). One red line: the first failure's time, the commit
- *  it tried, the redacted failure text, and the next step. A SkillSpector rejection
- *  names the skill folder and its baseline file. Null renders nothing. */
+ *  it tried, and the recorded text's first sentence; the full text and the next step
+ *  live behind the Details disclosure. A SkillSpector rejection names the skill folder
+ *  and its baseline file. Null renders nothing. */
 export function SeedFailedLine({
 	fail,
 	inboxKey,
 	fresh,
+	cards,
 }: {
 	fail: SeedFailedView | null;
 	inboxKey?: string;
 	fresh: boolean;
+	cards?: CardLinkCtx | null;
 }) {
+	const hosted = useContext(HostedContext);
 	if (fail === null) return null;
 	const skill = seedFailSkill(fail.text);
 	// The recorded tail often ends mid-sentence (the script cuts it), so the next
@@ -14632,19 +14808,35 @@ export function SeedFailedLine({
 		fail.text !== "" && !/[.!?;:]$/.test(fail.text)
 			? `${fail.text}.`
 			: fail.text;
+	const next =
+		skill !== null
+			? `Fix the skill ${skill}, or accept the findings in its .skillspector-baseline.yaml in the data repo.`
+			: "The next update run seeds the agent layer again.";
 	return (
-		<p className="notif-line" role="note" data-inbox-key={inboxKey}>
+		// A div: the Details disclosure is flow content, which a <p> cannot hold.
+		<div className="notif-line" role="note" data-inbox-key={inboxKey}>
 			<Mark kind="crit" />
 			<span>
 				Agent layer seed failed since {stamp(fail.since)}.{" "}
 				{fail.commit !== "" && <>Tried commit {fail.commit.slice(0, 12)}. </>}
-				{text !== "" && <>{text} </>}
-				{skill !== null
-					? `Fix the skill ${skill}, or accept the findings in its .skillspector-baseline.yaml in the data repo.`
-					: "The next update run seeds the agent layer again."}
+				{text !== "" && (
+					<NotifText
+						text={shortNoticeText(text)}
+						hosted={hosted}
+						cards={cards}
+						clampLinks
+					/>
+				)}
+				<details className="notif-details">
+					<summary>Details</summary>
+					{text !== "" && (
+						<NotifText text={text} hosted={hosted} cards={cards} />
+					)}{" "}
+					{next}
+				</details>
 			</span>
 			{fresh && <span className="new-tag">New</span>}
-		</p>
+		</div>
 	);
 }
 
@@ -14655,18 +14847,24 @@ export function ProvisionErrorLine({
 	error,
 	inboxKey,
 	fresh,
+	cards,
 }: {
 	error: string | null;
 	inboxKey?: string;
 	fresh: boolean;
+	cards?: CardLinkCtx | null;
 }) {
+	const hosted = useContext(HostedContext);
 	if (error === null) return null;
 	return (
 		<p className="notif-line" role="note" data-inbox-key={inboxKey}>
 			<Mark kind="crit" />
 			<span>
-				Agent layer provision failed: {error} Run Provision again, and check
-				that the alate server is up.
+				<NotifText
+					text={`Agent layer provision failed: ${error} Run Provision again, and check that the alate server is up.`}
+					hosted={hosted}
+					cards={cards}
+				/>
 			</span>
 			{fresh && <span className="new-tag">New</span>}
 		</p>
@@ -15247,6 +15445,25 @@ export function AppInboxPanel(p: {
 		setError,
 		setNotice,
 	} = p;
+	// Card references in the lines resolve against the live frame; open hides the
+	// panel first so the drawer lands unobstructed, like the alarm rows below.
+	const cardCtx: CardLinkCtx | null =
+		state === null
+			? null
+			: {
+					resolve(id, project) {
+						if (project !== null && !projects.some((pr) => pr.name === project))
+							return null;
+						const task = state.tasks.find((t) => t.id === id);
+						return task === undefined
+							? null
+							: { project: task.project, id: task.id };
+					},
+					open(id) {
+						document.getElementById("inbox")?.hidePopover();
+						openTask(id);
+					},
+				};
 	const critLine =
 		error !== null ? (
 			<p className="notif-line" data-inbox-key={critKey ?? undefined}>
@@ -15374,6 +15591,7 @@ export function AppInboxPanel(p: {
 					setNotice={setNotice}
 					updateCycle={state?.updateCycle ?? null}
 					nowMs={nowMs}
+					cards={cardCtx}
 				/>
 				<AppAdvisoryLines
 					state={state}
@@ -15389,6 +15607,7 @@ export function AppInboxPanel(p: {
 					nowMs={nowMs}
 					openTask={openTask}
 					isNew={isNew}
+					cards={cardCtx}
 				/>
 				{inbox.total === 0 && (
 					<section>
@@ -15549,6 +15768,7 @@ function AppInfoLines(p: {
 	setNotice: (v: string | null) => void;
 	updateCycle: UpdateCycleView | null;
 	nowMs: number;
+	cards?: CardLinkCtx | null;
 }) {
 	const {
 		notice,
@@ -15568,6 +15788,7 @@ function AppInfoLines(p: {
 		isNew,
 		setNotice,
 	} = p;
+	const hosted = useContext(HostedContext);
 	const showRestartControl = behind <= 0 && restartWait !== null;
 	if (
 		!(
@@ -15586,7 +15807,9 @@ function AppInfoLines(p: {
 			{notice !== null && (
 				<p className="notif-line" data-inbox-key={noticeKey ?? undefined}>
 					<Icon name="info" size={16} />
-					<span>{notice}</span>
+					<span>
+						<NotifText text={notice} hosted={hosted} cards={p.cards} />
+					</span>
 					{noticeKey !== null && isNew(noticeKey) && (
 						<span className="new-tag">New</span>
 					)}
@@ -15633,6 +15856,7 @@ function AppInfoLines(p: {
 				wait={restartWait}
 				inboxKey={restartWaitKey ?? undefined}
 				fresh={restartWaitKey !== null && isNew(restartWaitKey)}
+				cards={p.cards}
 			/>
 			{showRestartControl && (
 				<div className="update-cycle-restart">
@@ -15643,11 +15867,13 @@ function AppInfoLines(p: {
 				fail={seedFailed}
 				inboxKey={seedFailKey ?? undefined}
 				fresh={seedFailKey !== null && isNew(seedFailKey)}
+				cards={p.cards}
 			/>
 			<ProvisionErrorLine
 				error={provisionError}
 				inboxKey={provisionErrKey ?? undefined}
 				fresh={provisionErrKey !== null && isNew(provisionErrKey)}
+				cards={p.cards}
 			/>
 		</section>
 	);
@@ -15721,6 +15947,7 @@ function AppAdvisoryLines(p: {
 	nowMs: number;
 	openTask: (id: string) => void;
 	isNew: (key: string) => boolean;
+	cards?: CardLinkCtx | null;
 }) {
 	const {
 		state,
@@ -15750,7 +15977,7 @@ function AppAdvisoryLines(p: {
 	return (
 		<section>
 			<h2>Advisories</h2>
-			<WarningLines warnings={warnings} />
+			<WarningLines warnings={warnings} cards={p.cards} />
 			{orphansError !== null && (
 				<p className="notif-line" data-inbox-key={orphansErrorKey ?? undefined}>
 					<Icon name="info" size={16} />

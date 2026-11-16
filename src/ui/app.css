@@ -2107,6 +2107,45 @@ button.notif-link {
 .update-cycle-notice > .notif-commits {
 	padding-left: 24px;
 }
+/* Bell entry Details disclosure: the long tail (the host command, the seed failure
+   transcript) hides until opened, so the collapsed line stays short. The dim, small
+   type marks the tail as reference material, not the message. */
+.notif-details {
+	margin-top: 4px;
+	font-size: 12.5px;
+	color: var(--dim);
+}
+/* The summary reads like the bell's other links (a.notif-link), minus the native marker. */
+.notif-details summary {
+	padding: 0;
+	font: inherit;
+	color: var(--accent);
+	text-decoration: underline;
+	cursor: pointer;
+	list-style: none;
+	overflow-wrap: anywhere;
+}
+.notif-details summary::-webkit-details-marker {
+	display: none;
+}
+/* The host command is unbreakable words: wrap anywhere so a 320px pane never
+   scrolls on two axes (WCAG reflow). */
+.notif-details code {
+	overflow-wrap: anywhere;
+}
+/* The "+N more" control that reveals the clamped card links in place. */
+.notif-more {
+	padding: 0;
+	border: 0;
+	background: none;
+	font: inherit;
+	color: var(--accent);
+	text-decoration: underline;
+	cursor: pointer;
+	overflow-wrap: anywhere;
+	/* The gap keeps "+N more" from gluing onto the id before it. */
+	margin-left: 0.35em;
+}
 
 /* ---- Shell: area list + main pane ---- */
 
