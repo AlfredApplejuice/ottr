@@ -309,8 +309,9 @@ export async function alateRotateKey(
 
 /** True when an alate editor error says the folder's filesystem refused (EROFS) or denied
  *  (EACCES) the write: the data folder is mounted read-only into the alate container.
- *  Alate 6b22013 answers health `writable` for a path source, but a true can over-report a
- *  read-only bind mount, so the failed save stays the signal the save path can trust. */
+ *  Alate 6b22013 answers health `writable` for a path source, where a false is reliable
+ *  and a true can over-report a read-only bind mount, so a refused save stays the
+ *  authoritative signal on the save path. */
 export function readOnlyMountError(error: string): boolean {
 	return /\b(?:EROFS|EACCES)\b/.test(error);
 }

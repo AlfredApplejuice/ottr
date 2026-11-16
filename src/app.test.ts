@@ -6413,6 +6413,9 @@ extensions:
 		// simulates the editor's 409. `puts` records the PUT /api/file bodies.
 		let pathMode = false;
 		let folderGit = true;
+		// The writable flag alate's health answers for the folder; a false is
+		// reliable, a true can over-report a read-only bind mount.
+		let folderWritable = true;
 		// False plays an alate older than 6b22013: /health answers no git
 		// field, so a stored verdict keeps its fallback role.
 		let healthGitField = true;
@@ -6437,6 +6440,7 @@ extensions:
 			alateReqs = [];
 			pathMode = false;
 			folderGit = true;
+			folderWritable = true;
 			healthGitField = true;
 			putConflict = false;
 			putFail = null;
@@ -6519,10 +6523,7 @@ extensions:
 										running: false,
 										path: "/data",
 										git: folderGit,
-										// True can over-report a read-only bind mount
-										// (alate specs/source-write-flags.md), so the
-										// fixture keeps it true even in the mount test.
-										writable: true,
+										writable: folderWritable,
 									}
 								: { ok: true, running: false, path: "/data" }
 							: {
@@ -7145,8 +7146,10 @@ cycleOrder:
 			});
 
 			test("health git:true re-arms Save after a mount refusal", async () => {
-				// The mount healed (or writable over-reports, alate's spec): the
-				// git folder commits again, so the mount verdict is stale on load.
+				// The mount healed: health answers git:true and writable:true, so
+				// the mount verdict is stale on load. A writable true can
+				// over-report a read-only bind mount (alate's spec); then the
+				// next refused save re-stores the verdict and re-locks.
 				reset();
 				pathMode = true;
 				putFail = {
@@ -7172,6 +7175,41 @@ cycleOrder:
 				const armed = await m.call("/api/model-roles");
 				expect(armed.status).toBe(200);
 				expect(await armed.json()).toMatchObject({ ro: null });
+			});
+
+			test("health writable:false keeps a mount verdict locked", async () => {
+				// A git folder still on a read-only mount: health answers
+				// git:true but writable:false, and a false is reliable (alate's
+				// spec). The mount verdict stays, so the editor stays locked
+				// instead of arming a Save that can only fail with EROFS.
+				reset();
+				pathMode = true;
+				putFail = {
+					status: 500,
+					error:
+						"EROFS: read-only file system, open '/data/user/omp/agent/config.yml'",
+				};
+				const res = await m.call("/api/model-roles", {
+					base: null,
+					hash: sha(ORIGINAL),
+					roles: {
+						default: "zai/glm-5.3-flash:max",
+						slow: "zai/glm-5.3-flash:max",
+					},
+				});
+				expect(res.status).toBe(400);
+				expect(await res.json()).toEqual({
+					error: "read-only: folder source",
+					path: "/data",
+					cause: "mount",
+				});
+				putFail = null;
+				folderWritable = false;
+				const get = await m.call("/api/model-roles");
+				expect(get.status).toBe(200);
+				expect(await get.json()).toMatchObject({
+					ro: { path: "/data", cause: "mount" },
+				});
 			});
 
 			test("a repo source never carries a folder verdict", async () => {
