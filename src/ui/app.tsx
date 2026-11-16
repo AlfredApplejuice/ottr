@@ -14598,12 +14598,43 @@ export function warningLinks(
 	return out;
 }
 
+/** True for a whitespace-delimited token whose shape is host detail the collapsed
+ * line must not carry (OTTR-1084): a path (holds "/", but an http(s) link stays),
+ * a CLI flag ("-d", "--no-deps"), or a container-style name ("ottr-worker-1").
+ * Card refs ("OTTR-1071", "ottr#OTTR-1071") match no shape. */
+function isNoticeDetailToken(token: string): boolean {
+	if (/^https?:\/\//i.test(token)) return false;
+	if (token.includes("/")) return true;
+	if (/^-{1,2}[a-zA-Z0-9]/.test(token)) return true;
+	return /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*-\d+$/.test(token);
+}
+
+/** A notice segment's collapsed copy: detail tokens gone, repeated spaces
+ * collapsed, and a trailing connector word popped so the line does not end on a
+ * dangling preposition. The last remaining word never pops. */
+function stripNoticeTokens(segment: string): string {
+	let out = segment
+		.split(/\s+/)
+		.filter((t) => t !== "" && !isNoticeDetailToken(t))
+		.join(" ")
+		.trim();
+	while (out.includes(" ")) {
+		const word = out.slice(out.lastIndexOf(" ") + 1);
+		if (!/^(?:in|at|on|from|with|to|for|by|into|under|via)$/.test(word)) break;
+		out = out.slice(0, out.lastIndexOf(" ")).trimEnd();
+	}
+	return out;
+}
+
 /** The collapsed form of a bell entry's text: the first line, cut at the end of
- * its first sentence when more sentence follows. Whatever this drops, the entry's
- * Details disclosure must carry. */
+ * its first sentence when more sentence follows. A cut whose text still holds
+ * host detail (isNoticeDetailToken) is skipped for a clean later cut, else the
+ * whole line returns stripped; a line that strips empty returns the plain cut.
+ * Whatever this drops, the entry's Details disclosure must carry. */
 export function shortNoticeText(text: string): string {
 	const nl = text.indexOf("\n");
 	const line = nl < 0 ? text : text.slice(0, nl);
+	let plainCut = "";
 	for (let i = 0; i < line.length - 1; i++) {
 		const ch = line[i];
 		if (
@@ -14611,10 +14642,15 @@ export function shortNoticeText(text: string): string {
 			".!?;:".includes(ch) &&
 			line[i + 1] === " " &&
 			line.slice(i + 2).trim() !== ""
-		)
-			return line.slice(0, i + 1);
+		) {
+			const cut = line.slice(0, i + 1);
+			if (plainCut === "") plainCut = cut;
+			if (!cut.split(/\s+/).some(isNoticeDetailToken)) return cut;
+		}
 	}
-	return line;
+	const stripped = stripNoticeTokens(line);
+	if (stripped !== "") return stripped;
+	return plainCut === "" ? line : plainCut;
 }
 
 /** A collapsed bell line shows at most this many card links; the rest hide behind

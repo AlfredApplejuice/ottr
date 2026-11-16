@@ -1939,6 +1939,34 @@ describe("card links in bell text", () => {
 			"Trailing end is the whole line.",
 		);
 	});
+
+	test("shortNoticeText drops host paths, flags, and container names from the collapsed copy", () => {
+		expect(
+			shortNoticeText(
+				"SkillSpector rejected /tmp/alate-data-9f34/user/omp/agent/skills/egm-review-loop (exit 1); nothing was installed",
+			),
+		).toBe("SkillSpector rejected (exit 1); nothing was installed");
+		expect(
+			shortNoticeText("bun install failed (exit 1) in /opt/agent-data"),
+		).toBe("bun install failed (exit 1)");
+		expect(
+			shortNoticeText(
+				"container ottr-worker-1 exited before the seed finished",
+			),
+		).toBe("container exited before the seed finished");
+		expect(
+			shortNoticeText(
+				"Install it at https://github.com/apps/ottr-ai/installations/new.",
+			),
+		).toBe("Install it at https://github.com/apps/ottr-ai/installations/new.");
+		expect(shortNoticeText("seed flags -d --no-deps --wait ignored")).toBe(
+			"seed flags ignored",
+		);
+		// Card refs match no detail-token shape, tagged or bare.
+		expect(
+			shortNoticeText("cards ottr#OTTR-1071, alate#ALAT-180 were running"),
+		).toBe("cards ottr#OTTR-1071, alate#ALAT-180 were running");
+	});
 });
 
 describe("RestartWaitLine", () => {
