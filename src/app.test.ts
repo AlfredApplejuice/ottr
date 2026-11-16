@@ -6413,6 +6413,9 @@ extensions:
 		// simulates the editor's 409. `puts` records the PUT /api/file bodies.
 		let pathMode = false;
 		let folderGit = true;
+		// False plays an alate older than 6b22013: /health answers no git
+		// field, so a stored verdict keeps its fallback role.
+		let healthGitField = true;
 		let putConflict = false;
 		// A PUT failure before any byte: alate's answer body and status (a read-only
 		// mount answers its raw fs error with a 500).
@@ -6434,6 +6437,7 @@ extensions:
 			alateReqs = [];
 			pathMode = false;
 			folderGit = true;
+			healthGitField = true;
 			putConflict = false;
 			putFail = null;
 			puts = [];
@@ -6504,10 +6508,30 @@ extensions:
 					auth: req.headers.get("authorization"),
 				});
 				if (u.pathname === "/health")
+					// Alate 6b22013 answers `git`/`writable` for a path source and
+					// null for a repo source. `healthGitField` false plays an
+					// older alate whose health carries neither field.
 					return Response.json(
 						pathMode
-							? { ok: true, running: false, path: "/data" }
-							: { ok: true, running: false, repo: "o/data" },
+							? healthGitField
+								? {
+										ok: true,
+										running: false,
+										path: "/data",
+										git: folderGit,
+										// True can over-report a read-only bind mount
+										// (alate specs/source-write-flags.md), so the
+										// fixture keeps it true even in the mount test.
+										writable: true,
+									}
+								: { ok: true, running: false, path: "/data" }
+							: {
+									ok: true,
+									running: false,
+									repo: "o/data",
+									git: null,
+									writable: null,
+								},
 					);
 				if (u.pathname === "/api/file" && req.method === "PUT")
 					return alatePut(req);
@@ -7035,6 +7059,9 @@ cycleOrder:
 			test("a read-only mounted folder maps alate's EROFS to the read-only answer", async () => {
 				reset();
 				pathMode = true;
+				// The fallback: an alate older than 6b22013 answers no git field,
+				// so the verdict keeps the editor locked on the next GET.
+				healthGitField = false;
 				putFail = {
 					status: 500,
 					error:
@@ -7064,6 +7091,87 @@ cycleOrder:
 				expect(await get.json()).toMatchObject({
 					ro: { path: "/data", cause: "mount" },
 				});
+			});
+
+			test("health git:true re-arms Save after a plain-folder refusal", async () => {
+				// The user's flow: the save into a plain folder stored the verdict,
+				// then the folder became a git repo. Health now says git:true, so
+				// the next editor load drops the stale verdict and arms Save — no
+				// server restart.
+				reset();
+				pathMode = true;
+				folderGit = false;
+				const res = await m.call("/api/model-roles", {
+					base: null,
+					hash: sha(ORIGINAL),
+					roles: {
+						default: "zai/glm-5.3-flash:max",
+						slow: "zai/glm-5.3-flash:max",
+					},
+				});
+				expect(res.status).toBe(400);
+				const locked = await m.call("/api/model-roles");
+				expect(await locked.json()).toMatchObject({
+					ro: { path: "/data", cause: "plain" },
+				});
+				// The folder is a git repo now, so alate's health answers git:true.
+				folderGit = true;
+				const armed = await m.call("/api/model-roles");
+				expect(armed.status).toBe(200);
+				expect(await armed.json()).toMatchObject({ ro: null });
+			});
+
+			test("an alate whose health carries no git field keeps the plain verdict", async () => {
+				// Fallback: before 6b22013 the health answer had no git field, so
+				// the refused save stays the only signal and the lock holds.
+				reset();
+				pathMode = true;
+				folderGit = false;
+				healthGitField = false;
+				const res = await m.call("/api/model-roles", {
+					base: null,
+					hash: sha(ORIGINAL),
+					roles: {
+						default: "zai/glm-5.3-flash:max",
+						slow: "zai/glm-5.3-flash:max",
+					},
+				});
+				expect(res.status).toBe(400);
+				const get = await m.call("/api/model-roles");
+				expect(get.status).toBe(200);
+				expect(await get.json()).toMatchObject({
+					ro: { path: "/data", cause: "plain" },
+				});
+			});
+
+			test("health git:true re-arms Save after a mount refusal", async () => {
+				// The mount healed (or writable over-reports, alate's spec): the
+				// git folder commits again, so the mount verdict is stale on load.
+				reset();
+				pathMode = true;
+				putFail = {
+					status: 500,
+					error:
+						"EROFS: read-only file system, open '/data/user/omp/agent/config.yml'",
+				};
+				const res = await m.call("/api/model-roles", {
+					base: null,
+					hash: sha(ORIGINAL),
+					roles: {
+						default: "zai/glm-5.3-flash:max",
+						slow: "zai/glm-5.3-flash:max",
+					},
+				});
+				expect(res.status).toBe(400);
+				expect(await res.json()).toEqual({
+					error: "read-only: folder source",
+					path: "/data",
+					cause: "mount",
+				});
+				putFail = null;
+				const armed = await m.call("/api/model-roles");
+				expect(armed.status).toBe(200);
+				expect(await armed.json()).toMatchObject({ ro: null });
 			});
 
 			test("a repo source never carries a folder verdict", async () => {

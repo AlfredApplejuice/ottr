@@ -12934,11 +12934,15 @@ export async function createApp(deps: AppDeps) {
 
 	// A folder source saves through alate's editor PUT: alate checks `base`
 	// (the sha256 the editor loaded) against the folder before writing.
-	// Alate's state and health carry no git-ness or writability field for a
-	// folder, so the board learns "cannot save" only from a refused save.
-	// The verdicts below remember that per folder path, in memory: they
-	// survive page reloads and clear at a server restart, so a mount that
-	// becomes writable re-arms Save instead of staying locked forever.
+	// Alate 6b22013 answers GET /health with `git` and `writable` for a
+	// folder source (`git` says whether a PUT commits; a `writable` true can
+	// over-report a read-only bind mount, so the board trusts only `git`).
+	// The verdicts below remember a refused save per folder path, in
+	// memory: they survive page reloads and clear at a server restart.
+	// On an editor load the board asks health and drops the verdict when
+	// `git` is true again, so a fixed folder re-arms Save without a
+	// restart; the stored verdict stays as the fallback for an alate
+	// whose health carries no `git` field.
 	const folderSaveVerdicts = new Map<string, "plain" | "mount">();
 	function folderSaveVerdict(
 		path: string | null,
@@ -12946,6 +12950,22 @@ export async function createApp(deps: AppDeps) {
 		if (path === null) return null;
 		const cause = folderSaveVerdicts.get(path);
 		return cause ? { path, cause } : null;
+	}
+	// The editor load's verdict: a stored refusal, unless alate's health
+	// says the folder commits again (`git: true`) — then the verdict is
+	// stale; drop it and arm Save. A health answer without `git` (an older
+	// alate) or a failed health call keeps the stored verdict.
+	async function folderSaveVerdictLive(
+		path: string | null,
+	): Promise<{ path: string; cause: "plain" | "mount" } | null> {
+		const stored = folderSaveVerdict(path);
+		if (!stored) return null;
+		const h = await alateHealth(alate);
+		if (h.ok && h.body.git === true) {
+			folderSaveVerdicts.delete(stored.path);
+			return null;
+		}
+		return stored;
 	}
 	async function saveRolesFolder(
 		f: RolesSource,
@@ -13578,8 +13598,9 @@ export async function createApp(deps: AppDeps) {
 								repo: f.body.repo,
 								path: f.body.path,
 								// A folder the board saw refuse a save locks the editor on
-								// load, before any edit; null until such a save.
-								ro: folderSaveVerdict(f.body.path),
+								// load, before any edit; null until such a save. Alate
+								// health git:true drops a stale verdict on the load.
+								ro: await folderSaveVerdictLive(f.body.path),
 								// One sign-in, on the board (docs/specs/provider-credentials.md): the
 								// board store's active providers; null when it cannot be read.
 								signIns: (() => {
