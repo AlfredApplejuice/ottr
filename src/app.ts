@@ -10322,6 +10322,7 @@ export async function createApp(deps: AppDeps) {
 				head: string;
 				prev: string | null;
 				event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
+				blocking: boolean;
 		  }
 	> {
 		return withTask(e, task, async () => {
@@ -10353,7 +10354,7 @@ export async function createApp(deps: AppDeps) {
 					: settings.prReviewApprove === true && !blocking
 						? ("APPROVE" as const)
 						: ("COMMENT" as const);
-			return { row, head: rawHead, prev, event };
+			return { row, head: rawHead, prev, event, blocking };
 		});
 	}
 	async function preparePrPost(
@@ -10367,6 +10368,7 @@ export async function createApp(deps: AppDeps) {
 				head: string;
 				prev: string | null;
 				event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
+				blocking: boolean;
 				draft: ParsedReview;
 				github: string;
 		  }
@@ -10388,6 +10390,7 @@ export async function createApp(deps: AppDeps) {
 			head: claimed.head,
 			prev: claimed.prev,
 			event: claimed.event,
+			blocking: claimed.blocking,
 			draft: picked.draft,
 			github: storedGithub,
 		};
@@ -10463,10 +10466,15 @@ export async function createApp(deps: AppDeps) {
 				current.postedHead !== head
 			)
 				return json({ error: "the draft changed" }, 409);
-			// A comment replaces the board's earlier REQUEST_CHANGES review:
-			// dismiss it, so the PR does not keep an outdated changes request.
+			// A clean comment replaces the board's earlier REQUEST_CHANGES review:
+			// dismiss it, so the PR does not keep an outdated changes request. A
+			// still-blocking comment keeps it: the changes request still stands.
 			let dismissError: string | null = null;
-			if (event === "COMMENT" && row.postedEvent === "REQUEST_CHANGES") {
+			if (
+				event === "COMMENT" &&
+				!prep.blocking &&
+				row.postedEvent === "REQUEST_CHANGES"
+			) {
 				const reviewId = postedReviewId(row.postedUrl);
 				if (reviewId !== null)
 					dismissError = await dismissPrChangesReview(

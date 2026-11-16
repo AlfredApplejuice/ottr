@@ -18475,7 +18475,7 @@ describe(
 				await removeApp();
 			});
 
-			test("a comment post dismisses the earlier request-changes review", async () => {
+			test("a clean comment post dismisses the earlier request-changes review", async () => {
 				await saveApp();
 				let dismissal = null as {
 					url: string;
@@ -18504,8 +18504,9 @@ describe(
 					}
 					return Response.json({ message: "no route" }, { status: 404 });
 				};
-				// The earlier post requested changes; its link carries review 7.
-				const t = await reviewed(67, H1);
+				// The earlier post requested changes; its link carries review 7. The
+				// later draft is clean: its run found no blocking findings.
+				const t = await reviewed(67, H1, true, false);
 				await prStore.setPrPostedUrl(
 					67,
 					"https://github.com/acme/widget/pull/67#pullrequestreview-7",
@@ -18535,7 +18536,8 @@ describe(
 
 			test("a failed dismissal keeps the post and stores the error", async () => {
 				await removeApp();
-				const t = await reviewed(68, H1);
+				// The later draft is clean: its run found no blocking findings.
+				const t = await reviewed(68, H1, true, false);
 				// The earlier post requested changes; its link carries review 7.
 				await prStore.setPrPostedUrl(
 					68,
@@ -18596,6 +18598,33 @@ describe(
 					"(HTTP 403) not allowed to dismiss",
 				);
 				expect((await row(68)).postedEvent).toBe("COMMENT");
+			});
+
+			test("a blocking comment post keeps the earlier request-changes review", async () => {
+				await removeApp();
+				// The new draft is still blocking (the helper's default), so the
+				// comment must not dismiss the changes request: it still stands.
+				const t = await reviewed(70, H1);
+				// The earlier post requested changes; its link carries review 7.
+				await prStore.setPrPostedUrl(
+					70,
+					"https://github.com/acme/widget/pull/70#pullrequestreview-7",
+					"octocat",
+					"REQUEST_CHANGES",
+				);
+				const res = await postReview(t.id, { body: "Still broken." });
+				expect(res.status).toBe(200);
+				expect(await res.json()).toEqual({
+					ok: true,
+					login: null,
+					via: "token",
+					inline: 0,
+				});
+				// The review post went out; no dismissal call followed it.
+				expect(ghCalls).toEqual([expectedArgv(70)]);
+				expect((await row(70)).postedHead).toBe(H1);
+				expect((await row(70)).postError).toBeNull();
+				expect((await row(70)).postedEvent).toBe("COMMENT");
 			});
 
 			test("an approve after a request-changes review sends no dismissal", async () => {
