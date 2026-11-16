@@ -267,7 +267,7 @@ import {
 	workCheckSendBack,
 	workCheckSendBackDirection,
 } from "./prompts.ts";
-import { createPrWatcher, PR_GATES, prUrl } from "./prs.ts";
+import { createPrWatcher, PR_GATES, postedReviewId, prUrl } from "./prs.ts";
 import { requirementsListPath } from "./python.ts";
 import { fetchQuota, forProvider, providerBlocked } from "./quota.ts";
 import {
@@ -1717,6 +1717,7 @@ const BOOLEAN_SETTING_FIELDS = [
 	"prReviews",
 	"prReviewNotify",
 	"prReviewApprove",
+	"prReviewRequestChanges",
 	"prMode",
 	"issueWatch",
 	"dependabotWarn",
@@ -9978,9 +9979,16 @@ export async function createApp(deps: AppDeps) {
 		owner: string,
 		draft: ParsedReview,
 		comments: Record<string, unknown>,
-		event: "COMMENT" | "APPROVE",
+		event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES",
 	): Promise<
-		{ via: "app"; stdout: string; approveSkipped?: string } | Response | null
+		| {
+				via: "app";
+				stdout: string;
+				approveSkipped?: string;
+				changesSkipped?: string;
+		  }
+		| Response
+		| null
 	> {
 		if (githubApp === null || appTokens === null) return null;
 		const appSecrets = [...gitSecrets()];
@@ -10001,7 +10009,7 @@ export async function createApp(deps: AppDeps) {
 			"content-type": "application/json",
 			"user-agent": "Ottr",
 		};
-		const postOnce = (ev: "COMMENT" | "APPROVE") =>
+		const postOnce = (ev: "COMMENT" | "APPROVE" | "REQUEST_CHANGES") =>
 			githubAppFetch(url, {
 				method: "POST",
 				headers,
@@ -10017,20 +10025,31 @@ export async function createApp(deps: AppDeps) {
 		try {
 			let res = await postOnce(event);
 			let text = await res.text();
-			if (!res.ok && event === "APPROVE" && res.status === 422) {
-				// GitHub refuses an APPROVE review when the posting identity opened
-				// the PR (HTTP 422), so the same draft goes out as a comment and the
-				// response notes the skip. Any other failure stays a 502: a 5xx or a
-				// rate limit must never trade the approval of this head away.
+			if (
+				!res.ok &&
+				(event === "APPROVE" || event === "REQUEST_CHANGES") &&
+				res.status === 422
+			) {
+				// GitHub refuses an APPROVE or REQUEST_CHANGES review when the
+				// posting identity opened the PR (HTTP 422), so the same draft goes
+				// out as a comment and the response notes the skip. Any other failure
+				// stays a 502: a 5xx or a rate limit must never trade the verdict of
+				// this head away.
 				const refused = res.status;
 				res = await postOnce("COMMENT");
 				text = await res.text();
 				if (res.ok)
-					return {
-						via: "app",
-						stdout: text,
-						approveSkipped: `GitHub refused the approve review (HTTP ${refused}); posted it as a comment instead`,
-					};
+					return event === "REQUEST_CHANGES"
+						? {
+								via: "app",
+								stdout: text,
+								changesSkipped: `GitHub refused the request-changes review (HTTP ${refused}); posted it as a comment instead`,
+							}
+						: {
+								via: "app",
+								stdout: text,
+								approveSkipped: `GitHub refused the approve review (HTTP ${refused}); posted it as a comment instead`,
+							};
 			}
 			if (!res.ok) {
 				const error =
@@ -10059,8 +10078,15 @@ export async function createApp(deps: AppDeps) {
 		repo: string | null,
 		draft: ParsedReview,
 		comments: Record<string, unknown>,
-		event: "COMMENT" | "APPROVE",
-	): Promise<{ stdout: string; approveSkipped?: string } | Response> {
+		event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES",
+	): Promise<
+		| {
+				stdout: string;
+				approveSkipped?: string;
+				changesSkipped?: string;
+		  }
+		| Response
+	> {
 		const payload = {
 			event,
 			body: `${draft.body}${REVIEW_FOOTER}`,
@@ -10072,8 +10098,11 @@ export async function createApp(deps: AppDeps) {
 		try {
 			dir = await mkdtemp(join(tmpdir(), "ottr-review-"));
 			// A fresh payload per attempt: the retry must send COMMENT, not the
-			// refused APPROVE.
-			const callGh = async (ev: "COMMENT" | "APPROVE", at: string) => {
+			// refused APPROVE or REQUEST_CHANGES.
+			const callGh = async (
+				ev: "COMMENT" | "APPROVE" | "REQUEST_CHANGES",
+				at: string,
+			) => {
 				const file = join(at, "review.json");
 				await writeFile(file, JSON.stringify({ ...payload, event: ev }), {
 					mode: 0o600,
@@ -10090,20 +10119,28 @@ export async function createApp(deps: AppDeps) {
 			res = await callGh(event, dir);
 			if (
 				res.code !== 0 &&
-				event === "APPROVE" &&
-				/\b422\b|Can not approve your own pull request/i.test(res.stderr)
+				(event === "APPROVE" || event === "REQUEST_CHANGES") &&
+				/\b422\b|Can not approve your own pull request|Can not request changes on your own pull request/i.test(
+					res.stderr,
+				)
 			) {
-				// GitHub refuses an APPROVE review when the posting identity opened
-				// the PR; gh prints the refusal body to stderr. Only that signature
-				// downsizes to a comment — any other exit stays a 502, so a 5xx or a
-				// rate limit never trades the approval of this head away.
+				// GitHub refuses an APPROVE or REQUEST_CHANGES review when the
+				// posting identity opened the PR; gh prints the refusal body to
+				// stderr. Only that signature downsizes to a comment — any other exit
+				// stays a 502, so a 5xx or a rate limit never trades the verdict of
+				// this head away.
 				const refused = res.code;
 				res = await callGh("COMMENT", dir);
 				if (res.code === 0)
-					return {
-						stdout: res.stdout,
-						approveSkipped: `GitHub refused the approve review (gh exit ${refused}); posted it as a comment instead`,
-					};
+					return event === "REQUEST_CHANGES"
+						? {
+								stdout: res.stdout,
+								changesSkipped: `GitHub refused the request-changes review (gh exit ${refused}); posted it as a comment instead`,
+							}
+						: {
+								stdout: res.stdout,
+								approveSkipped: `GitHub refused the approve review (gh exit ${refused}); posted it as a comment instead`,
+							};
 			}
 		} catch (err) {
 			// A spawn or temp file failure (e.g. gh missing) sent nothing: free the claim, or the head reads as posted.
@@ -10117,6 +10154,89 @@ export async function createApp(deps: AppDeps) {
 			return json({ error }, 502);
 		}
 		return { stdout: res.stdout };
+	}
+	/** Dismisses the board's earlier REQUEST_CHANGES review: null on success, else the error text. */
+	async function dismissPrChangesReview(
+		_e: Entry,
+		repo: string,
+		owner: string,
+		repoName: string,
+		number: number,
+		reviewId: string,
+	): Promise<string | null> {
+		const appSecrets = [...gitSecrets()];
+		if (githubApp !== null && appTokens !== null) {
+			try {
+				const tok = await appTokens.tokenFor(owner, repoName);
+				if (tok !== null) {
+					// Direct fetch, no gh: the dismissal rides the app's installation
+					// token like the review post, under Pull requests: Read and write.
+					const res = await githubAppFetch(
+						`${githubHost().apiBase}/repos/${repo}/pulls/${number}/reviews/${reviewId}/dismissals`,
+						{
+							method: "PUT",
+							headers: {
+								authorization: `Bearer ${tok}`,
+								accept: "application/vnd.github+json",
+								"content-type": "application/json",
+								"user-agent": "Ottr",
+							},
+							body: JSON.stringify({
+								message: "A newer Ottr review found no blocking findings",
+							}),
+						},
+					);
+					if (res.ok) return null;
+					const text = await res.text();
+					return (
+						redact(text.trim().slice(0, 300), appSecrets) ||
+						requestFailed(
+							`The dismissal of review ${reviewId} on ${repo}#${number}`,
+							res.status,
+							"check the app's or token's permissions, then post the review again",
+						)
+					);
+				}
+			} catch (err) {
+				// A mint or network failure dismissed nothing: the post already stands.
+				return (
+					redact(errmsg(err), appSecrets).trim().slice(0, 300) ||
+					"the dismissal failed"
+				);
+			}
+		}
+		const payload = {
+			message: "A newer Ottr review found no blocking findings",
+		};
+		let res: { code: number; stdout: string; stderr: string };
+		let dir: string | null = null;
+		try {
+			dir = await mkdtemp(join(tmpdir(), "ottr-dismiss-"));
+			const file = join(dir, "dismissal.json");
+			await writeFile(file, JSON.stringify(payload), { mode: 0o600 });
+			res = await gh([
+				"api",
+				`repos/${repo}/pulls/${number}/reviews/${reviewId}/dismissals`,
+				"-X",
+				"PUT",
+				"--input",
+				file,
+			]);
+		} catch (err) {
+			// A spawn or temp file failure sent nothing: the post already stands.
+			res = {
+				code: -1,
+				stdout: "",
+				stderr:
+					redact(errmsg(err), appSecrets).trim().slice(0, 300) ||
+					"the dismissal failed",
+			};
+		} finally {
+			if (dir !== null) await rm(dir, { recursive: true, force: true });
+		}
+		if (res.code !== 0)
+			return res.stderr.trim().slice(0, 300) || `gh exited ${res.code}`;
+		return null;
 	}
 	/** True when u is an https URL on the configured GitHub host. */
 	function isHostedHttpsUrl(u: string): boolean {
@@ -10201,7 +10321,7 @@ export async function createApp(deps: AppDeps) {
 				row: PrReviewRow;
 				head: string;
 				prev: string | null;
-				event: "APPROVE" | "COMMENT";
+				event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
 		  }
 	> {
 		return withTask(e, task, async () => {
@@ -10222,11 +10342,17 @@ export async function createApp(deps: AppDeps) {
 			const prev = await e.store.claimPrPost(row.number, rawHead);
 			if (prev === undefined)
 				return json({ error: "already posted for this head" }, 409);
+			// REQUEST_CHANGES when the project opted in and this draft's own run
+			// found blocking findings; APPROVE when opted in and clean; an unknown
+			// verdict or no opt-in posts a plain comment.
+			const settings = await e.store.getSettings();
+			const blocking = await e.store.lastPrRunBlocking(row.number);
 			const event =
-				(await e.store.getSettings()).prReviewApprove === true &&
-				!(await e.store.lastPrRunBlocking(row.number))
-					? ("APPROVE" as const)
-					: ("COMMENT" as const);
+				settings.prReviewRequestChanges === true && blocking
+					? ("REQUEST_CHANGES" as const)
+					: settings.prReviewApprove === true && !blocking
+						? ("APPROVE" as const)
+						: ("COMMENT" as const);
 			return { row, head: rawHead, prev, event };
 		});
 	}
@@ -10240,7 +10366,7 @@ export async function createApp(deps: AppDeps) {
 				row: PrReviewRow;
 				head: string;
 				prev: string | null;
-				event: "APPROVE" | "COMMENT";
+				event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
 				draft: ParsedReview;
 				github: string;
 		  }
@@ -10280,8 +10406,9 @@ export async function createApp(deps: AppDeps) {
 			draft.comments.length > 0
 				? { comments: reviewPayloadComments(draft.comments) }
 				: {};
-		// APPROVE only when the project opted in and this draft's own run found no blocking
-		// findings; an unknown verdict posts a plain comment.
+		// REQUEST_CHANGES when the project opted in and this draft's own run found
+		// blocking findings, APPROVE when opted in and clean; an unknown verdict or
+		// no opt-in posts a plain comment.
 		const event = prep.event;
 		const app = await postReviewViaApp(
 			e,
@@ -10299,10 +10426,12 @@ export async function createApp(deps: AppDeps) {
 		let via: "app" | "token" = "token";
 		let stdout: string;
 		let approveSkipped: string | undefined;
+		let changesSkipped: string | undefined;
 		if (app !== null) {
 			stdout = app.stdout;
 			via = "app";
 			approveSkipped = app.approveSkipped;
+			changesSkipped = app.changesSkipped;
 		} else {
 			const posted = await postReviewViaGh(
 				e,
@@ -10317,6 +10446,7 @@ export async function createApp(deps: AppDeps) {
 			if (posted instanceof Response) return posted;
 			stdout = posted.stdout;
 			approveSkipped = posted.approveSkipped;
+			changesSkipped = posted.changesSkipped;
 		}
 		// GitHub's response body is untrusted: only an https URL on the configured
 		// host becomes the drawer link, and only a plausible login names the
@@ -10333,8 +10463,37 @@ export async function createApp(deps: AppDeps) {
 				current.postedHead !== head
 			)
 				return json({ error: "the draft changed" }, 409);
+			// A comment replaces the board's earlier REQUEST_CHANGES review:
+			// dismiss it, so the PR does not keep an outdated changes request.
+			let dismissError: string | null = null;
+			if (event === "COMMENT" && row.postedEvent === "REQUEST_CHANGES") {
+				const reviewId = postedReviewId(row.postedUrl);
+				if (reviewId !== null)
+					dismissError = await dismissPrChangesReview(
+						e,
+						repo,
+						owner,
+						repoName,
+						row.number,
+						reviewId,
+					);
+			}
 			// A watcher can close or merge this PR during the post. Preserve that state.
-			await e.store.setPrPostedUrl(row.number, url, login);
+			// The review GitHub accepted decides the stored event: a downsized post is
+			// a comment on GitHub, whatever the decided event was.
+			await e.store.setPrPostedUrl(
+				row.number,
+				url,
+				login,
+				approveSkipped !== undefined || changesSkipped !== undefined
+					? "COMMENT"
+					: event,
+			);
+			// A skipped review or a failed dismissal must show on the card: the note
+			// lands in post_error, the post itself stays.
+			const postError = dismissError ?? changesSkipped ?? null;
+			if (postError !== null)
+				await e.store.setPrPostError(row.number, postError);
 			// The posted review's own comments must never alert: the baseline is the post time.
 			await e.store.setPrComments(row.number, Date.now(), false);
 			// The head is posted: the card leaves needs_you for done/idle.
@@ -10348,6 +10507,7 @@ export async function createApp(deps: AppDeps) {
 			via,
 			inline: draft.comments.length,
 			...(approveSkipped !== undefined ? { approveSkipped } : {}),
+			...(changesSkipped !== undefined ? { changesSkipped } : {}),
 		});
 	}
 

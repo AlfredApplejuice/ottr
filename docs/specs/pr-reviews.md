@@ -12,8 +12,10 @@ No agent runs over PR code. An agent turn in a checkout of the PR was the first 
 - `POST /api/projects/:project/settings` accepts `prReviews`. A value that is not a boolean gets 400 `prReviews must be a boolean`.
 - `ProjectSettings.prReviewApprove: boolean`. The default is `false`.
 - `POST /api/projects/:project/settings` accepts `prReviewApprove`. A value that is not a boolean gets 400 `prReviewApprove must be a boolean`.
+- `ProjectSettings.prReviewRequestChanges: boolean`. The default is `false`.
+- `POST /api/projects/:project/settings` accepts `prReviewRequestChanges`. A value that is not a boolean gets 400 `prReviewRequestChanges must be a boolean`.
 - The watcher works only when `prReviews` is true and the project has a GitHub repo (`project.github !== null`). In other cases, the watcher makes no `gh` call for the project.
-- Project settings show a "PR reviews" checkbox next to "Fork research", a "PR review notifications" checkbox under it, and a "PR review approvals" checkbox under those. When `prReviewApprove` is on, the Post click sends the review with event `APPROVE` when the draft's run found no blocking findings (see "Post").
+- Project settings show a "PR reviews" checkbox next to "Fork research", a "PR review notifications" checkbox under it, and a "PR review approvals" checkbox under those. A "PR review request changes" checkbox sits under "PR review approvals", disabled until PR reviews is on. When `prReviewApprove` is on, the Post click sends the review with event `APPROVE` when the draft's run found no blocking findings (see "Post"). When `prReviewRequestChanges` is on, a blocking draft posts as `REQUEST_CHANGES` (see "Post").
 
 ### Watcher (`src/prs.ts`)
 
@@ -57,9 +59,13 @@ The earlier review gives a re-review its context: `fetchReReviewContext()` (in `
 
 Each project has its own store, so the PR number is the key inside it.
 
-- Table `pr_review`: `number INTEGER PRIMARY KEY, task_id TEXT, head TEXT NOT NULL, first_seen_at INTEGER NOT NULL, reviewed_head TEXT, posted_head TEXT, posted_url TEXT, posted_login TEXT, state TEXT NOT NULL CHECK (state IN ('open','closed','merged')), draft INTEGER NOT NULL, title TEXT NOT NULL, post_error TEXT`.
+- Table `pr_review`: `number INTEGER PRIMARY KEY, task_id TEXT, head TEXT NOT NULL, first_seen_at INTEGER NOT NULL, reviewed_head TEXT, posted_head TEXT, posted_url TEXT, posted_login TEXT, posted_event TEXT, state TEXT NOT NULL CHECK (state IN ('open','closed','merged')), draft INTEGER NOT NULL, title TEXT NOT NULL, post_error TEXT`.
 - Table `pr_review_runs`: `id INTEGER PRIMARY KEY AUTOINCREMENT, number INTEGER NOT NULL, started_at INTEGER NOT NULL, head TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, blocking INTEGER NOT NULL DEFAULT 1`. Each row is one attempt. `done = 1` marks a saved draft, so the done rows are the history of reviewed heads. `blocking` says whether the run found blocking findings; the default 1 is fail-safe, so a database from an older build never reads as clean.
 - Both tables are in `SCHEMA` (`CREATE TABLE IF NOT EXISTS`), so an old database gets them on open.
+- `posted_event` is additive: DDL in `SCHEMA` plus the `PRAGMA table_info` migration in `ProjectStore.open` (the `posted_url` pattern). The column is null for every older row, and older builds never sent `REQUEST_CHANGES`, so null never hides one.
+- `setPrPostedUrl(number, url, login = null)` gains the optional event argument; `undefined` leaves the column untouched.
+- New store call `setPrPostError(number, error)` writes `post_error` only; `releasePrPost` stays the only writer that restores the head.
+- `savePrReview` keeps its explicit column list and never writes `posted_event`.
 - `savePrDraft({ run, number, head, draft, prompt, blocking })` runs in one transaction:
   - No card yet: create a card with kind `pr_review`, title `PR review: #N <title>`, topic `pr review`.
   - The card gets the draft as its `details` and a one-line summary. A card that exists gets the new prompt. `syncPrCard` then sets the card's stage and state (see "Card state").
@@ -91,8 +97,9 @@ A draft that nobody posted waits for the user, so the card must not hide in Done
   - The PR state must be `open`, else 409 with the state.
   - `postedHead === reviewedHead` gets 409 `already posted for this head`.
   - Before the GitHub call, one SQL statement claims the head: it sets `posted_head = reviewed_head` only when the PR is open and the head is not posted. A second Post of the same head loses the claim and gets 409. So two concurrent Posts send one review.
-  - The event is `COMMENT` by default. When the project setting `prReviewApprove` is on and the draft's own run found no blocking findings (`lastPrRunBlocking` false), the same post sends one review with event `APPROVE` and the comment as its body; the inline comments ride along. An unknown verdict never approves. Both send paths take the same event.
-  - When GitHub refuses the `APPROVE` review with HTTP 422 (for example when the posting identity opened the pull request), the same post retries once with event `COMMENT` and the same body. The `gh` fallback reads the refusal from stderr: a `422` status or GitHub's self-approve message downsizes. Any other failure of the `APPROVE` attempt stays a 502 and releases the claim, so a 5xx or a rate limit never trades the approval of this head away. The response of a downsized post carries `approveSkipped` with the reason; a refused `COMMENT` stays a 502 and releases the claim.
+  - The event is `COMMENT` by default. When the project setting `prReviewApprove` is on and the draft's own run found no blocking findings (`lastPrRunBlocking` false), the same post sends one review with event `APPROVE` and the comment as its body; the inline comments ride along. When the project setting `prReviewRequestChanges` is on and the run found blocking findings, the same post sends one review with event `REQUEST_CHANGES` and the comment as its body; the inline comments ride along. With both settings on, blocking sends `REQUEST_CHANGES` and clean sends `APPROVE`. An unknown verdict never approves or requests changes. The verdict comes from the run (`lastPrRunBlocking`), never from a text search of the edited draft. Both send paths take the same event.
+  - When GitHub refuses the `APPROVE` or `REQUEST_CHANGES` review with HTTP 422 (GitHub refuses both on a pull request whose author is the posting identity), the same post retries once with event `COMMENT` and the same body. The `gh` fallback reads the refusal from stderr: a `422` status or GitHub's self-approve / self-request-changes message downsizes. Any other failure of the refused attempt stays a 502 and releases the claim on both paths, so a 5xx or a rate limit never trades the approval of this head away. The response of a downsized post carries `approveSkipped` or `changesSkipped` with the reason; a downsized request-changes post also records the reason in the card's `post_error`, so the card says so; a refused `COMMENT` stays a 502 and releases the claim.
+  - `pr_review` stores the decided event in the new `posted_event` column. On a successful `COMMENT` post whose row held `posted_event` `REQUEST_CHANGES` and whose `posted_url` carries the `#pullrequestreview-<id>` fragment, Ottr dismisses the earlier review with PUT `repos/{owner}/{repo}/pulls/N/reviews/{id}/dismissals` and a short message. A later `APPROVE` needs no dismissal: GitHub clears the Changes requested state itself. A failed dismissal (for example no permission) keeps the successful post and stores the error in `post_error`.
   - The review goes through the GitHub App when one is configured: Ottr mints an installation token per [github-app.md](github-app.md), then sends a direct fetch POST to the reviews endpoint with that event, the review body without `REVIEW_FOOTER` (the app's Bot badge already says who posted it), `commit_id` set to the reviewed head, and `comments` when the draft has inline comments.
   - With no app configured, or when the app has no installation for the repo, Ottr falls back to today's `gh` call with the board token. The response reports which path ran: `{ ok, login, via }` with `via: "app" | "token"`, plus `approveSkipped` when the approve review was refused and the post went out as a comment.
   - Ottr runs the gh call as `gh api repos/{repo}/pulls/N/reviews -X POST --input <file>`. The file is a JSON payload `{ event: <COMMENT or APPROVE per the rule above>, body: <review body + REVIEW_FOOTER>, commit_id: <reviewedHead>, comments? }` in a fresh directory below the OS temp dir. Ottr removes the directory after the call. The footer (`src/types.ts`) says that Ottr, an AI agent tracker, drafted the review and a person posted it, because the review goes out under the poster's own GitHub identity.
@@ -168,7 +175,7 @@ A deterministic scan looks for two classic performance defects in the added diff
 
 - The only GitHub write is the Post click. The watcher reads only.
 - No agent runs over PR code. The model gets the PR only as data and has no tools.
-- The event is `COMMENT`, or `APPROVE` when `prReviewApprove` is on and the draft's run found no blocking findings. Ottr never sends `REQUEST_CHANGES`.
+- The event is `COMMENT` by default, `APPROVE` when `prReviewApprove` is on and the draft's run found no blocking findings, and `REQUEST_CHANGES` when `prReviewRequestChanges` is on and the run found blocking findings. With both settings on, a blocking draft sends `REQUEST_CHANGES` and a clean draft sends `APPROVE`.
 - Only the PR review post uses the GitHub App. Merge pushes, releases and CI reads keep the board token.
 - Schema changes are additive only.
 
@@ -187,12 +194,16 @@ A deterministic scan looks for two classic performance defects in the added diff
 - The re-review paragraph instructs both triage outcomes: list only the still open or partly fixed findings with evidence, and one short line of thanks with no per-finding list when every earlier finding is fixed.
 - A reply on a `pr_review` card runs a new draft for the refreshed current head with the note outside the DATA blocks, counts one cap slot, and gets 429 once the daily cap is full, 409 on a closed PR, and 400 on empty or oversized text.
 - Post sends one `COMMENT` review with the edited body, the inline comments, and the reviewed head as `commit_id`. A second Post on the same head gets 409. A new reviewed head opens Post again.
-- With `prReviewApprove` on and a clean run, the Post sends exactly POST `repos/{owner}/{repo}/pulls/N/reviews` with event `APPROVE`, the comment as its body, and the reviewed head as `commit_id`. A run with a blocking finding, or the option off, sends the same review with event `COMMENT` and approves nothing.
+- With `prReviewApprove` on and a clean run, the Post sends exactly POST `repos/{owner}/{repo}/pulls/N/reviews` with event `APPROVE`, the comment as its body, and the reviewed head as `commit_id`. A run with a blocking finding, or the option off, sends the same review with event `COMMENT` and approves nothing while `prReviewRequestChanges` is off.
+- With `prReviewRequestChanges` on and a blocking run, the Post sends exactly POST `repos/{owner}/{repo}/pulls/N/reviews` with event `REQUEST_CHANGES`; with the setting off it sends `COMMENT`. With both settings on, blocking sends `REQUEST_CHANGES` and clean sends `APPROVE`.
+- A 422 refusal of the `REQUEST_CHANGES` attempt retries once as `COMMENT`, the response carries `changesSkipped`, and `post_error` notes the reason. A non-422 failure of the `REQUEST_CHANGES` attempt stays a 502 on both paths and releases the claim.
+- A later clean `COMMENT` post sends the exact dismissal request for the earlier review id: PUT `repos/{owner}/{repo}/pulls/N/reviews/<id>/dismissals`, the id from the `posted_url` fragment. A failed dismissal keeps the post and records the error in `post_error`.
 - A verdict line quoted into an inline comment stays in the comment, never votes, and cannot clear a trailing verdict. The verdict is honored only as the draft's last non-blank plain line; a second plain verdict line, any content after the verdict (block content included), or a block with no close marker counts as blocking.
 - A model answer of only the verdict line saves no draft: the empty-answer rule stops the review and a later tick retries the head.
 - When GitHub refuses the approve review with 422, the post retries once with event `COMMENT` and the same body, succeeds, and its response carries `approveSkipped`; the `gh` fallback detects the refusal by the `422` status or GitHub's self-approve message in stderr. A non-422 failure of the `APPROVE` attempt (a 5xx, a 403) stays a 502 on both paths, releases the claim, and sends no second review; a refused `COMMENT` stays a 502 and releases the claim.
 - The verdict line never reaches the saved draft; a missing or malformed verdict counts as blocking.
 - A `prReviewApprove` value that is not a boolean gets 400 `prReviewApprove must be a boolean`.
+- A `prReviewRequestChanges` value that is not a boolean gets 400 `prReviewRequestChanges must be a boolean`.
 - An inline block on a diff line posts as an inline comment with `side: "RIGHT"`; a range block also sends `start_line`. A block outside the diff lands in the body of the saved draft. A suggestion fence reaches GitHub unchanged.
 - An open PR with an unposted draft puts the card in `in_progress/needs_you`. A Post, a close, or a merge moves it to `done/idle`. A new head on a posted card brings it back to `needs_you`. A card that an older build left in Done moves at the next tick.
 - A closed or merged PR disables Post and stops new reviews.
@@ -217,7 +228,6 @@ A deterministic scan looks for two classic performance defects in the added diff
 - Running PR tests or CI.
 - GitHub webhooks.
 - A post without a click.
-- `REQUEST_CHANGES` events.
 - The comment watch starts no re-review and no model call; it reads only.
 - Comments on closed or merged PRs, and comment bodies as stored data.
 - The performance lens runs only in the PR review flow. The board's Review-button and release reviews (whole-repo agent turns) have no label surface and are out of scope. The lens never blocks or fails a review; it only adds candidates.

@@ -238,6 +238,8 @@ export interface ProjectSettings {
 	prReviewNotify: boolean;
 	/** Post also approves the PR when the run found no blocking findings; off by default. */
 	prReviewApprove: boolean;
+	/** Post requests changes when the run found blocking findings; off by default. */
+	prReviewRequestChanges: boolean;
 	/** Per-project PR mode: integration pushes the card branch and opens a GitHub pull request instead of merging into the target branch (off by default). */
 	prMode: boolean;
 	/** Run work turns in a Firecracker microVM via vm-runner instead of a worker container (off by default; docs/adr/0009-microvm-workers.md). */
@@ -405,6 +407,8 @@ export interface PrReviewRow {
 	postedUrl: string | null;
 	/** GitHub login the review was posted as (app bot or person); null when unknown. */
 	postedLogin: string | null;
+	/** The event the posted review used (REQUEST_CHANGES); null for COMMENT/APPROVE or no post. */
+	postedEvent: string | null;
 	state: PrState;
 	draft: boolean;
 	title: string;

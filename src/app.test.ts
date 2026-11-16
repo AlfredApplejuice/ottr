@@ -13498,6 +13498,7 @@ describe("web push (R1-1, R2-3)", () => {
 			postedHead: null,
 			postedUrl: null,
 			postedLogin: null,
+			postedEvent: null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -13592,6 +13593,7 @@ describe("web push (R1-1, R2-3)", () => {
 			postedHead: null,
 			postedUrl: null,
 			postedLogin: null,
+			postedEvent: null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -13651,6 +13653,7 @@ describe("web push (R1-1, R2-3)", () => {
 			postedHead: null,
 			postedUrl: null,
 			postedLogin: null,
+			postedEvent: null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -14953,6 +14956,7 @@ describe("read marks (/api/seen)", () => {
 			postedHead: null,
 			postedUrl: null,
 			postedLogin: null,
+			postedEvent: null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -16957,6 +16961,7 @@ describe(
 				postedHead: prev?.postedHead ?? null,
 				postedUrl: prev?.postedUrl ?? null,
 				postedLogin: prev?.postedLogin ?? null,
+				postedEvent: prev?.postedEvent ?? null,
 				state: "open",
 				draft: false,
 				title: "Fix it",
@@ -17119,6 +17124,7 @@ describe(
 					postedHead: prev?.postedHead ?? null,
 					postedUrl: prev?.postedUrl ?? null,
 					postedLogin: prev?.postedLogin ?? null,
+					postedEvent: prev?.postedEvent ?? null,
 					state: "open",
 					draft: false,
 					title: "Fix it",
@@ -17250,6 +17256,25 @@ describe(
 				expect(await errorOf(bad)).toBe("prReviewApprove must be a boolean");
 				await post("/api/projects/p1/settings", { prReviewApprove: false });
 				expect((await store.getSettings()).prReviewApprove).toBe(false);
+			});
+
+			test("project settings route accepts prReviewRequestChanges and rejects non-boolean", async () => {
+				const ok = await post("/api/projects/p1/settings", {
+					prReviewRequestChanges: true,
+				});
+				expect(ok.status).toBe(200);
+				expect((await store.getSettings()).prReviewRequestChanges).toBe(true);
+				const bad = await post("/api/projects/p1/settings", {
+					prReviewRequestChanges: "yes",
+				});
+				expect(bad.status).toBe(400);
+				expect(await errorOf(bad)).toBe(
+					"prReviewRequestChanges must be a boolean",
+				);
+				await post("/api/projects/p1/settings", {
+					prReviewRequestChanges: false,
+				});
+				expect((await store.getSettings()).prReviewRequestChanges).toBe(false);
 			});
 
 			test("project settings route accepts prReviewNotify and rejects non-boolean", async () => {
@@ -18181,6 +18206,418 @@ describe(
 					body: "Two nits.",
 					commit_id: H1,
 				});
+				await prStore.setSettings({ prReviewApprove: false });
+				await removeApp();
+			});
+
+			test("a blocking draft requests changes through gh when the option is on", async () => {
+				await removeApp();
+				await prStore.setSettings({ prReviewRequestChanges: true });
+				const t = await reviewed(60, H1);
+				ghResult = {
+					code: 0,
+					stdout: JSON.stringify({
+						html_url:
+							"https://github.com/acme/widget/pull/60#pullrequestreview-1",
+						user: { login: "octocat" },
+					}),
+					stderr: "",
+				};
+				const res = await postReview(t.id, { body: "Two nits." });
+				expect(res.status).toBe(200);
+				expect(await res.json()).toEqual({
+					ok: true,
+					login: "octocat",
+					via: "token",
+					inline: 0,
+				});
+				expect(ghCalls).toEqual([expectedArgv(60)]);
+				expect(ghPayloads).toEqual([
+					{
+						event: "REQUEST_CHANGES",
+						body: `Two nits.${REVIEW_FOOTER}`,
+						commit_id: H1,
+					},
+				]);
+				expect((await row(60)).postedEvent).toBe("REQUEST_CHANGES");
+				await prStore.setSettings({ prReviewRequestChanges: false });
+			});
+
+			test("a blocking draft still comments when prReviewRequestChanges is off", async () => {
+				await removeApp();
+				const t = await reviewed(61, H1);
+				ghResult = {
+					code: 0,
+					stdout: JSON.stringify({
+						html_url:
+							"https://github.com/acme/widget/pull/61#pullrequestreview-1",
+						user: { login: "octocat" },
+					}),
+					stderr: "",
+				};
+				const res = await postReview(t.id, { body: "Two nits." });
+				expect(res.status).toBe(200);
+				expect(ghPayloads).toEqual([
+					{
+						event: "COMMENT",
+						body: `Two nits.${REVIEW_FOOTER}`,
+						commit_id: H1,
+					},
+				]);
+				expect((await row(61)).postedEvent).toBe("COMMENT");
+			});
+
+			test("both settings on: a blocking draft requests changes and a clean draft approves", async () => {
+				await removeApp();
+				await prStore.setSettings({
+					prReviewApprove: true,
+					prReviewRequestChanges: true,
+				});
+				const blocking = await reviewed(62, H1);
+				const clean = await reviewed(63, H1, true, false);
+				const first = await postReview(blocking.id, { body: "Two nits." });
+				expect(first.status).toBe(200);
+				const second = await postReview(clean.id, { body: "Ship it." });
+				expect(second.status).toBe(200);
+				expect(ghCalls).toEqual([expectedArgv(62), expectedArgv(63)]);
+				expect(ghPayloads).toEqual([
+					{
+						event: "REQUEST_CHANGES",
+						body: `Two nits.${REVIEW_FOOTER}`,
+						commit_id: H1,
+					},
+					{
+						event: "APPROVE",
+						body: `Ship it.${REVIEW_FOOTER}`,
+						commit_id: H1,
+					},
+				]);
+				expect((await row(62)).postedEvent).toBe("REQUEST_CHANGES");
+				expect((await row(63)).postedEvent).toBe("APPROVE");
+				await prStore.setSettings({
+					prReviewApprove: false,
+					prReviewRequestChanges: false,
+				});
+			});
+
+			test("a refused request-changes downsizes to a comment on the gh fallback", async () => {
+				await removeApp();
+				await prStore.setSettings({ prReviewRequestChanges: true });
+				const t = await reviewed(64, H1);
+				// The fake gh inspects each attempt's payload: the REQUEST_CHANGES gets
+				// refused with GitHub's self-review 422 body on stderr, the retried
+				// COMMENT gets the success envelope.
+				ghHook = async () => {
+					const last: unknown = ghPayloads[ghPayloads.length - 1];
+					ghResult =
+						typeof last === "object" &&
+						last !== null &&
+						"event" in last &&
+						last.event === "REQUEST_CHANGES"
+							? {
+									code: 1,
+									stdout: "",
+									stderr:
+										'(HTTP 422) {"message":"Can not request changes on your own pull request"}',
+								}
+							: {
+									code: 0,
+									stdout: JSON.stringify({
+										html_url:
+											"https://github.com/acme/widget/pull/64#pullrequestreview-1",
+										user: { login: "octocat" },
+									}),
+									stderr: "",
+								};
+				};
+				const res = await postReview(t.id, { body: "Two nits." });
+				expect(res.status).toBe(200);
+				expect(await res.json()).toEqual({
+					ok: true,
+					login: "octocat",
+					via: "token",
+					inline: 0,
+					changesSkipped: expect.stringContaining("posted it as a comment"),
+				});
+				expect(ghCalls).toEqual([expectedArgv(64), expectedArgv(64)]);
+				// Both attempts carry the same body and head; only the event changes.
+				expect(ghPayloads).toEqual([
+					{
+						event: "REQUEST_CHANGES",
+						body: `Two nits.${REVIEW_FOOTER}`,
+						commit_id: H1,
+					},
+					{
+						event: "COMMENT",
+						body: `Two nits.${REVIEW_FOOTER}`,
+						commit_id: H1,
+					},
+				]);
+				// The retry posted: the head is stored, and the card says the post went
+				// out as a comment.
+				expect((await row(64)).postedHead).toBe(H1);
+				expect((await row(64)).postError).toBe(
+					"GitHub refused the request-changes review (gh exit 1); posted it as a comment instead",
+				);
+				// GitHub has a comment, so the stored event is the comment's.
+				expect((await row(64)).postedEvent).toBe("COMMENT");
+				await prStore.setSettings({ prReviewRequestChanges: false });
+			});
+
+			test("a refused request-changes downsizes to a comment on the app path", async () => {
+				await saveApp();
+				// The reviews endpoint refuses the REQUEST_CHANGES with GitHub's
+				// self-review 422, then answers the retried COMMENT with the success
+				// envelope.
+				appFetchImpl = async (url, init) => {
+					if (url.endsWith("/installation")) return Response.json({ id: 77 });
+					if (url.includes("/access_tokens"))
+						return Response.json({
+							token: "INSTA",
+							expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+						});
+					if (url.endsWith("/reviews")) {
+						const body: unknown = JSON.parse(String(init?.body));
+						const event =
+							typeof body === "object" &&
+							body !== null &&
+							"event" in body &&
+							typeof body.event === "string"
+								? body.event
+								: "";
+						if (event === "REQUEST_CHANGES")
+							return new Response(
+								"Can not request changes on your own pull request",
+								{ status: 422 },
+							);
+						return Response.json({
+							html_url: "https://github.com/acme/widget/pull/65#review-1",
+							user: { login: "ottr[bot]" },
+						});
+					}
+					return Response.json({ message: "no route" }, { status: 404 });
+				};
+				await prStore.setSettings({ prReviewRequestChanges: true });
+				const t = await reviewed(65, H1);
+				const res = await postReview(t.id, { body: "Two nits." });
+				expect(res.status).toBe(200);
+				expect(await res.json()).toEqual({
+					ok: true,
+					login: "ottr[bot]",
+					via: "app",
+					inline: 0,
+					changesSkipped: expect.stringContaining("posted it as a comment"),
+				});
+				expect(ghCalls).toEqual([]);
+				const reviewCalls = appCalls.filter((c) => c.url.endsWith("/reviews"));
+				expect(reviewCalls.length).toBe(2);
+				expect(JSON.parse(reviewCalls[0]!.init!.body as string)).toEqual({
+					event: "REQUEST_CHANGES",
+					body: "Two nits.",
+					commit_id: H1,
+				});
+				expect(JSON.parse(reviewCalls[1]!.init!.body as string)).toEqual({
+					event: "COMMENT",
+					body: "Two nits.",
+					commit_id: H1,
+				});
+				// The card says the post went out as a comment.
+				expect((await row(65)).postError).toBe(
+					"GitHub refused the request-changes review (HTTP 422); posted it as a comment instead",
+				);
+				expect((await row(65)).postedEvent).toBe("COMMENT");
+				await prStore.setSettings({ prReviewRequestChanges: false });
+				await removeApp();
+			});
+
+			test("a non-422 request-changes failure stays a 502 on the app path", async () => {
+				await saveApp();
+				// A 5xx is not a refusal: no downsize, one attempt, claim released.
+				appFetchImpl = async (url, init) => {
+					if (url.endsWith("/installation")) return Response.json({ id: 77 });
+					if (url.includes("/access_tokens"))
+						return Response.json({
+							token: "INSTA",
+							expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+						});
+					if (url.endsWith("/reviews")) {
+						const body: unknown = JSON.parse(String(init?.body));
+						const event =
+							typeof body === "object" &&
+							body !== null &&
+							"event" in body &&
+							typeof body.event === "string"
+								? body.event
+								: "";
+						if (event === "REQUEST_CHANGES")
+							return new Response("Server Error", { status: 500 });
+						throw new Error("the route must not retry a non-422 refusal");
+					}
+					return Response.json({ message: "no route" }, { status: 404 });
+				};
+				await prStore.setSettings({ prReviewRequestChanges: true });
+				const t = await reviewed(66, H1);
+				const res = await postReview(t.id, { body: "Two nits." });
+				expect(res.status).toBe(502);
+				expect(await errorOf(res)).toContain("Server Error");
+				const reviewCalls = appCalls.filter((c) => c.url.endsWith("/reviews"));
+				expect(reviewCalls).toHaveLength(1);
+				expect(ghCalls).toEqual([]);
+				// The claim is released: the head reads as not posted, so a retry stays possible.
+				const view = (await (
+					await m.call(`/api/projects/pg/tasks/${t.id}`)
+				).json()) as {
+					prReview: { postedHead: string | null; postError: string | null };
+				};
+				expect(view.prReview.postedHead).toBeNull();
+				expect(view.prReview.postError).not.toBeNull();
+				await prStore.setSettings({ prReviewRequestChanges: false });
+				await removeApp();
+			});
+
+			test("a comment post dismisses the earlier request-changes review", async () => {
+				await saveApp();
+				let dismissal = null as {
+					url: string;
+					method: string;
+					body: unknown;
+				} | null;
+				appFetchImpl = async (url, init) => {
+					if (url.endsWith("/installation")) return Response.json({ id: 77 });
+					if (url.includes("/access_tokens"))
+						return Response.json({
+							token: "INSTA",
+							expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+						});
+					if (url.endsWith("/reviews"))
+						return Response.json({
+							html_url: "https://github.com/acme/widget/pull/67#review-2",
+							user: { login: "ottr[bot]" },
+						});
+					if (url.endsWith("/dismissals")) {
+						dismissal = {
+							url,
+							method: init?.method ?? "",
+							body: JSON.parse(String(init?.body)),
+						};
+						return Response.json({});
+					}
+					return Response.json({ message: "no route" }, { status: 404 });
+				};
+				// The earlier post requested changes; its link carries review 7.
+				const t = await reviewed(67, H1);
+				await prStore.setPrPostedUrl(
+					67,
+					"https://github.com/acme/widget/pull/67#pullrequestreview-7",
+					"octocat",
+					"REQUEST_CHANGES",
+				);
+				const res = await postReview(t.id, { body: "Looks good." });
+				expect(res.status).toBe(200);
+				expect(await res.json()).toEqual({
+					ok: true,
+					login: "ottr[bot]",
+					via: "app",
+					inline: 0,
+				});
+				// The dismissal PUT carries the review id from the stored link.
+				expect(dismissal).toEqual({
+					url: "https://api.github.com/repos/acme/widget/pulls/67/reviews/7/dismissals",
+					method: "PUT",
+					body: {
+						message: "A newer Ottr review found no blocking findings",
+					},
+				});
+				expect((await row(67)).postedEvent).toBe("COMMENT");
+				expect((await row(67)).postError).toBeNull();
+				await removeApp();
+			});
+
+			test("a failed dismissal keeps the post and stores the error", async () => {
+				await removeApp();
+				const t = await reviewed(68, H1);
+				// The earlier post requested changes; its link carries review 7.
+				await prStore.setPrPostedUrl(
+					68,
+					"https://github.com/acme/widget/pull/68#pullrequestreview-7",
+					"octocat",
+					"REQUEST_CHANGES",
+				);
+				// The review post succeeds; the dismissal PUT exits non-zero.
+				ghHook = async () => {
+					const last = ghCalls[ghCalls.length - 1] ?? [];
+					ghResult = last.some((a) => a.includes("dismissals"))
+						? {
+								code: 1,
+								stdout: "",
+								stderr: "(HTTP 403) not allowed to dismiss",
+							}
+						: {
+								code: 0,
+								stdout: JSON.stringify({
+									html_url:
+										"https://github.com/acme/widget/pull/68#pullrequestreview-8",
+									user: { login: "octocat" },
+								}),
+								stderr: "",
+							};
+				};
+				const res = await postReview(t.id, { body: "Looks good." });
+				expect(res.status).toBe(200);
+				expect(await res.json()).toEqual({
+					ok: true,
+					login: "octocat",
+					via: "token",
+					inline: 0,
+				});
+				expect(ghCalls).toEqual([
+					expectedArgv(68),
+					[
+						"api",
+						"repos/acme/widget/pulls/68/reviews/7/dismissals",
+						"-X",
+						"PUT",
+						"--input",
+						expect.any(String),
+					],
+				]);
+				// The dismissal payload rides its own --input file.
+				expect(ghPayloads).toEqual([
+					{
+						event: "COMMENT",
+						body: `Looks good.${REVIEW_FOOTER}`,
+						commit_id: H1,
+					},
+					{ message: "A newer Ottr review found no blocking findings" },
+				]);
+				// The post stands; only post_error carries the dismissal failure.
+				expect((await row(68)).postedHead).toBe(H1);
+				expect((await row(68)).postError).toBe(
+					"(HTTP 403) not allowed to dismiss",
+				);
+				expect((await row(68)).postedEvent).toBe("COMMENT");
+			});
+
+			test("an approve after a request-changes review sends no dismissal", async () => {
+				await saveApp();
+				appHappyPath({
+					html_url: "https://github.com/acme/widget/pull/69#review-3",
+					user: { login: "ottr[bot]" },
+				});
+				await prStore.setSettings({ prReviewApprove: true });
+				const t = await reviewed(69, H1, true, false);
+				// The earlier post requested changes; GitHub clears an APPROVE itself.
+				await prStore.setPrPostedUrl(
+					69,
+					"https://github.com/acme/widget/pull/69#pullrequestreview-7",
+					"octocat",
+					"REQUEST_CHANGES",
+				);
+				const res = await postReview(t.id, { body: "Ship it." });
+				expect(res.status).toBe(200);
+				expect(appCalls.some((c) => c.url.includes("/dismissals"))).toBe(false);
+				expect((await row(69)).postedEvent).toBe("APPROVE");
+				expect((await row(69)).postError).toBeNull();
 				await prStore.setSettings({ prReviewApprove: false });
 				await removeApp();
 			});

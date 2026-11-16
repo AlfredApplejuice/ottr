@@ -772,7 +772,7 @@ interface EarlierReview {
  * last match wins so a review edited on GitHub keeps its latest body. */
 function pickReview(
 	list: unknown,
-	wantId: string | undefined,
+	wantId: string | null | undefined,
 	postedHead: string,
 ): { id: unknown; body: unknown; submittedAt: unknown } | null {
 	if (!Array.isArray(list)) return null;
@@ -784,12 +784,19 @@ function pickReview(
 		if (
 			typeof x.body !== "string" ||
 			x.body === "" ||
-			(wantId !== undefined ? `${x.id}` !== wantId : x.commit_id !== postedHead)
+			(wantId !== undefined && wantId !== null
+				? `${x.id}` !== wantId
+				: x.commit_id !== postedHead)
 		)
 			continue;
 		picked = { id: x.id, body: x.body, submittedAt: x.submitted_at };
 	}
 	return picked;
+}
+
+/** The review id in a posted review's html_url fragment; null when the URL carries none. */
+export function postedReviewId(url: string | null): string | null {
+	return /#pullrequestreview-(\d+)/.exec(url ?? "")?.[1] ?? null;
 }
 
 /** The posted-review branch: read the review, then its inline comments; null when GitHub no
@@ -813,7 +820,7 @@ async function postedReview(
 	} catch {
 		throw new Error("reviews: bad JSON");
 	}
-	const wantId = /#pullrequestreview-(\d+)/.exec(postedUrl ?? "")?.[1];
+	const wantId = postedReviewId(postedUrl);
 	const picked = pickReview(list, wantId, postedHead);
 	if (picked === null || typeof picked.body !== "string") return null;
 	const ts =
@@ -1012,6 +1019,7 @@ async function syncSeenPulls(
 				postedHead: null,
 				postedUrl: null,
 				postedLogin: null,
+				postedEvent: null,
 				state: "open",
 				draft: p.draft,
 				title: p.title,

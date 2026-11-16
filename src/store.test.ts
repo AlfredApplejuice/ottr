@@ -1053,6 +1053,7 @@ describe("settings", () => {
 			prReviews: false,
 			prReviewNotify: true,
 			prReviewApprove: false,
+			prReviewRequestChanges: false,
 			prMode: false,
 			microVm: false,
 			trendingScout: false,
@@ -1090,6 +1091,7 @@ describe("settings", () => {
 			prReviews: false,
 			prReviewNotify: true,
 			prReviewApprove: false,
+			prReviewRequestChanges: false,
 			prMode: false,
 			microVm: false,
 			trendingScout: false,
@@ -4953,6 +4955,7 @@ describe("pr review store methods", () => {
 		postedHead: null,
 		postedUrl: null,
 		postedLogin: null,
+		postedEvent: null,
 		state: "open" as const,
 		draft: false,
 		title: "Fix the thing",
@@ -4990,6 +4993,19 @@ describe("pr review store methods", () => {
 		expect(
 			(await (await open(join(root, "pr-approve"))).getSettings())
 				.prReviewApprove,
+		).toBe(true);
+	});
+
+	test("prReviewRequestChanges defaults to false and persists across reopen", async () => {
+		expect(DEFAULT_SETTINGS.prReviewRequestChanges).toBe(false);
+		const store = await open(join(root, "pr-request-changes"));
+		expect((await store.getSettings()).prReviewRequestChanges).toBe(false);
+		await store.setSettings({ prReviewRequestChanges: true });
+		expect((await store.getSettings()).prReviewRequestChanges).toBe(true);
+		await store.close();
+		expect(
+			(await (await open(join(root, "pr-request-changes"))).getSettings())
+				.prReviewRequestChanges,
 		).toBe(true);
 	});
 
@@ -5041,6 +5057,7 @@ describe("pr review store methods", () => {
 			postedHead: null,
 			postedUrl: null,
 			postedLogin: null,
+			postedEvent: null,
 			state: "open",
 			draft: false,
 			title: "t",
@@ -5298,6 +5315,7 @@ describe("pr review store methods", () => {
 		expect(await store.getPrReview(7)).toMatchObject({
 			postedUrl: "https://github.com/acme/widget/pull/7#pullrequestreview-2",
 			postedLogin: null,
+			postedEvent: null,
 		});
 		await store.setPrPostedUrl(7, null, "octocat");
 		expect((await store.getPrReview(7))?.postedLogin).toBe("octocat");
@@ -5305,6 +5323,49 @@ describe("pr review store methods", () => {
 		expect(await store.getPrReview(7)).toMatchObject({
 			postedUrl: null,
 			postedLogin: null,
+		});
+		const changesUrl =
+			"https://github.com/acme/widget/pull/7#pullrequestreview-9";
+		await store.setPrPostedUrl(7, changesUrl, "ottr[bot]", "REQUEST_CHANGES");
+		expect(await store.getPrReview(7)).toMatchObject({
+			postedUrl: changesUrl,
+			postedLogin: "ottr[bot]",
+			postedEvent: "REQUEST_CHANGES",
+		});
+		// The two-column clear keeps the decided event: only a post with an event rewrites it.
+		await store.setPrPostedUrl(7, null, null);
+		expect(await store.getPrReview(7)).toMatchObject({
+			postedUrl: null,
+			postedLogin: null,
+			postedEvent: "REQUEST_CHANGES",
+		});
+		// The watcher's two-column update (no event argument) leaves the stored event untouched.
+		await store.setPrPostedUrl(7, changesUrl, "ottr[bot]");
+		expect(await store.getPrReview(7)).toMatchObject({
+			postedUrl: changesUrl,
+			postedLogin: "ottr[bot]",
+			postedEvent: "REQUEST_CHANGES",
+		});
+		await store.close();
+	});
+
+	test("setPrPostError writes and clears post_error and keeps the posted fields", async () => {
+		const store = await open(join(root, "pr-post-error"));
+		await store.savePrReview({ ...row, number: 7 });
+		const url = "https://github.com/acme/widget/pull/7#pullrequestreview-4";
+		await store.setPrPostedUrl(7, url, "ottr[bot]", "REQUEST_CHANGES");
+		await store.setPrPostError(7, "dismissal failed: 403");
+		expect(await store.getPrReview(7)).toMatchObject({
+			postError: "dismissal failed: 403",
+			postedUrl: url,
+			postedLogin: "ottr[bot]",
+			postedEvent: "REQUEST_CHANGES",
+		});
+		await store.setPrPostError(7, null);
+		expect(await store.getPrReview(7)).toMatchObject({
+			postError: null,
+			postedUrl: url,
+			postedEvent: "REQUEST_CHANGES",
 		});
 		await store.close();
 	});
@@ -7369,6 +7430,7 @@ describe("async store serial operations", () => {
 			postedHead: null,
 			postedUrl: null,
 			postedLogin: null,
+			postedEvent: null,
 			state: "open",
 			draft: false,
 			title: "PR",

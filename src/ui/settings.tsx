@@ -8673,6 +8673,15 @@ function ProjectWatchesCard({
 					act={act}
 				/>
 				<CheckRow
+					sub
+					name="PR review request changes"
+					desc="When the draft has a blocking finding, the Post click requests changes on GitHub instead of commenting; needs PR reviews"
+					checked={st.prReviewRequestChanges}
+					disabled={!st.prReviews}
+					save={(v) => send({ prReviewRequestChanges: v })}
+					act={act}
+				/>
+				<CheckRow
 					name="Fork research"
 					desc={`${privateNote("forks to watch")}Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval`}
 					tag={privateTag}
