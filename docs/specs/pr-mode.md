@@ -407,13 +407,26 @@ strictly before the source; the source's `merge_commit_sha` then pins the
 watch. Equal or unreadable times are unresolved — the target may not hold
 the fixes — and the card parks needs_you ("Follow-up PR #F merged without
 proof its fixes reached the target ..."). The follow-up closed without
-merge parks the card needs_you ("follow-up PR #F closed without merging");
-the source closed without merge parks it the same way while the follow-up
-waits. These three parks redesign (OTTR-809): they set `stage` to
-`in_progress`, keeping `follow_up_pr_number` and the branch, so the card
-leaves the merging watch entirely and the pass neither re-reads the PRs nor
-rewrites the row while the user works. The exact-reason guards stay on top
-(defense in depth): a repeat window with the same answer adds no log line.
+merge parks the card needs_you ("follow-up PR #F closed without merging").
+The source closed without merge reads the open follow-up's current base.
+On the target branch — GitHub's retarget after the bump merged elsewhere
+included — the follow-up already carries the whole bump, so the card
+adopts it instead of parking: the follow-up becomes the PR of record
+(`pr_number`, `pr_url`, `pr_head_sha`), the source fields name it (its
+branch, its head sha, `source_pr_dependabot` false, so a later fix turn
+ships to the follow-up's branch), the follow-up fields clear, the card
+stays `merging`/`idle`, and one log line records the shift. The next
+window settles the follow-up alone, and a merged follow-up finishes the
+card with its own merge commit. A park reason that names the follow-up
+(its conflict or feedback) stays; any other reason clears to idle. On the
+bump branch the card parks needs_you ("PR #S closed without merging")
+while the follow-up waits. These three parks redesign (OTTR-809): they set
+`stage` to `in_progress`, keeping `follow_up_pr_number` and the branch, so
+the card leaves the merging watch entirely and the pass neither re-reads
+the PRs nor rewrites the row while the user works. The exact-reason guards
+stay on top (defense in depth): a repeat window with the same answer adds
+no log line.
+
 A reply re-queues the card, and the next merge turn re-ships and re-judges
 both PRs from fresh REST reads. The remote card-branch delete still runs
 only at the finish: the follow-up PR's head is the card branch, and it may

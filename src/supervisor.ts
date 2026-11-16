@@ -253,6 +253,9 @@ interface DependabotPr {
 	crossRepo: boolean;
 }
 
+/** A GitHub commit sha: 40 hex (or 64 on SHA-256 repos). Pure. */
+const SHA_HEX = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
+
 /** Open PRs from `gh pr list --json number,title,createdAt,headRefName,headRefOid,
  * isCrossRepository`. The JSON is untrusted: only entries with a positive safe-integer
  * number, a string title, a parseable createdAt (epoch ms), a non-empty sanitized string
@@ -290,7 +293,6 @@ function dependabotPrs(stdout: string): DependabotPr[] | string {
 						.trim()
 						.slice(0, 200)
 				: "";
-		const shaHex = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 		return typeof n === "number" &&
 			Number.isSafeInteger(n) &&
 			n > 0 &&
@@ -298,7 +300,7 @@ function dependabotPrs(stdout: string): DependabotPr[] | string {
 			!Number.isNaN(ms) &&
 			ref !== "" &&
 			typeof headRefOid === "string" &&
-			shaHex.test(headRefOid) &&
+			SHA_HEX.test(headRefOid) &&
 			typeof isCrossRepository === "boolean"
 			? [
 					{
@@ -328,6 +330,11 @@ interface PrDetail {
 	/** GitHub's merge verdict for an open PR: false = it conflicts with its base. Null = GitHub
 	 * still computes it, the field is absent, or the value is not a boolean. */
 	mergeable: boolean | null;
+	/** The head branch name and head sha at read time; null when absent or malformed.
+	 * The follow-up adoption stamps them onto the row, so a later fix turn ships to
+	 * the follow-up's branch. */
+	headRef: string | null;
+	headSha: string | null;
 }
 
 function parsePull(body: unknown): PrDetail | null {
@@ -344,6 +351,17 @@ function parsePull(body: unknown): PrDetail | null {
 		typeof base === "object" && base !== null && typeof base.ref === "string"
 			? base.ref
 			: null;
+	const head = x.head as Record<string, unknown> | null | undefined;
+	const headRef =
+		typeof head === "object" && head !== null && typeof head.ref === "string"
+			? head.ref
+			: null;
+	const headShaRaw =
+		typeof head === "object" && head !== null ? head.sha : null;
+	const headSha =
+		typeof headShaRaw === "string" && SHA_HEX.test(headShaRaw)
+			? headShaRaw
+			: null;
 	return {
 		state: x.state,
 		merged: typeof x.merged_at === "string",
@@ -353,6 +371,8 @@ function parsePull(body: unknown): PrDetail | null {
 		// Tolerant on purpose: the merged/closed settle uses this parser too, so a strange
 		// mergeable value must not turn a readable PR into null.
 		mergeable: typeof x.mergeable === "boolean" ? x.mergeable : null,
+		headRef,
+		headSha,
 	};
 }
 
@@ -2648,8 +2668,10 @@ export function createSupervisor(
 
 	/** One tracked Merging follow-up card whose follow-up PR is not in the open list. The
 	 * follow-up merged moves the card's wait onto the source PR alone; both merged finishes
-	 * the card with the follow-up's merge commit (the later one on the target); a closed PR
-	 * parks the card needs_you. Never throws; read failures log and skip. */
+	 * the card with the follow-up's merge commit (the later one on the target); the source
+	 * closed unmerged while the follow-up merged onto the target adopts the follow-up as
+	 * the card's PR of record; a closed PR parks the card needs_you. Never throws; read
+	 * failures log and skip. */
 	async function settleFollowUpPr(
 		e: SupervisorEntry,
 		settings: ProjectSettings,
@@ -2689,6 +2711,7 @@ export function createSupervisor(
 				await clearFollowUp();
 				return;
 			}
+			const targetShort = (e.target ?? t.base ?? "").replace(/^origin\//, "");
 			const s = await prState(e, repo, S);
 			if (s === null) return;
 			if (s.state === "open") {
@@ -2703,7 +2726,6 @@ export function createSupervisor(
 				// source's merge, provable only when it merged strictly before the
 				// source. Equal or unreadable times are unresolved — the target may
 				// not hold the fixes — and the card parks instead of finishing.
-				const targetShort = (e.target ?? t.base ?? "").replace(/^origin\//, "");
 				const targetBased = pr.base !== null && pr.base === targetShort;
 				if (targetBased) {
 					// Both commits sit on the target; pin the later merge, and the
@@ -2756,6 +2778,22 @@ export function createSupervisor(
 				await ops.schedule();
 				return;
 			}
+			// The follow-up merged with its base on the target: its commit is already
+			// on the target (Dependabot closes the source once the target holds the
+			// update), so the source's closure strands nothing. The follow-up becomes
+			// the card's PR of record and the plain watch finishes the card with its
+			// merge commit next window. A follow-up still based on the bump branch
+			// parks below: nothing proves the fixes reached the target.
+			if (
+				targetShort !== "" &&
+				pr.base !== null &&
+				pr.base === targetShort &&
+				pr.headRef !== null &&
+				pr.headSha !== null
+			) {
+				await adoptFollowUpAsPr(e, t, S, F, targetShort, pr);
+				return;
+			}
 			if (await wentStale(e.store, t)) return;
 			// stage in_progress: the card leaves the merging watch, so no later
 			// window re-reads the PRs or re-writes the park until a reply
@@ -2803,19 +2841,86 @@ export function createSupervisor(
 		await ops.schedule();
 	}
 
+	/** The source PR closed unmerged while the follow-up targets the target branch: the
+	 * follow-up already carries the whole bump (Dependabot closed the source because the
+	 * target holds the update), so the source's closure strands nothing. The follow-up
+	 * becomes the card's PR of record — the adopt shape a fix turn ships to and a cancel
+	 * keeps the branch of — the follow-up fields clear, and one log line records the
+	 * shift. A park reason that names the follow-up (its conflict or feedback) stays;
+	 * any other reason clears to idle. Never throws. */
+	async function adoptFollowUpAsPr(
+		e: SupervisorEntry,
+		t: ListedTask,
+		S: number,
+		F: number,
+		targetName: string,
+		pr: PrDetail,
+	): Promise<void> {
+		const url = t.followUpPrUrl;
+		const keepsReason =
+			t.state === "needs_you" &&
+			(t.needsReason === prConflictReason(F) ||
+				t.needsReason === prFeedbackReason(F));
+		if (
+			!(await applyTask(e, t, {
+				prNumber: F,
+				prUrl: url,
+				prHeadSha: pr.headSha,
+				sourcePrNumber: F,
+				sourcePrUrl: url,
+				sourcePrHeadRef: pr.headRef,
+				sourcePrHeadSha: pr.headSha,
+				sourcePrCrossRepo: false,
+				sourcePrDependabot: false,
+				followUpPrNumber: null,
+				followUpPrUrl: null,
+				pushSha: null,
+				...(keepsReason ? {} : { state: "idle", needsReason: null }),
+			}))
+		)
+			return;
+		await ops.appendLog(
+			e.store,
+			t.id,
+			`supervisor: PR #${S} closed without merging; follow-up PR #${F} targets ${targetName}, so the card watches PR #${F} alone`,
+		);
+		await ops.schedule();
+	}
+
 	/** One tracked Merging follow-up card whose follow-up PR is open but whose source PR
 	 * left the open list. A merged source writes nothing: the pass repeats until the
 	 * follow-up settles and finishPrMerge names both PRs. A closed unmerged source parks
-	 * the card like settlePrCard. Never throws; read failures log and skip. */
+	 * the card like settlePrCard — unless the follow-up targets the target branch, which
+	 * already carries the whole bump: the card then adopts the follow-up as its PR of
+	 * record and keeps watching it alone. Never throws; read failures log and skip. */
 	async function settleOpenFollowUpsSource(
 		e: SupervisorEntry,
 		t: ListedTask,
 		repo: string,
 		S: number,
+		F: number,
 	): Promise<void> {
 		const s = await prState(e, repo, S);
 		if (s === null) return;
 		if (s.merged || s.state === "open") return;
+		// The follow-up's base decides. On the target branch it carries the whole
+		// bump, so the source's closure strands nothing and the card adopts it —
+		// also from the park below: GitHub retargets an open follow-up onto the
+		// target when the bump merges elsewhere, which un-strands the card. A
+		// follow-up that left the open list since the poll settles through
+		// settleFollowUpPr next window; an unreadable one skips the window.
+		const f = await prState(e, repo, F);
+		if (f === null || f.state !== "open") return;
+		const targetShort = (e.target ?? t.base ?? "").replace(/^origin\//, "");
+		if (
+			targetShort !== "" &&
+			f.base === targetShort &&
+			f.headRef !== null &&
+			f.headSha !== null
+		) {
+			await adoptFollowUpAsPr(e, t, S, F, targetShort, f);
+			return;
+		}
 		const reason = `PR #${S} closed without merging`;
 		// The park repeats in every window unless the guard stops it: the same
 		// reason, the same write, one log line, once.
@@ -2857,7 +2962,7 @@ export function createSupervisor(
 		// Settle the not-listed side first: once the follow-up merged the card waits on the
 		// source alone, and the conflict watch below must not re-read a settled PR this pass.
 		if (!fOpen) await settleFollowUpPr(e, settings, t, repo, sOpen, F, S);
-		else if (!sOpen) await settleOpenFollowUpsSource(e, t, repo, S);
+		else if (!sOpen) await settleOpenFollowUpsSource(e, t, repo, S, F);
 		// Conflict watch on each open PR for idle cards (or cards parked with that PR's
 		// own conflict reason) — only while the card still tracks the follow-up.
 		const row = await e.store.getTask(t.id);

@@ -3215,6 +3215,7 @@ describe("worker sweep", () => {
 
 const MERGE_SHA = "b".repeat(40);
 const OTHER_SHA = "d".repeat(40);
+const FOLLOW_SHA = "e".repeat(40);
 
 /** Merging card with an open PR whose head is CI-watched. */
 async function prCard(
@@ -4246,6 +4247,8 @@ describe("prPass", () => {
 		mergeSha?: string | null;
 		mergeable?: unknown;
 		base?: string;
+		headRef?: string;
+		headSha?: string;
 	}) =>
 		JSON.stringify({
 			number: 9,
@@ -4254,6 +4257,10 @@ describe("prPass", () => {
 			merge_commit_sha: o.mergeSha ?? null,
 			mergeable: o.mergeable,
 			...(o.base !== undefined && { base: { ref: o.base } }),
+			...(o.headRef !== undefined &&
+				o.headSha !== undefined && {
+					head: { ref: o.headRef, sha: o.headSha },
+				}),
 		});
 
 	async function followUpCard(store: ProjectStore): Promise<Task> {
@@ -4662,8 +4669,10 @@ describe("prPass", () => {
 	});
 
 	test("a closed source parks the card while the follow-up waits, idempotently", async () => {
-		// The source closed unmerged while the follow-up is still open: the card
-		// parks needs_you and one log line says so, however many windows pass.
+		// The source closed unmerged while the follow-up is still open and still
+		// bases on the Dependabot branch: nothing proves the fixes reach the target
+		// without the source, so the card parks needs_you and one log line says so,
+		// however many windows pass.
 		const store = await prModeProject("pr-fu-src-closed");
 		const t = await followUpCard(store);
 		const ops = fakeOps({
@@ -4674,7 +4683,13 @@ describe("prPass", () => {
 							stdout: pullBody({ state: "closed" }),
 							stderr: "",
 						}
-					: openList([9]),
+					: url.endsWith("/pulls/9")
+						? {
+								code: 0,
+								stdout: pr9Body({ state: "open", base: "ottr/552" }),
+								stderr: "",
+							}
+						: openList([9]),
 		});
 		await tick(new Map([["proj", entry(store)]]), ops);
 		const after = (await store.getTask(t.id))!;
@@ -4700,6 +4715,139 @@ describe("prPass", () => {
 		expect(
 			log2.split("\n").filter((l) => l.includes("closed without merging")),
 		).toHaveLength(1);
+		await store.close();
+	});
+
+	test("a closed source adopts a target-based follow-up and watches it alone", async () => {
+		// Dependabot closed the source PR because the target branch already holds
+		// the update; the open follow-up targets the target branch and carries the
+		// whole bump. The card adopts the follow-up as its PR of record and keeps
+		// watching it in the merging stage instead of parking.
+		const store = await prModeProject("pr-fu-src-closed-target-based");
+		const t = await followUpCard(store);
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? {
+							code: 0,
+							stdout: pullBody({ state: "closed", base: "main" }),
+							stderr: "",
+						}
+					: url.endsWith("/pulls/9")
+						? {
+								code: 0,
+								stdout: pr9Body({
+									state: "open",
+									base: "main",
+									headRef: "ottr/552",
+									headSha: FOLLOW_SHA,
+								}),
+								stderr: "",
+							}
+						: openList([9]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = (await store.getTask(t.id))!;
+		// The card stays in the merging watch, on the follow-up alone.
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(after.prNumber).toBe(9);
+		expect(after.prUrl).toBe("https://github.com/acme/widget/pull/9");
+		expect(after.followUpPrNumber).toBeNull();
+		expect(after.followUpPrUrl).toBeNull();
+		// The adopt shape: the follow-up is the source PR of record, so a later fix
+		// turn ships to the follow-up's own branch and a cancel keeps it.
+		expect(after.sourcePrNumber).toBe(9);
+		expect(after.sourcePrUrl).toBe("https://github.com/acme/widget/pull/9");
+		expect(after.sourcePrHeadRef).toBe("ottr/552");
+		expect(after.sourcePrHeadSha).toBe(FOLLOW_SHA);
+		expect(after.sourcePrCrossRepo).toBe(false);
+		expect(after.sourcePrDependabot).toBe(false);
+		expect(after.pushSha).toBeNull();
+		const log = await Bun.file(await store.logPath(t.id)).text();
+		expect(log).toContain(
+			"supervisor: PR #7 closed without merging; follow-up PR #9 targets main, so the card watches PR #9 alone",
+		);
+		expect(
+			log.split("\n").filter((l) => l.includes("card parked")),
+		).toHaveLength(0);
+
+		// A second window keeps the plain watch on the follow-up: no park, no
+		// rewrite, still one log line.
+		ops.time += 6 * 60_000; // past the PR poll window
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after2 = (await store.getTask(t.id))!;
+		expect(after2.stage).toBe("merging");
+		expect(after2.state).toBe("idle");
+		const log2 = await Bun.file(await store.logPath(t.id)).text();
+		expect(
+			log2.split("\n").filter((l) => l.includes("closed without merging")),
+		).toHaveLength(1);
+		await store.close();
+	});
+
+	test("a closed source with a merged target-based follow-up finishes on the follow-up", async () => {
+		// The follow-up merged straight into the target branch and Dependabot closed
+		// the source afterwards: the adopt moves the card onto the follow-up, and
+		// the next window's plain settle finishes the card with the follow-up's own
+		// merge commit.
+		const store = await prModeProject("pr-fu-src-closed-merged-target");
+		await store.setSettings({
+			originUrl: "https://github.com/acme/widget.git",
+		});
+		const t = await followUpCard(store);
+		await store.updateTask(t.id, { sourcePrHeadRef: "ottr/552" });
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/9")
+					? {
+							code: 0,
+							stdout: pr9Body({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: MERGE_SHA,
+								base: "main",
+								headRef: "ottr/552",
+								headSha: FOLLOW_SHA,
+							}),
+							stderr: "",
+						}
+					: url.endsWith("/pulls/7")
+						? {
+								code: 0,
+								stdout: pullBody({ state: "closed", base: "main" }),
+								stderr: "",
+							}
+						: openList([]),
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
+		const after = (await store.getTask(t.id))!;
+		// Window 1 adopts: the follow-up is the PR of record, the card stays watched.
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.prNumber).toBe(9);
+		expect(after.followUpPrNumber).toBeNull();
+		const log = await Bun.file(await store.logPath(t.id)).text();
+		expect(log).toContain(
+			"follow-up PR #9 targets main, so the card watches PR #9 alone",
+		);
+
+		// Window 2 settles the follow-up alone: merged, so the card finishes with
+		// the follow-up's merge commit.
+		ops.time += 6 * 60_000; // past the PR poll window
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
+		const done = (await store.getTask(t.id))!;
+		expect(done.stage).toBe("done");
+		expect(done.pushSha).toBe(MERGE_SHA);
+		const log2 = await Bun.file(await store.logPath(t.id)).text();
+		expect(log2).toContain("supervisor: PR #9 merged; card done");
 		await store.close();
 	});
 
