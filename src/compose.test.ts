@@ -135,6 +135,7 @@ describe("the buildkit sidecar compose shape", () => {
 		expect(typeof buildkit.cpus).toBe("string");
 		expect((buildkit.cpus as string).length).toBeGreaterThan(0);
 		expect(composeText).toContain(
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: literal buildkitd config line, not a TS template
 			'maxUsedSpace = "${OTTR_BUILDKIT_CACHE_CAP:-20GB}"',
 		);
 		expect(composeText).toContain("gcpolicy");
@@ -151,6 +152,7 @@ describe("the buildkit sidecar compose shape", () => {
 		for (const line of [
 			"ARG BUILDKIT_VERSION=",
 			"ARG BUILDKIT_SHA256=",
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: literal Dockerfile ARG expansion, not a TS template
 			"buildkit-v${BUILDKIT_VERSION}.linux-amd64.tar.gz",
 			"sha256sum -c -",
 			"buildctl --version",
@@ -158,6 +160,7 @@ describe("the buildkit sidecar compose shape", () => {
 		]) {
 			expect(workerDockerfile).toContain(line);
 		}
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: literal Dockerfile ARG expansion, not a TS template
 		expect(workerDockerfile).toContain('"openssl=${OPENSSL_VERSION}" \\');
 	});
 
@@ -205,9 +208,11 @@ describe("the PostgreSQL test infrastructure shape", () => {
 	test("server and worker environments pass both optional test variables", () => {
 		for (const service of [server, xWorker, svc("worker-a"), svc("worker-b")]) {
 			expect(service.environment.OTTR_TEST_PG_URL).toBe(
+				// biome-ignore lint/suspicious/noTemplateCurlyInString: literal compose env default, not a TS template
 				"${OTTR_TEST_PG_URL:-}",
 			);
 			expect(service.environment.OTTR_REQUIRE_PG_TESTS).toBe(
+				// biome-ignore lint/suspicious/noTemplateCurlyInString: literal compose env default, not a TS template
 				"${OTTR_REQUIRE_PG_TESTS:-}",
 			);
 		}
@@ -249,6 +254,7 @@ describe("the PostgreSQL test infrastructure shape", () => {
 		expect(testStep).toBeDefined();
 		expect(testStep?.env).toEqual({
 			OTTR_TEST_PG_URL:
+				// biome-ignore lint/suspicious/noTemplateCurlyInString: literal GitHub Actions expression, not a TS template
 				"postgres://postgres@127.0.0.1:${{ job.services.postgres-test.ports[5432] }}/postgres",
 			OTTR_REQUIRE_PG_TESTS: "1",
 		});
