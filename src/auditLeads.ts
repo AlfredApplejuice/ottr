@@ -35,3 +35,31 @@ export function leadTitleKey(prompt: string): string {
 		.replace(/\s+/g, " ")
 		.trim();
 }
+
+/** A validation run's per-lead result, read from the recorded prompt's exact
+ * first line `Validation: #<lead id> <outcome>` (OTTR-1047,
+ * docs/specs/review-findings-persistence.md "Batch validation of leads").
+ * Strict: only the first line decides, so a result line in the evidence body
+ * never wins, and the outcome word is matched case-sensitively. The trimmed
+ * rest of the prompt is the evidence; a one-line prompt reads as empty
+ * evidence. Null: any other shape — no recorded result. Never throws. */
+export function validationResult(prompt: string): {
+	leadId: string;
+	outcome: "confirmed" | "refuted" | "blocked" | "deployment";
+	evidence: string;
+} | null {
+	const lines = prompt.split("\n");
+	const match =
+		/^Validation: #(\S+) (confirmed|refuted|blocked|deployment)$/.exec(
+			lines[0] ?? "",
+		);
+	if (match === null) return null;
+	const leadId = match[1];
+	const outcome = match[2];
+	if (leadId === undefined || outcome === undefined) return null;
+	return {
+		leadId,
+		outcome: outcome as "confirmed" | "refuted" | "blocked" | "deployment",
+		evidence: lines.slice(1).join("\n").trim(),
+	};
+}

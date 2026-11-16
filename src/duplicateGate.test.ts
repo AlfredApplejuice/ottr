@@ -41,6 +41,7 @@ function task(p: Partial<Task> = {}): Task {
 		updatedAt: seq,
 		summary: null,
 		report: null,
+		validatedAt: null,
 		...p,
 	} as Task;
 }

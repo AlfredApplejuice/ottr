@@ -11,7 +11,8 @@ import {
 import { type ValidateResponse, VM_VALIDATE } from "./vmValidateShared.ts";
 
 const JOB_ID = "val-1763000000-cafebabe";
-const REFUSAL = "sandbox_run runs only in review or trending scout runs";
+const REFUSAL =
+	"sandbox_run runs only in review, validation, or trending scout runs";
 
 const guestResponse: ValidateResponse = {
 	id: JOB_ID,

@@ -5,7 +5,11 @@
 // filesystem, no audit run directory.
 
 import { describe, expect, test } from "bun:test";
-import { leadFingerprint, leadTitleKey } from "./auditLeads.ts";
+import {
+	leadFingerprint,
+	leadTitleKey,
+	validationResult,
+} from "./auditLeads.ts";
 import fc from "./test/properties.ts";
 
 describe("leadFingerprint", () => {
@@ -89,6 +93,96 @@ describe("the lead prompt contract", () => {
 			const key = leadTitleKey(prompt);
 			expect(key.startsWith("needs validation:")).toBe(true);
 			expect(key).not.toContain("\n");
+		});
+		fc.assert(props);
+	});
+});
+
+describe("validationResult", () => {
+	test("reads the exact first line: lead id, outcome, trimmed evidence", () => {
+		// A one-line result reads as empty evidence.
+		expect(validationResult("Validation: #12 confirmed")).toEqual({
+			leadId: "12",
+			outcome: "confirmed",
+			evidence: "",
+		});
+		// The evidence is the rest of the prompt, trimmed.
+		expect(
+			validationResult("Validation: #12 confirmed\n\noutput line\n"),
+		).toEqual({
+			leadId: "12",
+			outcome: "confirmed",
+			evidence: "output line",
+		});
+		expect(
+			validationResult("Validation: #7 refuted\nthe path is unreachable"),
+		).toEqual({
+			leadId: "7",
+			outcome: "refuted",
+			evidence: "the path is unreachable",
+		});
+		expect(
+			validationResult("Validation: #8 blocked\nmissing: job runner"),
+		).toEqual({
+			leadId: "8",
+			outcome: "blocked",
+			evidence: "missing: job runner",
+		});
+		expect(
+			validationResult("Validation: #9 deployment\nwhich secret rotates?"),
+		).toEqual({
+			leadId: "9",
+			outcome: "deployment",
+			evidence: "which secret rotates?",
+		});
+	});
+
+	test("any other first line reads as null", () => {
+		expect(validationResult("")).toBeNull();
+		// Missing: no result line at all.
+		expect(validationResult("just prose\nno result here")).toBeNull();
+		// A result line in the body never wins: only the first line decides.
+		expect(
+			validationResult("no result here\nValidation: #9 confirmed"),
+		).toBeNull();
+		// Indented, or prose around the line, is not the exact shape.
+		expect(validationResult("  Validation: #9 confirmed")).toBeNull();
+		expect(validationResult("Validation: #9 confirmed extra")).toBeNull();
+		// Case-sensitive outcome word.
+		expect(validationResult("Validation: #9 CONFIRMED")).toBeNull();
+		expect(validationResult("Validation: 9 confirmed")).toBeNull();
+	});
+
+	test("any prompt stays total: only an exact first line parses", () => {
+		// Arbitrary text never throws, and near misses that carry a valid result
+		// line as a body line or with padding stay null.
+		const resultLine =
+			/^Validation: #(\S+) (confirmed|refuted|blocked|deployment)$/;
+		const fcPrompt = fc.oneof(
+			fc.string({ maxLength: 120 }),
+			fc.constant("evidence\nValidation: #9 confirmed"),
+			fc.constant("  Validation: #9 confirmed"),
+			fc.constant("Validation: #9 confirmed\n"),
+			fc.constant("Validation: 9 confirmed"),
+		);
+		const isOutcomeWord = (
+			word: string | undefined,
+		): word is "confirmed" | "refuted" | "blocked" | "deployment" =>
+			["confirmed", "refuted", "blocked", "deployment"].some((w) => w === word);
+		const props = fc.property(fcPrompt, (prompt) => {
+			const result = validationResult(prompt);
+			const match = resultLine.exec(prompt.split("\n")[0] ?? "");
+			// Group 0 is the whole match: the capture groups start at 1.
+			const [, leadId, outcome] = match ?? [];
+			if (leadId === undefined || !isOutcomeWord(outcome)) {
+				expect(result).toBeNull();
+				return;
+			}
+			expect(result).toEqual({
+				leadId,
+				outcome,
+				evidence: prompt.split("\n").slice(1).join("\n").trim(),
+			});
 		});
 		fc.assert(props);
 	});

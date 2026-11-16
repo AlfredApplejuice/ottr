@@ -523,6 +523,33 @@ Before you finish, call report_outcome: ${REVIEW_OUTCOMES}.
 ${ONE_SHOT}`;
 }
 
+/** The batch validation run's prompt (OTTR-1047): one run proves or refutes a review's
+ * sandbox leads with sandbox_run and records one `Validation:` result per lead. The fixed
+ * text is the spec's (docs/specs/review-findings-persistence.md, "Batch validation of
+ * leads"); the turn loop lists the batch's leads under `Leads:`. */
+export function validationRunPrompt(o: {
+	reviewId: string;
+	leads: { id: string; prompt: string }[];
+}): string {
+	const listed = o.leads.map((l) => `#${l.id}\n${l.prompt}`).join("\n");
+	return `Lead validation for review #${o.reviewId}.
+
+You validate a batch of "Needs validation" leads of review #${o.reviewId}, in the order given. For each lead, prove or refute it with the sandbox_run tool: read the lead's plan, build the smallest job that exercises it, and run it. Trust a job only when its selfCheck.ok is true. Do not commit, do not write outside the job, and do not touch other cards.
+
+When the proof waits on a fact only the user knows (a deployment setting, a secret, an external system), skip the job and record the outcome "deployment" with the question.
+
+Record exactly one result per processed lead with propose_task. The prompt's first line must be exactly "Validation: #<lead card id> <outcome>", where <outcome> is one of:
+- confirmed: the job output shows the risk is real.
+- refuted: the job output shows the risk is not real.
+- blocked: the sandbox could not exercise the lead; name the exact missing control.
+- deployment: the proof waits on a user-known fact; restate the question.
+Put the evidence (the decisive output lines, shortened) on the lines after the first line. Record no other propose_task calls.
+
+Leads:
+${listed}
+`;
+}
+
 /** The Check the board button's card (a dev tool, POST /api/projects/:project/board-check). It
  * runs in the server's own container, where loopback reaches the whole board API. The store
  * marks the card (boardCheckId), never this text: an agent may file the same prompt, and that

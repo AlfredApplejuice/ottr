@@ -213,8 +213,8 @@ validate VM itself never gets the network-interfaces entry.
 
 ## Board endpoint and tool: `sandbox_run` (src/app.ts, extension/tracker.ts)
 
-One eval-kernel tool for review and scout runs. The audit calls it; it is the
-only way the harness executes target code on this board.
+One eval-kernel tool for review, validation, and scout runs. The audit calls
+it; it is the only way the harness executes target code on this board.
 
 The v0.5.0 review (OTTR-969) showed the direct path cannot work: the tool ran
 in the agent's eval kernel, and `childEnv` (src/runner.ts) strips
@@ -241,10 +241,12 @@ through the board like `propose_task`:
   request idle timeout: one validation runs up to the 600 s job cap plus boot
   slack.
 - The server refuses before it packs:
-  - the caller's card must exist and be a review or trending-scout card (the
+  - the caller's card must exist and be a review, validation, or
+    trending-scout card (the
     body's `taskId`, checked against the store's `kind`); a work, retro,
     interview or pr_review run gets `403` with
-    `"sandbox_run runs only in review or trending scout runs"`, and an absent
+    `"sandbox_run runs only in review, validation, or trending scout runs"`,
+    and an absent
     or empty `taskId` gets the same class of refusal;
   - the args must pass `sandboxRequestError` (`400` otherwise);
   - a gitless project gets `409`, an unknown project `404`.

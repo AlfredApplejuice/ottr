@@ -260,6 +260,179 @@ for leads anymore: a planted run directory is inert whatever its mtime, a pass
 whose agent records no lead proposals files none, and the prompts the agent
 records carry whatever the audit run held.
 
+#### Batch validation of leads (OTTR-1047)
+
+A done review's sandbox-run leads wait for one batch run, not one turn per
+lead and not never. After a review lands done and filed leads, the board files
+one validation card for that review. The card's run carries the review toolset
+(`OTTR_REVIEW=1`: `propose_task` and `sandbox_run`) and the board's cheap
+model role (the selector stored under `modelRoles().plan`, the role the prompt
+gate uses). It validates at most `validationBatchSize` leads per run (project
+setting, default 10), and one validation run is open per project at any time,
+so a backlog of 59 leads drains as paced chained runs, never as parallel slot
+fills.
+
+##### Card kind, identity, and env
+
+`TaskKind` gains `validation` (`src/types.ts`). The tasks `kind` column
+carries no CHECK constraint, so the kind needs no schema change and no
+migration. `turnIdentityFlags` (`src/turn.ts`) gains `validation:
+task.kind === "validation"`. A validation card is not a review: `isReview`
+stays false, so no review hold, no review check, and no `reviewBlocked` delay
+applies. `isWorkCard` excludes it, so no work check runs. The run-env marks
+give a validation run `OTTR_REVIEW=1` plus the review model catalog env, which
+makes the extension register `propose_task` and `sandbox_run`; the extension
+needs no change. The board's sandbox endpoint kind check accepts `validation`
+next to `review` and `trending`, and its refusal text names the three kinds.
+`parkCardKind` refuses a `merging` landing for a validation card with
+`needs_you` ("A validation run must not commit. Cancel this card, or reply to
+continue."), and routes its `done` landing through the result settle below.
+
+##### Filing
+
+`filePendingValidationRun` (a method on the turn loop, `src/turn.ts`, same
+`e` parameter type as the loop's `cancel`) files at most one validation card
+per call, in one store transaction. It returns `{ id }` for the new card, or
+`{ error, status }` when no card files. Inside one transaction it:
+
+- Finds candidate reviews: `isReview`, `stage: "done"`, not cancelled, with at
+  least one batchable lead. A batchable lead is a direct child (`followUpOf` =
+  the review) in `stage: "backlog"`, not cancelled, with `validatedAt ===
+  null` and a `leadBlocker(prompt)` of kind `sandbox`. Deployment-fact leads
+  never enter a batch.
+- Skips a review when an open validation card of that review exists (same
+  `followUpOf`, kind `validation`, not cancelled, stage not `done`), or when
+  the review's newest validation card is cancelled (the user declined; the
+  manual start overrides).
+- Keeps at most one open validation card per project: the call files one card
+  only. Priority: an explicit `reviewId` argument first (the chain of the run
+  that just finished), then candidate reviews by `doneAt` ascending.
+- Creates the card: `createTask(batchPrompt, planModel, "validation")` (it
+  lands `todo`/`queued`), then `updateTask` with `followUpOf` (the review),
+  `promptAuthor: "board"`, and details
+  `Batch validation of <n> lead(s) of review <review id>.` `planModel` is the
+  selector stored under `modelRoles().plan`; null when the role is absent, so
+  the default role runs. The card sets no `base`, so `reviewCard` stays false.
+- The card is created after the review's `doneAt`, so the `reviewFindings`
+  created-at cutoff excludes it: it never holds merges, never blocks the
+  project's next review, and never holds its review's Done. Tests pin this.
+
+The batch is the review's batchable leads in severity order: ascending `rank`
+from the review's stored findings (`listReviewFindings(reviewId)`, matched by
+exact prompt; a lead with no stored rank sorts last), ties by card id
+ascending, capped at `validationBatchSize` (a stored value below 1 behaves as
+1).
+
+Triggers, and only these (older done reviews drain through the chain and the
+manual start, not through a periodic sweep):
+
+1. After a review's Done write: the live settle path after `writePostCheckState`
+   lands `done` for a review card, and the scheduled `settleReviewCard` and
+   `settleReleaseCard` after their `done` write.
+2. After a validation card settles `done` (the chain: the same review's
+   remainder first, then other candidate reviews). A validation card that
+   lands `needs_you` triggers nothing, so a run that records no results stops
+   its chain.
+3. The manual start below.
+
+The batch prompt is a new builder in `src/prompts.ts`,
+`validationRunPrompt({ reviewId, leads })`, where `leads` is
+`{ id: string; prompt: string }[]`. Its exact text, with `<reviewId>`, `#<id>`
+and `<lead prompt>` substituted:
+
+```text
+Lead validation for review #<reviewId>.
+
+You validate a batch of "Needs validation" leads of review #<reviewId>, in the order given. For each lead, prove or refute it with the sandbox_run tool: read the lead's plan, build the smallest job that exercises it, and run it. Trust a job only when its selfCheck.ok is true. Do not commit, do not write outside the job, and do not touch other cards.
+
+When the proof waits on a fact only the user knows (a deployment setting, a secret, an external system), skip the job and record the outcome "deployment" with the question.
+
+Record exactly one result per processed lead with propose_task. The prompt's first line must be exactly "Validation: #<lead card id> <outcome>", where <outcome> is one of:
+- confirmed: the job output shows the risk is real.
+- refuted: the job output shows the risk is not real.
+- blocked: the sandbox could not exercise the lead; name the exact missing control.
+- deployment: the proof waits on a user-known fact; restate the question.
+Put the evidence (the decisive output lines, shortened) on the lines after the first line. Record no other propose_task calls.
+
+Leads:
+#<id>
+<lead prompt>
+```
+
+##### Results
+
+The strict reader `validationResult(prompt)` (`src/auditLeads.ts`): the first
+line must match `/^Validation: #(\S+) (confirmed|refuted|blocked|deployment)$/`;
+the trimmed rest of the prompt is the evidence. Any other shape reads as null.
+A property test holds over arbitrary text: the reader never throws, and only
+an exact first line parses.
+
+The settle of a validation card's `done` landing reads the stored findings of
+the validation card (`listReviewFindings(validationCardId)`) unioned with the
+run's recorded set (dedupe by prompt, stored first — the same union rule as
+the review check), parses each result, and applies the first result per lead
+in order. For that wiring the run's `onRecorded` callback also stores a
+validation card's findings. A result counts only when its lead is a child of
+the validation card's own review, is not cancelled, and has `validatedAt ===
+null`; every other result lands only in the settle log (`st.log`). Each
+applied lead gets `validatedAt` set. A lead's prompt changes only in the
+confirmed case, which appends after lines 1 and 2 and keeps the fingerprint
+and title dedupe keys stable:
+
+- `confirmed`: the lead becomes a normal finding card — `stage: "todo"`,
+  `state: "queued"`, `queuedAt` set (the OTTR-869 promotion shape), the
+  evidence appended to its prompt as
+  `\n\nValidated <YYYY-MM-DD> by validation run #<card id>: <evidence>`, and
+  the same note in its details. A lead the user already started (any other
+  stage or state) records the outcome in its details only; no run state is
+  overwritten.
+- `refuted`: an idle backlog lead cancels with the direct patch
+  (`cancelledAt` set, `state: "idle"`) and `needsReason`
+  `Refuted by validation run #<card id> on <YYYY-MM-DD>: <evidence>`; a
+  started lead records the outcome in its details only.
+- `blocked`: the lead stays `backlog`/`idle`; its details gain
+  `Validated by validation run #<card id> on <YYYY-MM-DD>: still blocked —
+  <evidence>`.
+- `deployment`: the lead stays `backlog`/`idle` and joins the review's
+  question flow: an open question card gains one question in its `asked`
+  (`<question> (card #<lead id>)`, the same two options as the filing pass,
+  `multi: false`, `recommended: null`); with no open question card the settle
+  files one with the exact shape of the filing pass's question card. The
+  lead's details gain a deployment note.
+
+A run that parses zero results parks the validation card at `needs_you`
+("The validation run recorded no per-lead results"), touches no lead, and
+files no follow-up. Otherwise the card lands `done` and the chain trigger
+runs the filing again.
+
+##### Manual start
+
+`POST /api/projects/:project/tasks/:id/validate` (the `:id` is the review
+card): the route resolves the task, refuses a non-review, a review that is
+not `done`, or a cancelled card (404/409 with a short reason), then calls the
+loop's `filePendingValidationRun` for that review through a new `AppDeps`
+entry wired next to `cancel` in `src/server.ts`. An open validation card
+anywhere in the project answers 409. The route calls `deps.schedule()` and
+returns the new card. The manual start overrides the cancelled-decline skip,
+so the user can restart a declined review's validation.
+
+##### Settings
+
+`ProjectSettings` gains `validationBatchSize: number`, default 10
+(`DEFAULT_SETTINGS`, `SETTINGS_SHAPES` entry `"number"`).
+
+##### Schema
+
+One additive tasks column via `addColumn` in `ProjectStore.open`:
+
+```sql
+ALTER TABLE tasks ADD COLUMN validated_at INTEGER
+```
+
+`Task` gains `validatedAt: number | null` (mapped like the other camelCase
+fields). Unlike `leadAtDone`, the field joins `TaskPatch` and `TASK_COLUMNS`:
+the validation settle writes it, and nothing else does.
+
 ### 5. research-report.md survives the worktree
 
 The report harvest (`readReportFile` -> `archiveReport` -> `task.report`) runs
@@ -310,6 +483,16 @@ ALTER TABLE tasks ADD COLUMN lead_at_done INTEGER
 `Task` gains `leadAtDone: boolean` (mapped from the 0/1 column; NULL reads as
 false). The field stays outside `TaskPatch`: the raw write in `runTaskUpdate`
 sets it when a review lands done, and nothing clears it.
+
+OTTR-1047 adds one more tasks column the same way:
+
+```sql
+ALTER TABLE tasks ADD COLUMN validated_at INTEGER
+```
+
+`Task` gains `validatedAt: number | null` (mapped from the 0/1-style column;
+NULL reads as unvalidated). Unlike `leadAtDone`, the field joins `TaskPatch`
+and `TASK_COLUMNS`: the validation settle writes it, and nothing else does.
 
 ## Store API contract
 
@@ -391,18 +574,52 @@ before the run resolves.
     `Blocker:` lines included.
 13. turn (OTTR-980): a landing review whose agent recorded no proposals files
     no leads and runs no check.
+14. auditLeads (unit + property, OTTR-1047): `validationResult` reads the
+    first line's exact `Validation: #<id> <outcome>` shape, trims the
+    evidence, and reads any other shape as null; the property test holds over
+    arbitrary prompts and never throws.
+15. store (OTTR-1047): the `validated_at` migration converges an old-schema
+    database, and `validatedAt` round-trips through `TaskPatch`.
+16. turn (red, OTTR-1047): a done review with leads files exactly one queued
+    validation card: kind `validation`, `followUpOf` set, the `plan` role
+    model, the batch prompt, sandbox-blocker leads only, severity order, the
+    batch cap, deployment-fact and already-validated leads excluded.
+17. turn (red, OTTR-1047): each of the four results moves its lead as the
+    Results section says, a started lead records details only, a result for a
+    foreign lead only logs, and a zero-result run parks `needs_you` and
+    touches nothing.
+18. turn (red, OTTR-1047): a review whose leads exceed the cap chains a
+    follow-up card for the remainder after the run settles `done`; a second
+    review files no card while another validation card is open, and files one
+    after it settles; a cancelled validation card stops its review's
+    auto-filing.
+19. turn (red, OTTR-1047): a validation card created after its review's
+    `doneAt` holds no merge, blocks no next review, and holds no Done; a
+    `merging` landing refuses with `needs_you`.
+20. app (red, OTTR-1047): the sandbox endpoint accepts a validation-kind card
+    and still refuses a work card; the manual validate route files, queues
+    and schedules for a done review, refuses a not-done or cancelled review,
+    and answers 409 while a validation card is open.
+21. settings (OTTR-1047): `validationBatchSize` round-trips, and a stored
+    value below 1 behaves as 1.
 
 ## Non-goals
 
 - No UI changes (no `src/ui/**` edits beyond the AskPanel's move onto the shared
   `askAnswerLine` wire-format helper, which keeps its output byte-identical; the
   Findings trail text update is card data, not UI code).
-- No `src/prompts.ts` change beyond the one OTTR-980 sentence (the user
-  approved it): the review prompt tells the agent to put the audit record's
-  fingerprint on each lead prompt's second line. The blocker-line wording of
+- No `src/prompts.ts` change beyond the one OTTR-980 sentence and the
+  OTTR-1047 `validationRunPrompt` builder (the user approved the change in
+  principle on 2026-11-15; the exact wording ships in the ready report): the
+  review prompt tells the agent to put the audit record's fingerprint on each
+  lead prompt's second line. The blocker-line wording of
   the original task shipped after its own approval; until then the sorting
   machinery stayed dormant.
-- No validation sandbox; sandbox-run leads keep waiting for one.
+- No validation sandbox; sandbox-run leads keep waiting for one. (OTTR-1047
+  lifts the batch runner on top of the existing sandbox; see the batch
+  validation subsection.)
+- No change to how the review writes leads, and no auto-start of single lead
+  cards: only the per-review batch card starts by itself (OTTR-1047).
 - No change to leads that already exist (OTTR-929 adds the title dedupe of new
   leads against open lead cards).
 - No recovery of findings lost before this change; no parsing of omp session

@@ -929,6 +929,7 @@ const app = await createApp({
 	workersHome,
 	projects,
 	cancel: loop.cancel,
+	validateLeads: loop.filePendingValidationRun,
 	stopTurn: loop.stopTurn,
 	creditStop: loop.creditStop,
 	creditRelease: loop.creditRelease,

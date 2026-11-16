@@ -79,6 +79,7 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	iconText: null,
 	releaseCommand: null,
 	archReviewCap: 150,
+	validationBatchSize: 10,
 	maxImages: 8,
 	keptWorktreeDays: 7,
 	autoTend: false,
@@ -375,6 +376,7 @@ interface TaskRow {
 	hold_set_at: number | null;
 	proposal_summary: string | null;
 	findings_checked_at: number | null;
+	validated_at: number | null;
 	lead_at_done: number | null;
 	kind: string;
 }
@@ -602,6 +604,7 @@ function toListedTask(
 		holdSetAt: r.hold_set_at,
 		proposalSummary: parseProposalSummary(r.proposal_summary),
 		findingsCheckedAt: r.findings_checked_at,
+		validatedAt: r.validated_at,
 		leadAtDone: r.lead_at_done === 1,
 	};
 }
@@ -958,6 +961,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	holdSetAt: "hold_set_at",
 	proposalSummary: "proposal_summary",
 	findingsCheckedAt: "findings_checked_at",
+	validatedAt: "validated_at",
 };
 
 // Wide text columns the list read never selects (OTTR-866): diff_text alone is up to
@@ -1224,6 +1228,7 @@ const SETTINGS_SHAPES = {
 	iconText: "string",
 	releaseCommand: "string",
 	archReviewCap: "number",
+	validationBatchSize: "number",
 	maxImages: "number",
 	keptWorktreeDays: "number",
 	autoTend: "boolean",
@@ -2352,6 +2357,15 @@ export class ProjectStore {
 									ORDER BY e.at DESC, e.id DESC LIMIT 1) = 'backlog'
 						)
 				`);
+				// OTTR-1047: the validation stamp on a backlog lead — set when the validation
+				// settle applies a result to it. ALTER-only after every rebuild, like the
+				// columns above; the validation settle writes it through TaskPatch.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"validated_at",
+					"ALTER TABLE tasks ADD COLUMN validated_at INTEGER",
+				);
 				await ProjectStore.convergeProposalReasons(db, store.queue);
 				// posted_url landed after the first pr_review release: CREATE TABLE IF NOT EXISTS never
 				// updates a live table, so converge additively like the tasks columns above.

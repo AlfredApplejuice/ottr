@@ -1039,6 +1039,7 @@ describe("settings", () => {
 			iconText: null,
 			releaseCommand: "node scripts/release.mjs --ottr",
 			archReviewCap: 80,
+			validationBatchSize: 10,
 			maxImages: 4,
 			keptWorktreeDays: 7,
 			autoTend: false,
@@ -1075,6 +1076,7 @@ describe("settings", () => {
 			iconText: null,
 			releaseCommand: null,
 			archReviewCap: 80,
+			validationBatchSize: 10,
 			maxImages: 4,
 			keptWorktreeDays: 7,
 			autoTend: false,
@@ -3956,6 +3958,30 @@ describe("arch-review changed-line coverage", () => {
 			await store.close();
 		});
 
+		test("validationBatchSize defaults to 10, round-trips, and a corrupt value keeps the default", async () => {
+			const dir = join(root, "validation-batch-size");
+			let store = await open(dir);
+			// Unset: the default holds.
+			expect((await store.getSettings()).validationBatchSize).toBe(
+				DEFAULT_SETTINGS.validationBatchSize,
+			);
+			await store.setSettings({ validationBatchSize: 4 });
+			await store.close();
+			store = await open(dir);
+			expect((await store.getSettings()).validationBatchSize).toBe(4);
+			await store.close();
+			// A corrupt stored value falls back to the default, alone. The store is
+			// closed before the raw write, like every corrupt-value test above.
+			const db = rawDb(dir);
+			db.run(
+				"UPDATE settings SET value = '{oops' WHERE key = 'validationBatchSize'",
+			);
+			db.close();
+			store = await open(dir);
+			expect((await store.getSettings()).validationBatchSize).toBe(10);
+			await store.close();
+		});
+
 		test("returned settings are a deep copy: mutating them touches neither the defaults nor a later read", async () => {
 			const store = await open(join(root, "ar-deepcopy"));
 			const first = await store.getSettings();
@@ -6018,6 +6044,40 @@ describe("review findings storage", () => {
 		expect(
 			mergeHold([reviewRow, committedRow, otherRow], committedRow),
 		).toBeNull();
+	});
+
+	// OTTR-1047: a database from before validation runs existed — the pre-lead-flag
+	// shape above, which carries no validated_at — converges on open, and the stamp
+	// the validation settle writes round-trips.
+	test("open adds validated_at to an old-schema database, and the patch round-trips (OTTR-1047)", async () => {
+		const dir = join(root, "validated-at-upgrade");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		raw.exec(PRE_LEAD_FLAG_TASKS_DDL);
+		raw.exec(EVENTS_DDL);
+		raw.exec(
+			"INSERT INTO tasks (id, title, stage, state, kind, created_at, updated_at, follow_up_of) VALUES ('lead1', 'lead card', 'backlog', 'idle', 'work', 100, 100, 'rev1')",
+		);
+		raw.close();
+
+		const store = await open(dir);
+		// The seeded row survives the migration and reads a null stamp.
+		expect((await store.getTask("lead1"))?.validatedAt).toBeNull();
+
+		// The validation settle's patch sets the stamp, and getTask and listTasks
+		// both see it.
+		await store.updateTask("lead1", { validatedAt: 1720000000000 });
+		expect((await store.getTask("lead1"))?.validatedAt).toBe(1720000000000);
+		const rows = await store.listTasks();
+		expect(rows.find((t) => t.id === "lead1")!.validatedAt).toBe(1720000000000);
+
+		// The same patch clears it back to null.
+		await store.updateTask("lead1", { validatedAt: null });
+		expect((await store.getTask("lead1"))?.validatedAt).toBeNull();
+		expect(
+			(await store.listTasks()).find((t) => t.id === "lead1")!.validatedAt,
+		).toBeNull();
+		await store.close();
 	});
 
 	test("appendReviewFinding stores findings and listReviewFindings returns them in arrival order", async () => {

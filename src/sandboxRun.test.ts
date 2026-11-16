@@ -608,13 +608,15 @@ describe("runSandboxViaBoard", () => {
 		const { fetchImpl } = fakeFetch(
 			403,
 			JSON.stringify({
-				error: "sandbox_run runs only in review or trending scout runs",
+				error:
+					"sandbox_run runs only in review, validation, or trending scout runs",
 			}),
 		);
 		const res = await runSandboxViaBoard(boardEnv, validReq, fetchImpl);
 		expect(res).toEqual({
 			ok: false,
-			error: "sandbox_run runs only in review or trending scout runs",
+			error:
+				"sandbox_run runs only in review, validation, or trending scout runs",
 		});
 	});
 

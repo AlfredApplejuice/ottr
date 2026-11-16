@@ -208,6 +208,8 @@ export interface ProjectSettings {
 	releaseCommand: string | null;
 	/** Commits on the integration target before an architecture review is due. */
 	archReviewCap: number;
+	/** Leads one validation run (OTTR-1047) validates per run; a stored value below 1 behaves as 1. */
+	validationBatchSize: number;
 	/** Images allowed per message (prompt, reply, follow-up, steer). */
 	maxImages: number;
 	/** Days a kept-worktree card may sit before the supervisor quarantines it. */
@@ -290,7 +292,8 @@ export type TaskKind =
 	| "review"
 	| "interview"
 	| "pr_review"
-	| "trending";
+	| "trending"
+	| "validation";
 
 /** A trending scout's judgement of one repo for one project: filed and no_fit are final; deferred is offered again next scan. */
 export type TrendingVerdictKind = "filed" | "no_fit" | "deferred";
@@ -560,6 +563,10 @@ export interface Task {
 	/** The review-check stamp over the card's stored review findings (findingsCheckedAt in the
 	 * store): set when a check pass completes over them, cleared when a new finding arrives. */
 	findingsCheckedAt: number | null;
+	/** OTTR-1047: the card was validated by a validation run (validatedAt in the store). Set
+	 * when the validation settle applies a result to this backlog lead; never set for any
+	 * other kind. Store column validated_at; the validation settle writes it, nothing else. */
+	validatedAt: number | null;
 	/** OTTR-963: the card sat in stage `backlog` when its review finished. The store stamps
 	 * it when a review card lands done and never changes it afterwards, so it is the
 	 * recorded stage at doneAt, not a derivable one. The scheduler exempts flagged findings

@@ -6,7 +6,11 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import type { ensureProjectPackages } from "./apt.ts";
-import { leadFingerprint, leadTitleKey } from "./auditLeads.ts";
+import {
+	leadFingerprint,
+	leadTitleKey,
+	validationResult,
+} from "./auditLeads.ts";
 import {
 	copyBelow,
 	readBelow,
@@ -82,6 +86,7 @@ import {
 	restartResumePrompt,
 	retroReplyPrompt,
 	reviewCheckPrompt,
+	validationRunPrompt,
 	WORK_CHECK_MAX_SENDBACKS,
 	WORK_CHECK_SENDBACK_OPENING,
 	workCheckPrompt,
@@ -1543,6 +1548,13 @@ export interface TurnLoop {
 	scheduleTick(): Promise<void>;
 	runTurn(name: string, id: string): Promise<void>;
 	cancel(e: TurnProject, id: string, force: boolean): Promise<CancelOutcome>;
+	/** OTTR-1047: files at most one batch validation card ({ id }), or { error, status }
+	 * when nothing files. The manual start route passes the review's id (it overrides a
+	 * cancelled-decline skip); the done-review and chain triggers call it without one. */
+	filePendingValidationRun(
+		e: TurnProject,
+		reviewId?: string,
+	): Promise<{ id: string } | { error: string; status: number }>;
 	/** Stops the running turn without cancelling the task (the board's Esc). */
 	stopTurn(e: TurnProject, id: string): Promise<StopOutcome>;
 	/** Hosted mode: sets the credit hold and stops every turn in flight (work or merge runs like
@@ -1592,6 +1604,17 @@ type TurnIdentityFlags = {
 	interview: boolean;
 	grill: boolean;
 	scout: boolean;
+	validation: boolean;
+};
+
+/** One lead result a validation run recorded with propose_task; the shape
+ * `validationResult` (auditLeads.ts) parses a recorded prompt into. */
+type LeadValidationResult = {
+	/** The lead card the result names (`#<id>` on the prompt's first line). */
+	leadId: string;
+	outcome: "confirmed" | "refuted" | "blocked" | "deployment";
+	/** The prompt text after the first line, trimmed. */
+	evidence: string;
 };
 
 /** The flags plus the session name resolveTurnIdentity fixed before the run. */
@@ -3552,6 +3575,11 @@ export function createTurnLoop(
 			commits,
 			mergeHead,
 		});
+		// OTTR-1047: the done release review files its batch validation; results are
+		// ignored (a refusal just ends the chain), a crash is logged, not silent.
+		await filePendingValidationRun(e).catch((err) =>
+			logStoreError(e.store.name, err),
+		);
 	}
 
 	/** One review card whose findings are done: the Review button's card lands done, a release
@@ -3583,6 +3611,11 @@ export function createTurnLoop(
 				commits,
 				mergeHead,
 			});
+			// OTTR-1047: the done review files its batch validation; results are ignored
+			// (a refusal just ends the chain), a crash is logged, not silent.
+			await filePendingValidationRun(e).catch((err) =>
+				logStoreError(e.store.name, err),
+			);
 			return;
 		}
 		await settleReleaseCard(e, t, t.releaseVersion, base, target, cancelled);
@@ -4317,6 +4350,10 @@ export function createTurnLoop(
 			// third-party text, so it runs on a worker when one exists (D6) and never holds the
 			// board's GitHub token, also on a local run.
 			scout: task.kind === "trending",
+			// OTTR-1047: the batch validation run of a done review's "Needs validation" leads.
+			// Not a review: no review hold, no review check, no reviewBlocked delay; isWorkCard
+			// excludes it, so no work check runs either.
+			validation: task.kind === "validation",
 		};
 	}
 
@@ -5932,9 +5969,10 @@ export function createTurnLoop(
 			onProgress: (text) => dispatchProgressEntry(mx, ops, text),
 			onSession: async (sid) =>
 				await dispatchSessionEntry(store, id, kind, sid),
-			// A review run stores each finding the moment the runner parses it (the
-			// spec's arrival persistence); other cards store nothing.
-			...(idn.reviewCard && {
+			// A review or validation run stores each finding the moment the runner parses it
+			// (the spec's arrival persistence; a validation card's findings are its per-lead
+			// results, read back by the settle); other cards store nothing.
+			...((idn.reviewCard || idn.validation) && {
 				onRecorded: async (finding: RecordedFinding) => {
 					await store.appendReviewFinding(id, finding);
 				},
@@ -6033,7 +6071,7 @@ export function createTurnLoop(
 		// OTTR_MODELS: its proposal files past the card-filing routes' catalog check,
 		// so propose_task must check at record time).
 		const marks =
-			idn.retroCard || idn.reviewCard || idn.scout
+			idn.retroCard || idn.reviewCard || idn.validation || idn.scout
 				? await retroEnvMarks(idn)
 				: {};
 
@@ -6232,6 +6270,10 @@ export function createTurnLoop(
 			};
 		if (idn.reviewCard)
 			return { OTTR_REVIEW: "1", ...(await retroModelsEnv()) };
+		// A validation run gets the review env: OTTR_REVIEW=1 makes the extension register
+		// propose_task and sandbox_run, and the model catalog rides for record-time checks.
+		if (idn.validation)
+			return { OTTR_REVIEW: "1", ...(await retroModelsEnv()) };
 		if (idn.scout) return { OTTR_TRENDING: "1" };
 		return {};
 	}
@@ -6377,6 +6419,21 @@ export function createTurnLoop(
 		if (await runWorkCheck(st, planned)) return true;
 		await writePostCheckState(st, planned);
 		await stampDoneCard(st, planned);
+		if (planned.stage === "done") {
+			// OTTR-1047: a done review files its batch validation, a done validation run
+			// files its review's remainder (the chain). The results are ignored here: a
+			// refusal (an open run elsewhere, no batchable leads) just ends the chain,
+			// a crash is logged, not silent.
+			if (st.idn.reviewCard)
+				await filePendingValidationRun(e).catch((err) =>
+					logStoreError(e.store.name, err),
+				);
+			if (st.idn.validation)
+				await filePendingValidationRun(
+					e,
+					st.task.followUpOf ?? undefined,
+				).catch((err) => logStoreError(e.store.name, err));
+		}
 		return false;
 	}
 
@@ -8654,8 +8711,17 @@ export function createTurnLoop(
 				state: "needs_you",
 				needsReason: "A trending scout must not commit.",
 			};
+		if (st.idn.validation && next.stage === "merging")
+			return {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason:
+					"A validation run must not commit. Cancel this card, or reply to continue.",
+			};
 		if (st.idn.reviewCard && next.stage === "done")
 			return await parkReviewDone(st, next);
+		if (st.idn.validation && next.stage === "done")
+			return await settleValidationResults(st, next);
 		return next;
 	}
 
@@ -8702,6 +8768,279 @@ export function createTurnLoop(
 		// A cancel before the publish step skips it and is caught by the settle recheck below;
 		// from the publish step to the final write, the `publishing` claim refuses a cancel.
 		return next;
+	}
+
+	/** A validation card classified done (OTTR-1047): parse the run's per-lead results —
+	 * the card's stored findings unioned with this run's recorded set, dedupe by prompt,
+	 * stored first (the review check's union rule) — and apply the first result per lead,
+	 * in order. A result applies only when its lead is a direct child of the card's review,
+	 * not cancelled, never validated, and still a backlog card; a lead the user already
+	 * started keeps its state and records the outcome in its details only. Every other
+	 * result lands in the card log. Zero parsed results park the card at needs_you and
+	 * touch no lead; otherwise the done Next passes through unchanged and the chain
+	 * trigger files the review's remainder. */
+	async function settleValidationResults(
+		st: TurnSettle,
+		next: Next,
+	): Promise<Next> {
+		const reviewId = st.task.followUpOf;
+		const stored = await st.store.listReviewFindings(st.id);
+		const seen = new Set(stored.map((f) => f.prompt));
+		const all = [...stored];
+		for (const finding of st.result.recorded) {
+			if (seen.has(finding.prompt)) continue;
+			seen.add(finding.prompt);
+			all.push(finding);
+		}
+		const results = all
+			.map((finding) => validationResult(finding.prompt))
+			.filter((r) => r !== null);
+		if (results.length === 0)
+			return {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: "The validation run recorded no per-lead results",
+			};
+		if (reviewId === null) return next;
+		const now = Date.now();
+		const date = new Date(now).toISOString().slice(0, 10);
+		const first = new Map<string, LeadValidationResult>();
+		for (const result of results)
+			if (!first.has(result.leadId)) first.set(result.leadId, result);
+		const deployment: string[] = [];
+		let applied = 0;
+		const tasks = await st.store.listTasks();
+		for (const [leadId, result] of first) {
+			const full = await st.store.getTask(leadId);
+			const lead = tasks.find((t) => t.id === leadId);
+			if (lead === undefined) {
+				await st.log(
+					`- ${result.outcome} result for #${leadId} not applied: no card carries the id`,
+				);
+				continue;
+			}
+			const why =
+				lead.followUpOf !== reviewId
+					? "not a lead of this run's review"
+					: lead.cancelledAt !== null
+						? "the lead is cancelled"
+						: lead.validatedAt !== null
+							? "the lead is already validated"
+							: null;
+			if (why !== null || full === null) {
+				await st.log(
+					`- ${result.outcome} result for #${leadId} not applied: ${why ?? "the card is gone"}`,
+				);
+				continue;
+			}
+			// A started lead (any stage beyond backlog, or a backlog lead whose grill is
+			// queued or running) records the outcome in its details only; no run state and
+			// no prompt is overwritten (the OTTR-869 rule).
+			if (lead.stage !== "backlog" || lead.state !== "idle") {
+				const evidence = result.evidence.trim();
+				const text =
+					result.outcome === "blocked" ? "still blocked" : result.outcome;
+				await st.store.updateTask(lead.id, {
+					validatedAt: now,
+					details: `${full.details ?? ""}\nValidated by validation run #${st.id} on ${date}: ${text}${evidence === "" ? "" : ` — ${evidence}`}.`,
+				});
+				applied += 1;
+				continue;
+			}
+			if (result.outcome === "confirmed") {
+				const evidence = result.evidence.trim();
+				await st.store.updateTask(lead.id, {
+					stage: "todo",
+					state: "queued",
+					queuedAt: now,
+					validatedAt: now,
+					prompt: `${lead.prompt}\n\nValidated ${date} by validation run #${st.id}${evidence === "" ? "" : `: ${evidence}`}`,
+					details: `${full.details ?? ""}\nValidated by #${st.id} on ${date}: confirmed.${evidence === "" ? "" : ` ${evidence}`}`,
+				});
+			} else if (result.outcome === "refuted") {
+				await st.store.updateTask(lead.id, {
+					cancelledAt: now,
+					state: "idle",
+					validatedAt: now,
+					needsReason: `Refuted by validation run #${st.id} on ${date}: ${result.evidence}`,
+				});
+			} else if (result.outcome === "blocked") {
+				await st.store.updateTask(lead.id, {
+					validatedAt: now,
+					details: `${full.details ?? ""}\nValidated by validation run #${st.id} on ${date}: still blocked — ${result.evidence}`,
+				});
+			} else {
+				await st.store.updateTask(lead.id, {
+					validatedAt: now,
+					details: `${full.details ?? ""}\nValidated by validation run #${st.id} on ${date}: deployment — ${result.evidence}`,
+				});
+				const blocker = leadBlocker(lead.prompt);
+				deployment.push(
+					`${blocker.kind === "deployment" ? blocker.question : result.evidence} (card #${lead.id})`,
+				);
+			}
+			applied += 1;
+		}
+		await st.log(
+			`- validation results: ${applied} applied, ${first.size - applied} not applied`,
+		);
+		// The deployment leads join the review's question flow: one open question card
+		// gains the questions in its `asked`; with none the settle files the filing
+		// pass's question card, exact shape.
+		if (deployment.length > 0) {
+			const open = (await st.store.listTasks()).find(
+				(t) =>
+					t.followUpOf === reviewId &&
+					t.cancelledAt === null &&
+					t.stage !== "done" &&
+					t.prompt.startsWith(LEAD_QUESTIONS_PROMPT_PREFIX),
+			);
+			const asked = deployment.map((question) => ({
+				question,
+				options: [
+					{ label: LEAD_APPLIES_OPTION },
+					{ label: LEAD_NOT_APPLY_OPTION },
+				],
+				multi: false,
+				recommended: null,
+			}));
+			if (open !== undefined) {
+				const q = await st.store.getTask(open.id);
+				if (q !== null)
+					await st.store.updateTask(q.id, {
+						asked: [...(q.asked ?? []), ...asked],
+					});
+			} else {
+				const q = await st.store.createTask(
+					`${LEAD_QUESTIONS_PROMPT_PREFIX}${reviewId}: reply with one answer per question, and the board applies each answer to its lead card.`,
+				);
+				await st.store.updateTask(q.id, {
+					followUpOf: reviewId,
+					promptAuthor: "board",
+					stage: "backlog",
+					state: "needs_you",
+					queuedAt: null,
+					asked,
+					needsReason: `Wants your answer: ${asked.length} question${asked.length === 1 ? "" : "s"} about the review's needs-validation leads`,
+				});
+			}
+		}
+		return next;
+	}
+
+	/** OTTR-1047: files at most one batch validation card per call, in one store
+	 * transaction. The manual start route, the done-review triggers, and the chain of a
+	 * done validation run share this one implementation. Candidate reviews: `isReview`,
+	 * done, not cancelled, with at least one batchable lead (a direct backlog child, not
+	 * cancelled, never validated, a sandbox blocker — deployment-fact leads never enter
+	 * a batch). A review with an open validation card waits; one whose newest validation
+	 * card is cancelled stays declined unless `reviewId` overrides (the manual start).
+	 * One validation run is open per project, so the call files one card only: an open
+	 * card anywhere answers 409. Priority: an explicit `reviewId` first (the chain of the
+	 * run that just finished), then candidate reviews by doneAt ascending. The batch is
+	 * the review's batchable leads in severity order — ascending rank from the review's
+	 * stored findings by exact prompt (missing rank last, ties by card id) — capped at
+	 * `validationBatchSize` (below 1 behaves as 1). */
+	async function filePendingValidationRun(
+		e: TurnProject,
+		reviewId?: string,
+	): Promise<{ id: string } | { error: string; status: number }> {
+		return await e.store.transaction(async () => {
+			const tasks = await e.store.listTasks();
+			// One open validation run per project: the manual route's 409 and the
+			// triggers' quiet no-op come from this single check.
+			if (
+				tasks.some(
+					(t) =>
+						t.kind === "validation" &&
+						t.cancelledAt === null &&
+						t.stage !== "done",
+				)
+			)
+				return { error: "a validation run is already open", status: 409 };
+			const batchableOf = (review: ListedTask): ListedTask[] =>
+				tasks.filter(
+					(t) =>
+						t.followUpOf === review.id &&
+						// A lead, not any backlog child: the review's question card is a
+						// backlog child too, and leadBlocker reads a missing line as a
+						// sandbox blocker, so the tag is what keeps it out of a batch.
+						t.prompt.startsWith("Needs validation") &&
+						t.stage === "backlog" &&
+						t.cancelledAt === null &&
+						t.validatedAt === null &&
+						leadBlocker(t.prompt).kind === "sandbox",
+				);
+			// The user declined the review's validation by cancelling its newest card;
+			// the explicit reviewId (the manual start, the chain restart) overrides.
+			const declined = (review: ListedTask): boolean => {
+				const cards = tasks.filter(
+					(t) => t.followUpOf === review.id && t.kind === "validation",
+				);
+				if (cards.length === 0) return false;
+				const newest = cards.reduce((a, b) =>
+					a.createdAt !== b.createdAt
+						? a.createdAt > b.createdAt
+							? a
+							: b
+						: a.id > b.id
+							? a
+							: b,
+				);
+				return newest.cancelledAt !== null;
+			};
+			const candidates = tasks
+				.filter(
+					(t) =>
+						isReview(t) &&
+						t.stage === "done" &&
+						t.cancelledAt === null &&
+						(t.id === reviewId || !declined(t)) &&
+						batchableOf(t).length > 0,
+				)
+				.sort((a, b) => {
+					if (a.id === reviewId) return -1;
+					if (b.id === reviewId) return 1;
+					return (a.doneAt ?? 0) - (b.doneAt ?? 0);
+				});
+			const review = candidates[0];
+			if (review === undefined)
+				return { error: "no batchable leads", status: 409 };
+			const leads = batchableOf(review);
+			const ranks = new Map<string, number>();
+			for (const finding of await e.store.listReviewFindings(review.id))
+				if (finding.rank !== null && !ranks.has(finding.prompt))
+					ranks.set(finding.prompt, finding.rank);
+			leads.sort((a, b) => {
+				const ra = ranks.get(a.prompt);
+				const rb = ranks.get(b.prompt);
+				if (ra !== rb) {
+					if (ra === undefined) return 1;
+					if (rb === undefined) return -1;
+					return ra - rb;
+				}
+				return a.id < b.id ? -1 : 1;
+			});
+			const cap = Math.max(1, (await getSettingsLogged(e)).validationBatchSize);
+			const batch = leads.slice(0, cap);
+			// The board's cheap model role: the selector under modelRoles().plan; null
+			// runs the default role.
+			const planModel = (ops.modelRoles ?? modelRoles)().plan ?? null;
+			const card = await e.store.createTask(
+				validationRunPrompt({
+					reviewId: review.id,
+					leads: batch.map((lead) => ({ id: lead.id, prompt: lead.prompt })),
+				}),
+				planModel,
+				"validation",
+			);
+			await e.store.updateTask(card.id, {
+				followUpOf: review.id,
+				promptAuthor: "board",
+				details: `Batch validation of ${batch.length} lead(s) of review ${review.id}.`,
+			});
+			return { id: card.id };
+		});
 	}
 
 	/** UI-shot guard: a work turn whose diff touches UI files (uiFiles) but attached no
@@ -8963,7 +9302,8 @@ export function createTurnLoop(
 			!st.idn.interview &&
 			!st.idn.grill &&
 			!st.idn.scout &&
-			!st.idn.retroCard
+			!st.idn.retroCard &&
+			!st.idn.validation
 		);
 	}
 
@@ -11364,6 +11704,7 @@ export function createTurnLoop(
 		scheduleTick,
 		runTurn,
 		cancel,
+		filePendingValidationRun,
 		stopTurn,
 		creditStop,
 		creditRelease,

@@ -1062,10 +1062,10 @@ answer says so instead of a guess.
 
 `POST /validate` on the runner (the same `OTTR_WORKER_TOKEN`, the same health
 gate and slot pool as `/run`) takes the job and answers the result JSON. The
-board tool `sandbox_run` (review and scout runs) is the audit-facing way to
+board tool `sandbox_run` (review, validation, and scout runs) is the audit-facing way to
 call it: it sends its args and the run's own card id to the board endpoint
 `POST /api/projects/<project>/sandbox` with the run's boot token, the server
-checks the run kind (review or trending scout only), packs the target with
+checks the run kind (review, validation, or trending scout only), packs the target with
 `git archive` from the project's registered checkout, stages the tar under the
 board's data dir (`OTTR_DATA_DIR`, default `/data`), and calls the runner with
 the server's own `OTTR_WORKER_TOKEN`. The agent process never holds the worker

@@ -1061,6 +1061,7 @@ describe("handoffMarkdown research report", () => {
 		pendingBy: null,
 		pushRetries: 0,
 		findingsCheckedAt: null,
+		validatedAt: null,
 		leadAtDone: false,
 		revision: 1,
 		promptAuthor: "user" as const,

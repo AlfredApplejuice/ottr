@@ -353,12 +353,25 @@ let stopTurnImpl: (e: Entry, id: string) => Promise<StopOutcome> =
 	async () => ({
 		ok: true,
 	});
+// OTTR-1047: the validate route's filing seam; the route tests swap validateLeadsImpl per
+// case and the shared app reads it per request. Unstubbed calls fail loudly.
+let validateLeadsImpl:
+	| ((
+			e: Entry,
+			reviewId: string,
+	  ) => Promise<{ id: string } | { error: string; status: number }>)
+	| null = null;
 const loopStubs = () => ({
 	cancel: (e: Entry, id: string, force: boolean) => cancelImpl(e, id, force),
 	finishKept: (e: Entry, id: string, choices: unknown) =>
 		finishKeptImpl(e, id, choices),
 	stopTurn: (e: Entry, id: string) => stopTurnImpl(e, id),
 	claimedPids: () => new Set<number>(),
+	validateLeads: (e: Entry, reviewId: string) => {
+		if (!validateLeadsImpl)
+			return Promise.reject(new Error("validateLeads not stubbed"));
+		return validateLeadsImpl(e, reviewId);
+	},
 });
 // Deepen seam: the route tests swap deepenImpl per test; unstubbed calls fail loudly.
 let deepenImpl: (prompt: string, model: string | null) => Promise<string> =
@@ -9801,12 +9814,39 @@ describe("sandbox endpoint", () => {
 			);
 			expect(res.status).toBe(403);
 			expect(await errorOf(res)).toBe(
-				"sandbox_run runs only in review or trending scout runs",
+				"sandbox_run runs only in review, validation, or trending scout runs",
 			);
 			expect(runnerCalls.length).toBe(0);
 		} finally {
 			await store.updateTask(work.id, { cancelledAt: Date.now() });
 			restoreFetch();
+		}
+	});
+
+	// OTTR-1047: a validation run carries OTTR_REVIEW=1, so its card passes the same
+	// kind gate as a review's and packs the checkout like one.
+	test("a validation run's card packs the checkout like a review's", async () => {
+		const card = await store.createTask("validation run", null, "validation");
+		const { restore } = withRunnerEnv(true);
+		const { runnerCalls, restore: restoreFetch } = stubRunner();
+		seedCommit();
+		try {
+			const res = await post(
+				"/api/projects/p1/sandbox",
+				{ taskId: card.id, project: "p1", argv: ["sh", "-c", "true"] },
+				asTurn(BOARD_TOKEN),
+			);
+			expect(res.status).toBe(200);
+			expect(runnerCalls.length).toBe(1);
+			const body = JSON.parse(String(runnerCalls[0]!.init.body)) as {
+				project: string;
+			};
+			expect(body.project).toBe("p1");
+		} finally {
+			await store.updateTask(card.id, { cancelledAt: Date.now() });
+			restoreFetch();
+			restore();
+			dropGit();
 		}
 	});
 
@@ -9818,7 +9858,7 @@ describe("sandbox endpoint", () => {
 		);
 		expect(missing.status).toBe(403);
 		expect(await errorOf(missing)).toBe(
-			"unknown task P1-999; sandbox_run needs this run's review or scout card",
+			"unknown task P1-999; sandbox_run needs this run's review, validation, or scout card",
 		);
 		const noTask = await post(
 			"/api/projects/p1/sandbox",
@@ -9991,6 +10031,145 @@ describe("sandbox endpoint", () => {
 			dropGit();
 		}
 	}, 30_000);
+});
+
+// OTTR-1047: the manual start of a done review's batch validation run. The filing
+// itself is the stubbed validateLeads seam (the loop's filePendingValidationRun);
+// these tests pin the route's gating and its calls around the seam.
+describe("manual validation start route (OTTR-1047)", () => {
+	/** A done review with one lead child, the route's happy-path input. */
+	const doneReviewWithLead = async () => {
+		const review = await store.createTask(
+			"done review for validation",
+			null,
+			"review",
+		);
+		await store.updateTask(review.id, { stage: "done", state: "idle" });
+		const lead = await store.createTask("the sandbox lead's prompt");
+		await store.updateTask(lead.id, { followUpOf: review.id });
+		return { review, lead };
+	};
+
+	test("the manual start files one queued validation child and schedules", async () => {
+		const { review, lead } = await doneReviewWithLead();
+		const seen: Array<{ e: Entry; reviewId: string }> = [];
+		validateLeadsImpl = async (e, reviewId) => {
+			seen.push({ e, reviewId });
+			// The seam mimics the loop's filing: createTask lands the card queued.
+			const card = await e.store.createTask(
+				"Batch validation of 1 lead(s) of review.",
+				null,
+				"validation",
+			);
+			await e.store.updateTask(card.id, {
+				followUpOf: reviewId,
+				promptAuthor: "board",
+			});
+			return { id: card.id };
+		};
+		const before = calls;
+		try {
+			const res = await post(
+				`/api/projects/p1/tasks/${review.id}/validate`,
+				{},
+			);
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as { id: string };
+			expect(seen.length).toBe(1);
+			expect(seen[0]!.reviewId).toBe(review.id);
+			expect(seen[0]!.e.store).toBe(store);
+			const card = (await store.listTasks()).find((t) => t.id === b.id)!;
+			expect(card.kind).toBe("validation");
+			expect(card.followUpOf).toBe(review.id);
+			expect(card.state).toBe("queued");
+			expect(card.promptAuthor).toBe("board");
+			expect(calls).toBe(before + 1);
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
+	test("a review that is not done is refused before the filing", async () => {
+		const review = await store.createTask(
+			"running review for validation",
+			null,
+			"review",
+		);
+		let filed = 0;
+		validateLeadsImpl = async () => {
+			filed++;
+			return { id: "nope" };
+		};
+		try {
+			const res = await post(
+				`/api/projects/p1/tasks/${review.id}/validate`,
+				{},
+			);
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe(
+				"only a done review can start a validation run",
+			);
+			expect(filed).toBe(0);
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+		}
+	});
+
+	test("a non-review card is refused", async () => {
+		const work = await store.createTask("plain work for validation route");
+		await store.updateTask(work.id, { stage: "done", state: "idle" });
+		validateLeadsImpl = async () => ({ id: "nope" });
+		try {
+			const res = await post(`/api/projects/p1/tasks/${work.id}/validate`, {});
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe("only a review card can be validated");
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(work.id, { cancelledAt: Date.now() });
+		}
+	});
+
+	test("a cancelled review is refused", async () => {
+		const { review } = await doneReviewWithLead();
+		await store.updateTask(review.id, { cancelledAt: Date.now() });
+		validateLeadsImpl = async () => ({ id: "nope" });
+		try {
+			const res = await post(
+				`/api/projects/p1/tasks/${review.id}/validate`,
+				{},
+			);
+			expect(res.status).toBe(404);
+			expect(await errorOf(res)).toBe("task is cancelled");
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+		}
+	});
+
+	test("an open validation card in the project answers 409", async () => {
+		const { review, lead } = await doneReviewWithLead();
+		validateLeadsImpl = async () => ({
+			error: "a validation run is already open in this project",
+			status: 409,
+		});
+		try {
+			const res = await post(
+				`/api/projects/p1/tasks/${review.id}/validate`,
+				{},
+			);
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe(
+				"a validation run is already open in this project",
+			);
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
 });
 
 describe("readJson bounds untrusted bodies (R1-2)", () => {

@@ -607,6 +607,13 @@ interface AppDeps {
 	defaultDir: string;
 	projects: Map<string, Entry>;
 	cancel(e: Entry, id: string, force: boolean): Promise<CancelOutcome>;
+	/** OTTR-1047: files at most one batch validation card for a done review's sandbox
+	 * leads (the turn loop's filePendingValidationRun); the manual start route calls it.
+	 * Optional only so narrow route-test mounts that never call the route stay type-valid. */
+	validateLeads?(
+		e: Entry,
+		reviewId: string,
+	): Promise<{ id: string } | { error: string; status: number }>;
 	stopTurn(e: Entry, id: string): Promise<StopOutcome>;
 	finishKept(
 		e: Entry,
@@ -10436,6 +10443,33 @@ export async function createApp(deps: AppDeps) {
 		return await taskResponse(e, task.id);
 	}
 
+	/** OTTR-1047: the manual start of a done review's batch validation run. The card
+	 * itself is filed by the turn loop (deps.validateLeads, filePendingValidationRun);
+	 * the route only gates the input and schedules after the filing. */
+	async function handlePOSTProjectsTasksValidateByProjectAndId(
+		req: BunRequest<"/api/projects/:project/tasks/:id/validate">,
+	): Promise<Response> {
+		const found = await resolveTask(req.params.project, req.params.id);
+		if (found instanceof Response) return found;
+		const { e, task } = found;
+		if (task.cancelledAt !== null)
+			return json({ error: "task is cancelled" }, 404);
+		if (!isReview(task))
+			return json({ error: "only a review card can be validated" }, 409);
+		if (task.stage !== "done")
+			return json(
+				{ error: "only a done review can start a validation run" },
+				409,
+			);
+		const fileRun = deps.validateLeads;
+		if (fileRun === undefined)
+			return json({ error: "validation filing is not wired" }, 500);
+		const filed = await fileRun(e, task.id);
+		if ("error" in filed) return json({ error: filed.error }, filed.status);
+		await deps.schedule();
+		return await taskResponse(e, filed.id);
+	}
+
 	/** The steering refusal for a card not in flight; null lets the steer queue. */
 	function steerStateRefusal(task: Task): Response | null {
 		if (
@@ -11856,8 +11890,8 @@ export async function createApp(deps: AppDeps) {
 
 	// The sandbox_run tool's board leg (docs/specs/microvm-validation-mode.md, "Board
 	// endpoint and tool"): agentRefusal already checked the run's boot token, so the
-	// handler checks the run kind (review or trending scout only) against the route's
-	// project — the calling run's own — and packs the TARGET project's registered
+	// handler checks the run kind (review, validation, or trending scout only) against
+	// the route's project — the calling run's own — and packs the TARGET project's
 	// checkout server-side. runSandboxJob reads the server's own env
 	// (OTTR_VM_RUNNER_URL, OTTR_WORKER_TOKEN, OTTR_DATA_DIR); the agent process never
 	// holds them (src/runner.ts childEnv strips OTTR_WORKER_TOKEN on purpose).
@@ -11883,13 +11917,20 @@ export async function createApp(deps: AppDeps) {
 		if (task === null)
 			return json(
 				{
-					error: `unknown task ${b.taskId}; sandbox_run needs this run's review or scout card`,
+					error: `unknown task ${b.taskId}; sandbox_run needs this run's review, validation, or scout card`,
 				},
 				403,
 			);
-		if (task.kind !== "review" && task.kind !== "trending")
+		if (
+			task.kind !== "review" &&
+			task.kind !== "validation" &&
+			task.kind !== "trending"
+		)
 			return json(
-				{ error: "sandbox_run runs only in review or trending scout runs" },
+				{
+					error:
+						"sandbox_run runs only in review, validation, or trending scout runs",
+				},
 				403,
 			);
 		// The body's project names the checkout to pack, which may differ from the
@@ -13983,6 +14024,17 @@ export async function createApp(deps: AppDeps) {
 				await api(
 					req,
 					async () => await handlePOSTProjectsTasksBacklogByProjectAndId(req),
+					{
+						costly: true,
+					},
+				),
+		},
+		// OTTR-1047: the manual start of a done review's batch validation run.
+		"/api/projects/:project/tasks/:id/validate": {
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksValidateByProjectAndId(req),
 					{
 						costly: true,
 					},
