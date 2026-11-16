@@ -4,6 +4,8 @@ Ottr uses two kinds of GitHub credentials. The token asked at onboarding (the "C
 
 The server's GitHub API fetches (GitHub App, trending scan, releases watch, branch-rule and auth probes, expiry probe) retry a `429`, a `502`/`503`/`504`, or a `403` that carries `Retry-After` or `x-ratelimit-remaining: 0`. The wait follows `Retry-After` or `x-ratelimit-reset`, capped at 4 seconds, with jittered exponential backoff and 3 attempts at most. Only repeat-safe requests (GET, HEAD) retry; a POST that creates something never retries. A wait above the cap stops, and the caller's next poll handles the error.
 
+The trending scan and the releases watch read public `api.github.com` data on every board. A `github.com` board sends the board token (`GH_TOKEN`). Another host sends the stored `github.com` token from **Settings → GitHub** first, then `GH_TOKEN`; the host's own token never goes to `api.github.com`. With no token, the scan's requests share the unauthenticated limit of 60 per hour of the network's IP. The **Trending scout** row in a project's settings shows a hint then, and a failed scan names it in its error. A `403` or `429` whose headers say the limit is used up is reported as a rate limit with its reset time.
+
 ### Recommended token
 
 Use a fine-grained personal access token:

@@ -2092,7 +2092,12 @@ describe("settings TOC", () => {
 				idleReviews={true}
 				trendingScan={true}
 				commitIdentity={null}
-				trendingStatus={{ lastRunAt: null, lastError: null, running: false }}
+				trendingStatus={{
+					lastRunAt: null,
+					lastError: null,
+					running: false,
+					tokenPresent: false,
+				}}
 				act={async () => true}
 				view="settings"
 				openTask={() => {}}

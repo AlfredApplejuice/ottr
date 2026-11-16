@@ -325,6 +325,10 @@ export interface TrendingStatus {
 	lastError: { reason: string; at: number } | null;
 	/** True while a scan fetches GitHub or a scout card is live on any project. */
 	running: boolean;
+	/** True when the scan can send a github.com token (GH_TOKEN, or a stored github.com
+	 *  token under Settings -> Git hosts); false means its api.github.com requests share
+	 *  the network IP's unauthenticated 60-per-hour limit. */
+	tokenPresent: boolean;
 }
 
 /** U7: an update card parked by holdUpdateMerges; the reply recognizes it by this reason. Shared by the turn loop and the drawer's hold action bar. */
@@ -334,6 +338,11 @@ export const UPDATE_HOLD_REASON =
 /** A fork-born task parked for merge approval; the reply recognizes it by this reason. */
 export const FORK_HOLD_REASON =
 	"Fork-research-born task: the merge is held. Reply to approve the merge, or cancel the card.";
+
+/** The trending scan's hint for a board with no github.com token: its api.github.com
+ *  requests then share the network IP's unauthenticated 60-per-hour limit. */
+export const TRENDING_TOKEN_HINT =
+	"Add a github.com token under Settings -> Git hosts. Requests without a token share the 60 per hour limit of your network's IP.";
 
 /** OTTR-274: a merge turn added changes beyond an approved hold head; the reply approves the exact parked push head. */
 export const MERGE_HOLD_MISMATCH_REASON =

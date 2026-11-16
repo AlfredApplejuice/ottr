@@ -132,6 +132,8 @@ import {
 	githubHost,
 	hostMatcher,
 	parseGithubHost,
+	storedGithubComToken,
+	upstreamToken,
 } from "./githubHost.ts";
 import { withGithubRetry } from "./githubRetry.ts";
 import {
@@ -2969,8 +2971,10 @@ export async function createApp(deps: AppDeps) {
 			publishSoon();
 			return next;
 		},
-		// No token and apiBase here: trending is a github.com feature, so the scan reads
-		// api.github.com and lends GH_TOKEN only on a github.com board (upstreamToken).
+		// The scan reads api.github.com on every board (trending is a github.com feature):
+		// a github.com board lends GH_TOKEN, another board lends the stored github.com
+		// token from Settings -> Git hosts first (upstreamToken via upstreamGithubToken).
+		token: upstreamGithubToken,
 		fetch: deps.trendingFetch,
 		now,
 		log: (msg: string) => console.log(`[trending] ${msg}`),
@@ -3035,6 +3039,9 @@ export async function createApp(deps: AppDeps) {
 		projects: () => deps.projects.values(),
 		load: async (p) => await deps.gstore.get(`ompWatch:${p}`),
 		save: async (p, s) => await deps.gstore.set(`ompWatch:${p}`, s),
+		// Upstream release fetches hit api.github.com: the same github.com token as the
+		// trending scan (upstreamGithubToken).
+		token: upstreamGithubToken,
 		log: (m) => console.log(`[omp-watch] ${m}`),
 		schedule: deps.schedule,
 	});
@@ -4329,6 +4336,15 @@ export async function createApp(deps: AppDeps) {
 	// token: gitAuthEnv scopes the helper to credential.https://<host>, so only a git
 	// call to that host reads it. Kept-unreadable stored rows are no credential, so the
 	// board token still covers the host when only those remain (ADR-0011).
+	/**
+	 * The token the trending scan and the omp releases watch lend to their api.github.com
+	 * fetches (upstreamToken): GH_TOKEN on a github.com board, the stored github.com
+	 * token from Settings -> Git hosts first on any other board.
+	 */
+	function upstreamGithubToken(): string | undefined {
+		return upstreamToken(process.env, storedGithubComToken(gitTokens));
+	}
+
 	function boardGitToken(): GitToken | null {
 		const h = githubHost();
 		if (h.isDefault || githubToken === null) return null;
@@ -5644,7 +5660,10 @@ export async function createApp(deps: AppDeps) {
 			idleReviews: deps.shared.idleReviews,
 			trendingScan: deps.shared.trendingScan,
 			commitIdentity: deps.shared.commitIdentity,
-			trendingStatus: await trendingScanner.status(),
+			trendingStatus: {
+				...(await trendingScanner.status()),
+				tokenPresent: upstreamGithubToken() !== undefined,
+			},
 			serverVersion: deps.serverVersion,
 			quota,
 			// Absent on self-hosted boards, so their payload stays as before.

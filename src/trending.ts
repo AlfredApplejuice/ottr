@@ -4,7 +4,12 @@ import { upstreamToken } from "./githubHost.ts";
 import { withGithubRetry } from "./githubRetry.ts";
 import { trendingScoutPrompt } from "./prompts.ts";
 import type { ProjectStore } from "./store.ts";
-import type { ListedTask, TrendingStatus, TrendingVerdict } from "./types.ts";
+import {
+	type ListedTask,
+	TRENDING_TOKEN_HINT,
+	type TrendingStatus,
+	type TrendingVerdict,
+} from "./types.ts";
 
 // Weekly GitHub trending pages the scan reads; their union is the week's candidate pool.
 export const TRENDING_PAGES: readonly string[] = [
@@ -204,12 +209,32 @@ export function createTrendingScanner(deps: {
 		| { ok: true; filed: string[] }
 		| { ok: false; status: 409 | 502; error: string }
 	>;
-	status(): Promise<TrendingStatus>;
+	status(): Promise<Omit<TrendingStatus, "tokenPresent">>;
 } {
 	const doFetch = withGithubRetry(deps.fetch ?? fetch);
 	const now = deps.now ?? Date.now;
 	// Shared by tick and scanNow: one scan at a time board-wide.
 	let inFlight = false;
+
+	/** Local HH:MM of an epoch-ms instant, e.g. 14:32. */
+	const clockAt = (ms: number): string => {
+		const d = new Date(ms);
+		return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+	};
+
+	/**
+	 * The rate-limit note of a 403/429 whose headers name the exhausted limit; null on
+	 * any other answer. With `x-ratelimit-reset` the note carries the reset time in the
+	 * server's local clock and the minutes left.
+	 */
+	function rateLimitNote(res: Response): string | null {
+		if (res.status !== 403 && res.status !== 429) return null;
+		if (res.headers.get("x-ratelimit-remaining") !== "0") return null;
+		const reset = Number((res.headers.get("x-ratelimit-reset") ?? "").trim());
+		if (!Number.isFinite(reset) || reset <= 0) return "rate limited";
+		const mins = Math.max(0, Math.round((reset * 1000 - now()) / 60000));
+		return `rate limited, resets at ${clockAt(reset * 1000)} (in ${mins} min)`;
+	}
 
 	// Fresh iteration per call: a one-shot iterator would be empty on the next tick.
 	const optedIn = async (): Promise<TrendingProject[]> => {
@@ -230,8 +255,12 @@ export function createTrendingScanner(deps: {
 		} catch (e) {
 			throw new Error(`trending page ${url}: ${errText(e)}`);
 		}
-		if (!res.ok)
-			throw new Error(`trending page ${url} returned HTTP ${res.status}`);
+		if (!res.ok) {
+			const note = rateLimitNote(res);
+			throw new Error(
+				`trending page ${url} returned HTTP ${res.status}${note === null ? "" : `: ${note}`}`,
+			);
+		}
 		let html: string;
 		try {
 			html = await res.text();
@@ -267,6 +296,8 @@ export function createTrendingScanner(deps: {
 
 	/** Non-2xx the scan cannot work around: rate limit, server error, auth. */
 	function apiFailure(path: string, res: Response): Error {
+		const note = rateLimitNote(res);
+		if (note !== null) return new Error(`GitHub API ${path}: ${note}`);
 		const why =
 			res.status === 403 || res.status === 429
 				? " (rate limited or forbidden)"
@@ -618,7 +649,13 @@ export function createTrendingScanner(deps: {
 			});
 			return { ok: true, filed };
 		} catch (e) {
-			const reason = errText(e).slice(0, 500);
+			const raw = errText(e).slice(0, 500);
+			// Without a token the scan shares the network IP's 60-per-hour limit:
+			// the hint rides every failure so the operator sees the fix.
+			const reason =
+				(deps.token ?? upstreamToken)() === undefined
+					? `${raw} ${TRENDING_TOKEN_HINT}`
+					: raw;
 			const at = now();
 			deps.log(`trending: scan failed: ${reason}`);
 			await deps.update((current) => {
@@ -700,7 +737,7 @@ export function createTrendingScanner(deps: {
 		}
 	}
 
-	async function status(): Promise<TrendingStatus> {
+	async function status(): Promise<Omit<TrendingStatus, "tokenPresent">> {
 		const s = await deps.load();
 		let running = inFlight;
 		if (!running)
