@@ -5577,6 +5577,106 @@ describe("ProjectSetupSteps gitless init jump", () => {
 			globalThis.fetch = realFetch;
 		}
 	});
+
+	test("Done appears only after the init and the settings walk", async () => {
+		const realFetch = globalThis.fetch;
+		const posts: string[] = [];
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			const method = init?.method ?? "GET";
+			if (method === "POST") posts.push(url);
+			// The init answers with a non-gitless view; the interview queues; the
+			// finish patch saves the checklist flag.
+			if (url.endsWith("/init") && method === "POST")
+				return okJson({ project: { ...gitless, gitless: false } });
+			if (url.endsWith("/interview") && method === "POST")
+				return okJson({ interview: "queued", id: "BARE-1" });
+			if (url.endsWith("/settings") && method === "POST")
+				// The settings route answers with the project view itself.
+				return okJson({ ...gitless, gitless: false });
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const buttonOf = (label: string): HTMLButtonElement => {
+			const b = [...container.querySelectorAll("button")].find(
+				(x) => x.textContent === label,
+			);
+			if (b === undefined) throw new Error(`no ${label} button`);
+			return b;
+		};
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectSetupSteps
+						project={gitless}
+						act={async (fn) => {
+							await fn();
+							return true;
+						}}
+						onClose={() => {}}
+					/>,
+				);
+			});
+			// At the gitless open the primary interview action and Back are not
+			// offered: the init button is the only way forward.
+			expect(
+				[...container.querySelectorAll("button")].some(
+					(b) => b.textContent === "Done",
+				),
+			).toBe(false);
+			expect(
+				[...container.querySelectorAll("button")].some(
+					(b) => b.textContent === "Back",
+				),
+			).toBe(false);
+			// Init lands on Automation. Done is a last-step action, so it is still
+			// absent here and returns once the walk reaches the rules step.
+			await act(async () => {
+				buttonOf("Create git repo").click();
+			});
+			expect(container.textContent).toContain("Retro");
+			expect(
+				[...container.querySelectorAll("button")].some(
+					(b) => b.textContent === "Done",
+				),
+			).toBe(false);
+			// The settings walk: Automation → Runners → Project → Rules.
+			await act(async () => {
+				buttonOf("Next").click();
+			});
+			expect(container.textContent).toContain("Runner cap");
+			await act(async () => {
+				buttonOf("Next").click();
+			});
+			expect(container.textContent).toContain("Target branch");
+			await act(async () => {
+				buttonOf("Next").click();
+			});
+			expect(container.textContent).toContain("Discuss rules");
+			// Done fires the interview; the finish patch follows it. The whole walk
+			// posts exactly: init, interview, checklist clear.
+			await act(async () => {
+				buttonOf("Done").click();
+			});
+			expect(posts).toHaveLength(3);
+			expect(posts[0]?.endsWith("/init")).toBe(true);
+			expect(posts[1]?.endsWith("/interview")).toBe(true);
+			expect(posts[2]?.endsWith("/settings")).toBe(true);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
 });
 
 describe("AlateSection user layer", () => {

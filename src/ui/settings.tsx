@@ -519,10 +519,11 @@ export function ProjectSetupSteps({
 		goto(step + 1);
 	};
 
-	/** The final Done: start the rules interview (init first when gitless), then finish.
-	 *  The settings steps saved first, so they hold for the interview's first commit. */
+	/** The final Done: start the rules interview, then finish. The settings steps
+	 *  saved first, so they hold for the interview's first commit. While gitless the
+	 *  button is hidden — the section's "Create git repo" leads into the settings
+	 *  walk instead (docs/specs/add-project-wizard.md). */
 	const finish = async (): Promise<boolean> => {
-		if (gitless && !(await initRepo())) return false;
 		if (!(await runInterview({}, () => setRulesQueued(true)))) return false;
 		const ok = await patch({ setupChecklist: false });
 		if (ok) onClose();
@@ -709,7 +710,7 @@ export function ProjectSetupSteps({
 						Skip, use defaults
 					</button>
 				)}
-				{step > 2 && (
+				{step > 2 && !gitless && (
 					<button type="button" onClick={() => goto(step - 1)}>
 						Back
 					</button>
@@ -719,9 +720,11 @@ export function ProjectSetupSteps({
 						Next
 					</button>
 				) : (
-					<BusyButton className="primary" run={finish}>
-						Done
-					</BusyButton>
+					!gitless && (
+						<BusyButton className="primary" run={finish}>
+							Done
+						</BusyButton>
+					)
 				)}
 			</div>
 		</>
