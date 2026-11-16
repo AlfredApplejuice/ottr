@@ -26959,6 +26959,267 @@ describe("stored review findings", () => {
 		expect(afterLead.validatedAt).toBeNull();
 		expect(afterLead.stage).toBe("backlog");
 	});
+
+	test("a review's done turn files the batch validation card on the live path (OTTR-1047)", async () => {
+		const record = baseRecord();
+		const { store, loop } = await storedReviewSetup(
+			record,
+			[],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+				recorded: [],
+			}),
+			// No stored findings: the settle lands done directly, and the done path
+			// must file the validation card for the review's leads.
+			[],
+			// A null run cap so schedule()'s tick reaches settleReviews (a 0 cap
+			// makes every tick return the cap bit before the settle).
+			{ maxTotalRuns: () => null },
+		);
+		const review = await reviewCard(store);
+		const leads = [
+			await leadCard(
+				store,
+				review.id,
+				"Needs validation: lead A\nBlocker: sandbox run: ca",
+			),
+			await leadCard(
+				store,
+				review.id,
+				"Needs validation: lead B\nBlocker: sandbox run: cb",
+			),
+			await leadCard(
+				store,
+				review.id,
+				"Needs validation: lead C\nBlocker: sandbox run: cc",
+			),
+		];
+
+		await loop.runTurn(store.name, review.id);
+
+		// The done path filed exactly one queued validation card for the review,
+		// with the whole batch (no stored ranks: card id order) in its prompt.
+		const after = (await store.getTask(review.id))!;
+		expect(after.stage).toBe("done");
+		const cards = (await store.listTasks()).filter(
+			(t) => t.kind === "validation",
+		);
+		expect(cards).toHaveLength(1);
+		const card = cards[0]!;
+		expect(card.followUpOf).toBe(review.id);
+		expect(card.stage).toBe("todo");
+		expect(card.state).toBe("queued");
+		expect(card.prompt).toBe(
+			validationRunPrompt({
+				reviewId: review.id,
+				leads: leads.map((l) => ({ id: l.id, prompt: l.prompt })),
+			}),
+		);
+		// The leads stay leads: the validation run has not happened yet.
+		for (const lead of leads) {
+			const full = (await store.getTask(lead.id))!;
+			expect(full.validatedAt).toBeNull();
+			expect(full.stage).toBe("backlog");
+		}
+	});
+
+	test("a review's scheduled settle files the batch validation card on the review path (OTTR-1047)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await storedReviewSetup(
+			record,
+			[],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+				recorded: [],
+			}),
+			[],
+			// A null run cap so schedule()'s tick reaches settleReviews (a 0 cap
+			// makes every tick return the cap bit before the settle).
+			{ maxTotalRuns: () => null },
+		);
+		projects.get(store.name)!.target = "origin/main";
+		const review = await reviewCard(store);
+		const leads = [
+			await leadCard(
+				store,
+				review.id,
+				"Needs validation: lead A\nBlocker: sandbox run: ca",
+			),
+			await leadCard(
+				store,
+				review.id,
+				"Needs validation: lead B\nBlocker: sandbox run: cb",
+			),
+			await leadCard(
+				store,
+				review.id,
+				"Needs validation: lead C\nBlocker: sandbox run: cc",
+			),
+		];
+		// Park the review in the tick's held shape without running any turn: the
+		// scheduled settleReviewCard is the path under test.
+		await store.updateTask(review.id, {
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+		});
+		await loop.schedule();
+		await eventually(
+			async () => (await store.getTask(review.id))?.stage === "done",
+		);
+
+		const cards = (await store.listTasks()).filter(
+			(t) => t.kind === "validation",
+		);
+		expect(cards).toHaveLength(1);
+		expect(cards[0]!.followUpOf).toBe(review.id);
+		expect(cards[0]!.stage).toBe("todo");
+		expect(cards[0]!.state).toBe("queued");
+		expect(cards[0]!.prompt).toBe(
+			validationRunPrompt({
+				reviewId: review.id,
+				leads: leads.map((l) => ({ id: l.id, prompt: l.prompt })),
+			}),
+		);
+
+		// A second tick files no second card (the one-open guard) and the
+		// review stays done.
+		await loop.schedule();
+		await flushPromises();
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "validation"),
+		).toHaveLength(1);
+		expect((await store.getTask(review.id))!.stage).toBe("done");
+	});
+
+	test("a release review's scheduled settle files the batch validation card on the release path (OTTR-1047)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await storedReviewSetup(
+			record,
+			[],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+				recorded: [],
+			}),
+			[],
+			{ publishRelease: publishingRelease(record), maxTotalRuns: () => null },
+		);
+		projects.get(store.name)!.target = "origin/main";
+		const review = await store.createTask(
+			`${ARCH_REVIEW_MARKER}release v1.0.0`,
+			null,
+			"review",
+		);
+		await store.updateTask(review.id, {
+			releaseVersion: "v1.0.0",
+			base: "shaR",
+			worktree: "wt-rel",
+			branch: "ott/rel",
+			releaseNotes: "notes body",
+			// Parked in the tick's held shape directly: the scheduled
+			// settleReleaseCard (publish, then done, then the filing) is the path
+			// under test, and no live turn runs.
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+		});
+		const lead = await leadCard(
+			store,
+			review.id,
+			"Needs validation: release lead\nBlocker: sandbox run: cr",
+		);
+		await loop.schedule();
+		await eventually(
+			async () => (await store.getTask(review.id))?.stage === "done",
+		);
+
+		expect(record.publishRelease).toHaveLength(1);
+		const done = (await store.getTask(review.id))!;
+		expect(done.summary).toBe("Released v1.0.0");
+		const cards = (await store.listTasks()).filter(
+			(t) => t.kind === "validation",
+		);
+		expect(cards).toHaveLength(1);
+		expect(cards[0]!.followUpOf).toBe(review.id);
+		expect(cards[0]!.stage).toBe("todo");
+		expect(cards[0]!.state).toBe("queued");
+		expect(cards[0]!.prompt).toContain(`#${lead.id}`);
+	});
+
+	test("a run whose results apply to nothing parks needs_you and stops the chain (OTTR-1047)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop, batches } = await validationCase(record);
+		const review = await doneReview(store, "stuck");
+		const lead = await leadCard(
+			store,
+			review.id,
+			"Needs validation: stuck lead\nBlocker: sandbox run: cs",
+		);
+		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
+		expect("id" in v1).toBe(true);
+		if (!("id" in v1)) throw new Error("no validation run filed");
+		// Every parsed result names a lead id no card carries: the run applies
+		// nothing, so landing done would refile the same batch forever.
+		batches.push([mkFinding("Validation: #no-such-card confirmed\nevidence")]);
+		await loop.runTurn(store.name, v1.id);
+
+		const after = await settled(store, v1.id);
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"None of the validation run's results applied to a lead",
+		);
+		const afterLead = (await store.getTask(lead.id))!;
+		expect(afterLead.validatedAt).toBeNull();
+		expect(afterLead.stage).toBe("backlog");
+		expect(afterLead.state).toBe("idle");
+		// A needs_you validation card triggers nothing: exactly one card exists.
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "validation"),
+		).toHaveLength(1);
+	});
+
+	test("the strict manual start files for its review only; the chain call falls back (OTTR-1047)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await validationCase(record);
+		const a = await doneReview(store, "no batchable lead");
+		await leadCard(
+			store,
+			a.id,
+			"Needs validation: proxy\nBlocker: deployment fact: Which proxy?",
+		);
+		const b = await doneReview(store, "one sandbox lead");
+		const bLead = await leadCard(
+			store,
+			b.id,
+			"Needs validation: b lead\nBlocker: sandbox run: cb",
+		);
+
+		// Strict (the manual start): review A has no batchable lead (a
+		// deployment-fact lead never enters a batch), so the start refuses
+		// instead of filing for B.
+		const strict = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			a.id,
+			true,
+		);
+		expect(strict).toEqual({
+			error: `no batchable leads for review ${a.id}`,
+			status: 409,
+		});
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "validation"),
+		).toHaveLength(0);
+
+		// Non-strict (the chain): the call still falls back to the next
+		// candidate review, here B.
+		const chain = await loop.filePendingValidationRun(entryOf(projects, store));
+		expect("id" in chain).toBe(true);
+		if (!("id" in chain)) throw new Error("no validation run filed");
+		const card = (await store.getTask(chain.id))!;
+		expect(card.followUpOf).toBe(b.id);
+		expect(card.prompt).toContain(`#${bLead.id}`);
+	});
 });
 
 describe("prompt gate", () => {

@@ -306,7 +306,11 @@ per call, in one store transaction. It returns `{ id }` for the new card, or
   manual start overrides).
 - Keeps at most one open validation card per project: the call files one card
   only. Priority: an explicit `reviewId` argument first (the chain of the run
-  that just finished), then candidate reviews by `doneAt` ascending.
+  that just finished), then candidate reviews by `doneAt` ascending. A
+  `strictReview` call files for that review only: when the named review has no
+  batchable leads it refuses (409, `no batchable leads for review <reviewId>`)
+  instead of falling back to another candidate. The chain trigger keeps the
+  priority-then-fallback.
 - Creates the card: `createTask(batchPrompt, planModel, "validation")` (it
   lands `todo`/`queued`), then `updateTask` with `followUpOf` (the review),
   `promptAuthor: "board"`, and details
@@ -331,8 +335,8 @@ manual start, not through a periodic sweep):
    `settleReleaseCard` after their `done` write.
 2. After a validation card settles `done` (the chain: the same review's
    remainder first, then other candidate reviews). A validation card that
-   lands `needs_you` triggers nothing, so a run that records no results stops
-   its chain.
+   lands `needs_you` triggers nothing, so a run that records no results, or
+   none that apply, stops its chain.
 3. The manual start below.
 
 The batch prompt is a new builder in `src/prompts.ts`,
@@ -402,8 +406,11 @@ and title dedupe keys stable:
 
 A run that parses zero results parks the validation card at `needs_you`
 ("The validation run recorded no per-lead results"), touches no lead, and
-files no follow-up. Otherwise the card lands `done` and the chain trigger
-runs the filing again.
+files no follow-up. A run that parses results but applies none of them (a
+foreign lead id, a missing card, another review's card) parks the card at
+`needs_you` too ("None of the validation run's results applied to a lead")
+and files no follow-up: its chain stops. Otherwise the card lands `done` and
+the chain trigger runs the filing again.
 
 ##### Manual start
 
@@ -411,10 +418,13 @@ runs the filing again.
 card): the route resolves the task, refuses a non-review, a review that is
 not `done`, or a cancelled card (404/409 with a short reason), then calls the
 loop's `filePendingValidationRun` for that review through a new `AppDeps`
-entry wired next to `cancel` in `src/server.ts`. An open validation card
-anywhere in the project answers 409. The route calls `deps.schedule()` and
-returns the new card. The manual start overrides the cancelled-decline skip,
-so the user can restart a declined review's validation.
+entry wired next to `cancel` in `src/server.ts`. The route passes the strict
+flag, so the start files for that review only and refuses (409, `no batchable
+leads for review <id>`) when the review has no batchable leads. An open
+validation card anywhere in the project answers 409. The route calls
+`deps.schedule()` and returns the new card. The manual start overrides the
+cancelled-decline skip, so the user can restart a declined review's
+validation.
 
 ##### Settings
 
@@ -598,10 +608,31 @@ before the run resolves.
     `merging` landing refuses with `needs_you`.
 20. app (red, OTTR-1047): the sandbox endpoint accepts a validation-kind card
     and still refuses a work card; the manual validate route files, queues
-    and schedules for a done review, refuses a not-done or cancelled review,
+    and schedules for a done review, calls the filing with the strict flag
+    (`(entry, review id, true)`), refuses a not-done or cancelled review,
     and answers 409 while a validation card is open.
 21. settings (OTTR-1047): `validationBatchSize` round-trips, and a stored
     value below 1 behaves as 1.
+22. turn (red, OTTR-1047): a review that lands `done` through the live settle
+    path files exactly one queued validation card (`kind: "validation"`,
+    `followUpOf` the review) whose prompt lists all three lead ids and no
+    others; the leads stay unvalidated (`validatedAt` null).
+23. turn (red, OTTR-1047): a review parked at `merging` that the scheduled
+    `settleReviewCard` tick lands `done` files exactly one validation card,
+    and a second tick files no second card (the one-open guard) and leaves
+    the review done.
+24. turn (red, OTTR-1047): a release review parked at `merging` that the
+    scheduled `settleReleaseCard` tick publishes and lands `done` files
+    exactly one validation card following the release review, with the lead
+    id in the prompt.
+25. turn (red, OTTR-1047): a run whose results all fail to apply (a lead id
+    no card carries) lands the validation card `needs_you` with the exact
+    reason "None of the validation run's results applied to a lead", touches
+    no lead, and files no follow-up card: the chain stops.
+26. turn (red, OTTR-1047): the strict manual start files for the named review
+    only — a review with no batchable leads answers 409
+    `no batchable leads for review <id>` and no card files — while the
+    non-strict chain call still falls back to the next candidate review.
 
 ## Non-goals
 

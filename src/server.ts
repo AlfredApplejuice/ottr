@@ -929,7 +929,9 @@ const app = await createApp({
 	workersHome,
 	projects,
 	cancel: loop.cancel,
-	validateLeads: loop.filePendingValidationRun,
+	// OTTR-1047: the manual start is strict — it files for the named review only.
+	validateLeads: (e, reviewId) =>
+		loop.filePendingValidationRun(e, reviewId, true),
 	stopTurn: loop.stopTurn,
 	creditStop: loop.creditStop,
 	creditRelease: loop.creditRelease,

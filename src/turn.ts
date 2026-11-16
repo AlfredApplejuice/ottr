@@ -1550,10 +1550,13 @@ export interface TurnLoop {
 	cancel(e: TurnProject, id: string, force: boolean): Promise<CancelOutcome>;
 	/** OTTR-1047: files at most one batch validation card ({ id }), or { error, status }
 	 * when nothing files. The manual start route passes the review's id (it overrides a
-	 * cancelled-decline skip); the done-review and chain triggers call it without one. */
+	 * cancelled-decline skip) with `strictReview`: it files for that review only and
+	 * refuses when the review has no batchable leads; the done-review and chain triggers
+	 * call it without one and fall back to the next candidate. */
 	filePendingValidationRun(
 		e: TurnProject,
 		reviewId?: string,
+		strictReview?: boolean,
 	): Promise<{ id: string } | { error: string; status: number }>;
 	/** Stops the running turn without cancelling the task (the board's Esc). */
 	stopTurn(e: TurnProject, id: string): Promise<StopOutcome>;
@@ -8884,6 +8887,15 @@ export function createTurnLoop(
 		await st.log(
 			`- validation results: ${applied} applied, ${first.size - applied} not applied`,
 		);
+		// Nothing applied: the run made no progress, so landing done would refile the
+		// same batch forever. Park needs_you and stop the chain (the zero-applied stop
+		// next to the zero-parsed one above).
+		if (applied === 0)
+			return {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: "None of the validation run's results applied to a lead",
+			};
 		// The deployment leads join the review's question flow: one open question card
 		// gains the questions in its `asked`; with none the settle files the filing
 		// pass's question card, exact shape.
@@ -8937,13 +8949,16 @@ export function createTurnLoop(
 	 * card is cancelled stays declined unless `reviewId` overrides (the manual start).
 	 * One validation run is open per project, so the call files one card only: an open
 	 * card anywhere answers 409. Priority: an explicit `reviewId` first (the chain of the
-	 * run that just finished), then candidate reviews by doneAt ascending. The batch is
-	 * the review's batchable leads in severity order — ascending rank from the review's
-	 * stored findings by exact prompt (missing rank last, ties by card id) — capped at
-	 * `validationBatchSize` (below 1 behaves as 1). */
+	 * run that just finished), then candidate reviews by doneAt ascending. With
+	 * `strictReview` (the manual start) the call files for that review only and refuses
+	 * when it has no batchable leads, instead of falling back to another candidate. The
+	 * batch is the review's batchable leads in severity order — ascending rank from the
+	 * review's stored findings by exact prompt (missing rank last, ties by card id) —
+	 * capped at `validationBatchSize` (below 1 behaves as 1). */
 	async function filePendingValidationRun(
 		e: TurnProject,
 		reviewId?: string,
+		strictReview?: boolean,
 	): Promise<{ id: string } | { error: string; status: number }> {
 		return await e.store.transaction(async () => {
 			const tasks = await e.store.listTasks();
@@ -9001,11 +9016,21 @@ export function createTurnLoop(
 				.sort((a, b) => {
 					if (a.id === reviewId) return -1;
 					if (b.id === reviewId) return 1;
-					return (a.doneAt ?? 0) - (b.doneAt ?? 0);
+					// The id tiebreak keeps the pick deterministic when two reviews
+					// land done in the same millisecond.
+					return (a.doneAt ?? 0) - (b.doneAt ?? 0) || (a.id < b.id ? -1 : 1);
 				});
-			const review = candidates[0];
+			const review = strictReview
+				? candidates.find((t) => t.id === reviewId)
+				: candidates[0];
 			if (review === undefined)
-				return { error: "no batchable leads", status: 409 };
+				return {
+					error:
+						reviewId === undefined
+							? "no batchable leads"
+							: `no batchable leads for review ${reviewId}`,
+					status: 409,
+				};
 			const leads = batchableOf(review);
 			const ranks = new Map<string, number>();
 			for (const finding of await e.store.listReviewFindings(review.id))

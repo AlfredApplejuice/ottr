@@ -359,6 +359,7 @@ let validateLeadsImpl:
 	| ((
 			e: Entry,
 			reviewId: string,
+			strictReview?: boolean,
 	  ) => Promise<{ id: string } | { error: string; status: number }>)
 	| null = null;
 const loopStubs = () => ({
@@ -367,10 +368,10 @@ const loopStubs = () => ({
 		finishKeptImpl(e, id, choices),
 	stopTurn: (e: Entry, id: string) => stopTurnImpl(e, id),
 	claimedPids: () => new Set<number>(),
-	validateLeads: (e: Entry, reviewId: string) => {
+	validateLeads: (e: Entry, reviewId: string, strictReview?: boolean) => {
 		if (!validateLeadsImpl)
 			return Promise.reject(new Error("validateLeads not stubbed"));
-		return validateLeadsImpl(e, reviewId);
+		return validateLeadsImpl(e, reviewId, strictReview);
 	},
 });
 // Deepen seam: the route tests swap deepenImpl per test; unstubbed calls fail loudly.
@@ -10052,9 +10053,13 @@ describe("manual validation start route (OTTR-1047)", () => {
 
 	test("the manual start files one queued validation child and schedules", async () => {
 		const { review, lead } = await doneReviewWithLead();
-		const seen: Array<{ e: Entry; reviewId: string }> = [];
-		validateLeadsImpl = async (e, reviewId) => {
-			seen.push({ e, reviewId });
+		const seen: Array<{
+			e: Entry;
+			reviewId: string;
+			strictReview?: boolean;
+		}> = [];
+		validateLeadsImpl = async (e, reviewId, strictReview) => {
+			seen.push({ e, reviewId, strictReview });
 			// The seam mimics the loop's filing: createTask lands the card queued.
 			const card = await e.store.createTask(
 				"Batch validation of 1 lead(s) of review.",
@@ -10078,6 +10083,9 @@ describe("manual validation start route (OTTR-1047)", () => {
 			expect(seen.length).toBe(1);
 			expect(seen[0]!.reviewId).toBe(review.id);
 			expect(seen[0]!.e.store).toBe(store);
+			// The start is strict: it files for this review only and must never
+			// accept a fallback to another candidate review.
+			expect(seen[0]!.strictReview).toBe(true);
 			const card = (await store.listTasks()).find((t) => t.id === b.id)!;
 			expect(card.kind).toBe("validation");
 			expect(card.followUpOf).toBe(review.id);

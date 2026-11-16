@@ -613,6 +613,7 @@ interface AppDeps {
 	validateLeads?(
 		e: Entry,
 		reviewId: string,
+		strictReview?: boolean,
 	): Promise<{ id: string } | { error: string; status: number }>;
 	stopTurn(e: Entry, id: string): Promise<StopOutcome>;
 	finishKept(
@@ -10464,7 +10465,7 @@ export async function createApp(deps: AppDeps) {
 		const fileRun = deps.validateLeads;
 		if (fileRun === undefined)
 			return json({ error: "validation filing is not wired" }, 500);
-		const filed = await fileRun(e, task.id);
+		const filed = await fileRun(e, task.id, true);
 		if ("error" in filed) return json({ error: filed.error }, filed.status);
 		await deps.schedule();
 		return await taskResponse(e, filed.id);
