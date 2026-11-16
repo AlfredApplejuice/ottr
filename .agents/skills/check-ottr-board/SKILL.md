@@ -79,7 +79,7 @@ The script sorted the cards with this table; the table is the rule.
 | Card | Verdict |
 |---|---|
 | `needs_you` with `asked` | A question for the user. Not stuck. |
-| `needs_you` with an approval reason: "Update card: read the summary, then reply to approve the merge.", "Fork-research-born task: the merge is held. …", or a held proposal that ends with "Accept to start it, edit the prompt first, or cancel to decline." | A decision for the user. Not stuck. |
+| `needs_you` with an approval reason: "Update card: read the summary, then reply to approve the merge.", "Fork-research-born task: the merge is held. …", or a proposal that ends with "Accept starts it. Edit task changes the prompt first. Cancel task declines it." (stored reasons from before 2026-11 end with "Accept to start it, edit the prompt first, or cancel to decline.") | A decision for the user. Not stuck. |
 | `needs_you` with a resume reason: "Please resume … after `<date>`" or "Re-run this card's … after `<date>`" | Waits by design: it resumes on the condition in its reason. Not stuck. |
 | `needs_you` with any other reason | Stuck. Go to step 4. |
 | `running` or `preparing` | Stuck only when the log does not grow for 20 minutes, or when a check runs past its limit of 30 minutes (`maxTime` 1800 s). The board sweeps dead runs by itself, so wait one 60 s tick before you act. |
