@@ -29,6 +29,22 @@ const ambientDataRoot =
 	providedRoot ?? mkdtempSync(join(tmpdir(), "ottr-sbx-smoke-ambient-"));
 // Only remove and restore what this file created; the guard owns its own dir.
 const ownsRoot = providedRoot === undefined;
+
+// The sandbox staging signature: <project>/validate-jobs/<id>. The belt root may
+// legally carry other OTTR_DATA_DIR consumers — ProjectStore adopts
+// <dataRoot>/<store name> per board entry — so only this signature names a leak.
+function sandboxStageDirs(root: string): string[] {
+	const out: string[] = [];
+	for (const project of readdirSync(root, { withFileTypes: true })) {
+		if (!project.isDirectory()) continue;
+		for (const leaf of readdirSync(join(root, project.name), {
+			withFileTypes: true,
+		}))
+			if (leaf.isDirectory() && leaf.name === "validate-jobs")
+				out.push(join(project.name, leaf.name));
+	}
+	return out;
+}
 const savedDataDir = process.env.OTTR_DATA_DIR;
 beforeAll(() => {
 	// Both modes: in guard mode this re-establishes the value after earlier
@@ -36,7 +52,7 @@ beforeAll(() => {
 	process.env.OTTR_DATA_DIR = ambientDataRoot;
 });
 afterAll(() => {
-	const staged = readdirSync(ambientDataRoot);
+	const staged = sandboxStageDirs(ambientDataRoot);
 	if (savedDataDir === undefined) delete process.env.OTTR_DATA_DIR;
 	else process.env.OTTR_DATA_DIR = savedDataDir;
 	// The guard owns its watched dir; this file removes only what it created.

@@ -1,5 +1,18 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import {
+	afterAll,
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	test,
+} from "bun:test";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -130,6 +143,50 @@ afterEach(() => {
 	runtimeReady = true;
 	stopHandlers.length = 0;
 	resultHandlers.length = 0;
+});
+
+// The sandbox staging signature: <project>/validate-jobs/<id>. The belt root may
+// legally carry other OTTR_DATA_DIR consumers — ProjectStore adopts
+// <dataRoot>/<store name> per board entry — so only this signature names a leak.
+function sandboxStageDirs(root: string): string[] {
+	const out: string[] = [];
+	for (const project of readdirSync(root, { withFileTypes: true })) {
+		if (!project.isDirectory()) continue;
+		for (const leaf of readdirSync(join(root, project.name), {
+			withFileTypes: true,
+		}))
+			if (leaf.isDirectory() && leaf.name === "validate-jobs")
+				out.push(join(project.name, leaf.name));
+	}
+	return out;
+}
+
+// Belt against /data: merge and review turns run bun test inside the server
+// container, where OTTR_DATA_DIR is the board's live data root. The sandbox_run
+// execute tests set their own data root, but a future staging call that drops
+// it would consult the ambient env — and the afterEach above deletes it after
+// every test, so this file re-establishes the belt root before every test. The
+// sandbox data guard (src/sandboxRunDataGuard.test.ts) provides
+// OTTR_TEST_DATA_ROOT: the belt then IS the guard's watched dir, so such a call
+// lands there and fails both this file's afterAll and the guard.
+const providedRoot = process.env.OTTR_TEST_DATA_ROOT;
+const beltDataRoot =
+	providedRoot ?? mkdtempSync(join(tmpdir(), "ottr-tracker-ambient-"));
+// Only remove and restore what this file created; the guard owns its own dir.
+const ownsRoot = providedRoot === undefined;
+const savedDataDir = process.env.OTTR_DATA_DIR;
+beforeEach(() => {
+	process.env.OTTR_DATA_DIR = beltDataRoot;
+});
+afterAll(() => {
+	// Read, restore, remove, then assert: a failure here must not orphan the dir.
+	const staged = sandboxStageDirs(beltDataRoot);
+	if (savedDataDir === undefined) delete process.env.OTTR_DATA_DIR;
+	else process.env.OTTR_DATA_DIR = savedDataDir;
+	if (ownsRoot)
+		rmSync(beltDataRoot, { recursive: true, force: true, maxRetries: 5 });
+	// Nothing may stage through the ambient env; the execute tests own their root.
+	expect(staged).toEqual([]);
 });
 
 const text = (r: ToolResult) => r.content[0]!.text;

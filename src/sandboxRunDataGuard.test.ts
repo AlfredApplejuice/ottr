@@ -27,6 +27,22 @@ const sandboxTestFiles = [
 
 const liveJobsDir = "/data/ottr/validate-jobs";
 
+// The sandbox staging signature: <project>/validate-jobs/<id>. The watched dir
+// may legally carry other OTTR_DATA_DIR consumers — ProjectStore adopts
+// <dataRoot>/<store name> per board entry — so only this signature names a leak.
+function sandboxStageDirs(root: string): string[] {
+	const out: string[] = [];
+	for (const project of readdirSync(root, { withFileTypes: true })) {
+		if (!project.isDirectory()) continue;
+		for (const leaf of readdirSync(join(root, project.name), {
+			withFileTypes: true,
+		}))
+			if (leaf.isDirectory() && leaf.name === "validate-jobs")
+				out.push(join(project.name, leaf.name));
+	}
+	return out;
+}
+
 test("the suite's sandbox paths never stage a job in the ambient OTTR_DATA_DIR", () => {
 	const dataDir = mkdtempSync(join(tmpdir(), "ottr-sbx-guard-"));
 	const before = existsSync(liveJobsDir) ? readdirSync(liveJobsDir) : null;
@@ -50,7 +66,7 @@ test("the suite's sandbox paths never stage a job in the ambient OTTR_DATA_DIR",
 		// Channel 1 first, so it reports even when the child is already red: the
 		// belt files use OTTR_TEST_DATA_ROOT as their root, so a staging call that
 		// consults the ambient env lands right here.
-		expect(readdirSync(dataDir)).toEqual([]);
+		expect(sandboxStageDirs(dataDir)).toEqual([]);
 		expect(run.exitCode).toBe(0);
 		// Channel 2: the live dir gains only real jobs (they carry result.json).
 		if (before !== null) {
