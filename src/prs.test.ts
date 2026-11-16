@@ -213,6 +213,8 @@ async function setup(
 		github?: string | null;
 		spawn?: SpawnFn;
 		perfScan?: (diff: string, labels: string[]) => PerfFinding[];
+		/** OTTR-1071: the host's background-work hook for the quiet-time tick. */
+		runQuiet?: (project: string) => Promise<void> | void;
 	} = {},
 ) {
 	const dir = join(root, `p${++seq}`);
@@ -295,6 +297,7 @@ async function setup(
 		spawn: opts.spawn,
 		perfScan: opts.perfScan,
 		schedule,
+		runQuiet: opts.runQuiet,
 		review: opts.spawn
 			? undefined
 			: async (messages) => {
@@ -1237,6 +1240,29 @@ describe("createPrWatcher", () => {
 		expect(second[0]!.cancelled).toBe(true);
 		expect(third[0]).not.toBe(second[0]);
 		expect(third[0]!.delay).toBe(PR_GATES.QUIET_MS + QUIET_RUN_SLACK_MS);
+	});
+
+	test("the fired quiet timer runs under the host's background control", async () => {
+		// The board passes backgroundTick, so shutdown neither starts the scan nor
+		// loses its rejection; the watcher must delegate to it, not scan directly.
+		const quietRuns: string[] = [];
+		const s = await setup({
+			runQuiet: (project) => {
+				quietRuns.push(project);
+				return s.watcher.tick({ manual: project });
+			},
+		});
+		s.setOpen([pr(1, sha("a"))]);
+		await s.watcher.tick();
+		const pending = s.pendingTimers();
+		expect(pending).toHaveLength(1);
+		s.advance(PR_GATES.QUIET_MS + QUIET_RUN_SLACK_MS);
+		pending[0]!.fire();
+		await s.watcher.tick({ manual: "p" });
+		// The hook got the project, and the review it ran produced the draft.
+		expect(quietRuns).toEqual(["p"]);
+		expect(s.prompts).toHaveLength(1);
+		expect((await s.cards()).length).toBe(1);
 	});
 
 	test("concurrent review requests share the final daily slot", async () => {

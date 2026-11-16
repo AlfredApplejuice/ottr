@@ -1713,6 +1713,11 @@ export function createPrWatcher(deps: {
 	/** OTTR-1071: timer seam for the quiet-time runs; defaults to setTimeout. Tests inject
 	 * a fake clock, so no test waits on a real timer. */
 	schedule?: (fn: () => void, ms: number) => () => void;
+	/** OTTR-1071: the host's background-work control for the timer-fired tick (the board
+	 * passes backgroundTick: no new scan once it closes, the run is tracked so close()
+	 * drains it, rejections are logged). Defaults to a direct tick whose rejection the
+	 * watcher logs. */
+	runQuiet?: (project: string) => Promise<void> | void;
 }): {
 	tick(opts?: { manual?: string }): Promise<void>;
 	reviewNow(o: {
@@ -1798,6 +1803,15 @@ export function createPrWatcher(deps: {
 	// the check route, so every gate holds at fire time: prReviews on, daily cap,
 	// cancelled card, head already reviewed.
 	const tick = singleFlightTick((opts) => scanTick(ctx, opts));
+	// The board's backgroundTick: no new scan once the app closes, the run is tracked
+	// so close() drains it, and a rejection lands in the error log. Without the hook
+	// (standalone watchers, tests), the tick runs directly and a rejection is logged.
+	const runQuiet =
+		deps.runQuiet ??
+		((project: string) =>
+			tick({ manual: project }).catch((e) =>
+				log(`prs: ${project}: quiet-time run failed: ${(e as Error).message}`),
+			));
 	const scheduleQuietRun = (project: string, at: number | null): void => {
 		const pending = quietTimers.get(project);
 		if (pending && pending.at === at) return;
@@ -1810,7 +1824,7 @@ export function createPrWatcher(deps: {
 			() => {
 				// Delete first: a scan that runs inside the handler must not see a stale entry.
 				quietTimers.delete(project);
-				void tick({ manual: project }).catch(() => {});
+				void runQuiet(project);
 			},
 			Math.max(0, at + QUIET_RUN_SLACK_MS - now()),
 		);

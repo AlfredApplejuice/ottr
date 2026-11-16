@@ -3021,6 +3021,13 @@ export async function createApp(deps: AppDeps) {
 		log: (msg: string) => console.log(`[pr] ${msg}`),
 		gh,
 		spawn: deps.prReviewSpawn,
+		// OTTR-1071: the quiet-time timer's tick runs under the same background control
+		// as the hourly poll: no new scan once the app closes, close() drains the run,
+		// and a rejection reaches the error log.
+		runQuiet: (project) =>
+			backgroundTick("PR review quiet gate", () =>
+				prWatcher.tick({ manual: project }),
+			),
 		// A re-review rewrites a draft the user may have read: the mark must go,
 		// or the updated card never wears the unread badge again. OTTR-827: the
 		// completion key goes with the plain id, or a done card's rail mark would
