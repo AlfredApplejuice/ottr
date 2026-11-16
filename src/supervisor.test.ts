@@ -5499,6 +5499,48 @@ describe("CI on the PR head", () => {
 		await store.close();
 	});
 
+	test("a pass on the head clears the stored answered failure", async () => {
+		// A re-run passes: the answered failure is stale state. The watch clears it
+		// with pushSha, so a later no-commit ready turn cannot divert with the old
+		// failed-check lines while the head's CI is green.
+		const dir = join(root, "ci-pr-head-pass-clears");
+		const store = await ProjectStore.open(dir);
+		const t = await prCard(store);
+		const failed = {
+			id: 42,
+			status: "completed",
+			conclusion: "failure",
+			name: "build",
+			html_url: "https://example.com/run/42",
+		};
+		const ops = fakeOps({
+			ghResult: { code: 0, stdout: runsJson([failed]), stderr: "" },
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const answered = (await store.getTask(t.id))!;
+		expect(answered.ciPrAnsweredKey).toBe("abc1234567890:42#1");
+		// The fix turn ships; the settle re-pins the same head. The re-run passed.
+		await store.updateTask(t.id, {
+			stage: "merging",
+			state: "idle",
+			pendingPrompt: null,
+			pushSha: "abc1234567890",
+		});
+		ops.ghResult = {
+			code: 0,
+			stdout: runsJson([{ ...failed, conclusion: "success", run_attempt: 2 }]),
+			stderr: "",
+		};
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = (await store.getTask(t.id))!;
+		expect(after.pushSha).toBeNull();
+		expect(after.ciPrAnsweredKey).toBeNull();
+		expect(after.ciPrAnsweredInfo).toBeNull();
+		const log = await Bun.file(await store.logPath(t.id)).text();
+		expect(log).toContain("CI passed for abc1234");
+		await store.close();
+	});
+
 	test("the reply carries the fetched failed-step log block", async () => {
 		const dir = join(root, "ci-pr-head-log");
 		const store = await ProjectStore.open(dir);

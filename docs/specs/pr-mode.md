@@ -627,17 +627,25 @@ The fix stores the answer on the card row:
   follow-up card. A new attempt of the same run, or a new head SHA, yields
   a new key and gets exactly one reply. The reply write stores the key
   and the info on the card.
-- The no-new-commit settle (`classifyTurnEnd` in src/turn.ts): a work
-  turn on a card with a `prNumber` meets three conditions. The outcome
-  classifies to merging/queued. The stored key starts with
-  `<prHeadSha>:`. The branch tip still equals `prHeadSha`. The card then
-  settles `merging`/`idle` and queues no merge turn. It ships nothing and
-  re-runs no gate, because the tree is the already-verified shipped tree.
-  The settle re-pins `pushSha` to the tip, so the CI watch stays on the
-  head. `needsReason` shows the failed check lines plus the report
-  summary, and the summary part is capped at 140 characters. The
-  second-model work check: this settle skips it. A turn that moved
-  the tip, or an answered report, follows today's paths unchanged.
+- The no-new-commit settle (`classifyTurnEnd` in src/turn.ts): the work
+  turn must answer the CI reply. Its delivered input carries the board's
+  authorship (`pendingBy` "supervisor" at dispatch), and a user reply or
+  any other settle never diverts. The card has a `prNumber`, the stored
+  key starts with `<prHeadSha>:`, and the branch tip still equals
+  `prHeadSha`. The card then settles `merging`/`idle` and queues no merge
+  turn. It ships nothing and re-runs no gate, because the tree is the
+  already-verified shipped tree. The settle re-pins `pushSha` to the tip,
+  so the CI watch stays on the head. `needsReason` shows the failed check
+  lines plus the report summary, and the summary part is capped at 140
+  characters. The second-model work check: this settle skips it. A turn
+  that moved the tip, or an answered report, follows today's paths
+  unchanged.
+- The stored answer dies with its truth. When the head's verdict passes,
+  the CI watch clears `ci_pr_answered_key` and `ci_pr_answered_info` with
+  `pushSha`: a re-run that passed makes the old failure stale, and a
+  later reply that changes nothing runs today's path over a green head.
+  The give-up paths keep the key: the next ship re-pins `pushSha`, and
+  the re-poll of the same failed runs stays deduped.
 - The `prPass` widening (`prSettleMerging` in src/supervisor.ts): the
   per-project PR pass also settles cards in stage `in_progress` that
   carry a `prNumber`. The existing skips stay: a cancelled card, a

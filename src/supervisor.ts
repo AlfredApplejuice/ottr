@@ -2044,7 +2044,7 @@ export function createSupervisor(
 		t: ListedTask,
 		pushSha: string,
 		runs: WorkflowRun[],
-		stop: (line?: string) => Promise<void>,
+		stop: (line?: string, patch?: TaskPatch) => Promise<void>,
 	): Promise<WorkflowRun[] | null> {
 		if (runs.length === 0) {
 			if (ops.now() - (t.doneAt ?? t.updatedAt) > CI_WAIT_MS)
@@ -2056,7 +2056,14 @@ export function createSupervisor(
 		const verdict = ciVerdict(runs);
 		if (verdict === "pending") return null;
 		if (verdict === "passed") {
-			await stop(`CI passed for ${pushSha.slice(0, 7)}`);
+			// OTTR-1056: the head's CI is green, so the answered failure is stale state.
+			// Clear it — a later no-commit ready turn must not divert with the old
+			// failed-check lines. The give-up paths keep the key: the next ship re-pins
+			// pushSha and the re-poll of the same failed runs stays deduped.
+			await stop(`CI passed for ${pushSha.slice(0, 7)}`, {
+				ciPrAnsweredKey: null,
+				ciPrAnsweredInfo: null,
+			});
 			return null;
 		}
 		return runs.filter((r) => ciVerdict([r]) === "failed");
@@ -2074,11 +2081,14 @@ export function createSupervisor(
 			return;
 		const key = `${e.name}/${t.id}`;
 		const pushSha = t.pushSha;
-		const stop = async (line?: string): Promise<void> => {
+		const stop = async (
+			line?: string,
+			patch: TaskPatch = {},
+		): Promise<void> => {
 			// A reply, steer or cancel may have landed during the gh awaits; skip the write
 			// and re-decide on fresh facts next tick.
 			if (await wentStale(e.store, t)) return;
-			if (!(await applyTask(e, t, { pushSha: null }))) return;
+			if (!(await applyTask(e, t, { pushSha: null, ...patch }))) return;
 			if (line) await ops.appendLog(e.store, t.id, `supervisor: ${line}`);
 		};
 

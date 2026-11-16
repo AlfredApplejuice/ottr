@@ -8041,12 +8041,16 @@ export function createTurnLoop(
 		// OTTR-1056: without this divert, classify queues a merge turn whose ship
 		// pins the same head and the CI watch re-answers the same failure. The tree
 		// is the already-verified shipped tree, so the card settles merging/idle:
-		// no ship and no gate re-run happens. A turn that moved the tip, or an
-		// answered report, takes today's path.
+		// no ship and no gate re-run happens. Only the turn the supervisor queued
+		// with the CI reply (its delivered input carries the board's authorship)
+		// diverts: a later user reply or any other settle takes today's path, and
+		// a passed head clears the stored key at the watch. A turn that moved the
+		// tip, or an answered report, takes today's path too.
 		if (
 			st.kind === "work" &&
 			next.stage === "merging" &&
 			next.state === "queued" &&
+			st.input.live.pendingBy === "supervisor" &&
 			st.task.prNumber !== null &&
 			st.task.prHeadSha !== null &&
 			st.task.ciPrAnsweredKey !== null &&

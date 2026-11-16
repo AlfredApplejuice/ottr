@@ -24004,7 +24004,11 @@ describe("turn PR-mode CI idle divert (OTTR-1056)", () => {
 	 * with the ship spies the divert must keep silent and a ready work run. The `tip`
 	 * argument is what the worktree HEAD read returns: the answered head keeps the
 	 * divert, a moved tip takes today's merge queue path. */
-	async function ciRepliedSetup(overrides: FixtureOps = {}, tip = "pr-head") {
+	async function ciRepliedSetup(
+		overrides: FixtureOps = {},
+		tip = "pr-head",
+		by: "user" | "supervisor" = "supervisor",
+	) {
 		const pushes: unknown[][] = [];
 		let openPrCalls = 0;
 		const record = baseRecord();
@@ -24052,6 +24056,11 @@ describe("turn PR-mode CI idle divert (OTTR-1056)", () => {
 			prHeadSha: "pr-head",
 			ciPrAnsweredKey: "pr-head:42#1",
 			ciPrAnsweredInfo: "- build: failure - https://example.com/run/42",
+			// The CI reply the supervisor queued: only a turn whose delivered input
+			// carries the board's authorship diverts (OTTR-1056 send-back fix).
+			pendingPrompt:
+				"CI failed on the PR head of this card (pr-head on ott/card):\n\n- build: failure - https://example.com/run/42",
+			pendingBy: by,
 			worktree: join(setup.store.worktreesDir, task.id),
 			branch: "ott/card",
 			base: "abc",
@@ -24098,6 +24107,24 @@ describe("turn PR-mode CI idle divert (OTTR-1056)", () => {
 			"unchanged since the CI reply",
 		);
 		// One run: the merge turn queued behind the fixture's held dispatch.
+		expect(s.record.runs).toHaveLength(1);
+	});
+
+	test("a user reply that changed nothing does not divert, even with the key stored", async () => {
+		// The stored key only proves a CI reply happened earlier; the divert needs
+		// the turn itself to answer one. A user reply queued on the card runs
+		// today's path: the merge turn queues and re-ships the PR head.
+		const s = await ciRepliedSetup({}, "pr-head", "user");
+		await s.loop.runTurn(s.store.name, s.task.id);
+		const after = (await s.store.getTask(s.task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.needsReason).toBeNull();
+		expect(after.pushSha).toBeNull();
+		expect(after.ciPrAnsweredKey).toBe("pr-head:42#1");
+		expect(await logText(s.store, s.task.id)).not.toContain(
+			"unchanged since the CI reply",
+		);
 		expect(s.record.runs).toHaveLength(1);
 	});
 
