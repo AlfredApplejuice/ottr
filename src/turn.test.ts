@@ -302,6 +302,9 @@ function fakeOps(record: Recorded, overrides: FixtureOps = {}): TurnOps {
 		workCheck: () => false,
 		// The comprehension gate defaults to a clean pass here: only the prompt-gate tests inject
 		// a seam, so ordinary turn tests exercise the run loop, not the gate (OTTR-823).
+		// The gate's skill list defaults to none here (OTTR-1068): only the prompt-gate
+		// tests inject a catalog, so no turn test reads this machine's real skill home.
+		skillCatalog: () => [],
 		gateCheck: async () => ({
 			builds: "the task",
 			checks: "the recorded run",
@@ -27885,6 +27888,103 @@ describe("prompt gate", () => {
 		expect(after.gate?.hash).not.toBe(
 			gateFingerprint(gateCompareText(prompt, null, null)),
 		);
+	});
+
+	test("the gate sees the workers' skill block, so a video question with a default passes as an assumption (MYST-31)", async () => {
+		const seen: { prompt: string; skills: string | null | undefined }[] = [];
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+			skillCatalog: () => [
+				{
+					name: "tiktok",
+					description: "Use for TikTok video, captions, or photo slides.",
+				},
+				{ name: "watch", description: "Watch a video URL." },
+			],
+			gateCheck: async (o) => {
+				seen.push({ prompt: o.prompt, skills: o.skills });
+				return {
+					builds: "a research report on the video",
+					checks: "the report names the video's content",
+					points: DEEPEN_POINTS.map(() => ({
+						covered: true,
+						reason: "covered",
+					})),
+					questions: [
+						{
+							question: "What does the skill in the TikTok video do?",
+							default:
+								"The listed tiktok skill loads the video; report what it shows",
+							options: ["report its content", "skip the video"],
+						},
+					],
+				};
+			},
+		});
+		const task = await store.createTask(
+			"Investigate https://vm.tiktok.com/ZGdXCWsfk/ for our legal skills and report what the video shows",
+		);
+
+		await loop.runTurn(store.name, task.id);
+
+		// The gate input carried the workers' skill block after the prompt (the
+		// "<skills>" label wrap is gatePrompt's, asserted in prompts.test.ts).
+		expect(seen).toHaveLength(1);
+		expect(seen[0]!.skills).toBe(
+			"- tiktok: Use for TikTok video, captions, or photo slides.\n- watch: Watch a video URL.",
+		);
+		// The video question carried a default, so it parked nothing: the turn
+		// started and the question rides on as a gate assumption.
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("idle");
+		expect(record.runs).toHaveLength(1);
+		expect(after.gate?.assumptions).toEqual([
+			{
+				question: "What does the skill in the TikTok video do?",
+				answer: "The listed tiktok skill loads the video; report what it shows",
+			},
+		]);
+	});
+
+	test("a missing skill list leaves the gate input without the skills block", async () => {
+		const seen: (string | null | undefined)[] = [];
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+			skillCatalog: () => [],
+			gateCheck: async (o) => {
+				seen.push(o.skills);
+				return clearCheck();
+			},
+		});
+		const task = await store.createTask("clear work");
+
+		await loop.runTurn(store.name, task.id);
+
+		expect(seen).toEqual([null]);
+		expect(record.runs).toHaveLength(1);
+	});
+
+	test("an unreadable skill list logs one line and the gate runs without the block", async () => {
+		let calls = 0;
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+			skillCatalog: () => {
+				throw new Error("layer locked");
+			},
+			gateCheck: async () => {
+				calls += 1;
+				return clearCheck();
+			},
+		});
+		const task = await store.createTask("clear work");
+
+		await loop.runTurn(store.name, task.id);
+
+		expect(await logText(store, task.id)).toContain(
+			"! prompt gate: skill list unreadable: layer locked",
+		);
+		expect(calls).toBe(1);
+		expect(record.runs).toHaveLength(1);
 	});
 
 	test("a handoff whose steps lie past the cap still shows them to the gate", async () => {

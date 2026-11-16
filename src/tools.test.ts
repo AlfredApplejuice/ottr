@@ -26,6 +26,7 @@ import {
 	parseToolsJson,
 	readToolsList,
 	readUserLayer,
+	skillCatalog,
 	type ToolEntry,
 	toolsListPath,
 	turnEnvValues,
@@ -982,5 +983,79 @@ describe("readUserLayer", () => {
 			}),
 		);
 		expect(readUserLayer(h).skills).toEqual([]);
+	});
+});
+
+describe("skillCatalog", () => {
+	test("reads each skill's frontmatter description; a missing or unreadable one lists the name alone", () => {
+		const h = mkdtempSync(join(home, "catalog-"));
+		mkdirSync(join(h, ".omp", "agent", "skills", "tiktok"), {
+			recursive: true,
+		});
+		writeFileSync(
+			join(h, ".omp", "agent", "skills", "tiktok", "SKILL.md"),
+			"---\nname: tiktok\ndescription: Use for TikTok video, captions, or photo slides.\n---\nbody\n",
+		);
+		mkdirSync(join(h, ".agents", "skills", "watch"), { recursive: true });
+		writeFileSync(
+			join(h, ".agents", "skills", "watch", "SKILL.md"),
+			"# none\n",
+		);
+		mkdirSync(join(h, ".omp", "agent", "managed-skills", "correct"), {
+			recursive: true,
+		});
+		writeFileSync(
+			join(h, ".omp", "agent", "managed-skills", "correct", "SKILL.md"),
+			'---\nname: correct\ndescription: "quoted text"\n---\n',
+		);
+		// A YAML block scalar parses as no description, never garbage.
+		mkdirSync(join(h, ".omp", "agent", "skills", "blocky"), {
+			recursive: true,
+		});
+		writeFileSync(
+			join(h, ".omp", "agent", "skills", "blocky", "SKILL.md"),
+			"---\ndescription: |\n  line one\n---\n",
+		);
+		// A SKILL.md that is a directory reads as no description, never a throw.
+		mkdirSync(join(h, ".omp", "agent", "skills", "broken", "SKILL.md"), {
+			recursive: true,
+		});
+		// Dot-prefixed and not-a-skill dirs stay out; a name in two bridge dirs lists once.
+		mkdirSync(join(h, ".omp", "agent", "skills", ".hidden", "SKILL.md"), {
+			recursive: true,
+		});
+		mkdirSync(join(h, ".omp", "agent", "skills", "not-a-skill"), {
+			recursive: true,
+		});
+		mkdirSync(join(h, ".agents", "skills", "tiktok"), { recursive: true });
+		expect(skillCatalog(h)).toEqual([
+			{ name: "blocky", description: "" },
+			{ name: "broken", description: "" },
+			{ name: "correct", description: "quoted text" },
+			{
+				name: "tiktok",
+				description: "Use for TikTok video, captions, or photo slides.",
+			},
+			{ name: "watch", description: "" },
+		]);
+	});
+
+	test("the default home follows OTTR_WORKERS_HOME, the Missing-on-workers source", () => {
+		const h = mkdtempSync(join(home, "cataloghome-"));
+		mkdirSync(join(h, ".omp", "agent", "skills", "tiktok"), {
+			recursive: true,
+		});
+		writeFileSync(
+			join(h, ".omp", "agent", "skills", "tiktok", "SKILL.md"),
+			"---\ndescription: d\n---\n",
+		);
+		const saved = process.env.OTTR_WORKERS_HOME;
+		process.env.OTTR_WORKERS_HOME = h;
+		try {
+			expect(skillCatalog().map((s) => s.name)).toContain("tiktok");
+		} finally {
+			if (saved === undefined) delete process.env.OTTR_WORKERS_HOME;
+			else process.env.OTTR_WORKERS_HOME = saved;
+		}
 	});
 });

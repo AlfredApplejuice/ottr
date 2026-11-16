@@ -68,6 +68,7 @@ import {
 	missingCheckQuestion,
 	openQuestionsLines,
 	promptGateCheck,
+	skillBlock,
 	startAnywayQuestion,
 } from "./promptGate.ts";
 import {
@@ -169,6 +170,7 @@ import {
 	type TaskPatch,
 } from "./store.ts";
 import { progressKey } from "./stryker.ts";
+import { type SkillEntry, skillCatalog } from "./tools.ts";
 import type {
 	ArchReview,
 	AskQuestion,
@@ -875,6 +877,10 @@ export interface TurnOps {
 	titleRetryDelayMs?: number;
 	/** OTTR-823 preparation gate: the comprehension check model call; overridable for tests so none spawns a gateway. */
 	gateCheck?: typeof promptGateCheck;
+	/** OTTR-1068: the skills a worker turn can load, for the prompt gate's skill block
+	 * (the read behind the board's "Missing on workers" note); absent resolves the real
+	 * catalog from the workers' list home. Tests inject a fixture or an empty list. */
+	skillCatalog?: () => SkillEntry[];
 	/** OTTR-941 duplicate-work gate: the code search plus verdict model calls; overridable for tests so none spawns a gateway. */
 	duplicateCheck?: typeof duplicateCheck;
 	/** Commit subjects on the target since a base, for the check run's input; overridable for tests. */
@@ -4601,6 +4607,17 @@ export function createTurnLoop(
 			await log("+ prompt gate: board-written prompt runs without the model");
 			return true;
 		}
+		// OTTR-1068: the gate input carries the skills a worker turn can load, so the
+		// gate never asks for what a listed skill can find out (MYST-31: it asked for
+		// the content of a TikTok video that the workers' tiktok skill can load). An
+		// unreadable list logs one line and the gate runs without the block, as before.
+		let skills: string | null = null;
+		try {
+			const block = skillBlock((ops.skillCatalog ?? skillCatalog)());
+			if (block !== "") skills = block;
+		} catch (e) {
+			await log(`! prompt gate: skill list unreadable: ${errmsg(e)}`);
+		}
 		// Model evaluation; one immediate retry on any failure.
 		let check: GateCheck | null = null;
 		let err: Error | null = null;
@@ -4609,6 +4626,7 @@ export function createTurnLoop(
 				check = await (ops.gateCheck ?? promptGateCheck)({
 					prompt: judged,
 					userMessages: gateUserText(pending, seen),
+					skills,
 				});
 				err = null;
 				break;
