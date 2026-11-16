@@ -99,11 +99,12 @@ export async function spawnPiped(
 	return { code, stdout, stderr };
 }
 
-/** Git subcommands that touch the network and so need GH_TOKEN for their credential helper; every other board git runs without it. */
+/** Git subcommands that touch the network and so need GH_TOKEN for their credential helper; every other board git runs without it. `lfs` is here because `git lfs push` uploads to the origin over the same credentials as `git push` (OTTR-1058). */
 const NETWORK_GIT: Record<string, true> = {
 	clone: true,
 	fetch: true,
 	"ls-remote": true,
+	lfs: true,
 	pull: true,
 	push: true,
 };
@@ -1589,7 +1590,8 @@ export function redactUrlCredentials(text: string): string {
 }
 
 /** stderr lines that name a push failure's cause; hint lines stay out of needsReason. */
-const PUSH_REASON_LINE = /^\s*(?:!\s*\[|error:|fatal:|remote:)/;
+const PUSH_REASON_LINE =
+	/^\s*(?:!\s*\[|error:|fatal:|remote:|LFS:|batch response:)/;
 /** OTTR-743: the remote's race wording — the ref moved between the push's negotiation and its update. */
 const CANNOT_LOCK_REF_RE = /cannot lock ref/;
 /** Output prefix of a failed push whose head the remote already holds; turn.ts logs it as the done reason. */
@@ -1712,8 +1714,10 @@ async function lockRefAlreadyLanded(
 	};
 }
 
-/** The pre-flight gates of a server merge push: the branch and local tip to push and the
- * pinned origin to push to. A result means the push is skipped or failed outright. */
+/** The pre-flight gates of a server merge push: the branch, local tip and base the remote
+ * holds, and the pinned origin to push to. A result means the push is skipped or failed
+ * outright. `base` is the commit the remote already holds (null: it holds none) and is
+ * the LFS scan's range start. */
 async function mergePushPreflight(
 	mainPath: string,
 	worktreePath: string,
@@ -1722,7 +1726,8 @@ async function mergePushPreflight(
 	leaseTip: string | null,
 	originUrl: string | null,
 ): Promise<
-	{ branch: string; local: string; originUrl: string } | MergePushResult
+	| { branch: string; local: string; base: string | null; originUrl: string }
+	| MergePushResult
 > {
 	if (!target.startsWith("origin/")) return { status: "skipped" };
 	const branch = target.slice("origin/".length);
@@ -1733,9 +1738,9 @@ async function mergePushPreflight(
 		);
 		return r.code === 0 ? r.stdout.trim() : null;
 	};
+	const base = await sha(`refs/remotes/origin/${branch}`);
 	const local = await sha(`refs/heads/${branch}`);
-	if (local === null || local === (await sha(`refs/remotes/origin/${branch}`)))
-		return { status: "skipped" };
+	if (local === null || local === base) return { status: "skipped" };
 	if (leaseTip !== null) {
 		const gate = await holdGate(mainPath, leaseTip, branch);
 		if (gate !== null) return gate;
@@ -1756,7 +1761,7 @@ async function mergePushPreflight(
 		};
 	const guard = await checkPinnedRemote(mainPath, originUrl);
 	if (guard !== null) return { status: "failed", error: guard };
-	return { branch, local, originUrl };
+	return { branch, local, base, originUrl };
 }
 
 export async function serverMergePush(
@@ -1781,7 +1786,14 @@ export async function serverMergePush(
 		originUrl,
 	);
 	if ("status" in pre) return pre;
-	const { branch, local, originUrl: pinnedUrl } = pre;
+	const { branch, local, originUrl: pinnedUrl, base } = pre;
+	// The LFS objects go first (OTTR-1058): the board's git pins hooksPath=/dev/null, so
+	// git-lfs's pre-push hook never runs and the remote would reject unknown objects
+	// (GitHub's GH008). An upload failure fails the card before the push, the same shape
+	// as any push failure.
+	const lfs = await pushLfsObjects(mainPath, pinnedUrl, branch, local, base);
+	if (lfs !== null)
+		return { status: "failed", error: lfs.error, output: lfs.output };
 	const r = await git(
 		[
 			"push",
@@ -1858,6 +1870,147 @@ function pushFailure(r: GitResult): {
 	return { error, output };
 }
 
+/** A pointer an LFS-filtered file hashes to when git stages it (git-lfs pointer spec:
+ * the version line, then the content oid). A text file that merely starts like a pointer
+ * has no oid line and never matches. */
+const LFS_POINTER_RE =
+	/^version https:\/\/git-lfs\.github\.com\/spec\/v1\noid sha256:([0-9a-f]{64})\n/;
+
+/**
+ * The oids of the Git LFS pointers among a pushed range's objects (`base..tip`, the whole
+ * history of the tip when base is null). Plain git only, so a repo without LFS runs no
+ * git lfs command (the upload step's gate). Every commit of the range is scanned, not
+ * just the tip: a pointer added and deleted inside the range still shows, because each of
+ * those commits is one the remote must accept (GitHub's GH008 checks every pushed
+ * commit's pointers, OTTR-1058). Objects that git cannot read return no oids: the push
+ * then fails the remote the same way it did before this step existed.
+ */
+export async function lfsPointerOids(
+	mainPath: string,
+	tip: string,
+	base: string | null,
+): Promise<string[]> {
+	const r = await git(
+		["rev-list", "--objects", ...(base === null ? [tip] : [`${base}..${tip}`])],
+		mainPath,
+	);
+	if (r.code !== 0) return [];
+	const shas: string[] = [];
+	for (const line of r.stdout.split("\n")) {
+		const sha = line.slice(
+			0,
+			line.indexOf(" ") === -1 ? line.length : line.indexOf(" "),
+		);
+		if (/^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(sha)) shas.push(sha);
+	}
+	if (shas.length === 0) return [];
+	const buf = await catFileBatch(mainPath, shas);
+	const oids = new Set<string>();
+	let at = 0;
+	while (at < buf.length) {
+		const nl = buf.indexOf(10, at);
+		if (nl === -1) break;
+		const m = /^([0-9a-f]{40,64}) blob (\d+)$/.exec(
+			buf.toString("utf8", at, nl),
+		);
+		at = nl + 1;
+		if (m === null) continue; // a commit, a tree, or an unreadable object's header line
+		const size = Number(m[2]);
+		if (at + size > buf.length) break;
+		// latin1: 1 byte = 1 char, so the ASCII pointer text matches at the exact offsets.
+		const oid = LFS_POINTER_RE.exec(buf.toString("latin1", at, at + size))?.[1];
+		if (oid !== undefined) oids.add(oid);
+		at += size;
+		if (buf[at] === 10) at++; // --batch ends each object with a newline
+	}
+	return [...oids];
+}
+
+/**
+ * git cat-file --batch over one range's objects. Bespoke spawn, outside git(): the
+ * output is raw object bytes and the parse needs byte offsets (a blob with invalid
+ * UTF-8 would shift a string decode). A plain --batch names no config-driven program —
+ * filters run only behind --filters/--textconv, and cat-file runs no hook and no
+ * fsmonitor — so the planted-config pins git() carries do not apply here.
+ */
+async function catFileBatch(
+	mainPath: string,
+	shas: readonly string[],
+): Promise<Buffer> {
+	const proc = Bun.spawn([gitExe(), "cat-file", "--batch"], {
+		cwd: mainPath,
+		env: gitEnv(["cat-file", "--batch"]),
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	// Chunked writes keep the pipe moving while git streams the answer back.
+	for (let i = 0; i < shas.length; i += 256) {
+		proc.stdin.write(`${shas.slice(i, i + 256).join("\n")}\n`);
+		proc.stdin.flush();
+	}
+	proc.stdin.end();
+	const [bytes, err] = await Promise.all([
+		new Response(proc.stdout).arrayBuffer(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	// A broken repo reads as "no LFS here": the push keeps today's behavior.
+	return err.trim() !== "" ? Buffer.alloc(0) : Buffer.from(bytes);
+}
+
+/** The LFS endpoint git-lfs derives for an http(s) origin URL, pinned on the command
+ * line so a planted `lfs.url` cannot move the upload (verified against git-lfs 3.6.1:
+ * an empty `-c lfs.url=` fails the push, the derived value overrides the plant). */
+function lfsEndpointPin(originUrl: string): readonly string[] {
+	if (!/^https?:\/\//i.test(originUrl)) return [];
+	return ["-c", `lfs.url=${originUrl.replace(/\/+$/, "")}/info/lfs`];
+}
+
+/**
+ * The LFS half of a server-side push (OTTR-1058): git-lfs uploads objects from its
+ * pre-push hook, and the board's git pins `core.hooksPath=/dev/null`, so a push that
+ * adds or changes an LFS file fails the remote's unknown-object rejection (GitHub's
+ * GH008) unless the objects go first. No-op for a range without pointers: a repo
+ * without LFS runs no git lfs command. The upload runs with the push's own credential
+ * plumbing (git() classifies `lfs` as network git, so hosted mode mints the pinned
+ * origin's token and self-hosted mode passes its resolver env) and pins the LFS
+ * endpoint for an http(s) origin, so repo config a work turn planted (R5-1) cannot
+ * move it; the URL argument means `remote.<name>.lfsurl` is never read. A local-path
+ * origin becomes a file:// URL: git-lfs's standalone file transfer stores the objects
+ * in the bare repo itself. Residuals, documented in docs/WORKERS.md: for an ssh origin
+ * a planted `lfs.url` still wins (the https endpoint git-lfs authenticates over ssh
+ * cannot be derived offline), and an endpoint whose batch response names a custom
+ * transfer adapter runs the adapter its config names. `refName` is the ref the push
+ * carries (a branch, or a release's tag), `tip` the commit it names and `base` the
+ * commit the remote already holds (null: everything). `authEnv` re-uses a caller's
+ * scoped push credentials (the release identity). Returns null on success;
+ * `{ error, output }` puts the git-lfs failure on the card like any push failure and
+ * the caller stops before its git push.
+ */
+export async function pushLfsObjects(
+	mainPath: string,
+	originUrl: string,
+	refName: string,
+	tip: string,
+	base: string | null,
+	authEnv?: Record<string, string>,
+): Promise<{ error: string; output?: string } | null> {
+	if ((await lfsPointerOids(mainPath, tip, base)).length === 0) return null;
+	const remote = /^[a-z][a-z0-9+.-]*:\/\//i.test(originUrl)
+		? originUrl
+		: `file://${originUrl}`;
+	const r = await git(
+		[...lfsEndpointPin(originUrl), "lfs", "push", remote, refName],
+		mainPath,
+		undefined,
+		authEnv,
+	);
+	if (r.code === 0) return null;
+	return pushFailure(r);
+}
+
 /**
  * PR mode's server-side branch push: pushes the card branch's tip to the pinned origin from the
  * main checkout with the same credential plumbing as serverMergePush (git() adds the host auth;
@@ -1891,6 +2044,15 @@ export async function pushBranch(
 	const guard = await checkPinnedRemote(mainPath, originUrl);
 	if (guard !== null) return { status: "failed", error: guard };
 	const tip = await sha(`refs/remotes/origin/${dstBranch}`);
+	const local = await sha(`refs/heads/${branch}`);
+	// The LFS objects go first (OTTR-1058), same as the merge push; the upload failure
+	// fails the card before the push runs.
+	const lfs =
+		local === null
+			? null
+			: await pushLfsObjects(mainPath, originUrl, branch, local, tip);
+	if (lfs !== null)
+		return { status: "failed", error: lfs.error, output: lfs.output };
 	const r = await git(
 		[
 			"push",
@@ -1908,7 +2070,6 @@ export async function pushBranch(
 		mainPath,
 	);
 	if (r.code === 0) {
-		const local = await sha(`refs/heads/${branch}`);
 		if (local !== null)
 			await git(
 				["update-ref", `refs/remotes/origin/${dstBranch}`, local],

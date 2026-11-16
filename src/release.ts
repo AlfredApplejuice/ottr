@@ -11,6 +11,7 @@ import {
 	checkPinnedRemote,
 	git,
 	hostedGitAuth,
+	pushLfsObjects,
 	redact,
 	spawnPiped,
 } from "./worktree.ts";
@@ -830,6 +831,26 @@ async function pushReleaseTag(o: {
 		o.identity === undefined
 			? undefined
 			: (releasePushAuth(o.identity.token, o.originUrl) ?? undefined);
+	// The tag's LFS objects go first (OTTR-1058): the tag normally rides a tip origin
+	// already holds, but a tag on a commit origin lacks would fail the remote's
+	// unknown-object rejection. The scan covers the whole tagged history (base null),
+	// and the upload shares the push's scoped credentials.
+	const tagSha = await git(
+		["rev-parse", "--verify", "--quiet", `refs/tags/${o.version}`],
+		o.mainPath,
+	);
+	if (tagSha.code === 0) {
+		const lfs = await pushLfsObjects(
+			o.mainPath,
+			o.originUrl,
+			o.version,
+			tagSha.stdout.trim(),
+			null,
+			auth,
+		);
+		if (lfs !== null)
+			throw new Error(`git lfs push ${o.version} failed: ${lfs.error}`);
+	}
 	const p = await git(
 		["push", o.originUrl, `refs/tags/${o.version}`],
 		o.mainPath,

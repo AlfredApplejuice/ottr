@@ -1254,6 +1254,35 @@ https host can feed a fetch of a public repo, but no token matches the
 rewritten host. For a project without a GitHub remote, the server pushes the
 merged target to the pinned origin URL after the merge turn ends.
 
+Git LFS (OTTR-1058): git-lfs uploads objects from its pre-push hook, and the
+board's git pins `core.hooksPath=/dev/null`, so a push that adds or changes an
+LFS file would fail the remote's unknown-object rejection (GitHub's GH008) if
+the objects did not go first. The merge push, the PR-mode branch push and the
+release tag push therefore run a scan before they push: plain git
+(`rev-list --objects` and `cat-file --batch` over the pushed range, so a
+pointer added and deleted inside the range still shows) lists the LFS pointer
+oids, and only when the list is not empty does the server run
+`git lfs push <originUrl> <ref>` for the same ref with the same credential
+plumbing as the push (git() classifies `lfs` as network git). A repo whose
+pushed range holds no LFS pointers runs no git lfs command. The upload pins
+what the command line can pin: for an http(s) origin the server passes
+`-c lfs.url=<originUrl>/info/lfs`, which outranks a planted `lfs.url` (an
+empty `-c lfs.url=` fails the push, verified against git-lfs 3.6.1), and the
+URL argument means `remote.<name>.lfsurl` is never read; a local-path origin
+becomes a `file://` URL and git-lfs's built-in standalone file transfer stores
+the objects in the bare repo. An upload failure fails the card before the git
+push, the same shape as any push failure. Residuals: a planted `lfs.url`
+still wins for an ssh origin (the https endpoint git-lfs authenticates over
+ssh cannot be derived offline); an endpoint whose batch response names a
+custom transfer adapter runs the adapter repo config registers (verified with
+git-lfs 3.6.1: a planted `lfs.customtransfer.*` never runs against a
+basic-protocol endpoint, but a hostile endpoint can name one — the endpoint is
+already trust-rooted by the pin); and the `credential.helper` /
+`core.sshCommand` residual of every network git call applies to the LFS
+upload the same way. The delete push (`deleteRemoteBranch`) carries no
+objects and runs no LFS step, and a worker VM's branch sync pushes into the
+board's own clone, never the origin.
+
 The card of the dev-only **Check the board** button also runs in the server container.
 Only loopback there reaches the full board API. On the turns' host (`OTTR_BOARD_URL`), a
 worker's turn can only file cards. The board marks the check card in the project store when
