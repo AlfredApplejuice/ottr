@@ -2108,6 +2108,40 @@ describe("vmRootfs", () => {
 		expect(sixth.key).not.toBe(fifth.key);
 	});
 
+	test("a state dir outside the excluded roots is skipped like the tar skips it", async () => {
+		const src = srcRoot();
+		// An operator's OTTR_VM_STATE_DIR inside the copied root, like /srv/ottr-vm.
+		const stateDir = join(src, "srv/ottr-vm");
+		mkdirSync(join(stateDir, "base"), { recursive: true });
+		const home = mkdtempSync(join(root, "rb3-"));
+		const argvs: string[][] = [];
+		const exec: Exec = async (argv) => {
+			argvs.push(argv);
+			if (argv[0] === "omp")
+				return { code: 0, stdout: "omp 1.0\n", stderr: "" };
+			if (argv[0] === "du")
+				return { code: 0, stdout: "1000\t/x\n", stderr: "" };
+			return { code: 0, stdout: "", stderr: "" };
+		};
+		const make = (): VmRootfs =>
+			new VmRootfs({
+				stateDir,
+				homeRoot: home,
+				exec,
+				ottrVersion: "1.2.3",
+				sourceRoot: src,
+				layerBytes: 1024 * 1024,
+			});
+		const first = await make().base();
+		// The base build lands a new ext4 in the state dir; the key must not move,
+		// or every start would rebuild the base and every layer forever.
+		writeFileSync(join(stateDir, "base", "first.ext4"), "x");
+		const second = await make().base();
+		expect(second.key).toBe(first.key);
+		expect(second.path).toBe(first.path);
+		expect(argvs.filter((a) => a[0] === "mkfs.ext4")).toHaveLength(1);
+	});
+
 	test("two turns of one project bake once; a changed list re-bakes and drops the old layer", async () => {
 		const home = mkdtempSync(join(root, "rh-"));
 		const { fs, stateDir } = rootfs(home);

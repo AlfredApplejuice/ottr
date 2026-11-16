@@ -2,10 +2,11 @@
  * vm-runner disk images (docs/adr/0009-microvm-workers.md):
  * - base rootfs: an ext4 copy of this container's own root (the vm-runner image ships the
  *   same bun, omp and /app as a worker), read-only vda of every VM. Keyed by the content
- *   of everything it copies (the source root minus the tar's excludes and the
- *   per-container /etc files, see copiedPathSkipped) plus OTTR_VERSION and
- *   `omp --version`, so any change to a copied guest file rebuilds it once. The digest
- *   walk reads the whole copied tree, once per vm-runner process start.
+ *   of everything it copies (the source root minus the tar's excludes — the pinned
+ *   roots plus this process's state dir — and the per-container /etc files, see
+ *   copiedPathSkipped) plus OTTR_VERSION and `omp --version`, so any change to a
+ *   copied guest file rebuilds it once. The digest walk reads the whole copied tree,
+ *   once per vm-runner process start.
  * - project layer: an ext4 holding the overlay `upper/` and `work/` dirs a bake VM fills with
  *   the project's apt/tools/pip installs (the worker's per-turn installs, done once). Keyed
  *   by the base key plus the dispatch's provisioning list texts (docs/specs/vm-list-isolation.md),
@@ -29,7 +30,7 @@ import {
 	rmSync,
 	type Stats,
 } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import type { Exec } from "./vmNet.ts";
 import type { ProvisionLists } from "./workers.ts";
 
@@ -60,15 +61,16 @@ const ETC_RUNTIME_FILES: Record<string, true> = {
 };
 
 /**
- * True for a path the base rootfs never copies: the tar's anchored excludes
- * (BASE_EXCLUDES, at their exact paths — /var/lib/ottr-vm is the state dir the compose
- * volume pins) and the per-container /etc files above. Everything else under the source
- * root is hashed, so the key also moves when the image build writes a file no package
- * owns (for example /etc/gitconfig from Dockerfile.worker's `git config --system`, or
- * the root-level /ottr-entry.sh and /no-proxy.sh).
+ * True for a path the base rootfs never copies: `skips` (the tar's anchored excludes at
+ * their exact paths relative to the copy root, plus this process's state dir in the same
+ * form — OTTR_VM_STATE_DIR may place it outside the pinned /var/lib/ottr-vm, and a cache
+ * file there must never key the base) and the per-container /etc files above. Everything else under the source root is
+ * hashed, so the key also moves when the image build writes a file no package owns (for
+ * example /etc/gitconfig from Dockerfile.worker's `git config --system`, or the
+ * root-level /ottr-entry.sh and /no-proxy.sh).
  */
-function copiedPathSkipped(rel: string): boolean {
-	if ((BASE_EXCLUDES as readonly string[]).includes(rel)) return true;
+function copiedPathSkipped(rel: string, skips: readonly string[]): boolean {
+	if (skips.includes(rel)) return true;
 	const rest = rel.slice(1);
 	const slash = rest.indexOf("/");
 	return (
@@ -123,7 +125,11 @@ function fileDigest(path: string): string {
  * never gets followed as a directory, so there is no cycle, and paths that
  * copiedPathSkipped names contribute nothing.
  */
-function guestDigest(root: string, rel: string): string | null {
+function guestDigest(
+	root: string,
+	rel: string,
+	skips: readonly string[],
+): string | null {
 	const at = join(root, rel);
 	let st: Stats;
 	try {
@@ -137,11 +143,11 @@ function guestDigest(root: string, rel: string): string | null {
 	// The root call comes in as rel "/": its children must read "/name", not "//name".
 	const base = rel === "/" ? "" : rel;
 	const children = readdirSync(at, { withFileTypes: true })
-		.filter((e) => !copiedPathSkipped(`${base}/${e.name}`))
+		.filter((e) => !copiedPathSkipped(`${base}/${e.name}`, skips))
 		.sort((a, b) => (a.name < b.name ? -1 : 1));
 	for (const entry of children)
 		parts.push(
-			`${entry.name}\u0000${guestDigest(root, `${base}/${entry.name}`) ?? "?"}`,
+			`${entry.name}\u0000${guestDigest(root, `${base}/${entry.name}`, skips) ?? "?"}`,
 		);
 	return `d:${createHash("sha256").update(parts.join("\n")).digest("hex")}`;
 }
@@ -258,10 +264,19 @@ export class VmRootfs {
 
 	private async buildBase(): Promise<{ key: string; path: string }> {
 		const { exec, stateDir } = this.o;
+		// The digest skips exactly what the tar excludes: BASE_EXCLUDES plus this
+		// process's state dir, which OTTR_VM_STATE_DIR may move outside them. The tar's
+		// exclude is anchored at the copy root, so the state dir rides in its
+		// root-relative form ("/srv/ottr-vm" when root is a test's temp dir).
+		const copyRoot = this.o.sourceRoot ?? "/";
+		const skips: readonly string[] = [
+			...BASE_EXCLUDES,
+			`/${relative(copyRoot, stateDir)}`,
+		];
 		const key = baseKey({
 			ottrVersion: this.o.ottrVersion,
 			ompVersion: (await run(exec, ["omp", "--version"])).trim(),
-			guest: guestDigest(this.o.sourceRoot ?? "/", "/"),
+			guest: guestDigest(copyRoot, "/", skips),
 		});
 		const dir = join(stateDir, "base");
 		const path = join(dir, `${key}.ext4`);
