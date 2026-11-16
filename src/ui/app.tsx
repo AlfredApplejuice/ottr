@@ -3350,7 +3350,9 @@ function releaseSummary(
 	);
 }
 
-/** The notes editor: the proposal textarea, the full-commit-list toggle and its list. */
+/** The notes editor: the proposal textarea, the consolidation review under it, the
+ *  consolidate button, the full-commit-list toggle and its list. The button and the
+ *  toggle are absent before the first release: there is nothing to consolidate then. */
 function releaseNotes(
 	plan: ReleasePlan,
 	notesDraft: string | null,
@@ -3358,6 +3360,8 @@ function releaseNotes(
 	setNotesDraft: (v: string | null) => void,
 	showCommits: boolean,
 	setShowCommits: React.Dispatch<React.SetStateAction<boolean>>,
+	consolidate?: ReactNode,
+	review?: ReactNode,
 ): ReactNode {
 	return (
 		<>
@@ -3373,15 +3377,19 @@ function releaseNotes(
 					edited.current = e.target.value !== plan.notes;
 				}}
 			/>
+			{review}
 			{plan.from !== null && (
-				<button
-					type="button"
-					className="release-notes-toggle"
-					aria-pressed={showCommits}
-					onClick={() => setShowCommits((v) => !v)}
-				>
-					{showCommits ? "Hide full commit list" : "Show full commit list"}
-				</button>
+				<div className="release-notes-actions">
+					{consolidate}
+					<button
+						type="button"
+						className="release-notes-toggle"
+						aria-pressed={showCommits}
+						onClick={() => setShowCommits((v) => !v)}
+					>
+						{showCommits ? "Hide full commit list" : "Show full commit list"}
+					</button>
+				</div>
 			)}
 			{showCommits && (
 				<div className="release-notes">
@@ -3463,24 +3471,71 @@ function releaseActions(
 	);
 }
 
-/** The release summary reply: draft the notes, or record why none came. */
-function summaryReply(
-	res: { summary: string | null; reason: string | null },
-	alive: boolean,
-	edited: { current: boolean },
-	setNotesDraft: (v: string | null) => void,
-	setSummaryReason: (v: string | null) => void,
-): void {
-	if (!alive) return;
-	if (res.summary !== null) {
-		if (!edited.current) setNotesDraft(res.summary);
-	} else {
-		setSummaryReason(res.reason);
-	}
+/** The consolidation review: the line diff of the commit-history notes vs the model's
+ * consolidated proposal, each row with a +/- glyph, plus Use and Discard. Shown only
+ * after the user clicks Consolidate notes; nothing changes the draft until they accept,
+ * and Discard keeps the deterministic notes. The diff reuses the deepen review's
+ * classes and glyphs, so the accept-or-discard language stays the board's one pattern. */
+export function ConsolidationReview({
+	original,
+	consolidated,
+	onUse,
+	onDiscard,
+}: {
+	original: string;
+	consolidated: string;
+	onUse: () => void;
+	onDiscard: () => void;
+}) {
+	const rows = lineDiff(original, consolidated);
+	const changed = rows.some((r) => r.kind !== "same");
+	return (
+		<section className="deepen-review" aria-label="Consolidation review">
+			<p className="hint">Proposed notes</p>
+			{changed ? (
+				<div className="deepen-diff">
+					{rows.map((r, i) => (
+						<div
+							key={i}
+							className={
+								r.kind === "add"
+									? "dl-add"
+									: r.kind === "del"
+										? "dl-del"
+										: undefined
+							}
+						>
+							<span className="deepen-glyph" aria-hidden="true">
+								{r.kind === "add" ? "+" : r.kind === "del" ? "\u2212" : ""}
+							</span>
+							{/* An empty line keeps its row height, so the before and after
+							    views line up with the textarea above. */}
+							<span className="dl-text">
+								{r.text === "" ? "\u00a0" : r.text}
+							</span>
+						</div>
+					))}
+				</div>
+			) : (
+				<p className="hint">
+					The consolidated notes match the commit list line for line; nothing to
+					change.
+				</p>
+			)}
+			<div className="dialog-actions">
+				<button type="button" onClick={onDiscard}>
+					Discard
+				</button>
+				<button type="button" className="primary" onClick={onUse}>
+					Use consolidated notes
+				</button>
+			</div>
+		</section>
+	);
 }
 
 /** "Create release" preview: what accumulated on the target since the last tag, and the Start button. Refetches on every open. */
-function ReleaseDialog({
+export function ReleaseDialog({
 	project,
 	open,
 	onClose,
@@ -3501,6 +3556,14 @@ function ReleaseDialog({
 	/** When the notes consolidation call started; the busy line ticks its elapsed time. */
 	const [summarySince, setSummarySince] = useState<number | null>(null);
 	const [summaryReason, setSummaryReason] = useState<string | null>(null);
+	/** Consolidation awaiting accept: the commit-history notes beside the model's proposal;
+	 *  null while closed. Set only by the Consolidate notes button, never on open. */
+	const [review, setReview] = useState<{
+		original: string;
+		consolidated: string;
+	} | null>(null);
+	/** True while the dialog is open; a consolidation reply that lands after close must not set state. */
+	const summaryAlive = useRef(false);
 	const [showCommits, setShowCommits] = useState(false);
 	const edited = useRef(false);
 	const catalog = useModels();
@@ -3520,8 +3583,10 @@ function ReleaseDialog({
 		setSummaryBusy(false);
 		setSummarySince(null);
 		setSummaryReason(null);
+		setReview(null);
 		setShowCommits(false);
 		edited.current = false;
+		summaryAlive.current = true;
 		setLoading(true);
 		let alive = true;
 		// unwrap: a non-JSON 200 must surface as a load error, not an empty dialog.
@@ -3531,31 +3596,49 @@ function ReleaseDialog({
 				if (!alive) return;
 				setPlan(data);
 				setVersion(data.version);
-				if (data.from !== null) {
-					setSummaryBusy(true);
-					setSummarySince(Date.now());
-					post<{ summary: string | null; reason: string | null }>(
-						`/api/projects/${encodeURIComponent(project.name)}/release-summary`,
-						{ sha: data.sha },
-					)
-						.then((res) =>
-							summaryReply(res, alive, edited, setNotesDraft, setSummaryReason),
-						)
-						.catch((e) => {
-							if (alive)
-								setSummaryReason(e instanceof Error ? e.message : String(e));
-						})
-						.finally(() => {
-							if (alive) setSummaryBusy(false);
-						});
-				}
 			})
 			.catch((e) => setLoadError(e instanceof Error ? e.message : String(e)))
 			.finally(() => setLoading(false));
 		return () => {
 			alive = false;
+			summaryAlive.current = false;
 		};
 	}, [open, project.name]);
+	// The consolidation runs only on this button: opening the dialog never asks the
+	// model anything, and the deterministic notes stay in the editor until the user
+	// accepts a proposal.
+	const consolidate = (): void => {
+		if (plan === null || plan.from === null || summaryBusy) return;
+		setSummaryReason(null);
+		setSummaryBusy(true);
+		setSummarySince(Date.now());
+		post<{ summary: string | null; reason: string | null }>(
+			`/api/projects/${encodeURIComponent(project.name)}/release-summary`,
+			{ sha: plan.sha },
+		)
+			.then((res) => {
+				if (!summaryAlive.current) return;
+				if (res.summary !== null)
+					setReview({ original: plan.notes, consolidated: res.summary });
+				else setSummaryReason(res.reason);
+			})
+			.catch((e) => {
+				if (summaryAlive.current)
+					setSummaryReason(e instanceof Error ? e.message : String(e));
+			})
+			.finally(() => {
+				if (summaryAlive.current) setSummaryBusy(false);
+			});
+	};
+	// Through the draft path: the textarea holds the proposal, still editable. Discard
+	// closes the review and keeps the commit-history notes; Start still sends `notes`
+	// only when the draft differs from plan.notes.
+	const useConsolidated = (): void => {
+		if (review === null || plan === null) return;
+		setNotesDraft(review.consolidated);
+		edited.current = review.consolidated !== plan.notes;
+		setReview(null);
+	};
 	const start = (): void => {
 		if (plan === null || plan.blocked !== null || !versionOk) return;
 		const proposal = notesDraft ?? plan.notes;
@@ -3617,6 +3700,29 @@ function ReleaseDialog({
 							setNotesDraft,
 							showCommits,
 							setShowCommits,
+							plan.from !== null && (
+								<button
+									type="button"
+									disabled={summaryBusy || review !== null}
+									aria-busy={summaryBusy || undefined}
+									onClick={consolidate}
+								>
+									{summaryBusy ? (
+										<span className="spinner" aria-hidden="true" />
+									) : (
+										<Icon name="list-checks" size={14} />
+									)}
+									Consolidate notes
+								</button>
+							),
+							review !== null && (
+								<ConsolidationReview
+									original={review.original}
+									consolidated={review.consolidated}
+									onUse={useConsolidated}
+									onDiscard={() => setReview(null)}
+								/>
+							),
 						)}
 						{releaseHint(plan, project, short)}
 						<ModelField
@@ -3638,6 +3744,10 @@ function ReleaseDialog({
 						{err}
 					</p>
 				)}
+			</div>
+			{/* Pinned under the scrolling body, so Cancel and Start release stay
+			    reachable however tall the consolidation review makes the body. */}
+			<div className="release-dialog-foot">
 				{releaseActions(plan, versionOk, send, start)}
 			</div>
 		</Modal>

@@ -12,6 +12,7 @@ import type {
 	ProjectView,
 	ProposalSummary,
 	PrReviewView,
+	ReleasePlan,
 	StateResponse,
 	Task,
 	TaskCard,
@@ -69,8 +70,10 @@ const {
 	RailRows,
 	SEARCH_APPLY_MS,
 	ComposeDialog,
+	ConsolidationReview,
 	FollowUpDialog,
 	DeepenReview,
+	ReleaseDialog,
 	AddProjectModal,
 	OrphanNotice,
 	SeedFailedLine,
@@ -7372,6 +7375,302 @@ describe("DeepenReview", () => {
 		expect(html).toContain("Check unavailable: bad JSON: expected 5 points");
 		expect(html).not.toContain("deepen-points");
 		expect(html).not.toContain("Improves");
+	});
+});
+
+describe("ConsolidationReview", () => {
+	const review = (original: string, consolidated: string) =>
+		renderToStaticMarkup(
+			<ConsolidationReview
+				original={original}
+				consolidated={consolidated}
+				onUse={() => {}}
+				onDiscard={() => {}}
+			/>,
+		);
+	test("a changed proposal renders add and del rows with +/- glyphs and both actions", () => {
+		const html = review("keep\nold line", "keep\nnew line");
+		expect(html).toContain('aria-label="Consolidation review"');
+		expect(html).toContain("dl-add");
+		expect(html).toContain("dl-del");
+		expect(html).toContain("+");
+		expect(html).toContain("\u2212");
+		expect(html).toContain(">old line</span>");
+		expect(html).toContain(">new line</span>");
+		expect(html).toContain("Use consolidated notes");
+		expect(html).toContain("Discard");
+	});
+	test("an identical proposal says so instead of an empty diff box", () => {
+		const html = review("same\nnotes", "same\nnotes");
+		expect(html).not.toContain("dl-add");
+		expect(html).toContain("nothing to change");
+	});
+});
+
+describe("ReleaseDialog consolidation", () => {
+	// React interaction needs browser globals; the setup mirrors the deepen
+	// describes above: happy-dom registers them for this describe, and afterAll
+	// puts the originals back, so later test files in the same process see no DOM.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+	// happy-dom's dispatched clicks never reach React's event plugin: call the
+	// production onClick React rendered onto the node instead.
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+	// Buttons are found by their exact label.
+	const button = (box: ParentNode, name: string): HTMLButtonElement => {
+		const node = [...box.querySelectorAll("button")].find(
+			(b) => b.textContent?.trim() === name,
+		);
+		if (node === undefined) throw new Error(`no ${name} button`);
+		return node as HTMLButtonElement;
+	};
+	const notesValue = (box: ParentNode): string =>
+		(box.querySelector("#release-notes-proposal") as HTMLTextAreaElement).value;
+	const notes = "- add the thing\n- fix the bug";
+	const consolidated =
+		"- the thing landed\n\n## Bug fixes\n\n- the bug is gone";
+	const plan: ReleasePlan = {
+		sha: "a".repeat(40),
+		from: "v1.0.0",
+		version: "v1.1.0",
+		notes,
+		commits: 12,
+		tasks: [{ id: "t1", title: "Add the thing" }],
+		blocked: null,
+	};
+	const project = {
+		name: "proj",
+		github: null,
+		settings: { releaseCommand: null },
+	} as unknown as ProjectView;
+	const runAct = async (fn: () => Promise<unknown>): Promise<boolean> => {
+		await fn();
+		return true;
+	};
+	type Call = { url: string; method?: string; body?: unknown };
+	type Harness = {
+		calls: Call[];
+		container: HTMLDivElement;
+		done: () => Promise<void>;
+	};
+	const json = (body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		});
+	/** Mounts the open dialog over a fetch mock and lets the plan fetch land.
+	 *  GET /release answers the plan, POST /release answers {} (Start); the
+	 *  release-summary POST goes to `summary`, and every other URL 404s (the
+	 *  model catalog reads its failure and stays null). */
+	const mount = async (summary?: () => Response): Promise<Harness> => {
+		const calls: Call[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const call: Call = {
+				url: String(input),
+				method: init?.method,
+				body:
+					typeof init?.body === "string"
+						? (JSON.parse(init.body) as unknown)
+						: undefined,
+			};
+			calls.push(call);
+			if (call.url.endsWith("/release-summary") && call.method === "POST")
+				return summary !== undefined
+					? summary()
+					: new Response("{}", { status: 404 });
+			if (call.url.endsWith("/release") && call.method === "POST")
+				return json({});
+			if (call.url.endsWith("/release")) return json(plan);
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<ReleaseDialog
+						project={project}
+						open
+						onClose={() => {}}
+						act={runAct}
+					/>,
+				);
+			});
+			// One more act lets the plan fetch land.
+			await act(async () => {});
+		} catch (e) {
+			globalThis.fetch = realFetch;
+			throw e;
+		}
+		return {
+			calls,
+			container,
+			done: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+			},
+		};
+	};
+	/** Clicks a button by label and lets the resulting state settle. */
+	const click = async (h: Harness, name: string): Promise<void> => {
+		await act(async () => {
+			onClickOf(button(h.container, name))({});
+		});
+		await act(async () => {});
+	};
+
+	test("opening runs no consolidation request and keeps the commit-history notes", async () => {
+		const h = await mount();
+		try {
+			expect(h.calls.some((c) => c.url.endsWith("/release-summary"))).toBe(
+				false,
+			);
+			expect(notesValue(h.container)).toBe(notes);
+			expect(button(h.container, "Consolidate notes").disabled).toBe(false);
+			expect(h.container.textContent).not.toContain("Consolidation review");
+		} finally {
+			await h.done();
+		}
+	});
+
+	test("Consolidate notes posts once and shows the diff of both texts", async () => {
+		const h = await mount(() => json({ summary: consolidated, reason: null }));
+		try {
+			await click(h, "Consolidate notes");
+			const post = h.calls.find((c) => c.url.endsWith("/release-summary"));
+			expect(post?.method).toBe("POST");
+			expect(post?.body).toEqual({ sha: plan.sha });
+			expect(h.container.textContent).toContain("Proposed notes");
+			// One proposal at a time: the button re-arms after Use or Discard.
+			expect(button(h.container, "Consolidate notes").disabled).toBe(true);
+			expect(h.container.querySelector(".deepen-diff")).not.toBeNull();
+			expect(h.container.textContent).toContain("the thing landed");
+			expect(h.container.textContent).toContain("fix the bug");
+			// The proposal is a review, not a replacement: the draft still holds
+			// the deterministic notes until the user accepts.
+			expect(notesValue(h.container)).toBe(notes);
+		} finally {
+			await h.done();
+		}
+	});
+
+	test("Use consolidated notes writes the draft and Start sends it", async () => {
+		const h = await mount(() => json({ summary: consolidated, reason: null }));
+		try {
+			await click(h, "Consolidate notes");
+			await click(h, "Use consolidated notes");
+			expect(notesValue(h.container)).toBe(consolidated);
+			expect(h.container.textContent).not.toContain("Consolidation review");
+			await click(h, "Start release");
+			const rel = h.calls.find(
+				(c) => c.url.endsWith("/release") && c.method === "POST",
+			);
+			expect(rel?.body).toEqual({ sha: plan.sha, notes: consolidated });
+		} finally {
+			await h.done();
+		}
+	});
+
+	test("Discard keeps the original notes and Start sends no notes override", async () => {
+		const h = await mount(() => json({ summary: consolidated, reason: null }));
+		try {
+			await click(h, "Consolidate notes");
+			await click(h, "Discard");
+			expect(notesValue(h.container)).toBe(notes);
+			expect(h.container.textContent).not.toContain("Use consolidated notes");
+			// Discard re-arms the button, so a fresh proposal can be requested.
+			expect(button(h.container, "Consolidate notes").disabled).toBe(false);
+			await click(h, "Start release");
+			const rel = h.calls.find(
+				(c) => c.url.endsWith("/release") && c.method === "POST",
+			);
+			expect(rel?.body).toEqual({ sha: plan.sha });
+		} finally {
+			await h.done();
+		}
+	});
+
+	test("a failed consolidation shows the advisory, keeps the notes, and a retry succeeds", async () => {
+		let n = 0;
+		const h = await mount(() => {
+			n += 1;
+			return n === 1
+				? json({ summary: null, reason: "the gateway is down" })
+				: json({ summary: consolidated, reason: null });
+		});
+		try {
+			await click(h, "Consolidate notes");
+			expect(h.container.textContent).toContain(
+				"Consolidated notes unavailable: the gateway is down",
+			);
+			expect(notesValue(h.container)).toBe(notes);
+			expect(h.container.textContent).not.toContain("Consolidation review");
+			// The button re-arms: a retry clears the advisory and opens the review.
+			await click(h, "Consolidate notes");
+			expect(n).toBe(2);
+			expect(h.container.textContent).not.toContain("the gateway is down");
+			expect(h.container.querySelector(".deepen-diff")).not.toBeNull();
+		} finally {
+			await h.done();
+		}
+	});
+
+	test("an identical proposal reports no line changes instead of an empty diff box", async () => {
+		const h = await mount(() => json({ summary: notes, reason: null }));
+		try {
+			await click(h, "Consolidate notes");
+			expect(h.container.textContent).toContain("nothing to change");
+			expect(h.container.querySelector(".deepen-diff")).toBeNull();
+			expect(button(h.container, "Use consolidated notes").disabled).toBe(
+				false,
+			);
+		} finally {
+			await h.done();
+		}
 	});
 });
 
