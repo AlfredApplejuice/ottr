@@ -3312,6 +3312,8 @@ describe("rolling restart", () => {
 	test("a vm-runner image that does not build stops the run before any hold or recreate", async () => {
 		const { main, ci } = checkout();
 		bump(ci, "1.1.0");
+		const side = checkout();
+		bump(side.ci, "2.0.0");
 		delete process.env.OTTR_VERSION;
 		// The tag must sit on the commit the run deploys: bump moved origin/main,
 		// so tag the fetched ref, not main's own (still behind) HEAD.
@@ -3320,14 +3322,34 @@ describe("rolling restart", () => {
 		const f = fakes({
 			newImage: true,
 			running: "server\nvm-runner",
+			sidecar: { name: "sidecar", dir: side.main },
+			sidecarNewImage: true,
 			vmBuild: 1,
 			gets: [vmBoard(0)],
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
-		expect(f.calls).toEqual([PS, BUILD, CFGJSON, VM_BUILD]);
-		// Both builds describe the same deployed commit, and the vm-runner build
-		// re-stamps: the run stops before anything else could overwrite the value.
-		expect(f.buildStamps).toEqual(["v2.3.4", "v2.3.4"]);
+		expect(f.calls).toEqual([
+			PS,
+			BUILD,
+			CFGJSON,
+			SIDE_BUILD,
+			...SIDE_COMPARE,
+			SIDE_UP,
+			VM_BUILD,
+		]);
+		// The sidecar build stamped its own repo's commit between the two main
+		// builds, so the vm-runner stamp proves the re-stamp: without the reset
+		// in buildVmRunner the third value would stay the sidecar's short sha.
+		expect(f.buildStamps).toEqual([
+			"v2.3.4",
+			must(
+				side.main,
+				"rev-parse",
+				"--short",
+				must(side.origin, "rev-parse", "main"),
+			),
+			"v2.3.4",
+		]);
 		expect(f.logs).toContain("kvm build failed");
 		expect(f.logs).toContain(
 			"stopped: the vm-runner image does not build; the stack keeps the old one",
