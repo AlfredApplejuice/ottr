@@ -454,6 +454,7 @@ import {
 	serverMergePush,
 	setHostedGitAuth,
 	setNetworkGitAuth,
+	shownVersion,
 	statusFiles,
 	validateCopyPath,
 } from "./worktree.ts";
@@ -13232,7 +13233,9 @@ export async function createApp(deps: AppDeps) {
 				await api(req, async () =>
 					json({
 						onboarding: deps.hosted === undefined && admin === null,
-						version: deps.serverVersion,
+						// shownVersion: serverVersion keeps the boot-time stamp for the reload
+						// handshake, but the sidebar must never show a bare timestamp.
+						version: shownVersion(deps.serverVersion),
 						live: !prod,
 						...(deps.hosted !== undefined && { hosted: true }),
 					}),

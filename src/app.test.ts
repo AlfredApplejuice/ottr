@@ -12282,6 +12282,21 @@ describe("boot host wall (R2-11)", () => {
 	});
 });
 
+describe("/api/boot version", () => {
+	test("a boot-time stamp shows as unknown version; a real version passes through", async () => {
+		const stamped = await mount({ serverVersion: String(Date.now()) });
+		const boot = await stamped.call("/api/boot");
+		expect(boot.status).toBe(200);
+		const b = (await boot.json()) as { version: string };
+		expect(b.version).toBe("unknown version");
+		const tagged = await mount({ serverVersion: "v1.2.3-4-gabcdef0" });
+		const b2 = (await (await tagged.call("/api/boot")).json()) as {
+			version: string;
+		};
+		expect(b2.version).toBe("v1.2.3-4-gabcdef0");
+	});
+});
+
 describe(
 	"origin wall in api() (R1-2)",
 	await (async () => {

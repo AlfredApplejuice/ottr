@@ -187,7 +187,13 @@ omp. Two parts do the work:
    [README, Docker Compose, latest release](../README.md#docker-compose-latest-release))
    updates by moving its image tag. Neither host script runs there.
    The one-shot updater fast-forwards `main` and builds the image, then it
-   rolls the stack one runner at a time. A runner is a worker (its hostname, the
+   rolls the stack one runner at a time. Each build stamps the deployed
+   commit's version into the image as `OTTR_VERSION`: the
+   `git describe --tags --match "v[0-9]*"` output for that commit (`vX.Y.Z`,
+   or `vX.Y.Z-N-g<sha>` past the tag), or the short commit sha when no
+   release tag reaches it. The board shows this stamp in the sidebar. When
+   the image carries no stamp and git is unavailable, the board shows
+   `unknown version`, never a boot time. A runner is a worker (its hostname, the
    compose service name) or the server itself (`local`). It stops when the
    checkout has uncommitted changes or commits that origin lacks, when
    `docker compose ps` fails, or when it cannot compare the server's image with

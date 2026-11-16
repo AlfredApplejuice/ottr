@@ -784,7 +784,8 @@ export async function headVersion(dir: string): Promise<string> {
 /** Version the board shows: the release stamp baked into the image first (OTTR_VERSION; the
  * image ships no .git to describe), then the newest release tag reachable from HEAD
  * (`vX.Y.Z`, or `vX.Y.Z-N-g<short>` when HEAD sits past it), the short HEAD sha on a dev
- * checkout with no release, and headVersion's boot-time fallback when git is unusable. */
+ * checkout with no release, and headVersion's boot-time fallback when git is unusable
+ * (shownVersion maps that fallback to "unknown version" for every surface). */
 export async function describeVersion(dir: string): Promise<string> {
 	const stamp = process.env.OTTR_VERSION?.trim();
 	if (stamp !== undefined && stamp !== "") return stamp;
@@ -800,6 +801,14 @@ export async function describeVersion(dir: string): Promise<string> {
 		// git missing or unusable
 	}
 	return headVersion(dir);
+}
+
+/** The version a surface shows. describeVersion's boot-time fallback (no OTTR_VERSION, no
+ * git: epoch milliseconds, 13 digits today) still changes on every restart, which the
+ * stale-tab reload handshake needs, but it is not a version, so no surface shows it as
+ * one. */
+export function shownVersion(v: string): string {
+	return /^\d{13,}$/.test(v) ? "unknown version" : v;
 }
 
 /** What `archReviewDelta` reports: the commit delta, whether a watermark anchors it (false = never

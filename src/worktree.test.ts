@@ -73,6 +73,7 @@ import {
 	setGitSecrets,
 	setNetworkGitAuth,
 	setWorkerRoots,
+	shownVersion,
 	slugify,
 	spawnPiped,
 	statusFiles,
@@ -2684,6 +2685,33 @@ describe("describeVersion", () => {
 		try {
 			expect(await describeVersion(dir)).toMatch(/^\d+$/);
 		} finally {
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}, 60_000);
+});
+
+describe("shownVersion", () => {
+	test("the boot-time stamp shows as unknown version; every real version passes through", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-shown-"));
+		const old = process.env.OTTR_VERSION;
+		delete process.env.OTTR_VERSION;
+		try {
+			await must(dir, "init", "-q", "-b", "main");
+			// No git repo content yet: describeVersion lands on the boot-time stamp.
+			const stamp = await describeVersion(dir);
+			expect(shownVersion(stamp)).toBe("unknown version");
+			// The stamp is the wall clock (epoch ms), so a restart always ships a new
+			// serverVersion and the stale-tab reload handshake keeps firing.
+			expect(Number(stamp)).toBeGreaterThanOrEqual(Date.now() - 1000);
+			expect(Number(stamp)).toBeLessThanOrEqual(Date.now() + 1000);
+			// Real versions pass through untouched.
+			expect(shownVersion("v1.2.3")).toBe("v1.2.3");
+			expect(shownVersion("v1.2.3-4-gabcdef0")).toBe("v1.2.3-4-gabcdef0");
+			expect(shownVersion("abcdef0")).toBe("abcdef0"); // 7-hex short sha
+			expect(shownVersion("v9.9.9")).toBe("v9.9.9");
+		} finally {
+			if (old === undefined) delete process.env.OTTR_VERSION;
+			else process.env.OTTR_VERSION = old;
 			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
 		}
 	}, 60_000);
