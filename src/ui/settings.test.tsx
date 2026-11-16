@@ -5464,6 +5464,8 @@ describe("ProjectSetupSteps step order", () => {
 		expect(html).toContain("Skip, use defaults");
 		expect(html).not.toContain("PR mode");
 		expect(html).not.toContain("Target branch");
+		// Only Source is settled; the user has seen nothing else.
+		expect(html.match(/class="done"/g)).toHaveLength(1);
 	});
 
 	test("a project with retro and fork research done opens at the Project step", () => {
@@ -5473,6 +5475,8 @@ describe("ProjectSetupSteps step order", () => {
 		expect(html).toContain("Target branch");
 		expect(html).toContain("Skip, use defaults");
 		expect(html).not.toContain("Retro");
+		// The skipped board steps are settled by their defaults.
+		expect(html.match(/class="done"/g)).toHaveLength(3);
 	});
 
 	test("hosted mode hides the PR mode row and keeps the target branch", () => {
@@ -5488,6 +5492,90 @@ describe("ProjectSetupSteps step order", () => {
 		} as unknown as ProjectView);
 		expect(html).toContain("5 of 5");
 		expect(html).toContain("Create git repo");
+		// The settings steps are NOT settled: the user never saw them
+		// (OTTR-1065 send-back).
+		expect(html.match(/class="done"/g)).toHaveLength(1);
+	});
+});
+
+describe("ProjectSetupSteps gitless init jump", () => {
+	// A gitless project opens at the rules step's init panel; creating the repo must
+	// move to the first unsettled settings step, not stay beside the interview start
+	// (OTTR-1065 send-back).
+	const gitless = {
+		name: "bare",
+		hasRules: false,
+		gitless: true,
+		github: null,
+		settings: {
+			retroSince: null,
+			retroFilter: false,
+			forkResearch: false,
+			holdUpdateMerges: false,
+			forkMergeHold: false,
+			prMode: false,
+			targetBranch: null,
+			maxParallel: null,
+			copyExtra: [],
+		},
+	} as unknown as ProjectView;
+
+	test("creating the repo lands on the Automation step, not beside the interview", async () => {
+		const realFetch = globalThis.fetch;
+		let inits = 0;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			if (url.endsWith("/init") && (init?.method ?? "GET") === "POST") {
+				inits += 1;
+				return okJson({ project: { ...gitless, gitless: false } });
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectSetupSteps
+						project={gitless}
+						act={async (fn) => {
+							await fn();
+							return true;
+						}}
+						onClose={() => {}}
+					/>,
+				);
+			});
+			expect(container.textContent).toContain("Create git repo");
+			const button = [...container.querySelectorAll("button")].find(
+				(b) => b.textContent === "Create git repo",
+			);
+			expect(button).toBeDefined();
+			await act(async () => {
+				(button as HTMLButtonElement).click();
+			});
+			// The wizard moved to the Automation step: the settings walk precedes
+			// the interview.
+			expect(container.textContent).toContain("Retro");
+			expect(container.textContent).not.toContain("Create git repo");
+			// The strip marks only Source settled.
+			const done = container.querySelectorAll(".setup-steps li.done");
+			expect(done).toHaveLength(1);
+			expect(done[0]?.textContent).toBe("Source");
+			expect(inits).toBe(1);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
 	});
 });
 

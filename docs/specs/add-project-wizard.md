@@ -74,9 +74,14 @@ their home on the settings page. The wizard only shows existing settings.
 
 - **Gitless** (added by name without GitHub, or a commit-less clone):
   the settings routes 409 while gitless, so the wizard's first step after
-  Source is the rules section's "Create git repo" panel; the interview
-  stays the last step. Closing before init leaves the project with the
-  gitless advisory ("Create git repo") and the checklist.
+  Source is the rules section's "Create git repo" panel. Creating the
+  repository moves the wizard to the first unsettled settings step, so the
+  Automation, Runners and Project steps still come before the interview;
+  Done on the last step inits first when the project is still gitless, then
+  starts the interview. The step strip marks a step done only once the
+  wizard showed it or the add settled it by default. Closing before init
+  leaves the project with the gitless advisory ("Create git repo") and the
+  checklist.
 - **Hosted mode**: the Project step shows the target branch only; the PR
   mode row is hidden exactly when the settings page hides the Merging
   card. Everything else is identical; hosted tenants run the interview

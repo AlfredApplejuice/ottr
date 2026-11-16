@@ -135,8 +135,10 @@ const SETUP_STEPS = [
 const PR_MODE_DESC =
 	"Push finished card branches and open a pull request to the target branch instead of merging; the card waits in Merging until the pull request merges on GitHub";
 
-/** Step strip styled like .add-tabs: steel underline on the current step, a check on done ones. */
-function SetupStepsNav({ step }: { step: number }) {
+/** Step strip styled like .add-tabs: steel underline on the current step, a check on
+ *  settled ones (`seenUpTo` bounds them: a gitless start at the rules step must not
+ *  claim the settings steps the user never saw). */
+function SetupStepsNav({ step, seenUpTo }: { step: number; seenUpTo: number }) {
 	return (
 		<ol className="setup-steps" aria-label="Setup steps">
 			{SETUP_STEPS.map((name, i) => {
@@ -145,9 +147,9 @@ function SetupStepsNav({ step }: { step: number }) {
 					<li
 						key={name}
 						aria-current={n === step ? "step" : undefined}
-						className={n < step ? "done" : undefined}
+						className={n < step && n <= seenUpTo ? "done" : undefined}
 					>
-						{n < step && <Icon name="check" size={13} />}
+						{n < step && n <= seenUpTo && <Icon name="check" size={13} />}
 						{name}
 						{n === step && (
 							<span className="step-n">
@@ -353,15 +355,27 @@ export function ProjectSetupSteps({
 	onNotice?: (message: string) => void;
 	onClose: () => void;
 }) {
-	// Board settings still missing? The facts the setup checklist reads — no new flag:
-	// retro off, or fork research off on a GitHub project. When both are settled the
-	// wizard starts at the Project step and the strip marks the skipped ones done.
-	const boardMissing =
-		project.settings.retroSince === null ||
-		(project.github !== null && !project.settings.forkResearch);
+	// The first unsettled settings step: Automation while the checklist facts are open,
+	// else Project. Read per view: the init jump re-runs it on the refreshed settings.
+	const unsettledStep = (v: ProjectView): number =>
+		v.settings.retroSince === null ||
+		(v.github !== null && !v.settings.forkResearch)
+			? 2
+			: 4;
 	// A gitless project cannot save settings yet (the routes 409), so it opens at the
-	// rules step's init panel; the interview still starts only on this step's action.
-	const [step, setStep] = useState(project.gitless ? 5 : boardMissing ? 2 : 4);
+	// rules step's init panel; creating the repo moves it to the first unsettled
+	// settings step, so the settings walk still precedes the interview
+	// (docs/specs/add-project-wizard.md).
+	const initialStep = project.gitless ? 5 : unsettledStep(project);
+	const [step, setStep] = useState(initialStep);
+	// The strip's done checks follow what the user actually settled: Source is settled
+	// at open, steps the open skipped count as settled by their defaults, and a gitless
+	// start marks nothing but Source until the user walks the steps.
+	const [seenUpTo, setSeenUpTo] = useState(project.gitless ? 1 : initialStep);
+	const goto = (n: number): void => {
+		setStep(n);
+		setSeenUpTo((s) => Math.max(s, n));
+	};
 	// The latest ProjectView: every settings save returns one, so the checkboxes follow the server.
 	const [view, setView] = useState(project);
 	const [err, setErr] = useState<string | null>(null);
@@ -453,7 +467,7 @@ export function ProjectSetupSteps({
 	const next = (): void => {
 		if (step === 2 && forkEffective !== view.settings.forkResearch) {
 			void patch({ forkResearch: forkEffective }).then((ok) => {
-				if (ok) setStep(3);
+				if (ok) goto(3);
 			});
 			return;
 		}
@@ -469,21 +483,21 @@ export function ProjectSetupSteps({
 				paths.length === view.settings.copyExtra.length &&
 				paths.every((p, i) => p === view.settings.copyExtra[i]);
 			if (unchanged) {
-				setStep(4);
+				goto(4);
 				return;
 			}
 			void patch({ maxParallel: parallel, copyExtra: paths }).then((ok) => {
-				if (ok) setStep(4);
+				if (ok) goto(4);
 			});
 			return;
 		}
 		if (step === 4 && tb.trim() !== (view.settings.targetBranch ?? "")) {
 			void patch({ targetBranch: tb.trim() || null }).then((ok) => {
-				if (ok) setStep(5);
+				if (ok) goto(5);
 			});
 			return;
 		}
-		setStep(step + 1);
+		goto(step + 1);
 	};
 
 	/** "Skip, use defaults": drop the step's unsaved drafts and move on. Choices already
@@ -502,7 +516,7 @@ export function ProjectSetupSteps({
 		} else if (step === 4) {
 			setTb(view.settings.targetBranch ?? "");
 		}
-		setStep(step + 1);
+		goto(step + 1);
 	};
 
 	/** The final Done: start the rules interview (init first when gitless), then finish.
@@ -517,7 +531,7 @@ export function ProjectSetupSteps({
 
 	return (
 		<>
-			<SetupStepsNav step={step} />
+			<SetupStepsNav step={step} seenUpTo={seenUpTo} />
 			{err !== null && (
 				<p className="auth-error" role="alert">
 					{err}
@@ -667,7 +681,14 @@ export function ProjectSetupSteps({
 					rulesQueued={rulesQueued}
 					openTask={openTask}
 					onClose={onClose}
-					initRepo={initRepo}
+					// Creating the repo moves to the first unsettled settings step: the
+					// settings walk must precede the interview
+					// (docs/specs/add-project-wizard.md).
+					initRepo={async () => {
+						const ok = await initRepo();
+						if (ok) goto(unsettledStep(view));
+						return ok;
+					}}
 					alignRules={() => runInterview({ fix: true })}
 					discussRules={() => runInterview({}, () => setRulesQueued(true))}
 				/>
@@ -689,7 +710,7 @@ export function ProjectSetupSteps({
 					</button>
 				)}
 				{step > 2 && (
-					<button type="button" onClick={() => setStep(step - 1)}>
+					<button type="button" onClick={() => goto(step - 1)}>
 						Back
 					</button>
 				)}
