@@ -2147,6 +2147,14 @@ button.notif-link {
 	margin-left: 0.35em;
 }
 
+/* A card ref reads as one token, and browsers break it at the id's hyphen
+   ("OTTR-" / "1065"), so keep the anchors unbroken. Realistic refs (project
+   slug + PREFIX-N) fit the pane at every breakpoint; the notif-link class's
+   overflow-wrap stays for every other link (URLs, settings phrases). */
+a[data-card-link] {
+	white-space: nowrap;
+}
+
 /* ---- Shell: area list + main pane ---- */
 
 .shell {
