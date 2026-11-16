@@ -345,6 +345,8 @@ interface TaskRow {
 	pr_url: string | null;
 	pr_head_sha: string | null;
 	pr_watch_at: number | null;
+	ci_pr_answered_key: string | null;
+	ci_pr_answered_info: string | null;
 	pending_feedback: number;
 	source_pr_number: number | null;
 	source_pr_url: string | null;
@@ -352,6 +354,7 @@ interface TaskRow {
 	source_pr_head_sha: string | null;
 	source_pr_cross_repo: number;
 	source_pr_dependabot: number;
+	source_pr_superseded: number;
 	follow_up_pr_number: number | null;
 	follow_up_pr_url: string | null;
 	topic: string | null;
@@ -574,6 +577,8 @@ function toListedTask(
 		prUrl: r.pr_url,
 		prHeadSha: r.pr_head_sha,
 		prWatchAt: r.pr_watch_at,
+		ciPrAnsweredKey: r.ci_pr_answered_key,
+		ciPrAnsweredInfo: r.ci_pr_answered_info,
 		pendingFeedback: r.pending_feedback === 1,
 		sourcePrNumber: r.source_pr_number,
 		sourcePrUrl: r.source_pr_url,
@@ -581,6 +586,7 @@ function toListedTask(
 		sourcePrHeadSha: r.source_pr_head_sha,
 		sourcePrCrossRepo: r.source_pr_cross_repo === 1,
 		sourcePrDependabot: r.source_pr_dependabot === 1,
+		sourcePrSuperseded: r.source_pr_superseded === 1,
 		followUpPrNumber: r.follow_up_pr_number,
 		followUpPrUrl: r.follow_up_pr_url,
 		topic: r.topic,
@@ -930,6 +936,8 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	prUrl: "pr_url",
 	prHeadSha: "pr_head_sha",
 	prWatchAt: "pr_watch_at",
+	ciPrAnsweredKey: "ci_pr_answered_key",
+	ciPrAnsweredInfo: "ci_pr_answered_info",
 	pendingFeedback: "pending_feedback",
 	sourcePrNumber: "source_pr_number",
 	sourcePrUrl: "source_pr_url",
@@ -937,6 +945,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	sourcePrHeadSha: "source_pr_head_sha",
 	sourcePrCrossRepo: "source_pr_cross_repo",
 	sourcePrDependabot: "source_pr_dependabot",
+	sourcePrSuperseded: "source_pr_superseded",
 	followUpPrNumber: "follow_up_pr_number",
 	followUpPrUrl: "follow_up_pr_url",
 	topic: "topic",
@@ -2067,6 +2076,16 @@ export class ProjectStore {
 					"source_pr_dependabot",
 					"ALTER TABLE tasks ADD COLUMN source_pr_dependabot INTEGER NOT NULL DEFAULT 0",
 				);
+				// OTTR-1063: the ship proved the card branch holds nothing beyond the target,
+				// so the card finishes done once its source PR closes. ALTER-only after both
+				// CHECK rebuilds, same reason as pr_number above — a rebuild's explicit
+				// column list would drop it.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"source_pr_superseded",
+					"ALTER TABLE tasks ADD COLUMN source_pr_superseded INTEGER NOT NULL DEFAULT 0",
+				);
 				// OTTR-809: the follow-up PR the ship step opened for a Dependabot card's fixes
 				// beyond the source PR's head. ALTER-only after both CHECK rebuilds, same reason
 				// as pr_number above — a rebuild's explicit column list would drop them.
@@ -2365,6 +2384,24 @@ export class ProjectStore {
 					cols,
 					"validated_at",
 					"ALTER TABLE tasks ADD COLUMN validated_at INTEGER",
+				);
+				// OTTR-1056: the answered PR-head CI failure. The key is
+				// `<pushSha>:<runId>#<attempt>[,...]`; a matching key keeps ciPrHeadReply from
+				// replying again to the same head and run, also after the same head ships
+				// again. The info holds the failed-check lines a no-change settle shows.
+				// ALTER-only after both CHECK rebuilds, same reason as pr_number above — a
+				// rebuild's explicit column list would drop them.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"ci_pr_answered_key",
+					"ALTER TABLE tasks ADD COLUMN ci_pr_answered_key TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"ci_pr_answered_info",
+					"ALTER TABLE tasks ADD COLUMN ci_pr_answered_info TEXT",
 				);
 				await ProjectStore.convergeProposalReasons(db, store.queue);
 				// posted_url landed after the first pr_review release: CREATE TABLE IF NOT EXISTS never

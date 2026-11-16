@@ -115,14 +115,31 @@ export function ghEnvFor(
 
 /**
  * The token for fetches of public github.com data (trending repos, omp's upstream
- * releases): GH_TOKEN only when the board's own host is github.com. An enterprise host's
- * token belongs to that host and never goes to github.com; the public endpoint then runs
- * without a token.
+ * releases): those fetches always go to api.github.com, on every board. A github.com
+ * board lends GH_TOKEN. Another board lends only the stored github.com token from
+ * Settings -> Git hosts (`storedGithubCom`): GH_TOKEN there is the board host's own
+ * token — applyGithubToken writes the board token to it, and ghEnvFor and
+ * branchRulesToken read it as the configured host's credential — so it never serves
+ * these fetches.
  */
 export function upstreamToken(
 	env: Record<string, string | undefined> = process.env,
+	storedGithubCom?: string,
 ): string | undefined {
-	return githubHost(env).isDefault ? env.GH_TOKEN : undefined;
+	if (githubHost(env).isDefault) return env.GH_TOKEN;
+	return storedGithubCom || undefined;
+}
+
+/**
+ * The stored github.com token among Settings -> Git hosts rows: the one row whose host
+ * is github.com and whose blob this boot can open. A row for another host never serves
+ * a github.com fetch.
+ */
+export function storedGithubComToken(
+	tokens: readonly { host: string; token: string; unreadable?: true }[],
+): string | undefined {
+	return tokens.find((t) => t.host === "github.com" && t.unreadable !== true)
+		?.token;
 }
 
 /**

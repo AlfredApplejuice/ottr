@@ -71,39 +71,49 @@ export function gitExe(resolved: string | null = Bun.which("git")): string {
 
 /**
  * One piped spawn, shared by git() and runGh(). `timeout` (Bun 1.4) bounds a hung child:
- * Bun kills it and `exited` resolves non-zero, so no caller can wait forever.
+ * Bun kills it and `exited` resolves non-zero, so no caller can wait forever. `input` is
+ * written to the child's stdin (then closed) before the readers run, so a command that
+ * reads stdin (git cat-file --batch-check) stays one spawn; the readers start first, so
+ * a big input and a big output cannot deadlock on full pipes.
  */
 export async function spawnPiped(
 	argv: string[],
 	cwd: string | undefined,
 	timeoutMs: number,
 	env: Record<string, string | undefined> = process.env,
+	input?: string,
 ): Promise<GitResult> {
 	const proc = Bun.spawn(argv, {
 		cwd,
 		// Explicit: the caller picks the env; Bun's default would be this process's boot env
 		// (git scopes GH_TOKEN to network subcommands via gitEnv; gh keeps it for its API).
 		env,
-		stdin: "ignore",
+		stdin: input === undefined ? "ignore" : "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
 		// Stryker disable next-line BooleanLiteral: no test can see a console window, and the mutant would flash one per git call
 		windowsHide: true,
 		timeout: timeoutMs,
 	});
-	const [stdout, stderr] = await Promise.all([
+	const read = Promise.all([
 		new Response(proc.stdout).text(),
 		new Response(proc.stderr).text(),
 	]);
+	if (input !== undefined && proc.stdin !== null && proc.stdin !== undefined) {
+		proc.stdin.write(input);
+		proc.stdin.end();
+	}
+	const [stdout, stderr] = await read;
 	const code = await proc.exited;
 	return { code, stdout, stderr };
 }
 
-/** Git subcommands that touch the network and so need GH_TOKEN for their credential helper; every other board git runs without it. */
+/** Git subcommands that touch the network and so need GH_TOKEN for their credential helper; every other board git runs without it. `lfs` is here because `git lfs push` uploads to the origin over the same credentials as `git push` (OTTR-1058). */
 const NETWORK_GIT: Record<string, true> = {
 	clone: true,
 	fetch: true,
 	"ls-remote": true,
+	lfs: true,
 	pull: true,
 	push: true,
 };
@@ -255,6 +265,7 @@ export async function git(
 	timeoutMs = 10 * 60_000,
 	authEnv?: Record<string, string>,
 	env: Record<string, string> = {},
+	input?: string,
 ): Promise<GitResult> {
 	let at = -1;
 	for (let i = 0; i < args.length; i++) {
@@ -321,6 +332,7 @@ export async function git(
 		cwd,
 		timeoutMs,
 		{ ...gitEnv(args, auth), ...env },
+		input,
 	);
 	// Network git carries host tokens, and a remote may echo one back: its output reaches task
 	// logs and API errors, so stored secrets never leave this function raw.
@@ -1589,7 +1601,8 @@ export function redactUrlCredentials(text: string): string {
 }
 
 /** stderr lines that name a push failure's cause; hint lines stay out of needsReason. */
-const PUSH_REASON_LINE = /^\s*(?:!\s*\[|error:|fatal:|remote:)/;
+const PUSH_REASON_LINE =
+	/^\s*(?:!\s*\[|error:|fatal:|remote:|LFS:|batch response:)/;
 /** OTTR-743: the remote's race wording — the ref moved between the push's negotiation and its update. */
 const CANNOT_LOCK_REF_RE = /cannot lock ref/;
 /** Output prefix of a failed push whose head the remote already holds; turn.ts logs it as the done reason. */
@@ -1712,8 +1725,10 @@ async function lockRefAlreadyLanded(
 	};
 }
 
-/** The pre-flight gates of a server merge push: the branch and local tip to push and the
- * pinned origin to push to. A result means the push is skipped or failed outright. */
+/** The pre-flight gates of a server merge push: the branch, local tip and base the remote
+ * holds, and the pinned origin to push to. A result means the push is skipped or failed
+ * outright. `base` is the commit the remote already holds (null: it holds none) and is
+ * the LFS scan's range start. */
 async function mergePushPreflight(
 	mainPath: string,
 	worktreePath: string,
@@ -1722,7 +1737,8 @@ async function mergePushPreflight(
 	leaseTip: string | null,
 	originUrl: string | null,
 ): Promise<
-	{ branch: string; local: string; originUrl: string } | MergePushResult
+	| { branch: string; local: string; base: string | null; originUrl: string }
+	| MergePushResult
 > {
 	if (!target.startsWith("origin/")) return { status: "skipped" };
 	const branch = target.slice("origin/".length);
@@ -1733,9 +1749,9 @@ async function mergePushPreflight(
 		);
 		return r.code === 0 ? r.stdout.trim() : null;
 	};
+	const base = await sha(`refs/remotes/origin/${branch}`);
 	const local = await sha(`refs/heads/${branch}`);
-	if (local === null || local === (await sha(`refs/remotes/origin/${branch}`)))
-		return { status: "skipped" };
+	if (local === null || local === base) return { status: "skipped" };
 	if (leaseTip !== null) {
 		const gate = await holdGate(mainPath, leaseTip, branch);
 		if (gate !== null) return gate;
@@ -1756,7 +1772,7 @@ async function mergePushPreflight(
 		};
 	const guard = await checkPinnedRemote(mainPath, originUrl);
 	if (guard !== null) return { status: "failed", error: guard };
-	return { branch, local, originUrl };
+	return { branch, local, base, originUrl };
 }
 
 export async function serverMergePush(
@@ -1781,7 +1797,14 @@ export async function serverMergePush(
 		originUrl,
 	);
 	if ("status" in pre) return pre;
-	const { branch, local, originUrl: pinnedUrl } = pre;
+	const { branch, local, originUrl: pinnedUrl, base } = pre;
+	// The LFS objects go first (OTTR-1058): the board's git pins hooksPath=/dev/null, so
+	// git-lfs's pre-push hook never runs and the remote would reject unknown objects
+	// (GitHub's GH008). An upload failure fails the card before the push, the same shape
+	// as any push failure.
+	const lfs = await pushLfsObjects(mainPath, pinnedUrl, branch, local, base);
+	if (lfs !== null)
+		return { status: "failed", error: lfs.error, output: lfs.output };
 	const r = await git(
 		[
 			"push",
@@ -1858,6 +1881,196 @@ function pushFailure(r: GitResult): {
 	return { error, output };
 }
 
+/** A pointer an LFS-filtered file hashes to when git stages it (git-lfs pointer spec:
+ * the version line, then the content oid). A text file that merely starts like a pointer
+ * has no oid line and never matches. */
+const LFS_POINTER_RE =
+	/^version https:\/\/git-lfs\.github\.com\/spec\/v1\noid sha256:([0-9a-f]{64})\n/;
+
+/** Largest blob the content pass reads: a git-lfs pointer is the spec's three or four
+ * short lines, far under this. Blobs at or over it cannot be pointers, so the content
+ * pass never reads a big file's bytes (the whole range's content would be unbounded —
+ * a release of a large history reads every blob otherwise). */
+const LFS_POINTER_MAX_BYTES = 1024;
+
+/**
+ * The oids of the Git LFS pointers among a pushed range's objects (`base..tip`, the whole
+ * history of the tip when base is null). Plain git only, so a repo without LFS runs no
+ * git lfs command (the upload step's gate). Every commit of the range is scanned, not
+ * just the tip: a pointer added and deleted inside the range still shows, because each of
+ * those commits is one the remote must accept (GitHub's GH008 checks every pushed
+ * commit's pointers, OTTR-1058). The read stays bounded: a cat-file --batch-check pass
+ * (metadata only, one short line per object) first keeps just the blobs under
+ * LFS_POINTER_MAX_BYTES, and the content pass reads only those, so a large history's
+ * big blobs never enter the process memory. Objects that git cannot read return no
+ * oids: the push then fails the remote the same way it did before this step existed.
+ */
+export async function lfsPointerOids(
+	mainPath: string,
+	tip: string,
+	base: string | null,
+): Promise<string[]> {
+	const r = await git(
+		["rev-list", "--objects", ...(base === null ? [tip] : [`${base}..${tip}`])],
+		mainPath,
+	);
+	if (r.code !== 0) return [];
+	const shas: string[] = [];
+	for (const line of r.stdout.split("\n")) {
+		const sha = line.slice(
+			0,
+			line.indexOf(" ") === -1 ? line.length : line.indexOf(" "),
+		);
+		if (/^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(sha)) shas.push(sha);
+	}
+	if (shas.length === 0) return [];
+	const check = await git(
+		["cat-file", "--batch-check"],
+		mainPath,
+		undefined,
+		undefined,
+		{},
+		shas.join("\n") + "\n",
+	);
+	if (check.code !== 0) return [];
+	const small: string[] = [];
+	for (const line of check.stdout.split("\n")) {
+		// `<oid> blob <size>`, or `<oid> missing` for an unreadable name.
+		const m = /^([0-9a-f]{40,64}) blob (\d+)$/.exec(line);
+		const oid = m?.[1];
+		const size = m?.[2];
+		if (
+			oid !== undefined &&
+			size !== undefined &&
+			Number(size) < LFS_POINTER_MAX_BYTES
+		)
+			small.push(oid);
+	}
+	if (small.length === 0) return [];
+	const buf = await catFileBatch(mainPath, small);
+	const oids = new Set<string>();
+	let at = 0;
+	while (at < buf.length) {
+		const nl = buf.indexOf(10, at);
+		if (nl === -1) break;
+		const m = /^([0-9a-f]{40,64}) blob (\d+)$/.exec(
+			buf.toString("utf8", at, nl),
+		);
+		at = nl + 1;
+		if (m === null) continue; // a commit, a tree, or an unreadable object's header line
+		const size = Number(m[2]);
+		if (at + size > buf.length) break;
+		// latin1: 1 byte = 1 char, so the ASCII pointer text matches at the exact offsets.
+		const oid = LFS_POINTER_RE.exec(buf.toString("latin1", at, at + size))?.[1];
+		if (oid !== undefined) oids.add(oid);
+		at += size;
+		if (buf[at] === 10) at++; // --batch ends each object with a newline
+	}
+	return [...oids];
+}
+
+/**
+ * git cat-file --batch over the size-gated blobs lfsPointerOids kept. Bespoke spawn,
+ * outside git(): the output is raw object bytes and the parse needs byte offsets (a blob
+ * with invalid UTF-8 would shift a string decode). The candidate list holds blobs under
+ * LFS_POINTER_MAX_BYTES only, so the one output buffer is bounded by
+ * candidates x LFS_POINTER_MAX_BYTES no matter how big the range's other blobs are. A
+ * plain --batch names no config-driven program — filters run only behind
+ * --filters/--textconv, and cat-file runs no hook and no fsmonitor — so the
+ * planted-config pins git() carries do not apply here.
+ */
+async function catFileBatch(
+	mainPath: string,
+	shas: readonly string[],
+): Promise<Buffer> {
+	const proc = Bun.spawn([gitExe(), "cat-file", "--batch"], {
+		cwd: mainPath,
+		env: gitEnv(["cat-file", "--batch"]),
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	// Chunked writes keep the pipe moving while git streams the answer back.
+	for (let i = 0; i < shas.length; i += 256) {
+		proc.stdin.write(`${shas.slice(i, i + 256).join("\n")}\n`);
+		proc.stdin.flush();
+	}
+	proc.stdin.end();
+	const [bytes, err] = await Promise.all([
+		new Response(proc.stdout).arrayBuffer(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	// A broken repo reads as "no LFS here": the push keeps today's behavior.
+	return err.trim() !== "" ? Buffer.alloc(0) : Buffer.from(bytes);
+}
+
+/** The LFS endpoint git-lfs derives for an http(s) origin URL, pinned on the command
+ * line so a planted `lfs.url` cannot move the upload (verified against git-lfs 3.6.1:
+ * an empty `-c lfs.url=` fails the push, the derived value overrides the plant). */
+function lfsEndpointPin(originUrl: string): readonly string[] {
+	if (!/^https?:\/\//i.test(originUrl)) return [];
+	return ["-c", `lfs.url=${originUrl.replace(/\/+$/, "")}/info/lfs`];
+}
+
+/**
+ * The LFS half of a server-side push (OTTR-1058): git-lfs uploads objects from its
+ * pre-push hook, and the board's git pins `core.hooksPath=/dev/null`, so a push that
+ * adds or changes an LFS file fails the remote's unknown-object rejection (GitHub's
+ * GH008) unless the objects go first. No-op for a range without pointers: a repo
+ * without LFS runs no git lfs command. The upload runs with the push's own credential
+ * plumbing (git() classifies `lfs` as network git, so hosted mode mints the pinned
+ * origin's token and self-hosted mode passes its resolver env) and pins the LFS
+ * endpoint for an http(s) origin, so repo config a work turn planted (R5-1) cannot
+ * move it; the URL argument means `remote.<name>.lfsurl` is never read. A local-path
+ * origin becomes a file:// URL: git-lfs's standalone file transfer ignores endpoint
+ * config entirely and stores the objects in the bare repo itself. Any other scheme —
+ * `ssh://` in particular — runs no LFS step at all: there the https endpoint git-lfs
+ * authenticates over ssh cannot be derived offline, so no command-line pin exists, and
+ * a planted `lfs.url` (or `.lfsconfig`) would move the endpoint to a hostile server
+ * whose batch response can name a planted custom transfer adapter and run it next to
+ * the push's credentials (review finding on OTTR-1058). Those origins keep the
+ * pre-1058 behavior — the push itself fails the remote's unknown-object rejection,
+ * which the card shows (docs/WORKERS.md). `refName` is the ref the push carries (a
+ * branch, or a release's tag), `tip` the commit it names and `base` the commit the
+ * remote already holds (null: everything). `authEnv` re-uses a caller's scoped push
+ * credentials (the release identity). Returns null on success or when the step does
+ * not apply; `{ error, output }` puts the git-lfs failure on the card like any push
+ * failure and the caller stops before its git push.
+ */
+export async function pushLfsObjects(
+	mainPath: string,
+	originUrl: string,
+	refName: string,
+	tip: string,
+	base: string | null,
+	authEnv?: Record<string, string>,
+): Promise<{ error: string; output?: string } | null> {
+	if ((await lfsPointerOids(mainPath, tip, base)).length === 0) return null;
+	if (/^https?:\/\//i.test(originUrl)) {
+		const r = await git(
+			[...lfsEndpointPin(originUrl), "lfs", "push", originUrl, refName],
+			mainPath,
+			undefined,
+			authEnv,
+		);
+		if (r.code !== 0) return pushFailure(r);
+		return null;
+	}
+	// A local path: the standalone file transfer (no endpoint config to plant).
+	if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(originUrl)) {
+		const r = await git(
+			["lfs", "push", `file://${originUrl}`, refName],
+			mainPath,
+			undefined,
+			authEnv,
+		);
+		if (r.code !== 0) return pushFailure(r);
+	}
+	return null;
+}
+
 /**
  * PR mode's server-side branch push: pushes the card branch's tip to the pinned origin from the
  * main checkout with the same credential plumbing as serverMergePush (git() adds the host auth;
@@ -1891,6 +2104,15 @@ export async function pushBranch(
 	const guard = await checkPinnedRemote(mainPath, originUrl);
 	if (guard !== null) return { status: "failed", error: guard };
 	const tip = await sha(`refs/remotes/origin/${dstBranch}`);
+	const local = await sha(`refs/heads/${branch}`);
+	// The LFS objects go first (OTTR-1058), same as the merge push; the upload failure
+	// fails the card before the push runs.
+	const lfs =
+		local === null
+			? null
+			: await pushLfsObjects(mainPath, originUrl, branch, local, tip);
+	if (lfs !== null)
+		return { status: "failed", error: lfs.error, output: lfs.output };
 	const r = await git(
 		[
 			"push",
@@ -1908,7 +2130,6 @@ export async function pushBranch(
 		mainPath,
 	);
 	if (r.code === 0) {
-		const local = await sha(`refs/heads/${branch}`);
 		if (local !== null)
 			await git(
 				["update-ref", `refs/remotes/origin/${dstBranch}`, local],
@@ -2706,6 +2927,101 @@ export async function cleanMergeTree(
 	if (r.code !== 0) return null;
 	const tree = r.stdout.trim().split("\n")[0] ?? "";
 	return /^[0-9a-f]{40}$/.test(tree) ? tree : null;
+}
+
+/**
+ * OTTR-1064, PR mode's rules interview: the agent was told to never commit on a project
+ * whose target takes pull requests, so the board ships the written file itself. Builds one
+ * commit on `branch` from `baseRef`'s tree holding `file`'s working-tree content, with
+ * `baseRef`'s tip as the parent — pure plumbing (`hash-object`, `ls-tree`, `mktree`,
+ * `commit-tree`, `update-ref`), so the main checkout's HEAD, index and working tree never
+ * move and a failed ship leaves no partial state beyond a board-owned branch. "same" when
+ * the file is git-ignored (the interview's local-only decision), missing, or identical to
+ * the base ref's blob. The commit subject is `messages.update` when the base tree
+ * already held the file, else `messages.add`. Git trouble throws; the caller parks the
+ * card with the reason. `identity === null` keeps the built-in Ottr identity
+ * (gitIdentity.ts).
+ */
+export async function commitFileOnBranch(
+	mainPath: string,
+	file: string,
+	baseRef: string,
+	branch: string,
+	messages: { add: string; update: string },
+	identity: CommitIdentity | null = null,
+): Promise<{ kind: "same" } | { kind: "committed"; sha: string }> {
+	const ignore = await git(["check-ignore", "-q", "--", file], mainPath);
+	if (ignore.code !== 0 && ignore.code !== 1)
+		throw new Error(`git check-ignore failed: ${ignore.stderr.trim()}`);
+	if (ignore.code === 0) return { kind: "same" };
+	if (!existsSync(path.join(mainPath, file))) return { kind: "same" };
+	const hash = await git(["hash-object", "-w", "--", file], mainPath);
+	if (hash.code !== 0)
+		throw new Error(`git hash-object failed: ${hash.stderr.trim()}`);
+	const blob = hash.stdout.trim();
+	const parent = await git(
+		["rev-parse", "--verify", `${baseRef}^{commit}`],
+		mainPath,
+	);
+	if (parent.code !== 0)
+		throw new Error(`cannot resolve ${baseRef}: ${parent.stderr.trim()}`);
+	const baseTree = await git(
+		["rev-parse", "--verify", `${baseRef}^{tree}`],
+		mainPath,
+	);
+	if (baseTree.code !== 0)
+		throw new Error(
+			`cannot read the tree of ${baseRef}: ${baseTree.stderr.trim()}`,
+		);
+	const ls = await git(["ls-tree", "-z", baseTree.stdout.trim()], mainPath);
+	if (ls.code !== 0) throw new Error(`git ls-tree failed: ${ls.stderr.trim()}`);
+	// `ls-tree -z` rows: "mode SP type SP sha TAB name\0".
+	const entries = ls.stdout.split("\0").filter((row) => row !== "");
+	const nameOf = (row: string) => row.slice(row.indexOf("\t") + 1);
+	const existing = entries.find((row) => nameOf(row) === file);
+	const existingSha =
+		existing === undefined
+			? null
+			: (existing.slice(0, existing.indexOf("\t")).split(" ")[2] ?? null);
+	if (existingSha === blob) return { kind: "same" };
+	const mode = existing?.split(" ")[0] ?? "100644";
+	const rows =
+		existing !== undefined
+			? entries.map((row) =>
+					row === existing ? `${mode} blob ${blob}\t${file}` : row,
+				)
+			: [...entries, `100644 blob ${blob}\t${file}`].sort((a, b) =>
+					nameOf(a) < nameOf(b) ? -1 : 1,
+				);
+	const tree = await git(
+		["mktree", "-z"],
+		mainPath,
+		undefined,
+		undefined,
+		undefined,
+		`${rows.join("\0")}\0`,
+	);
+	if (tree.code !== 0)
+		throw new Error(`git mktree failed: ${tree.stderr.trim()}`);
+	const commit = await git(
+		[
+			...identityArgs(identity),
+			"commit-tree",
+			tree.stdout.trim(),
+			"-p",
+			parent.stdout.trim(),
+			"-m",
+			existingSha !== null ? messages.update : messages.add,
+		],
+		mainPath,
+	);
+	if (commit.code !== 0)
+		throw new Error(`git commit-tree failed: ${commit.stderr.trim()}`);
+	const sha = commit.stdout.trim();
+	const ref = await git(["update-ref", `refs/heads/${branch}`, sha], mainPath);
+	if (ref.code !== 0)
+		throw new Error(`git update-ref failed: ${ref.stderr.trim()}`);
+	return { kind: "committed", sha };
 }
 
 /** The branch's unified diff (same base as diffStat), or null when git fails. */

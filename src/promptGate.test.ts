@@ -23,6 +23,7 @@ import {
 	promptHandoffPaths,
 	replayGateParks,
 	START_ANYWAY,
+	skillBlock,
 	startAnywayQuestion,
 } from "./promptGate.ts";
 import { DEEPEN_POINTS, gatePrompt, gateSystem } from "./prompts.ts";
@@ -222,6 +223,47 @@ describe("ask mapping", () => {
 		const q = missingCheckQuestion();
 		expect(q.options).toEqual([]);
 		expect(q.recommended).toBeNull();
+	});
+});
+
+describe("skillBlock", () => {
+	test("renders one line per skill, name only when the description is empty", () => {
+		expect(
+			skillBlock([
+				{
+					name: "tiktok",
+					description: "Use for TikTok video, captions, or photo slides.",
+				},
+				{ name: "watch", description: "" },
+			]),
+		).toBe(
+			"- tiktok: Use for TikTok video, captions, or photo slides.\n- watch",
+		);
+	});
+
+	test("cuts a description at 200 characters", () => {
+		expect(skillBlock([{ name: "s", description: "a".repeat(300) }])).toBe(
+			`- s: ${"a".repeat(200)}`,
+		);
+	});
+
+	test("caps the entries at 4000 characters and names the skills left out", () => {
+		const skills = Array.from({ length: 100 }, (_, i) => ({
+			name: `s${i}`,
+			description: "d".repeat(150),
+		}));
+		const block = skillBlock(skills);
+		const lines = block.split("\n");
+		const note = lines.at(-1)!;
+		// The listed lines stay inside the cap; the note names exactly the rest.
+		expect(lines.slice(0, -1).join("\n").length).toBeLessThanOrEqual(4000);
+		expect(note).toMatch(/^…and \d+ more skills not listed$/);
+		expect(Number(note.match(/\d+/)![0])).toBe(100 - (lines.length - 1));
+		expect(block).not.toContain("- s99:");
+	});
+
+	test("an empty catalog renders no block", () => {
+		expect(skillBlock([])).toBe("");
 	});
 });
 

@@ -4,6 +4,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import { gatePrompt, gateSystem } from "./prompts.ts";
 import type { ProjectStore } from "./store.ts";
+import type { SkillEntry } from "./tools.ts";
 import type { AskQuestion, PromptGateState } from "./types.ts";
 
 /** The exact trimmed reply text (and drawer button label) that overrides a gate park. */
@@ -233,6 +234,37 @@ ${parts.join("\n")}
 </handoff>`;
 }
 
+/** Cap for one skill description in the gate's skill block; a longer frontmatter
+ * line cuts here (OTTR-1068). */
+const SKILL_DESC_CAP = 200;
+
+/** Cap for the skill block's entry text: the gate input stays bounded even on a home
+ * with hundreds of skills; entries past the cap collapse into the "…and N more" note. */
+export const SKILL_BLOCK_CAP = 4000;
+
+/** The gate's untrusted skills block: one "- name: description" line per skill the
+ * workers can load, descriptions cut at SKILL_DESC_CAP, the entry text capped at
+ * SKILL_BLOCK_CAP with a final "…and N more skills not listed" note. An empty
+ * catalog renders "" so the gate input keeps its older shape. */
+export function skillBlock(skills: SkillEntry[]): string {
+	const lines: string[] = [];
+	let used = 0;
+	let kept = 0;
+	for (const { name, description } of skills) {
+		const desc = description.slice(0, SKILL_DESC_CAP);
+		const line = desc === "" ? `- ${name}` : `- ${name}: ${desc}`;
+		// The +1 is the newline that joins this line to the ones before it.
+		const cost = line.length + (kept > 0 ? 1 : 0);
+		if (used + cost > SKILL_BLOCK_CAP) break;
+		used += cost;
+		kept += 1;
+		lines.push(line);
+	}
+	const more = skills.length - kept;
+	if (more > 0) lines.push(`…and ${more} more skills not listed`);
+	return lines.join("\n");
+}
+
 /** The prompt text the gate judges: the prompt, plus the named handoff as an
  * untrusted data block after it (gateSystem already covers the prompt block's
  * whole text with its untrusted-data rule). */
@@ -333,13 +365,19 @@ export function parseGateCheck(raw: string): GateCheck {
 export async function promptGateCheck(o: {
 	prompt: string;
 	userMessages: string | null;
+	/** OTTR-1068: the capped skills block text (skillBlock's output); null keeps the
+	 * gate input as before the block existed. */
+	skills?: string | null;
 	spawn?: SpawnFn;
 	timeoutMs?: number;
 }): Promise<GateCheck> {
 	const raw = await runGateway(
 		[
 			{ role: "system", content: gateSystem },
-			{ role: "user", content: gatePrompt(o.prompt, o.userMessages) },
+			{
+				role: "user",
+				content: gatePrompt(o.prompt, o.userMessages, o.skills ?? null),
+			},
 		],
 		o.spawn,
 		o.timeoutMs ?? 120_000,

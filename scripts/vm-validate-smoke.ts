@@ -47,6 +47,7 @@ export function probeArgv(opts: ProbeOptions = {}): string[] {
 			host +
 			":" +
 			port +
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: literal shell parameter expansion, not a TS template
 			' reason=${v#blocked:}";;',
 		'*) echo "ATTEMPT network probe-failed tcp/' +
 			host +

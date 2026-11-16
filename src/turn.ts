@@ -68,6 +68,7 @@ import {
 	missingCheckQuestion,
 	openQuestionsLines,
 	promptGateCheck,
+	skillBlock,
 	startAnywayQuestion,
 } from "./promptGate.ts";
 import {
@@ -169,6 +170,7 @@ import {
 	type TaskPatch,
 } from "./store.ts";
 import { progressKey } from "./stryker.ts";
+import { type SkillEntry, skillCatalog } from "./tools.ts";
 import type {
 	ArchReview,
 	AskQuestion,
@@ -209,6 +211,7 @@ import type {
 	checkedOutBranch,
 	checkoutState,
 	cleanMergeTree,
+	commitFileOnBranch,
 	commitsAhead,
 	createWorktree,
 	deleteRemoteBranch,
@@ -874,6 +877,10 @@ export interface TurnOps {
 	titleRetryDelayMs?: number;
 	/** OTTR-823 preparation gate: the comprehension check model call; overridable for tests so none spawns a gateway. */
 	gateCheck?: typeof promptGateCheck;
+	/** OTTR-1068: the skills a worker turn can load, for the prompt gate's skill block
+	 * (the read behind the board's "Missing on workers" note); absent resolves the real
+	 * catalog from the workers' list home. Tests inject a fixture or an empty list. */
+	skillCatalog?: () => SkillEntry[];
 	/** OTTR-941 duplicate-work gate: the code search plus verdict model calls; overridable for tests so none spawns a gateway. */
 	duplicateCheck?: typeof duplicateCheck;
 	/** Commit subjects on the target since a base, for the check run's input; overridable for tests. */
@@ -963,6 +970,12 @@ export interface TurnOps {
 	pushAuthKind?: (url: string) => string | null;
 	/** PR mode: pushes the card branch to the pinned origin from the main checkout (same plumbing as serverMergePush). */
 	pushBranch?: typeof pushBranch;
+	/** OTTR-1064, PR mode's rules interview: builds the board's one-file commit on a card
+	 * branch from the fetched target without touching the main checkout's HEAD, index or
+	 * working tree; "same" when the file is ignored (local-only), missing, or identical to
+	 * the target's copy. Optional like the other PR-mode ops: absent parks with the
+	 * not-wired reason. */
+	commitFileOnBranch?: typeof commitFileOnBranch;
 	/** OTTR-800: deletes the pushed remote card branch when a PR-mode card ends (git() adds the host auth). */
 	deleteRemoteBranch?: typeof deleteRemoteBranch;
 	/** PR mode: adopts or opens the pull request for the card branch (gh via runGh). */
@@ -1746,6 +1759,9 @@ type TurnSettle = {
 	remoteLanded: boolean;
 	refused: string | null;
 	prNext: Next | null;
+	/** OTTR-1056: the CI idle divert fired — the worktree tip still is the answered PR
+	 * head, so the settle writes merging/idle and re-pins the CI watch's pushSha. */
+	ciIdleSha: string | null;
 	// classify and post-classify state
 	research: boolean;
 	steered: boolean;
@@ -3341,6 +3357,7 @@ export function createTurnLoop(
 			github: e.github,
 			archReview,
 			originUrl: settings.originUrl,
+			target: head.target,
 			...(releaseToken !== undefined && { releaseToken }),
 			// Hosted: gh takes the project's minted token, never GH_TOKEN.
 			...(ops.hosted !== undefined && {
@@ -4590,6 +4607,17 @@ export function createTurnLoop(
 			await log("+ prompt gate: board-written prompt runs without the model");
 			return true;
 		}
+		// OTTR-1068: the gate input carries the skills a worker turn can load, so the
+		// gate never asks for what a listed skill can find out (MYST-31: it asked for
+		// the content of a TikTok video that the workers' tiktok skill can load). An
+		// unreadable list logs one line and the gate runs without the block, as before.
+		let skills: string | null = null;
+		try {
+			const block = skillBlock((ops.skillCatalog ?? skillCatalog)());
+			if (block !== "") skills = block;
+		} catch (e) {
+			await log(`! prompt gate: skill list unreadable: ${errmsg(e)}`);
+		}
 		// Model evaluation; one immediate retry on any failure.
 		let check: GateCheck | null = null;
 		let err: Error | null = null;
@@ -4598,6 +4626,7 @@ export function createTurnLoop(
 				check = await (ops.gateCheck ?? promptGateCheck)({
 					prompt: judged,
 					userMessages: gateUserText(pending, seen),
+					skills,
 				});
 				err = null;
 				break;
@@ -6374,6 +6403,7 @@ export function createTurnLoop(
 			remoteLanded: false,
 			refused: null,
 			prNext: null,
+			ciIdleSha: null,
 			research: false,
 			steered: false,
 			now: 0,
@@ -6874,15 +6904,117 @@ export function createTurnLoop(
 	 * the agent reported. A removed worktree (fromMain) still pushes: its merge is on the
 	 * local branch, and only this push moves it to origin. */
 	async function shipMergeTurn(st: TurnSettle): Promise<void> {
-		if (
-			st.kind !== "merge" ||
-			st.idn.interview ||
-			st.idn.grill ||
-			st.idn.releaseCard
-		)
+		if (st.idn.interview) {
+			await shipInterviewCard(st);
 			return;
+		}
+		if (st.kind !== "merge" || st.idn.grill || st.idn.releaseCard) return;
 		if (st.header.settings.prMode === true) await shipPrCard(st);
 		else await auditMergeHold(st);
+	}
+
+	/** OTTR-1064: a rules interview on a project that ships through pull requests (PR mode
+	 * on, or the target's GitHub branch rule) must not leave a commit on the local main —
+	 * the board never pushes the main checkout there, and the unpushed commits stop every
+	 * later merge (the AWSI-1 incident). The prompt forbids the commit; this settle step
+	 * ships the written file itself: one plumbing commit on a card branch from the fetched
+	 * target (commitFileOnBranch), pushed from the server, then the pull request — the same
+	 * delivery every PR-mode card gets, so the merge watch finishes the card when GitHub
+	 * merges it. An interview that ignored the prompt and committed on the main checkout
+	 * never settles: the card parks with the repair. A protected target without PR mode
+	 * parks too: the board holds no PR to open until the setting is on. A non-PR project
+	 * keeps the old flow: the interview commits on main (classify stays exempt) and the
+	 * next merge turn pushes it. */
+	async function shipInterviewCard(st: TurnSettle): Promise<void> {
+		if (st.header.settings.prMode !== true && st.e.protectedTarget !== true)
+			return;
+		const outcome = st.result.outcome;
+		// An ask-pause keeps prNext null: classify parks the card on the agent's question.
+		if (outcome?.status !== "answered") return;
+		if (!(await canShipPr(st))) return;
+		if (st.task.prNumber !== null) {
+			// A reply on a shipped interview must not re-open the PR; the watch owns the card.
+			st.prNext = { stage: "merging", state: "idle", needsReason: null };
+			return;
+		}
+		const ahead = await ops
+			.commitsAhead(st.loc.wt, st.header.target)
+			.catch((err: unknown) => {
+				st.prNext = {
+					stage: "merging",
+					state: "needs_you",
+					needsReason: `The board could not read how far the main checkout is ahead of ${st.header.target}: ${errmsg(err)}. The rules file ships only when the checkout holds no unpushed commit; repair the checkout and reply.`,
+				};
+				return null;
+			});
+		if (ahead === null) return;
+		if (ahead > 0) {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason: `The interview left the main checkout ${ahead} commit(s) ahead of ${st.header.target}; the board never pushes the main checkout on this project, and the unpushed commits stop every later merge. Undo them (git reset --soft ${st.header.target} keeps the files) or land them another way, then reply.`,
+			};
+			return;
+		}
+		if (st.header.settings.prMode !== true) {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason:
+					"The target branch requires pull requests; turn PR mode on in Settings, then reply, so the board can open the pull request with the rules file.",
+			};
+			return;
+		}
+		const pushBranchOp = ops.pushBranch;
+		const openPrOp = ops.openPr;
+		const commitFileOp = ops.commitFileOnBranch;
+		if (
+			commitFileOp === undefined ||
+			pushBranchOp === undefined ||
+			openPrOp === undefined
+		) {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason:
+					"PR mode is on but the server's ship step is not wired; restart the board",
+			};
+			return;
+		}
+		const branch = `ott/${st.id.toLowerCase()}-${slugify(st.task.title)}`;
+		const built = await commitFileOp(
+			st.e.path,
+			"AGENTS.md",
+			st.header.target,
+			branch,
+			// The op picks the subject from what the base tree holds: "update" when
+			// the target already carries AGENTS.md, "add" for the fresh AWSI-1 case.
+			{
+				add: "docs: add AGENTS.md for tracker agents",
+				update: "docs: update AGENTS.md for tracker agents",
+			},
+			(await ops.commitIdentity?.()) ?? null,
+		).catch((err: unknown) => {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason: `Building the rules-file commit failed: ${errmsg(err)}`,
+			};
+			return null;
+		});
+		if (!(await canShipPr(st))) return;
+		if (built === null) return;
+		// Local-only (ignored), missing, or already the target's content: nothing to ship,
+		// classify settles the answered report done.
+		if (built.kind === "same") return;
+		await st.store.transaction(async () => {
+			if (!(await canShipPr(st))) return;
+			await st.store.updateTask(st.id, { branch });
+		});
+		await st.log(
+			`- built ${branch} at ${built.sha.slice(0, 7)} with the rules file`,
+		);
+		await pushPrBranch(st, branch, built.sha, pushBranchOp, openPrOp);
 	}
 
 	/** Appends the GitHub-API hint under a bare 401/403; the git error stands alone
@@ -7061,7 +7193,7 @@ export function createTurnLoop(
 		// A conflict or a tree mismatch is a fix and ships. Git trouble reads as
 		// fixes, so the follow-up stays the safe delivery for work we cannot prove
 		// empty.
-		const beyond = await commitsBeyondHead(st, head, tip);
+		const beyond = await commitsBeyond(st, head, tip);
 		if (beyond === 0) {
 			await adoptSourcePr(st, n, head, src.url);
 			return;
@@ -7098,20 +7230,20 @@ export function createTurnLoop(
 		await parkOnSourcePr(st, n, src);
 	}
 
-	/** How many commits the card branch holds beyond the source PR's head
-	 * (`rev-list <head>..<tip>` in the card checkout); null on git trouble. The count
-	 * is pure commit graph — no HEAD, no worktree state, no patch shape — so rename,
-	 * mode and binary fixes all count as commits, and neither checkout's position can
-	 * skew it. */
-	async function commitsBeyondHead(
+	/** How many commits `tip` holds beyond `from` (`rev-list <from>..<tip>` in the card
+	 * checkout); null on git trouble. The count is pure commit graph — no HEAD, no
+	 * worktree state, no patch shape — so rename, mode and binary fixes all count as
+	 * commits, and neither checkout's position can skew it. Reads the source PR's head
+	 * at ship time and the target before a follow-up push. */
+	async function commitsBeyond(
 		st: TurnSettle,
-		head: string,
+		from: string,
 		tip: string,
 	): Promise<number | null> {
 		// The card checkout is the subject of the read; when it exists, the count
 		// runs there (same object store, never the main checkout's branch).
 		const path = existsSync(st.loc.wt) ? st.loc.wt : st.e.path;
-		return ops.revListCount(path, head, tip).catch(() => null);
+		return ops.revListCount(path, from, tip).catch(() => null);
 	}
 
 	/** True when merging the source PR's bump onto the target tip reproduces the card
@@ -7270,9 +7402,11 @@ export function createTurnLoop(
 				prNumber: n,
 				prUrl: url,
 				prHeadSha,
-				// A clean bump leaves no follow-up PR; a stale stamp from an earlier ship must go.
+				// A clean bump leaves no follow-up PR and no superseded wait; a stale
+				// stamp from an earlier ship must go.
 				followUpPrNumber: null,
 				followUpPrUrl: null,
+				sourcePrSuperseded: false,
 			});
 		});
 		await appendLog(
@@ -7337,6 +7471,21 @@ export function createTurnLoop(
 		tip: string,
 		onHead: boolean,
 	): Promise<void> {
+		// The merge turn's automatic rebase can land the branch on a moved target until
+		// it equals it (CSE-10: main already held newer deps than the source PR): pushing
+		// it and opening a PR then draws GitHub's "no commits between the branches" 422
+		// and parks the card. Nothing beyond the target finishes the card as superseded
+		// instead — no push, no PR. Git trouble reads as fixes: the push stays the safe
+		// delivery for work we cannot prove empty.
+		const beyondTarget = await commitsBeyond(st, st.header.target, prBranch);
+		if (!(await canShipPr(st))) return;
+		if (beyondTarget === 0) {
+			await st.log(
+				`- nothing beyond ${st.header.target}; no follow-up pull request`,
+			);
+			await finishSuperseded(st, n, src);
+			return;
+		}
 		const pushBranch = ops.pushBranch;
 		if (pushBranch === undefined) {
 			st.prNext = {
@@ -7444,6 +7593,9 @@ export function createTurnLoop(
 				pushSha: null,
 				followUpPrNumber: opened.pr.number,
 				followUpPrUrl: opened.pr.url,
+				// This ship delivered real fixes: any superseded stamp from an
+				// earlier ship must go, the same rule as the follow-up fields above.
+				sourcePrSuperseded: false,
 			});
 		});
 		await appendLog(
@@ -7456,6 +7608,37 @@ export function createTurnLoop(
 			state: "idle",
 			needsReason: null,
 		};
+	}
+
+	/** Finishes a fixless card as superseded: the ship proved its branch holds nothing
+	 * beyond the target, so the work already sits there and a follow-up PR would be
+	 * empty. The card carries its source PR's identity (merging/idle) and waits only on
+	 * that PR; sourcePrSuperseded tells the supervisor's watch to finish the card done
+	 * once the PR closes — merged or closed unmerged — and never to park it. */
+	async function finishSuperseded(
+		st: TurnSettle,
+		n: number,
+		src: SourcePrRef,
+	): Promise<void> {
+		if (!(await canShipPr(st))) return;
+		await st.store.transaction(async () => {
+			if (!(await canShipPr(st))) return;
+			await st.store.updateTask(st.id, {
+				prNumber: n,
+				prUrl: src.url,
+				prHeadSha: src.headSha,
+				pushSha: null,
+				followUpPrNumber: null,
+				followUpPrUrl: null,
+				sourcePrSuperseded: true,
+			});
+		});
+		await appendLog(
+			st.store,
+			st.id,
+			`- the card waits only on source PR #${n}; when that PR closes, merged or not, the card finishes done`,
+		);
+		st.prNext = { stage: "merging", state: "idle", needsReason: null };
 	}
 
 	/** Comments on the source PR and parks the card with the reason: the turn's work must
@@ -7676,6 +7859,9 @@ export function createTurnLoop(
 				prUrl: opened.pr.url,
 				prHeadSha: tip,
 				pushSha: tip,
+				// The card's own PR carries its delivery: a superseded stamp from an
+				// earlier ship must not finish it done on this PR's close.
+				sourcePrSuperseded: false,
 			});
 		});
 		await appendLog(
@@ -8034,6 +8220,43 @@ export function createTurnLoop(
 					dir: ops.http400Dir,
 				}),
 		});
+		// OTTR-1056: without this divert, classify queues a merge turn whose ship
+		// pins the same head and the CI watch re-answers the same failure. The tree
+		// is the already-verified shipped tree, so the card settles merging/idle:
+		// no ship and no gate re-run happens. Only the turn the supervisor queued
+		// with the CI reply (its delivered input carries the board's authorship)
+		// diverts: a later user reply or any other settle takes today's path, and
+		// a passed head clears the stored key at the watch. A turn that moved the
+		// tip, or an answered report, takes today's path too.
+		if (
+			st.kind === "work" &&
+			next.stage === "merging" &&
+			next.state === "queued" &&
+			st.input.live.pendingBy === "supervisor" &&
+			st.task.prNumber !== null &&
+			st.task.prHeadSha !== null &&
+			st.task.ciPrAnsweredKey !== null &&
+			st.task.ciPrAnsweredKey.startsWith(`${st.task.prHeadSha}:`)
+		) {
+			const tip = await ops.targetSha(st.loc.wt, "HEAD").catch(() => null);
+			if (tip === st.task.prHeadSha) {
+				st.ciIdleSha = tip;
+				const failed = st.task.ciPrAnsweredInfo ?? "the run failed";
+				const summary = (st.result.outcome?.summary ?? "").trim();
+				const answered =
+					summary !== ""
+						? `\n\nThe turn answered: ${summary.slice(0, 140)}`
+						: "";
+				next = {
+					stage: "merging",
+					state: "idle",
+					needsReason: `CI failed on the PR head ${tip.slice(0, 7)}:\n${failed}${answered}`,
+				};
+				await st.log(
+					`- PR head ${tip.slice(0, 7)} unchanged since the CI reply; the card waits on GitHub again (no re-ship)`,
+				);
+			}
+		}
 		// The PR-mode ship step owns the card's next state: it never lands, so the done
 		// write below (pushSha pinning, worktree removal, release stamping) is skipped.
 		if (st.prNext !== null) next = st.prNext;
@@ -9491,8 +9714,12 @@ export function createTurnLoop(
 					),
 			);
 		}
+		// OTTR-1056: a diverted CI idle settle has nothing new to check — the settle wrote
+		// the final state directly, and the second-model work check skips.
 		st.checkWillRun =
-			st.reviewFindings.length > 0 || (st.workCard && next.stage === "merging");
+			st.ciIdleSha === null &&
+			(st.reviewFindings.length > 0 ||
+				(st.workCard && next.stage === "merging"));
 	}
 
 	/** The stage/state columns ride the card write only when no second-model check runs: the
@@ -9561,6 +9788,9 @@ export function createTurnLoop(
 	async function writeSettledCard(st: TurnSettle, next: Next): Promise<void> {
 		await st.store.updateTask(st.id, {
 			...settledCardState(st, next),
+			// OTTR-1056: the CI idle divert re-pins the CI watch's head, so the watch
+			// stays on the PR head and a new run attempt can get a fresh reply.
+			...(st.ciIdleSha !== null ? { pushSha: st.ciIdleSha } : {}),
 			shots: st.shots,
 			pendingPrompt: next.pendingPrompt, // undefined keeps the column: only classify's automatic continue sets it
 			// Authorship rides only when the prompt is actually written; classify's
@@ -11455,8 +11685,12 @@ export function createTurnLoop(
 		// The target reads origin/<branch> (resolveTarget); the keep-list refusal compares
 		// short branch names, so strip the prefix. The base is a commit sha, never a name.
 		const target = (e.target ?? "").replace(/^origin\//, "");
+		// A keep name must be a branch the card does not own (deleteRemoteBranch's
+		// contract). An adopted follow-up's head is the card's own branch, so
+		// sourcePrHeadRef can equal it — that name stays off the list and the
+		// card branch still goes at cancel.
 		const keep = [target, task.sourcePrHeadRef].filter(
-			(b): b is string => b !== "" && b !== null,
+			(b): b is string => b !== "" && b !== null && b !== branch,
 		);
 		const err = await ops
 			.deleteRemoteBranch(e.path, branch, originUrl, keep)

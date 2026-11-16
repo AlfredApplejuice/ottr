@@ -120,6 +120,16 @@ interface WorkflowRun {
 	name: string;
 	html_url: string;
 	id: number;
+	/** GitHub's re-run counter; absent in older payloads. Untrusted JSON — read it through runAttempt. */
+	run_attempt?: number;
+}
+
+/** The run's re-run counter for the answered-CI key: 1 when GitHub omits run_attempt or
+ * sends a value that is not a finite number. Pure. */
+function runAttempt(r: WorkflowRun): number {
+	return typeof r.run_attempt === "number" && Number.isFinite(r.run_attempt)
+		? r.run_attempt
+		: 1;
 }
 
 interface CleanupState {
@@ -243,6 +253,9 @@ interface DependabotPr {
 	crossRepo: boolean;
 }
 
+/** A GitHub commit sha: 40 hex (or 64 on SHA-256 repos). Pure. */
+const SHA_HEX = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
+
 /** Open PRs from `gh pr list --json number,title,createdAt,headRefName,headRefOid,
  * isCrossRepository`. The JSON is untrusted: only entries with a positive safe-integer
  * number, a string title, a parseable createdAt (epoch ms), a non-empty sanitized string
@@ -280,7 +293,6 @@ function dependabotPrs(stdout: string): DependabotPr[] | string {
 						.trim()
 						.slice(0, 200)
 				: "";
-		const shaHex = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/;
 		return typeof n === "number" &&
 			Number.isSafeInteger(n) &&
 			n > 0 &&
@@ -288,7 +300,7 @@ function dependabotPrs(stdout: string): DependabotPr[] | string {
 			!Number.isNaN(ms) &&
 			ref !== "" &&
 			typeof headRefOid === "string" &&
-			shaHex.test(headRefOid) &&
+			SHA_HEX.test(headRefOid) &&
 			typeof isCrossRepository === "boolean"
 			? [
 					{
@@ -318,6 +330,11 @@ interface PrDetail {
 	/** GitHub's merge verdict for an open PR: false = it conflicts with its base. Null = GitHub
 	 * still computes it, the field is absent, or the value is not a boolean. */
 	mergeable: boolean | null;
+	/** The head branch name and head sha at read time; null when absent or malformed.
+	 * The follow-up adoption stamps them onto the row, so a later fix turn ships to
+	 * the follow-up's branch. */
+	headRef: string | null;
+	headSha: string | null;
 }
 
 function parsePull(body: unknown): PrDetail | null {
@@ -334,6 +351,17 @@ function parsePull(body: unknown): PrDetail | null {
 		typeof base === "object" && base !== null && typeof base.ref === "string"
 			? base.ref
 			: null;
+	const head = x.head as Record<string, unknown> | null | undefined;
+	const headRef =
+		typeof head === "object" && head !== null && typeof head.ref === "string"
+			? head.ref
+			: null;
+	const headShaRaw =
+		typeof head === "object" && head !== null ? head.sha : null;
+	const headSha =
+		typeof headShaRaw === "string" && SHA_HEX.test(headShaRaw)
+			? headShaRaw
+			: null;
 	return {
 		state: x.state,
 		merged: typeof x.merged_at === "string",
@@ -343,6 +371,8 @@ function parsePull(body: unknown): PrDetail | null {
 		// Tolerant on purpose: the merged/closed settle uses this parser too, so a strange
 		// mergeable value must not turn a readable PR into null.
 		mergeable: typeof x.mergeable === "boolean" ? x.mergeable : null,
+		headRef,
+		headSha,
 	};
 }
 
@@ -1692,9 +1722,11 @@ export function createSupervisor(
 	}
 
 	/** OTTR-552: a PR-mode card in Merging watches its PR head, not a merge push; a failed
-	 * run replies on the same card instead of filing a follow-up. Clearing pushSha here is
-	 * the one-fix-per-head dedupe — the next push re-pins pushSha at settle. True = the
-	 * failure was answered on the card. */
+	 * run replies on the same card instead of filing a follow-up. The dedupe is the stored
+	 * answered key (`<pushSha>:<runId>#<attempt>[,...]`, one entry per failed run of the
+	 * poll): the same head and failed runs never reply twice, while a re-run (new attempt)
+	 * or a new head changes the key and answers again. Clearing pushSha still stops the
+	 * watch until the next ship re-pins it. True = the failure was answered on the card. */
 	async function ciPrHeadReply(
 		e: SupervisorEntry,
 		t: ListedTask,
@@ -1704,8 +1736,17 @@ export function createSupervisor(
 		refetch: string,
 	): Promise<boolean> {
 		if (!(t.stage === "merging" && t.prNumber !== null)) return false;
+		const key = `${pushSha}:${failed
+			.map((r) => `${r.id}#${runAttempt(r)}`)
+			.sort()
+			.join(",")}`;
+		if (t.ciPrAnsweredKey === key) return true;
 		const short = pushSha.slice(0, 7);
 		const logs = await ciLogSection(e, t, failed, repo);
+		const info = failed
+			.map((r) => `- ${r.name}: ${r.conclusion ?? "failed"} - ${r.html_url}`)
+			.join("\n")
+			.slice(0, 300);
 		const text = [
 			[
 				`CI failed on the PR head of this card (${short} on ${t.branch ?? "the branch"}):`,
@@ -1731,6 +1772,8 @@ export function createSupervisor(
 				pendingBy: "supervisor",
 				pendingFeedback: feedback,
 				pushSha: null,
+				ciPrAnsweredKey: key,
+				ciPrAnsweredInfo: info,
 			}))
 		)
 			return true;
@@ -1747,7 +1790,9 @@ export function createSupervisor(
 	 * pushSha pins instead of filing a follow-up: fresh worktree from the current target at
 	 * the next dispatch (cleared worktree and branch take the create path), the same session
 	 * (sessionId untouched), the failed-check list plus the fetched log in the prompt, and
-	 * pushSha cleared — the same one-fix-per-head dedupe as ciPrHeadReply. The fallback that
+	 * pushSha cleared — the clear still stops the watch until the next ship re-pins it
+	 * (ciPrHeadReply's dedupe is its stored answered key; this reopen clears that key with
+	 * the PR fields, so the second life answers its own failures fresh). The fallback that
 	 * files the follow-up card as before: no single matching card, a cancelled match, or an
 	 * open follow-up already covering this head. True = the failure was answered on the card. */
 	async function ciReopenDoneCard(
@@ -1829,6 +1874,10 @@ export function createSupervisor(
 				prUrl: null,
 				prHeadSha: null,
 				prWatchAt: null,
+				// OTTR-1056: the stored CI answer names the first life's head; the reopened
+				// card has no PR of record and answers its own failures fresh.
+				ciPrAnsweredKey: null,
+				ciPrAnsweredInfo: null,
 				followUpPrNumber: null,
 				followUpPrUrl: null,
 				sourcePrNumber: null,
@@ -1836,6 +1885,7 @@ export function createSupervisor(
 				sourcePrHeadRef: null,
 				sourcePrHeadSha: null,
 				sourcePrCrossRepo: false,
+				sourcePrSuperseded: false,
 			}))
 		)
 			return true;
@@ -2015,7 +2065,7 @@ export function createSupervisor(
 		t: ListedTask,
 		pushSha: string,
 		runs: WorkflowRun[],
-		stop: (line?: string) => Promise<void>,
+		stop: (line?: string, patch?: TaskPatch) => Promise<void>,
 	): Promise<WorkflowRun[] | null> {
 		if (runs.length === 0) {
 			if (ops.now() - (t.doneAt ?? t.updatedAt) > CI_WAIT_MS)
@@ -2027,7 +2077,14 @@ export function createSupervisor(
 		const verdict = ciVerdict(runs);
 		if (verdict === "pending") return null;
 		if (verdict === "passed") {
-			await stop(`CI passed for ${pushSha.slice(0, 7)}`);
+			// OTTR-1056: the head's CI is green, so the answered failure is stale state.
+			// Clear it — a later no-commit ready turn must not divert with the old
+			// failed-check lines. The give-up paths keep the key: the next ship re-pins
+			// pushSha and the re-poll of the same failed runs stays deduped.
+			await stop(`CI passed for ${pushSha.slice(0, 7)}`, {
+				ciPrAnsweredKey: null,
+				ciPrAnsweredInfo: null,
+			});
 			return null;
 		}
 		return runs.filter((r) => ciVerdict([r]) === "failed");
@@ -2045,11 +2102,14 @@ export function createSupervisor(
 			return;
 		const key = `${e.name}/${t.id}`;
 		const pushSha = t.pushSha;
-		const stop = async (line?: string): Promise<void> => {
+		const stop = async (
+			line?: string,
+			patch: TaskPatch = {},
+		): Promise<void> => {
 			// A reply, steer or cancel may have landed during the gh awaits; skip the write
 			// and re-decide on fresh facts next tick.
 			if (await wentStale(e.store, t)) return;
-			if (!(await applyTask(e, t, { pushSha: null }))) return;
+			if (!(await applyTask(e, t, { pushSha: null, ...patch }))) return;
 			if (line) await ops.appendLog(e.store, t.id, `supervisor: ${line}`);
 		};
 
@@ -2259,12 +2319,13 @@ export function createSupervisor(
 	}
 
 	/** The done write after a PR merge: capture the worktree's status rows for the done
-	 * drawer, then pin pushSha when the merge commit is the fetched origin tip. A stale
-	 * card returns null and stops the pass. */
+	 * drawer, then pin pushSha when the merge commit is the fetched origin tip. A null
+	 * merge commit (a superseded card's close, OTTR-1063) pins nothing. A stale card
+	 * returns null and stops the pass. */
 	async function prPinDone(
 		e: SupervisorEntry,
 		t: ListedTask,
-		mergeCommit: string,
+		mergeCommit: string | null,
 		onOrigin: boolean,
 		settings: ProjectSettings,
 		target: string,
@@ -2291,7 +2352,7 @@ export function createSupervisor(
 				// The card is done: a feedback park's prompt (and flag) is void.
 				pendingPrompt: null,
 				pendingFeedback: false,
-				pushSha: onOrigin ? mergeCommit : null,
+				pushSha: onOrigin && mergeCommit !== null ? mergeCommit : null,
 				uncommittedFiles: uncommitted,
 			});
 		});
@@ -2313,8 +2374,12 @@ export function createSupervisor(
 		// The target reads origin/<branch> (resolveTarget); the keep-list refusal compares
 		// short branch names, so strip the prefix. The base is a commit sha, never a name.
 		const target = (e.target ?? "").replace(/^origin\//, "");
+		// A keep name must be a branch the card does not own (deleteRemoteBranch's
+		// contract). An adopted follow-up's head is the card's own branch, so
+		// sourcePrHeadRef can equal it — that name stays off the list and the
+		// OTTR-800 delete goes through.
 		const keep = [target, t.sourcePrHeadRef].filter(
-			(b): b is string => b !== "" && b !== null,
+			(b): b is string => b !== "" && b !== null && b !== branch,
 		);
 		const err = await ops
 			.deleteRemoteBranch(e.path, branch, originUrl, keep)
@@ -2471,12 +2536,32 @@ export function createSupervisor(
 			);
 			return;
 		}
+		// OTTR-1063: a superseded card's work already sits on the target — the ship
+		// proved the branch empty beyond it — so the close is the card's done, not a
+		// lost delivery to park. No merge commit exists: pushSha stays null. The
+		// stamp governs only the exact wait the ship left (merging/idle): a later
+		// park (a failed re-ship, an agent question) voids the auto-finish, and the
+		// close parks like any other PR close, so fixes the ship never delivered
+		// stay on the card with their branch and worktree.
+		if (
+			t.sourcePrSuperseded === true &&
+			t.stage === "merging" &&
+			t.state === "idle"
+		) {
+			await finishSupersededClose(e, settings, t);
+			return;
+		}
 		if (await wentStale(e.store, t)) return;
+		// The widening (OTTR-1056) keeps an in_progress PR card on the watch, so this
+		// park repeats in every window: the exact-reason guard, the same defense in
+		// depth the follow-up parks carry, keeps the rewrite and the log line to one.
+		const closed = `PR #${t.prNumber} closed without merging`;
+		if (t.state === "needs_you" && t.needsReason === closed) return;
 		if (
 			!(await applyTask(e, t, {
 				stage: "in_progress",
 				state: "needs_you",
-				needsReason: `PR #${t.prNumber} closed without merging`,
+				needsReason: closed,
 				pushSha: null,
 			}))
 		)
@@ -2487,6 +2572,37 @@ export function createSupervisor(
 			`supervisor: PR #${t.prNumber} closed without merging; card parked`,
 		);
 		await ops.schedule();
+	}
+
+	/** A superseded card's source PR closed unmerged (OTTR-1063): the card's work already
+	 * sits on the target (the ship proved the branch empty beyond it), so the close is
+	 * the card's done — the same write a merge finish makes, minus the merge commit:
+	 * pushSha stays null and no release stamp runs. The worktree goes and the remote
+	 * card branch is deleted like a merge finish. Never throws. */
+	async function finishSupersededClose(
+		e: SupervisorEntry,
+		settings: ProjectSettings,
+		t: ListedTask,
+	): Promise<void> {
+		const target = e.target ?? t.base;
+		if (target === null) {
+			console.error(
+				`supervisor: project ${e.name}: no target branch; superseded close skipped`,
+			);
+			return;
+		}
+		const done = await prPinDone(e, t, null, false, settings, target);
+		if (done === null) return;
+		const wt = done.worktree;
+		if (await wentStale(e.store, done)) return;
+		if (wt !== null && existsSync(wt)) await finishPrMergeRemove(e, done, wt);
+		if (await wentStale(e.store, done)) return;
+		await finishPrDeleteRemote(e, settings, done);
+		await ops.appendLog(
+			e.store,
+			t.id,
+			`supervisor: PR #${t.prNumber} closed without merging; the card's work was already on the target; card done`,
+		);
 	}
 
 	/** GitHub's merge verdict for the open PR of one tracked Merging card (OTTR-789): false
@@ -2502,6 +2618,15 @@ export function createSupervisor(
 		// prSettleMerging guards the number before prConflictCard gets here; this guard
 		// only narrows the type for the feedback-reason write below.
 		if (t.prNumber === null) return;
+		// OTTR-1063: while a superseded card waits idle on its source PR's closure,
+		// the stale PR's mergeability cannot park it. The stamp governs only the
+		// ship's wait state; a later park keeps the normal verdict rules.
+		if (
+			t.sourcePrSuperseded === true &&
+			t.stage === "merging" &&
+			t.state === "idle"
+		)
+			return;
 		const parked = t.state === "needs_you" && t.needsReason === reason;
 		if (t.state !== "idle" && !parked) return;
 		// A write needs a verdict that contradicts the card: false (conflict) while it waits
@@ -2604,8 +2729,10 @@ export function createSupervisor(
 
 	/** One tracked Merging follow-up card whose follow-up PR is not in the open list. The
 	 * follow-up merged moves the card's wait onto the source PR alone; both merged finishes
-	 * the card with the follow-up's merge commit (the later one on the target); a closed PR
-	 * parks the card needs_you. Never throws; read failures log and skip. */
+	 * the card with the follow-up's merge commit (the later one on the target); the source
+	 * closed unmerged while the follow-up merged onto the target adopts the follow-up as
+	 * the card's PR of record; a closed PR parks the card needs_you. Never throws; read
+	 * failures log and skip. */
 	async function settleFollowUpPr(
 		e: SupervisorEntry,
 		settings: ProjectSettings,
@@ -2645,6 +2772,7 @@ export function createSupervisor(
 				await clearFollowUp();
 				return;
 			}
+			const targetShort = (e.target ?? t.base ?? "").replace(/^origin\//, "");
 			const s = await prState(e, repo, S);
 			if (s === null) return;
 			if (s.state === "open") {
@@ -2659,7 +2787,6 @@ export function createSupervisor(
 				// source's merge, provable only when it merged strictly before the
 				// source. Equal or unreadable times are unresolved — the target may
 				// not hold the fixes — and the card parks instead of finishing.
-				const targetShort = (e.target ?? t.base ?? "").replace(/^origin\//, "");
 				const targetBased = pr.base !== null && pr.base === targetShort;
 				if (targetBased) {
 					// Both commits sit on the target; pin the later merge, and the
@@ -2712,6 +2839,22 @@ export function createSupervisor(
 				await ops.schedule();
 				return;
 			}
+			// The follow-up merged with its base on the target: its commit is already
+			// on the target (Dependabot closes the source once the target holds the
+			// update), so the source's closure strands nothing. The follow-up becomes
+			// the card's PR of record and the plain watch finishes the card with its
+			// merge commit next window. A follow-up still based on the bump branch
+			// parks below: nothing proves the fixes reached the target.
+			if (
+				targetShort !== "" &&
+				pr.base !== null &&
+				pr.base === targetShort &&
+				pr.headRef !== null &&
+				pr.headSha !== null
+			) {
+				await adoptFollowUpAsPr(e, t, S, F, targetShort, pr);
+				return;
+			}
 			if (await wentStale(e.store, t)) return;
 			// stage in_progress: the card leaves the merging watch, so no later
 			// window re-reads the PRs or re-writes the park until a reply
@@ -2759,19 +2902,86 @@ export function createSupervisor(
 		await ops.schedule();
 	}
 
+	/** The source PR closed unmerged while the follow-up targets the target branch: the
+	 * follow-up already carries the whole bump (Dependabot closed the source because the
+	 * target holds the update), so the source's closure strands nothing. The follow-up
+	 * becomes the card's PR of record — the adopt shape a fix turn ships to and a cancel
+	 * keeps the branch of — the follow-up fields clear, and one log line records the
+	 * shift. A park reason that names the follow-up (its conflict or feedback) stays;
+	 * any other reason clears to idle. Never throws. */
+	async function adoptFollowUpAsPr(
+		e: SupervisorEntry,
+		t: ListedTask,
+		S: number,
+		F: number,
+		targetName: string,
+		pr: PrDetail,
+	): Promise<void> {
+		const url = t.followUpPrUrl;
+		const keepsReason =
+			t.state === "needs_you" &&
+			(t.needsReason === prConflictReason(F) ||
+				t.needsReason === prFeedbackReason(F));
+		if (
+			!(await applyTask(e, t, {
+				prNumber: F,
+				prUrl: url,
+				prHeadSha: pr.headSha,
+				sourcePrNumber: F,
+				sourcePrUrl: url,
+				sourcePrHeadRef: pr.headRef,
+				sourcePrHeadSha: pr.headSha,
+				sourcePrCrossRepo: false,
+				sourcePrDependabot: false,
+				followUpPrNumber: null,
+				followUpPrUrl: null,
+				pushSha: null,
+				...(keepsReason ? {} : { state: "idle", needsReason: null }),
+			}))
+		)
+			return;
+		await ops.appendLog(
+			e.store,
+			t.id,
+			`supervisor: PR #${S} closed without merging; follow-up PR #${F} targets ${targetName}, so the card watches PR #${F} alone`,
+		);
+		await ops.schedule();
+	}
+
 	/** One tracked Merging follow-up card whose follow-up PR is open but whose source PR
 	 * left the open list. A merged source writes nothing: the pass repeats until the
 	 * follow-up settles and finishPrMerge names both PRs. A closed unmerged source parks
-	 * the card like settlePrCard. Never throws; read failures log and skip. */
+	 * the card like settlePrCard — unless the follow-up targets the target branch, which
+	 * already carries the whole bump: the card then adopts the follow-up as its PR of
+	 * record and keeps watching it alone. Never throws; read failures log and skip. */
 	async function settleOpenFollowUpsSource(
 		e: SupervisorEntry,
 		t: ListedTask,
 		repo: string,
 		S: number,
+		F: number,
 	): Promise<void> {
 		const s = await prState(e, repo, S);
 		if (s === null) return;
 		if (s.merged || s.state === "open") return;
+		// The follow-up's base decides. On the target branch it carries the whole
+		// bump, so the source's closure strands nothing and the card adopts it —
+		// also from the park below: GitHub retargets an open follow-up onto the
+		// target when the bump merges elsewhere, which un-strands the card. A
+		// follow-up that left the open list since the poll settles through
+		// settleFollowUpPr next window; an unreadable one skips the window.
+		const f = await prState(e, repo, F);
+		if (f === null || f.state !== "open") return;
+		const targetShort = (e.target ?? t.base ?? "").replace(/^origin\//, "");
+		if (
+			targetShort !== "" &&
+			f.base === targetShort &&
+			f.headRef !== null &&
+			f.headSha !== null
+		) {
+			await adoptFollowUpAsPr(e, t, S, F, targetShort, f);
+			return;
+		}
 		const reason = `PR #${S} closed without merging`;
 		// The park repeats in every window unless the guard stops it: the same
 		// reason, the same write, one log line, once.
@@ -2813,7 +3023,7 @@ export function createSupervisor(
 		// Settle the not-listed side first: once the follow-up merged the card waits on the
 		// source alone, and the conflict watch below must not re-read a settled PR this pass.
 		if (!fOpen) await settleFollowUpPr(e, settings, t, repo, sOpen, F, S);
-		else if (!sOpen) await settleOpenFollowUpsSource(e, t, repo, S);
+		else if (!sOpen) await settleOpenFollowUpsSource(e, t, repo, S, F);
 		// Conflict watch on each open PR for idle cards (or cards parked with that PR's
 		// own conflict reason) — only while the card still tracks the follow-up.
 		const row = await e.store.getTask(t.id);
@@ -2833,6 +3043,15 @@ export function createSupervisor(
 		repo: string,
 	): Promise<void> {
 		if (t.prNumber === null || t.cancelledAt !== null) return;
+		// OTTR-1063: a superseded card waits only on its source PR's closure; review
+		// feedback on that stale PR must not park it or queue a fix turn. The stamp
+		// governs only the ship's wait state; a later park keeps the normal watch.
+		if (
+			t.sourcePrSuperseded === true &&
+			t.stage === "merging" &&
+			t.state === "idle"
+		)
+			return;
 		const reason = prFeedbackReason(t.prNumber);
 		const conflict = prConflictReason(t.prNumber);
 		const watched =
@@ -2945,9 +3164,11 @@ export function createSupervisor(
 		);
 	}
 
-	/** Every tracked Merging card: settle the card whose PR is not in the open list, and check
-	 * the card whose PR is in it for a merge conflict. A Dependabot carry card parked for a
-	 * rebase reads Dependabot's answer instead; a follow-up card watches both its PRs. */
+	/** Every tracked Merging card, plus an in_progress card with a PR of record: settle the
+	 * card whose PR is not in the open list, and check the card whose PR is in it for a
+	 * merge conflict. An in_progress PR card — a live CI-fix work turn, or a parked work
+	 * turn — settles merged/closed/open like a merging card. A Dependabot carry card parked
+	 * for a rebase reads Dependabot's answer instead; a follow-up card watches both its PRs. */
 	async function prSettleMerging(
 		e: SupervisorEntry,
 		settings: ProjectSettings,
@@ -2955,7 +3176,12 @@ export function createSupervisor(
 		open: Set<number>,
 	): Promise<void> {
 		for (const t of await e.store.listTasks()) {
-			if (t.stage !== "merging" || t.cancelledAt !== null) continue;
+			// OTTR-1056: an in_progress card with a PR of record is tracked too, so a
+			// CI-fix work turn's PR settles or parks like a merging card's.
+			const tracked =
+				t.stage === "merging" ||
+				(t.stage === "in_progress" && t.prNumber !== null);
+			if (!tracked || t.cancelledAt !== null) continue;
 			// OTTR-799: a live merge turn settles its own card; a mid-turn settle would
 			// fight the ship step. wentStale cannot catch this: the snapshot and the row
 			// read the same state.

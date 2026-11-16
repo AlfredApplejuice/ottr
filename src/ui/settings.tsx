@@ -32,6 +32,7 @@ import type {
 	TaskCard,
 	TrendingStatus,
 } from "../types.ts";
+import { TRENDING_TOKEN_HINT } from "../types.ts";
 import {
 	type Act,
 	BusyButton,
@@ -8295,6 +8296,7 @@ export function SettingsPage({
 							project={project}
 							tasks={tasks}
 							trendingScan={trendingScan}
+							trendingStatus={trendingStatus}
 							act={act}
 							openTask={openTask}
 							hosted={host}
@@ -8533,11 +8535,14 @@ function ProjectProposalsCard({
 	st,
 	send,
 	trendingScan,
+	trendingStatus,
 	act,
 }: {
 	st: ProjectView["settings"];
 	send: (patch: Record<string, unknown>) => Promise<ProjectView>;
 	trendingScan: boolean;
+	/** The board's scan status; `tokenPresent: false` adds the no-token hint to the row. */
+	trendingStatus?: TrendingStatus;
 	act: Act;
 }) {
 	const retro = st.retroSince !== null;
@@ -8567,24 +8572,31 @@ function ProjectProposalsCard({
 				<CheckRow
 					name="Trending scout"
 					desc={
-						!trendingScan ? (
-							<>
-								The general 'Weekly trending scan' switch is off, so the scout
-								never runs — turn it on in{" "}
-								<a
-									href={`${settingsPath(null)}#automation-section`}
-									onClick={(e) =>
-										navClick(e, () => openSettingsSection("automation-section"))
-									}
-								>
-									General settings
-								</a>
-								. Weekly: an agent judges GitHub trending repos for this project
-								and files up to 3 backlog proposals
-							</>
-						) : (
-							"Weekly, when the general 'Weekly trending scan' is on: an agent judges GitHub trending repos for this project and files up to 3 backlog proposals"
-						)
+						<>
+							{!trendingScan ? (
+								<>
+									The general 'Weekly trending scan' switch is off, so the scout
+									never runs — turn it on in{" "}
+									<a
+										href={`${settingsPath(null)}#automation-section`}
+										onClick={(e) =>
+											navClick(e, () =>
+												openSettingsSection("automation-section"),
+											)
+										}
+									>
+										General settings
+									</a>
+									. Weekly: an agent judges GitHub trending repos for this
+									project and files up to 3 backlog proposals.
+								</>
+							) : (
+								"Weekly, when the general 'Weekly trending scan' is on: an agent judges GitHub trending repos for this project and files up to 3 backlog proposals."
+							)}
+							{trendingStatus?.tokenPresent === false && (
+								<> {TRENDING_TOKEN_HINT}</>
+							)}
+						</>
 					}
 					checked={st.trendingScout}
 					disabled={!trendingScan && !st.trendingScout}
@@ -9351,6 +9363,7 @@ export function ProjectSettingsForm({
 	project,
 	tasks,
 	trendingScan,
+	trendingStatus,
 	act,
 	openTask,
 	hosted,
@@ -9360,6 +9373,9 @@ export function ProjectSettingsForm({
 	/** The board's general "Weekly trending scan" switch: a project's Trending scout
 	 *  never runs while it is off, so the row shows that state. */
 	trendingScan: boolean;
+	/** The board's scan status; `tokenPresent: false` adds the no-token hint to the
+	 *  Trending scout row. */
+	trendingStatus?: TrendingStatus;
 	act: Act;
 	/** Opens a card in the board drawer: the Reviews card's counter links its review card. */
 	openTask: (id: string) => void;
@@ -9555,6 +9571,7 @@ export function ProjectSettingsForm({
 						st={st}
 						send={send}
 						trendingScan={trendingScan}
+						trendingStatus={trendingStatus}
 						act={act}
 					/>
 				</section>

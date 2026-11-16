@@ -23,7 +23,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { PROJECT, workerProjects } from "./apt.ts";
 import { resolveAgentLayer } from "./layers.ts";
-import { boardOmpHome } from "./login.ts";
+import { boardOmpHome, turnListHome } from "./login.ts";
 import { pluginSkillDirs } from "./pluginSkills.ts";
 
 /**
@@ -69,13 +69,17 @@ const objectKeys = (value: unknown): string[] =>
  *  come from the enabled plugins' `pi.skills` directories (pluginSkillDirs): a
  *  plugin-shipped skill folder with a SKILL.md counts, so a worker that has the
  *  skill only through a plugin does not report it missing. */
-export function readUserLayer(home: string): {
-	skills: string[];
-	plugins: string[];
-	mcp: string[];
-	rules: string[];
-} {
-	const skills = new Set<string>();
+/** One skill folder entry: the name and its SKILL.md path; the first dir that holds
+ *  the name wins (the `.agents/skills` bridge mirrors `.omp/agent/skills`). */
+interface SkillDir {
+	name: string;
+	skillMd: string;
+}
+
+/** The agent home's skill folders, sorted by name: the three user dirs plus the
+ *  enabled plugins' `pi.skills` dirs (pluginSkillDirs). */
+function skillDirs(home: string): SkillDir[] {
+	const skills = new Map<string, string>();
 	const addSkillNames = (dir: string): void => {
 		let names: string[];
 		try {
@@ -85,12 +89,24 @@ export function readUserLayer(home: string): {
 		}
 		for (const name of names) {
 			if (name.startsWith(".")) continue;
-			if (!existsSync(join(dir, name, "SKILL.md"))) continue;
-			skills.add(name);
+			const skillMd = join(dir, name, "SKILL.md");
+			if (!existsSync(skillMd)) continue;
+			if (!skills.has(name)) skills.set(name, skillMd);
 		}
 	};
 	for (const dir of USER_SKILL_DIRS) addSkillNames(join(home, dir));
 	for (const dir of pluginSkillDirs(home)) addSkillNames(dir);
+	return [...skills]
+		.map(([name, skillMd]) => ({ name, skillMd }))
+		.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+export function readUserLayer(home: string): {
+	skills: string[];
+	plugins: string[];
+	mcp: string[];
+	rules: string[];
+} {
 	const lock = readJsonObject(
 		join(home, ".omp", "plugins", "omp-plugins.lock.json"),
 	);
@@ -105,11 +121,58 @@ export function readUserLayer(home: string): {
 		.filter((name) => !name.startsWith(".") && name.endsWith(".md"))
 		.sort();
 	return {
-		skills: [...skills].sort(),
+		skills: skillDirs(home).map((s) => s.name),
 		plugins: objectKeys(lock?.plugins).sort(),
 		mcp: objectKeys(mcpFile?.mcpServers).sort(),
 		rules,
 	};
+}
+
+/** One skill a worker turn can load: its folder name and the `description:` line of
+ *  its SKILL.md frontmatter ("" when the file holds no parseable one). */
+export interface SkillEntry {
+	name: string;
+	description: string;
+}
+
+/** The SKILL.md frontmatter's `description:` value, trimmed, one outer pair of quotes
+ *  stripped; no frontmatter, a block scalar (`|`, `>`), or an unreadable file reads as "". */
+function skillDescription(skillMd: string): string {
+	let text: string;
+	try {
+		text = readFileSync(skillMd, "utf8");
+	} catch {
+		return "";
+	}
+	const lines = text.split("\n");
+	if (lines[0]?.trim() !== "---") return "";
+	const end = lines.indexOf("---", 1);
+	if (end === -1) return "";
+	for (let i = 1; i < end; i++) {
+		const m = /^description:[ \t]*(.*)$/.exec(lines[i]!);
+		if (m === null) continue;
+		let value = m[1]!.trim();
+		if (value === "|" || value === ">") return "";
+		if (
+			(value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
+			(value.startsWith("'") && value.endsWith("'") && value.length >= 2)
+		)
+			value = value.slice(1, -1);
+		return value;
+	}
+	return "";
+}
+
+/** The skills a worker turn of the project can load, sorted by name, each with its
+ *  SKILL.md frontmatter description: the same skill read the board's "Missing on
+ *  workers" check uses (readUserLayer), plus descriptions for the prompt gate's
+ *  skill block (OTTR-1068). The home defaults to the workers' list home
+ *  (turnListHome), the same resolution the provisioning endpoint's user layer uses. */
+export function skillCatalog(home: string = turnListHome()): SkillEntry[] {
+	return skillDirs(layerHome(home)).map((s) => ({
+		name: s.name,
+		description: skillDescription(s.skillMd),
+	}));
 }
 
 // PATH command names, unique within one file; a list entry can never escape its target dir.

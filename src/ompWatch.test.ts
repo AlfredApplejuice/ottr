@@ -958,20 +958,20 @@ describe("createOmpWatcher", () => {
 });
 
 describe("upstream release host", () => {
-	test("upstreamToken lends GH_TOKEN only when the board's host is github.com", () => {
+	test("upstreamToken lends GH_TOKEN on a github.com board, the stored token elsewhere", () => {
 		expect(upstreamToken({ GH_TOKEN: "t" })).toBe("t");
 		expect(
 			upstreamToken({ GH_TOKEN: "t", OTTR_GITHUB_HOST: "github.com" }),
 		).toBe("t");
-		expect(
-			upstreamToken({ GH_TOKEN: "t", OTTR_GITHUB_HOST: "acme.ghe.com" }),
-		).toBeUndefined();
+		// Another board: only a stored github.com token serves these fetches. GH_TOKEN
+		// there is the board host's own token, and an absent stored token means no token.
 		expect(
 			upstreamToken({ GH_TOKEN: "t", OTTR_GITHUB_HOST: "git.corp.example" }),
 		).toBeUndefined();
+		expect(upstreamToken({ OTTR_GITHUB_HOST: "acme.ghe.com" })).toBeUndefined();
 	});
 
-	test("a board on an enterprise host reads omp's notes from public github.com, without the enterprise token", async () => {
+	test("a board on an enterprise host reads omp's notes from public github.com without a token", async () => {
 		const saved = {
 			host: process.env.OTTR_GITHUB_HOST,
 			token: process.env.GH_TOKEN,
@@ -1017,6 +1017,8 @@ describe("upstream release host", () => {
 			expect(release?.url).toBe(
 				"https://api.github.com/repos/can1357/oh-my-pi/releases/tags/v18.16.0",
 			);
+			// GH_TOKEN on this board is the enterprise host's own token; it never
+			// authenticates an api.github.com fetch, and no stored github.com token exists.
 			expect(release?.auth).toBeNull();
 			expect(model.reviewed()).toEqual(["18.16.0"]);
 			expect(

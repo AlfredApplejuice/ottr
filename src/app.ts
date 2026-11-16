@@ -132,6 +132,8 @@ import {
 	githubHost,
 	hostMatcher,
 	parseGithubHost,
+	storedGithubComToken,
+	upstreamToken,
 } from "./githubHost.ts";
 import { withGithubRetry } from "./githubRetry.ts";
 import {
@@ -2969,8 +2971,10 @@ export async function createApp(deps: AppDeps) {
 			publishSoon();
 			return next;
 		},
-		// No token and apiBase here: trending is a github.com feature, so the scan reads
-		// api.github.com and lends GH_TOKEN only on a github.com board (upstreamToken).
+		// The scan reads api.github.com on every board (trending is a github.com feature):
+		// a github.com board lends GH_TOKEN, another board lends only the stored github.com
+		// token from Settings -> Git hosts (upstreamToken via upstreamGithubToken).
+		token: upstreamGithubToken,
 		fetch: deps.trendingFetch,
 		now,
 		log: (msg: string) => console.log(`[trending] ${msg}`),
@@ -3035,6 +3039,9 @@ export async function createApp(deps: AppDeps) {
 		projects: () => deps.projects.values(),
 		load: async (p) => await deps.gstore.get(`ompWatch:${p}`),
 		save: async (p, s) => await deps.gstore.set(`ompWatch:${p}`, s),
+		// Upstream release fetches hit api.github.com: the same github.com token as the
+		// trending scan (upstreamGithubToken).
+		token: upstreamGithubToken,
 		log: (m) => console.log(`[omp-watch] ${m}`),
 		schedule: deps.schedule,
 	});
@@ -4332,6 +4339,16 @@ export async function createApp(deps: AppDeps) {
 	// token: gitAuthEnv scopes the helper to credential.https://<host>, so only a git
 	// call to that host reads it. Kept-unreadable stored rows are no credential, so the
 	// board token still covers the host when only those remain (ADR-0011).
+	/**
+	 * The token the trending scan and the omp releases watch lend to their api.github.com
+	 * fetches (upstreamToken): GH_TOKEN on a github.com board, the stored github.com
+	 * token from Settings -> Git hosts on any other board (GH_TOKEN there is the board
+	 * host's own token, never an api.github.com credential).
+	 */
+	function upstreamGithubToken(): string | undefined {
+		return upstreamToken(process.env, storedGithubComToken(gitTokens));
+	}
+
 	function boardGitToken(): GitToken | null {
 		const h = githubHost();
 		if (h.isDefault || githubToken === null) return null;
@@ -5647,7 +5664,10 @@ export async function createApp(deps: AppDeps) {
 			idleReviews: deps.shared.idleReviews,
 			trendingScan: deps.shared.trendingScan,
 			commitIdentity: deps.shared.commitIdentity,
-			trendingStatus: await trendingScanner.status(),
+			trendingStatus: {
+				...(await trendingScanner.status()),
+				tokenPresent: upstreamGithubToken() !== undefined,
+			},
 			serverVersion: deps.serverVersion,
 			quota,
 			// Absent on self-hosted boards, so their payload stays as before.
@@ -5901,11 +5921,17 @@ export async function createApp(deps: AppDeps) {
 	}> {
 		const has = hasRules(e.path, e.targetRules === true);
 		if (has && !fix) return { interview: "not-needed", id: null };
+		const settings = await e.store.getSettings();
 		return e.store.transaction(async () => {
 			const live = liveCardOf(await e.store.listTasks(), "interview");
 			if (live !== null) return { interview: "running", id: live.id };
 			const t = await e.store.createTask(
-				rulesInterviewPrompt({ projectName: e.store.name, existing: has }),
+				rulesInterviewPrompt({
+					projectName: e.store.name,
+					existing: has,
+					shipsThroughPr:
+						settings.prMode === true || e.protectedTarget === true,
+				}),
 				null,
 				"interview",
 			);
@@ -12917,11 +12943,17 @@ export async function createApp(deps: AppDeps) {
 
 	// A folder source saves through alate's editor PUT: alate checks `base`
 	// (the sha256 the editor loaded) against the folder before writing.
-	// Alate's state and health carry no git-ness or writability field for a
-	// folder, so the board learns "cannot save" only from a refused save.
-	// The verdicts below remember that per folder path, in memory: they
-	// survive page reloads and clear at a server restart, so a mount that
-	// becomes writable re-arms Save instead of staying locked forever.
+	// Alate 6b22013 answers GET /health with `git` and `writable` for a
+	// folder source: `git` says whether a PUT commits, `writable` whether
+	// the folder accepts writes. A `writable` false is reliable; a true can
+	// over-report a read-only bind mount (alate's spec), and then the next
+	// refused save re-stores the verdict. The verdicts below remember a
+	// refused save per folder path, in memory: they survive page reloads
+	// and clear at a server restart. On an editor load the board asks
+	// health and drops the verdict when `git` and `writable` are true
+	// again, so a fixed folder re-arms Save without a restart; the stored
+	// verdict stays as the fallback for an alate whose health carries no
+	// `git` field.
 	const folderSaveVerdicts = new Map<string, "plain" | "mount">();
 	function folderSaveVerdict(
 		path: string | null,
@@ -12929,6 +12961,23 @@ export async function createApp(deps: AppDeps) {
 		if (path === null) return null;
 		const cause = folderSaveVerdicts.get(path);
 		return cause ? { path, cause } : null;
+	}
+	// The editor load's verdict: a stored refusal, unless alate's health
+	// says the folder commits again (`git: true`) and accepts writes
+	// (`writable: true`; a false there is reliable) — then the verdict is
+	// stale; drop it and arm Save. A health answer without `git` (an older
+	// alate) or a failed health call keeps the stored verdict.
+	async function folderSaveVerdictLive(
+		path: string | null,
+	): Promise<{ path: string; cause: "plain" | "mount" } | null> {
+		const stored = folderSaveVerdict(path);
+		if (!stored) return null;
+		const h = await alateHealth(alate);
+		if (h.ok && h.body.git === true && h.body.writable === true) {
+			folderSaveVerdicts.delete(stored.path);
+			return null;
+		}
+		return stored;
 	}
 	async function saveRolesFolder(
 		f: RolesSource,
@@ -13561,8 +13610,10 @@ export async function createApp(deps: AppDeps) {
 								repo: f.body.repo,
 								path: f.body.path,
 								// A folder the board saw refuse a save locks the editor on
-								// load, before any edit; null until such a save.
-								ro: folderSaveVerdict(f.body.path),
+								// load, before any edit; null until such a save. Health
+								// git:true with writable:true drops a stale verdict on
+								// the load.
+								ro: await folderSaveVerdictLive(f.body.path),
 								// One sign-in, on the board (docs/specs/provider-credentials.md): the
 								// board store's active providers; null when it cannot be read.
 								signIns: (() => {

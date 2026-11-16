@@ -2527,6 +2527,29 @@ describe("interview routes", () => {
 			rmSync(agents);
 		}
 	});
+
+	test("a PR-mode project queues an interview whose prompt forbids commits", async () => {
+		// Retire the live interview card from the test above, as a finished interview would be.
+		for (const t of (await store.listTasks()).filter((t) =>
+			t.prompt.startsWith(RULES_INTERVIEW_MARKER),
+		))
+			await store.updateTask(t.id, { cancelledAt: Date.now(), stage: "done" });
+		await store.setSettings({ prMode: true });
+		try {
+			const res = await post("/api/projects/p1/interview", {});
+			expect(res.status).toBe(200);
+			const task = (await store.listTasks()).find((t) =>
+				t.prompt.startsWith(RULES_INTERVIEW_MARKER),
+			);
+			expect(task).toBeDefined();
+			expect(task!.prompt).toContain("never commit");
+			expect(task!.prompt).toContain("opens the pull request");
+			expect(task!.prompt).not.toContain("commit the fix");
+			expect(task!.prompt).not.toContain("commit it only if we agreed");
+		} finally {
+			await store.setSettings({ prMode: false });
+		}
+	});
 });
 
 describe("board check route", () => {
@@ -2795,6 +2818,8 @@ describe("settings routes", () => {
 			lastRunAt: null,
 			lastError: null,
 			running: false,
+			// A github.com board carries a token exactly when GH_TOKEN is set.
+			tokenPresent: process.env.GH_TOKEN !== undefined,
 		});
 		// saveConfig persists it in the gstore config blob, and a restart reads it back.
 		const cfg = await m.g.get<{ trendingScan?: unknown }>("config");
@@ -3076,6 +3101,7 @@ describe("settings routes", () => {
 			lastRunAt: 1234,
 			lastError: { reason: "trending page failed", at: 99 },
 			running: false,
+			tokenPresent: process.env.GH_TOKEN !== undefined,
 		});
 		await g.set("trending", "garbage");
 		const empty = (await (await m.call("/api/state")).json()) as {
@@ -3085,6 +3111,7 @@ describe("settings routes", () => {
 			lastRunAt: null,
 			lastError: null,
 			running: false,
+			tokenPresent: process.env.GH_TOKEN !== undefined,
 		});
 	});
 
@@ -3769,7 +3796,7 @@ describe("trending scan host", () => {
 		);
 
 	/** One opted-in project and a fetch stub recording every call's URL and auth header. */
-	const setup = async () => {
+	const setup = async (gstore?: GlobalStore) => {
 		const dir = mkdtempSync(join(root, "trending-host-"));
 		const store = await ProjectStore.open(dir);
 		opened.push(store);
@@ -3830,16 +3857,19 @@ describe("trending scan host", () => {
 		const m = await mount({
 			projects: new Map([["tr", entry]]),
 			trendingFetch,
+			...(gstore === undefined ? {} : { gstore }),
 		});
 		return { m, calls };
 	};
 
-	test("a board on an enterprise host scans public api.github.com without a token", async () => {
+	test("an enterprise board sends its own GH_TOKEN nowhere: no stored github.com token means no token", async () => {
 		const saved = {
 			host: process.env.OTTR_GITHUB_HOST,
 			token: process.env.GH_TOKEN,
 		};
 		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+		// applyGithubToken writes the board token to GH_TOKEN: on this board that is the
+		// enterprise host's own credential, never an api.github.com token.
 		process.env.GH_TOKEN = "enterprise-token";
 		try {
 			const { m, calls } = await setup();
@@ -3848,10 +3878,64 @@ describe("trending scan host", () => {
 			// The scan filed one scout card: every fixture repo resolved.
 			const body = (await res.json()) as { filed: string[] };
 			expect(body.filed).toHaveLength(1);
-			// Every REST lookup hit exactly its public URL, and no call carried a token.
+			// Every REST lookup hit exactly its public URL, and no call carried a token:
+			// the enterprise token never authenticates an api.github.com request.
 			const rest = calls.filter((c) => PAGES[c.url] === undefined);
 			expect(new Set(rest.map((c) => c.url))).toEqual(expectedRestUrls());
 			for (const c of calls) expect(c.auth).toBeNull();
+			// The status names the token absent, so the Settings hint shows.
+			const state = (await (await m.call("/api/state")).json()) as {
+				trendingStatus: { tokenPresent: boolean };
+			};
+			expect(state.trendingStatus.tokenPresent).toBe(false);
+		} finally {
+			if (saved.host === undefined) delete process.env.OTTR_GITHUB_HOST;
+			else process.env.OTTR_GITHUB_HOST = saved.host;
+			if (saved.token === undefined) delete process.env.GH_TOKEN;
+			else process.env.GH_TOKEN = saved.token;
+		}
+	});
+
+	test("an enterprise board sends its stored github.com token, never the enterprise one", async () => {
+		const saved = {
+			host: process.env.OTTR_GITHUB_HOST,
+			token: process.env.GH_TOKEN,
+		};
+		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+		// applyGithubToken writes the board token to GH_TOKEN: on this board it is the
+		// enterprise host's own credential, and the stored github.com token outranks it.
+		process.env.GH_TOKEN = "enterprise-token";
+		try {
+			const g = await GlobalStore.open(join(root, "g-trending-stored"));
+			mountStores.push(g);
+			await g.set("config", {
+				gitTokens: [
+					{
+						host: "acme.ghe.com",
+						username: "x-access-token",
+						token: "enterprise-only",
+					},
+					{
+						host: "github.com",
+						username: "x-access-token",
+						token: "stored-com",
+					},
+				],
+			});
+			const { m, calls } = await setup(g);
+			const res = await m.call("/api/trending/scan", {});
+			expect(res.status).toBe(200);
+			const rest = calls.filter((c) => PAGES[c.url] === undefined);
+			expect(new Set(rest.map((c) => c.url))).toEqual(expectedRestUrls());
+			// The stored github.com token wins over GH_TOKEN; the page fetches stay anonymous.
+			for (const c of calls)
+				expect(c.auth).toBe(
+					c.url.startsWith("https://api.github.com/")
+						? "Bearer stored-com"
+						: null,
+				);
+			// The enterprise host's own token never rides any request.
+			for (const c of calls) expect(c.auth).not.toBe("Bearer enterprise-only");
 		} finally {
 			if (saved.host === undefined) delete process.env.OTTR_GITHUB_HOST;
 			else process.env.OTTR_GITHUB_HOST = saved.host;
@@ -6352,6 +6436,12 @@ extensions:
 		// simulates the editor's 409. `puts` records the PUT /api/file bodies.
 		let pathMode = false;
 		let folderGit = true;
+		// The writable flag alate's health answers for the folder; a false is
+		// reliable, a true can over-report a read-only bind mount.
+		let folderWritable = true;
+		// False plays an alate older than 6b22013: /health answers no git
+		// field, so a stored verdict keeps its fallback role.
+		let healthGitField = true;
 		let putConflict = false;
 		// A PUT failure before any byte: alate's answer body and status (a read-only
 		// mount answers its raw fs error with a 500).
@@ -6373,6 +6463,8 @@ extensions:
 			alateReqs = [];
 			pathMode = false;
 			folderGit = true;
+			folderWritable = true;
+			healthGitField = true;
 			putConflict = false;
 			putFail = null;
 			puts = [];
@@ -6443,10 +6535,27 @@ extensions:
 					auth: req.headers.get("authorization"),
 				});
 				if (u.pathname === "/health")
+					// Alate 6b22013 answers `git`/`writable` for a path source and
+					// null for a repo source. `healthGitField` false plays an
+					// older alate whose health carries neither field.
 					return Response.json(
 						pathMode
-							? { ok: true, running: false, path: "/data" }
-							: { ok: true, running: false, repo: "o/data" },
+							? healthGitField
+								? {
+										ok: true,
+										running: false,
+										path: "/data",
+										git: folderGit,
+										writable: folderWritable,
+									}
+								: { ok: true, running: false, path: "/data" }
+							: {
+									ok: true,
+									running: false,
+									repo: "o/data",
+									git: null,
+									writable: null,
+								},
 					);
 				if (u.pathname === "/api/file" && req.method === "PUT")
 					return alatePut(req);
@@ -6974,6 +7083,9 @@ cycleOrder:
 			test("a read-only mounted folder maps alate's EROFS to the read-only answer", async () => {
 				reset();
 				pathMode = true;
+				// The fallback: an alate older than 6b22013 answers no git field,
+				// so the verdict keeps the editor locked on the next GET.
+				healthGitField = false;
 				putFail = {
 					status: 500,
 					error:
@@ -6998,6 +7110,124 @@ cycleOrder:
 				expect(ghCalls).toEqual([]);
 				expect(snapshot).toBe(ORIGINAL);
 				// The mount verdict reaches the next GET, so the editor locks on load.
+				const get = await m.call("/api/model-roles");
+				expect(get.status).toBe(200);
+				expect(await get.json()).toMatchObject({
+					ro: { path: "/data", cause: "mount" },
+				});
+			});
+
+			test("health git:true re-arms Save after a plain-folder refusal", async () => {
+				// The user's flow: the save into a plain folder stored the verdict,
+				// then the folder became a git repo. Health now says git:true, so
+				// the next editor load drops the stale verdict and arms Save — no
+				// server restart.
+				reset();
+				pathMode = true;
+				folderGit = false;
+				const res = await m.call("/api/model-roles", {
+					base: null,
+					hash: sha(ORIGINAL),
+					roles: {
+						default: "zai/glm-5.3-flash:max",
+						slow: "zai/glm-5.3-flash:max",
+					},
+				});
+				expect(res.status).toBe(400);
+				const locked = await m.call("/api/model-roles");
+				expect(await locked.json()).toMatchObject({
+					ro: { path: "/data", cause: "plain" },
+				});
+				// The folder is a git repo now, so alate's health answers git:true.
+				folderGit = true;
+				const armed = await m.call("/api/model-roles");
+				expect(armed.status).toBe(200);
+				expect(await armed.json()).toMatchObject({ ro: null });
+			});
+
+			test("an alate whose health carries no git field keeps the plain verdict", async () => {
+				// Fallback: before 6b22013 the health answer had no git field, so
+				// the refused save stays the only signal and the lock holds.
+				reset();
+				pathMode = true;
+				folderGit = false;
+				healthGitField = false;
+				const res = await m.call("/api/model-roles", {
+					base: null,
+					hash: sha(ORIGINAL),
+					roles: {
+						default: "zai/glm-5.3-flash:max",
+						slow: "zai/glm-5.3-flash:max",
+					},
+				});
+				expect(res.status).toBe(400);
+				const get = await m.call("/api/model-roles");
+				expect(get.status).toBe(200);
+				expect(await get.json()).toMatchObject({
+					ro: { path: "/data", cause: "plain" },
+				});
+			});
+
+			test("health git:true re-arms Save after a mount refusal", async () => {
+				// The mount healed: health answers git:true and writable:true, so
+				// the mount verdict is stale on load. A writable true can
+				// over-report a read-only bind mount (alate's spec); then the
+				// next refused save re-stores the verdict and re-locks.
+				reset();
+				pathMode = true;
+				putFail = {
+					status: 500,
+					error:
+						"EROFS: read-only file system, open '/data/user/omp/agent/config.yml'",
+				};
+				const res = await m.call("/api/model-roles", {
+					base: null,
+					hash: sha(ORIGINAL),
+					roles: {
+						default: "zai/glm-5.3-flash:max",
+						slow: "zai/glm-5.3-flash:max",
+					},
+				});
+				expect(res.status).toBe(400);
+				expect(await res.json()).toEqual({
+					error: "read-only: folder source",
+					path: "/data",
+					cause: "mount",
+				});
+				putFail = null;
+				const armed = await m.call("/api/model-roles");
+				expect(armed.status).toBe(200);
+				expect(await armed.json()).toMatchObject({ ro: null });
+			});
+
+			test("health writable:false keeps a mount verdict locked", async () => {
+				// A git folder still on a read-only mount: health answers
+				// git:true but writable:false, and a false is reliable (alate's
+				// spec). The mount verdict stays, so the editor stays locked
+				// instead of arming a Save that can only fail with EROFS.
+				reset();
+				pathMode = true;
+				putFail = {
+					status: 500,
+					error:
+						"EROFS: read-only file system, open '/data/user/omp/agent/config.yml'",
+				};
+				const res = await m.call("/api/model-roles", {
+					base: null,
+					hash: sha(ORIGINAL),
+					roles: {
+						default: "zai/glm-5.3-flash:max",
+						slow: "zai/glm-5.3-flash:max",
+					},
+				});
+				expect(res.status).toBe(400);
+				expect(await res.json()).toEqual({
+					error: "read-only: folder source",
+					path: "/data",
+					cause: "mount",
+				});
+				putFail = null;
+				folderWritable = false;
 				const get = await m.call("/api/model-roles");
 				expect(get.status).toBe(200);
 				expect(await get.json()).toMatchObject({

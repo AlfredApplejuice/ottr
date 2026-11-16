@@ -9,6 +9,7 @@ import type {
 	TaskCard,
 	TrendingStatus,
 } from "../types.ts";
+import { TRENDING_TOKEN_HINT } from "../types.ts";
 import { resetCatalogCache } from "./models.ts";
 import {
 	AlateSection,
@@ -1878,6 +1879,7 @@ describe("Trending scout depends on the general weekly scan", () => {
 	async function scoutRow(
 		trendingScan: boolean,
 		trendingScout: boolean,
+		trendingStatus?: TrendingStatus,
 	): Promise<{ row: Element; unmount: () => Promise<void> }> {
 		const json = (body: unknown): Response =>
 			new Response(JSON.stringify(body), {
@@ -1905,6 +1907,7 @@ describe("Trending scout depends on the general weekly scan", () => {
 					project={project(trendingScout)}
 					tasks={[]}
 					trendingScan={trendingScan}
+					trendingStatus={trendingStatus}
 					act={async (fn) => {
 						await fn();
 						return true;
@@ -1958,6 +1961,34 @@ describe("Trending scout depends on the general weekly scan", () => {
 			const box = row.querySelector<HTMLInputElement>('input[type="checkbox"]');
 			expect(box?.disabled).toBe(false);
 			expect(row.querySelector("a")).toBeNull();
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a board with no github.com token shows the token hint on the row", async () => {
+		const { row, unmount } = await scoutRow(true, false, {
+			lastRunAt: null,
+			lastError: null,
+			running: false,
+			tokenPresent: false,
+		});
+		try {
+			expect(row.textContent).toContain(TRENDING_TOKEN_HINT);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a board with a github.com token shows no hint", async () => {
+		const { row, unmount } = await scoutRow(true, false, {
+			lastRunAt: null,
+			lastError: null,
+			running: false,
+			tokenPresent: true,
+		});
+		try {
+			expect(row.textContent).not.toContain("Add a github.com token");
 		} finally {
 			await unmount();
 		}
@@ -2258,6 +2289,7 @@ async function mountPage(
 		lastRunAt: null,
 		lastError: null,
 		running: false,
+		tokenPresent: false,
 	},
 	fetchMock?: typeof fetch,
 	actFn: (fn: () => Promise<void>) => Promise<boolean> = async () => true,
@@ -2558,6 +2590,7 @@ describe("General settings trending scan", () => {
 			lastRunAt: at - 7 * 86_400_000,
 			lastError: { reason: "GitHub answered 502", at },
 			running: false,
+			tokenPresent: true,
 		});
 		try {
 			// The failure replaces the last-run time until a scan succeeds.
@@ -2571,6 +2604,7 @@ describe("General settings trending scan", () => {
 			lastRunAt: at - 7 * 86_400_000,
 			lastError: null,
 			running: true,
+			tokenPresent: true,
 		});
 		try {
 			expect(container.textContent).toContain("A scan is running");

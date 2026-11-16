@@ -12,7 +12,7 @@ import {
 	type TrendingProject,
 	type TrendingState,
 } from "./trending.ts";
-import type { TrendingVerdict } from "./types.ts";
+import { TRENDING_TOKEN_HINT, type TrendingVerdict } from "./types.ts";
 
 const FIXTURES = join(import.meta.dir, "fixtures", "trending");
 const fixture = (name: string) =>
@@ -289,6 +289,7 @@ describe("scanNow", () => {
 			const a = await project();
 			const h = harness({
 				projects: [a],
+				token: "tok",
 				fake: { pages: { ...goodPages(), [TS_URL]: fixture(page) } },
 			});
 			const r = await h.scanner.scanNow();
@@ -322,6 +323,90 @@ describe("scanNow", () => {
 			expect(r.error).toContain("HTTP 403");
 		}
 		expect(await scouts(a)).toHaveLength(0);
+	});
+
+	for (const status of [403, 429] as const)
+		test(`a ${status} with the limit used up reports the rate limit and its reset time`, async () => {
+			const a = await project();
+			const NOW = 1_800_000_000_000;
+			const RESET_S = NOW / 1000 + 720;
+			const h = harness({
+				projects: [a],
+				token: "tok",
+				now: () => NOW,
+				fake: {
+					respond: (url) =>
+						url.startsWith(`${API}/repos/`)
+							? new Response("limit", {
+									status,
+									headers: {
+										"x-ratelimit-remaining": "0",
+										"x-ratelimit-reset": String(RESET_S),
+									},
+								})
+							: undefined,
+				},
+			});
+			const r = await h.scanner.scanNow();
+			// Local clock time of the reset, plus the minutes left.
+			const d = new Date(RESET_S * 1000);
+			const clock = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+			const error = `GitHub API /repos/${UNION[0]}: rate limited, resets at ${clock} (in 12 min)`;
+			expect(r).toEqual({ ok: false, status: 502, error });
+			expect(await h.scanner.status()).toMatchObject({
+				lastError: { reason: error },
+			});
+			expect(await scouts(a)).toHaveLength(0);
+		});
+
+	test("a 403 with the limit used up and no reset header still names the rate limit", async () => {
+		const a = await project();
+		const h = harness({
+			projects: [a],
+			token: "tok",
+			fake: {
+				respond: (url) =>
+					url.startsWith(`${API}/repos/`)
+						? new Response("limit", {
+								status: 403,
+								headers: { "x-ratelimit-remaining": "0" },
+							})
+						: undefined,
+			},
+		});
+		const r = await h.scanner.scanNow();
+		expect(r.ok).toBe(false);
+		if (!r.ok) {
+			expect(r.error).toContain("rate limited");
+			expect(r.error).not.toContain("resets at");
+		}
+		expect(await scouts(a)).toHaveLength(0);
+	});
+
+	test("a scan failure without a token carries the no-token hint", async () => {
+		const a = await project();
+		const h = harness({
+			projects: [a],
+			fake: { pages: { ...goodPages(), [TS_URL]: fixture("empty") } },
+		});
+		const r = await h.scanner.scanNow();
+		expect(r.ok).toBe(false);
+		if (!r.ok)
+			expect(r.error).toBe(
+				`trending page ${TS_URL} listed no repos (markup changed?) ${TRENDING_TOKEN_HINT}`,
+			);
+	});
+
+	test("a scan failure with a token carries no hint", async () => {
+		const a = await project();
+		const h = harness({
+			projects: [a],
+			token: "tok",
+			fake: { pages: { ...goodPages(), [TS_URL]: fixture("empty") } },
+		});
+		const r = await h.scanner.scanNow();
+		expect(r.ok).toBe(false);
+		if (!r.ok) expect(r.error).not.toContain("Add a github.com token");
 	});
 
 	// The headers arrived, then the body timed out: no optional-field fallback may hide it.

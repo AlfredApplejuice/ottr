@@ -325,6 +325,10 @@ export interface TrendingStatus {
 	lastError: { reason: string; at: number } | null;
 	/** True while a scan fetches GitHub or a scout card is live on any project. */
 	running: boolean;
+	/** True when the scan can send a github.com token (GH_TOKEN, or a stored github.com
+	 *  token under Settings -> Git hosts); false means its api.github.com requests share
+	 *  the network IP's unauthenticated 60-per-hour limit. */
+	tokenPresent: boolean;
 }
 
 /** U7: an update card parked by holdUpdateMerges; the reply recognizes it by this reason. Shared by the turn loop and the drawer's hold action bar. */
@@ -334,6 +338,11 @@ export const UPDATE_HOLD_REASON =
 /** A fork-born task parked for merge approval; the reply recognizes it by this reason. */
 export const FORK_HOLD_REASON =
 	"Fork-research-born task: the merge is held. Reply to approve the merge, or cancel the card.";
+
+/** The trending scan's hint for a board with no github.com token: its api.github.com
+ *  requests then share the network IP's unauthenticated 60-per-hour limit. */
+export const TRENDING_TOKEN_HINT =
+	"Add a github.com token under Settings -> Git hosts. Requests without a token share the 60 per hour limit of your network's IP.";
 
 /** OTTR-274: a merge turn added changes beyond an approved hold head; the reply approves the exact parked push head. */
 export const MERGE_HOLD_MISMATCH_REASON =
@@ -492,6 +501,10 @@ export interface Task {
 	prHeadSha: string | null;
 	/** OTTR-877: the review feedback watch's cutoff (epoch ms); null = never swept, the first sweep initializes silently. */
 	prWatchAt: number | null;
+	/** OTTR-1056: the answered PR-head CI failure as `<pushSha>:<runId>#<attempt>[,...]`; null = nothing answered on the card. A matching key keeps ciPrHeadReply from replying again to the same head and run. */
+	ciPrAnsweredKey: string | null;
+	/** OTTR-1056: that failure's failed-check lines (`- name: conclusion - url`, capped at 300 chars); a CI-reply work turn that changes nothing shows them on the card. */
+	ciPrAnsweredInfo: string | null;
 	/** OTTR-877: true when pending_prompt is supervisor-written reviewer feedback; passes settle through it, replies clear it. */
 	pendingFeedback: boolean;
 	/** OTTR-760: the pull request this card was filed from (a Dependabot PR); null for every other card. The ship step adopts it instead of opening a second PR. */
@@ -505,6 +518,8 @@ export interface Task {
 	sourcePrCrossRepo: boolean;
 	/** True when the source PR came from Dependabot: the bot stops updating a branch someone else pushed to, so the board comments "@dependabot rebase" instead of pushing. */
 	sourcePrDependabot: boolean;
+	/** OTTR-1063: true when the ship proved the card branch holds nothing beyond the target (an integrated merge turn rebased it onto a moved target). The card waits only on its source PR and finishes done once that PR closes — merged or closed unmerged; the watch never parks it. */
+	sourcePrSuperseded: boolean;
 	/** OTTR-809: the follow-up pull request the ship step opened for a Dependabot card's
 	 * fixes beyond the source PR's head (base = the Dependabot branch); null otherwise.
 	 * The card waits for this PR and the source PR to merge before it finishes. */

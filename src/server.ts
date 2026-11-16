@@ -91,6 +91,7 @@ import {
 	checkedOutBranch,
 	checkoutState,
 	cleanMergeTree,
+	commitFileOnBranch,
 	commitsAhead,
 	createWorktree,
 	deleteRemoteBranch,
@@ -743,6 +744,9 @@ const loop = createTurnLoop(projects, {
 	// force-with-lease) and adopts or opens the PR via gh; the integrated proof is a
 	// clean worktree with origin/<target> an ancestor of HEAD.
 	pushBranch,
+	// OTTR-1064: the rules-interview ship step builds the one-file commit on the card
+	// branch itself (the agent was told to never commit on a PR-shipped project).
+	commitFileOnBranch,
 	openPr: openPullRequest,
 	// OTTR-800: when a PR-mode card ends (PR merged, cancel), the server deletes the remote
 	// card branch the ship step pushed; the target branch and a source-PR head are refused.

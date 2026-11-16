@@ -10,6 +10,8 @@ import {
 	githubHost,
 	hostMatcher,
 	parseGithubHost,
+	storedGithubComToken,
+	upstreamToken,
 } from "./githubHost.ts";
 import fc from "./test/properties.ts";
 
@@ -255,5 +257,63 @@ describe("githubHost", () => {
 			expect(gheNoticeHost(null, null)).toBeNull();
 			expect(gheNoticeHost("not a url", null)).toBeNull();
 		});
+	});
+});
+
+describe("upstreamToken", () => {
+	test("a github.com board lends GH_TOKEN and ignores a stored token", () => {
+		expect(upstreamToken({ GH_TOKEN: "t" })).toBe("t");
+		expect(
+			upstreamToken(
+				{ GH_TOKEN: "t", OTTR_GITHUB_HOST: "github.com" },
+				"stored",
+			),
+		).toBe("t");
+	});
+
+	test("another board lends only the stored github.com token", () => {
+		expect(
+			upstreamToken(
+				{ GH_TOKEN: "env", OTTR_GITHUB_HOST: "acme.ghe.com" },
+				"stored",
+			),
+		).toBe("stored");
+		expect(
+			upstreamToken({ OTTR_GITHUB_HOST: "git.corp.example" }, "stored"),
+		).toBe("stored");
+	});
+
+	test("GH_TOKEN on another board is that host's token and never serves github.com", () => {
+		expect(
+			upstreamToken({ GH_TOKEN: "env", OTTR_GITHUB_HOST: "acme.ghe.com" }),
+		).toBeUndefined();
+		expect(upstreamToken({ OTTR_GITHUB_HOST: "acme.ghe.com" })).toBeUndefined();
+	});
+});
+
+describe("storedGithubComToken", () => {
+	const row = (host: string, token: string, unreadable?: true) => ({
+		host,
+		username: "x-access-token",
+		token,
+		...(unreadable && { unreadable }),
+	});
+
+	test("the github.com row of readable rows is the one", () => {
+		expect(
+			storedGithubComToken([
+				row("acme.ghe.com", "ent"),
+				row("github.com", "com"),
+			]),
+		).toBe("com");
+		expect(storedGithubComToken([row("github.com", "com")])).toBe("com");
+	});
+
+	test("another host's row and an unreadable github.com row give none", () => {
+		expect(storedGithubComToken([row("acme.ghe.com", "ent")])).toBeUndefined();
+		expect(
+			storedGithubComToken([row("github.com", "sealed", true)]),
+		).toBeUndefined();
+		expect(storedGithubComToken([])).toBeUndefined();
 	});
 });
