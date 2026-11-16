@@ -8841,13 +8841,12 @@ export function PrReviewSection({
 		lastDraft.current = draft;
 	}
 	// Second composer: a note asking for a fresh draft of the current head. On success the
-	// field clears and `noteFor` holds the cleared text plus the draft at send time, so the
-	// run status disappears once new text is typed or a new draft lands on the card.
+	// field clears and `noteFor` holds the cleared text, so the instant waiting state
+	// lives until new text is typed; the run record itself carries the result.
 	const [note, setNote] = useState("");
 	const [noteFor, setNoteFor] = useState<{
 		text: string;
-		draft: string | null;
-		/** The run record the ask started from: its startedAt, or -1 with none. A record newer than this is this ask's run. */
+		/** The run record the ask started from: its startedAt, or -1 with none. Only a newer record's end can be this ask's result. */
 		runAt: number;
 	} | null>(null);
 	const taskUrl = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}`;
@@ -8860,24 +8859,18 @@ export function PrReviewSection({
 	const inlineCount = parseReviewDraft(body).comments.length;
 	const shownError = error ?? pr.postError;
 	// The ask composer mirrors the card's last draft run (docs/specs/pr-reviews.md,
-	// "Draft runs"). An ask waits until a run record newer than the one it started
-	// from arrives; that record's end is the result. Without an ask, an in-flight
-	// run (a watcher re-review, say) shows the spinner line, and a clean end that
-	// landed a new draft after an ask shows "New draft ready."; a failed run shows
-	// its error.
+	// "Draft runs"). The run record alone drives the result: an in-flight run shows
+	// the spinner line (asked or watcher-run), a clean end names the draft ready,
+	// a failed end shows its error. `noteFor` only bridges the gap between the ask
+	// click and the record's arrival, and a stale ended record never masks a new
+	// ask's wait.
 	const run = pr.run;
-	const asked = noteFor !== null && note === noteFor.text;
-	const askedRun =
-		asked && run !== null && noteFor !== null && run.startedAt > noteFor.runAt;
-	const waiting = asked
-		? !askedRun || run.endedAt === null
-		: run !== null && run.endedAt === null;
-	const freshDraft =
-		asked &&
-		askedRun &&
-		run.endedAt !== null &&
-		run.error === null &&
-		draft !== noteFor.draft;
+	const waiting =
+		(run !== null && run.endedAt === null) ||
+		(noteFor !== null &&
+			note === noteFor.text &&
+			(run === null || run.startedAt <= noteFor.runAt));
+	const freshDraft = run !== null && run.endedAt !== null && run.error === null;
 	const runError =
 		run !== null && run.endedAt !== null && run.error !== null
 			? run.error
@@ -8976,12 +8969,11 @@ export function PrReviewSection({
 									setError(null);
 									await post(`${taskUrl}/reply`, { text: note });
 									setNote("");
-									// noteFor.text stays the cleared field: the run status lives
-									// while nothing new is typed, and noteFor.draft pins the
-									// draft at send time so a landed draft ends it. runAt is the
-									// record this ask started from: only a newer record ends the
-									// wait, so a stale ended run never swallows the status.
-									setNoteFor({ text: "", draft, runAt: run?.startedAt ?? -1 });
+									// noteFor.text stays the cleared field: the instant waiting
+									// state lives while nothing new is typed. runAt is the record
+									// this ask started from, so a stale ended record never masks
+									// the wait for this ask's own run.
+									setNoteFor({ text: "", runAt: run?.startedAt ?? -1 });
 								}, setError)
 							}
 						>

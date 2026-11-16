@@ -948,15 +948,17 @@ interface PrWatcherCtx {
 	gh: GhFn;
 	now: () => number;
 	review: ReviewFn;
-	/** The review model name for the run records: "custom" on an injected review, else "@plan". */
-	model: string;
-	/** Starts the PR's run record when none is active; an active record keeps its start. */
-	prRunStart: (project: string, number: number) => void;
-	/** Ends the active run record and returns it; a later end is a no-op and returns null. */
+	/** Starts the PR's run record when none is active; an active record keeps its start. A new record writes the card's start log line. */
+	prRunStart: (project: string, number: number, taskId?: string | null) => void;
+	/** Ends the active run record and writes its card-log end line; a later end is a no-op and returns null. */
 	prRunEnd: (
 		project: string,
 		number: number,
-		error: string | null,
+		outcome: {
+			kind: "saved" | "skipped" | "failed" | "cap";
+			text: string | null;
+		},
+		taskId?: string | null,
 	) => PrRunState | null;
 	/** The PR's last run record, or null when none ran since the watcher started. */
 	prRun: (project: string, number: number) => PrRunState | null;
@@ -1400,26 +1402,9 @@ async function reviewOnce(
 ): Promise<void> {
 	const store = project.store;
 	// The scan flow starts the run record here; an explicit request already started
-	// it, and that record's start time stands.
-	ctx.prRunStart(project.name, row.number);
-	const iso = (): string => new Date(ctx.now()).toISOString();
-	// The card-log lines ride on the row's card. A first review has no card yet and
-	// writes none; the [pr] server log keeps its lines.
-	const runLine = async (line: string): Promise<void> => {
-		if (row.taskId === null || ctx.cardLog === undefined) return;
-		await ctx.cardLog({
-			project: project.name,
-			taskId: row.taskId,
-			number: row.number,
-			line,
-		});
-	};
-	/** Ends the run record and writes its one card-log end line. */
-	const endRun = async (error: string | null, line: string): Promise<void> => {
-		ctx.prRunEnd(project.name, row.number, error);
-		await runLine(line);
-	};
-	await runLine(`== pr review draft ${iso()} (model ${ctx.model})`);
+	// it, and that record's start time stands. Every exit ends the record and, when
+	// the run has a card, writes its one card-log line (the record machinery does).
+	ctx.prRunStart(project.name, row.number, row.taskId);
 	const source = await store.transaction(async () => {
 		const current = await store.getPrReview(row.number);
 		const card = row.taskId === null ? null : await store.getTask(row.taskId);
@@ -1437,9 +1422,11 @@ async function reviewOnce(
 		return { card };
 	});
 	if (source === null) {
-		await endRun(
-			"the pull request or the card changed",
-			`- skipped ${iso()}: the pull request or the card changed`,
+		ctx.prRunEnd(
+			project.name,
+			row.number,
+			{ kind: "skipped", text: "the pull request or the card changed" },
+			row.taskId,
 		);
 		return;
 	}
@@ -1457,9 +1444,11 @@ async function reviewOnce(
 		const data = await pullData(repo, row.number, row.head, ctx.gh);
 		if (data === null) {
 			ctx.log(`prs: ${project.name}: #${row.number} moved; next tick`);
-			await endRun(
-				"the head moved on GitHub",
-				`- skipped ${iso()}: the head moved on GitHub`,
+			ctx.prRunEnd(
+				project.name,
+				row.number,
+				{ kind: "skipped", text: "the head moved on GitHub" },
+				row.taskId,
 			);
 			return;
 		}
@@ -1504,7 +1493,12 @@ async function reviewOnce(
 		// OTTR-942: the skip shows on the board, not only in this log line.
 		ctx.recordSkipNotice(project.name, row.number, row.head, reason);
 		ctx.log(`prs: ${project.name}: #${row.number} review skipped: ${reason}`);
-		await endRun(reason, `- skipped ${iso()}: ${reason}`);
+		ctx.prRunEnd(
+			project.name,
+			row.number,
+			{ kind: "skipped", text: reason },
+			row.taskId,
+		);
 		return;
 	}
 	// The model attempt counts against the cap before the slow call; only a saved draft
@@ -1544,15 +1538,17 @@ async function reviewOnce(
 		};
 	});
 	if (claim === null) {
-		if (capReached) {
-			const cap = `daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`;
-			await endRun(cap, `- stopped ${iso()}: ${cap}`);
-		} else {
-			await endRun(
-				"the pull request or the card changed",
-				`- skipped ${iso()}: the pull request or the card changed`,
-			);
-		}
+		ctx.prRunEnd(
+			project.name,
+			row.number,
+			capReached
+				? {
+						kind: "cap",
+						text: `daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
+					}
+				: { kind: "skipped", text: "the pull request or the card changed" },
+			row.taskId,
+		);
 		return;
 	}
 	const { run } = claim;
@@ -1605,25 +1601,31 @@ async function reviewOnce(
 			return true;
 		});
 		if (!saved) {
-			await endRun(
-				"the pull request or the card changed",
-				`- skipped ${iso()}: the pull request or the card changed`,
+			ctx.prRunEnd(
+				project.name,
+				row.number,
+				{ kind: "skipped", text: "the pull request or the card changed" },
+				row.taskId,
 			);
 			return;
 		}
 		// Notify only after the guarded draft transaction succeeds.
 		if (row.taskId !== null) await ctx.forgetSeen?.(row.taskId);
-		ctx.prRunEnd(project.name, row.number, null);
-		const startedAt = ctx.prRun(project.name, row.number)?.startedAt;
-		const took = Math.max(
-			0,
-			Math.round((ctx.now() - (startedAt ?? ctx.now())) / 1000),
+		ctx.prRunEnd(
+			project.name,
+			row.number,
+			{ kind: "saved", text: null },
+			row.taskId,
 		);
-		await runLine(`- draft saved ${iso()} (took ${took}s)`);
 	} catch (e) {
 		const error = (e as Error).message;
 		ctx.log(`prs: ${project.name}: #${row.number} review failed: ${error}`);
-		await endRun(error, `! failed ${iso()}: ${error}`);
+		ctx.prRunEnd(
+			project.name,
+			row.number,
+			{ kind: "failed", text: error },
+			row.taskId,
+		);
 	}
 }
 
@@ -1690,12 +1692,31 @@ async function requestReview(
 	o: { project: string; number: number; note: string },
 ): Promise<void> {
 	const project = [...ctx.projects()].find((p) => p.name === o.project);
-	// The explicit request is one run from here on: the record ends as a skip on
-	// every early exit below, and reviewOnce carries it to the end.
-	ctx.prRunStart(o.project, o.number);
-	if (!project || project.github === null) {
+	if (project === undefined) {
+		// No project, so no card can exist: the record ends without log lines.
+		ctx.prRunStart(o.project, o.number);
 		ctx.log(`prs: ${o.project}: no such project with GitHub reviews`);
-		ctx.prRunEnd(o.project, o.number, "no such project with GitHub reviews");
+		ctx.prRunEnd(o.project, o.number, {
+			kind: "skipped",
+			text: "no such project with GitHub reviews",
+		});
+		return;
+	}
+	// The explicit request is one run from here on: every early exit ends it as a
+	// skip and writes its card-log line, and reviewOnce carries it to the end. The
+	// card id comes from an early row read: the row may move during the gh refresh,
+	// so this is the best available id for the lines.
+	const store = project.store;
+	const taskId = (await store.getPrReview(o.number))?.taskId ?? null;
+	ctx.prRunStart(o.project, o.number, taskId);
+	if (project.github === null) {
+		ctx.log(`prs: ${o.project}: no such project with GitHub reviews`);
+		ctx.prRunEnd(
+			o.project,
+			o.number,
+			{ kind: "skipped", text: "no such project with GitHub reviews" },
+			taskId,
+		);
 		return;
 	}
 	let repo: string;
@@ -1703,10 +1724,14 @@ async function requestReview(
 		repo = repoForProject(project.github);
 	} catch (e) {
 		ctx.log(`prs: ${project.name}: ${(e as Error).message}`);
-		ctx.prRunEnd(o.project, o.number, (e as Error).message);
+		ctx.prRunEnd(
+			o.project,
+			o.number,
+			{ kind: "skipped", text: (e as Error).message },
+			taskId,
+		);
 		return;
 	}
-	const store = project.store;
 	// Explicit replies work even when the background watcher is disabled.
 	const { original, reviewsEnabled } = await store.transaction(async () => ({
 		original: await store.getPrReview(o.number),
@@ -1720,7 +1745,11 @@ async function requestReview(
 		ctx.prRunEnd(
 			o.project,
 			o.number,
-			`failed (${r.code}): ${r.stderr.slice(0, 300)}`,
+			{
+				kind: "skipped",
+				text: `failed (${r.code}): ${r.stderr.slice(0, 300)}`,
+			},
+			taskId,
 		);
 		return;
 	}
@@ -1732,12 +1761,22 @@ async function requestReview(
 		({ head, draft, title, ref } = prHeadInfo(r.stdout));
 	} catch (e) {
 		ctx.log(`prs: ${project.name}: #${o.number}: ${(e as Error).message}`);
-		ctx.prRunEnd(o.project, o.number, (e as Error).message);
+		ctx.prRunEnd(
+			o.project,
+			o.number,
+			{ kind: "skipped", text: (e as Error).message },
+			taskId,
+		);
 		return;
 	}
 	if (original === null) {
 		ctx.log(`prs: ${project.name}: #${o.number} is not watched`);
-		ctx.prRunEnd(o.project, o.number, "is not watched");
+		ctx.prRunEnd(
+			o.project,
+			o.number,
+			{ kind: "skipped", text: "is not watched" },
+			taskId,
+		);
 		return;
 	}
 	// The project's own PR-mode work: a review here would answer the board itself.
@@ -1746,7 +1785,12 @@ async function requestReview(
 		ctx.log(
 			`prs: ${project.name}: #${o.number} is this project's own PR; not reviewed`,
 		);
-		ctx.prRunEnd(o.project, o.number, "is this project's own PR; not reviewed");
+		ctx.prRunEnd(
+			o.project,
+			o.number,
+			{ kind: "skipped", text: "is this project's own PR; not reviewed" },
+			taskId,
+		);
 		return;
 	}
 	let cancelled = false;
@@ -1781,7 +1825,13 @@ async function requestReview(
 		ctx.prRunEnd(
 			o.project,
 			o.number,
-			cancelled ? "card is cancelled" : "the pull request or the card changed",
+			{
+				kind: "skipped",
+				text: cancelled
+					? "card is cancelled"
+					: "the pull request or the card changed",
+			},
+			taskId,
 		);
 		return;
 	}
@@ -1845,27 +1895,73 @@ export function createPrWatcher(deps: {
 	// record's start time, the first end wins, and a later start overwrites the
 	// ended record. A restart drops every record; the card log keeps the history.
 	const prRuns = new Map<string, PrRunState>();
-	const prRunStart = (project: string, number: number): void => {
+	/** One card-log line per record transition; a card-less run (taskId null) writes
+	 * none. A failed write reaches the [pr] server log, never the run's outcome. */
+	const emit = (
+		taskId: string | null | undefined,
+		project: string,
+		number: number,
+		line: string,
+	): void => {
+		if (taskId === null || taskId === undefined || deps.cardLog === undefined)
+			return;
+		void Promise.resolve(deps.cardLog({ project, taskId, number, line })).catch(
+			(e) =>
+				log(
+					`prs: ${project}: #${number} card log failed: ${(e as Error).message}`,
+				),
+		);
+	};
+	const prRunStart = (
+		project: string,
+		number: number,
+		taskId?: string | null,
+	): void => {
 		const key = `${project}/${number}`;
 		const active = prRuns.get(key);
 		if (active !== undefined && active.endedAt === null) return;
+		const startedAt = now();
 		prRuns.set(key, {
-			startedAt: now(),
+			startedAt,
 			endedAt: null,
 			error: null,
 			model,
 		});
+		emit(
+			taskId,
+			project,
+			number,
+			`== pr review draft ${new Date(startedAt).toISOString()} (model ${model})`,
+		);
 		deps.runEdge?.();
 	};
 	const prRunEnd = (
 		project: string,
 		number: number,
-		error: string | null,
+		outcome: {
+			kind: "saved" | "skipped" | "failed" | "cap";
+			text: string | null;
+		},
+		taskId?: string | null,
 	): PrRunState | null => {
 		const active = prRuns.get(`${project}/${number}`);
 		if (active === undefined || active.endedAt !== null) return null;
 		active.endedAt = now();
-		active.error = error;
+		active.error = outcome.kind === "saved" ? null : outcome.text;
+		const took = Math.max(
+			0,
+			Math.round((active.endedAt - active.startedAt) / 1000),
+		);
+		const iso = new Date(active.endedAt).toISOString();
+		const line =
+			outcome.kind === "saved"
+				? `- draft saved ${iso} (took ${took}s)`
+				: outcome.kind === "failed"
+					? `! failed ${iso}: ${outcome.text}`
+					: outcome.kind === "cap"
+						? `- stopped ${iso}: ${outcome.text}`
+						: `- skipped ${iso}: ${outcome.text}`;
+		emit(taskId, project, number, line);
 		deps.runEdge?.();
 		return active;
 	};
@@ -1917,7 +2013,6 @@ export function createPrWatcher(deps: {
 		gh,
 		now,
 		review,
-		model,
 		prRunStart,
 		prRunEnd,
 		prRun,

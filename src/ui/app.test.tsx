@@ -5657,7 +5657,8 @@ describe("Drawer of a cancelled card opens read-only", () => {
 
 	// The ask composer mirrors the card's last draft run (docs/specs/pr-reviews.md,
 	// "Draft runs"): in flight shows the spinner line, a failed run shows its error,
-	// and a clean end without an ask renders no stale status.
+	// and a clean end names the draft ready — the record is the status, so it also
+	// survives the section remount a moved head causes.
 	test("a draft run in flight shows Writing a new draft beside the composer", () => {
 		const html = section(waitingReview(), "## Summary\nreview", {
 			...prView("open"),
@@ -5686,7 +5687,7 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		expect(html).not.toContain("New draft ready.");
 	});
 
-	test("a clean ended run without an ask renders no stale status", () => {
+	test("a clean ended run shows New draft ready without an ask", () => {
 		const html = section(waitingReview(), "## Summary\nreview", {
 			...prView("open"),
 			run: {
@@ -5696,8 +5697,34 @@ describe("Drawer of a cancelled card opens read-only", () => {
 				model: "@plan",
 			},
 		});
+		expect(html).toContain("New draft ready.");
 		expect(html).not.toContain("Writing a new draft...");
-		expect(html).not.toContain("New draft ready.");
+	});
+
+	// The head moved between the ask and the run's end: requestReview refreshed the
+	// head, savePrDraft wrote the new reviewed_head, and the drawer's reviewedHead
+	// key remounts the section. The fresh mount still sees the ended run and shows
+	// its result (OTTR-1073 send-back).
+	test("a fresh mount after a head move shows the landed run's result", () => {
+		const moved = section(
+			{
+				...waitingReview(),
+				prReview: { ...prView("open"), reviewedHead: "d".repeat(40) },
+			} as TaskCard,
+			"## Summary\nreview of the new head",
+			{
+				...prView("open"),
+				reviewedHead: "d".repeat(40),
+				run: {
+					startedAt: 2_000,
+					endedAt: 2_500,
+					error: null,
+					model: "@plan",
+				},
+			},
+		);
+		expect(moved).toContain("New draft ready.");
+		expect(moved).toContain("review of the new head");
 	});
 });
 
@@ -5976,10 +6003,30 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 				"#pr-review-text",
 			) as unknown as HTMLTextAreaElement;
 			expect(box.value).toBe("## Summary\nrewritten review");
-			// Typing the next ask hides the landed status again.
+			// The status is the run record, not the typed text: typing the next ask
+			// leaves it up until that ask's own run arrives.
 			await act(async () => {
 				propOf(note, "onChange")({ target: { value: "One more pass" } });
 			});
+			expect(container.textContent).toContain("New draft ready.");
+			// The next run arriving in flight replaces the result with the spinner.
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 3_000,
+							endedAt: null,
+							error: null,
+							model: "@plan",
+						})}
+						draft={"## Summary\nrewritten review"}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			expect(container.textContent).toContain("Writing a new draft...");
 			expect(container.textContent).not.toContain("New draft ready.");
 		} finally {
 			await act(async () => {
@@ -6033,8 +6080,8 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 					/>,
 				);
 			});
-			// The user's edit wins over the landed draft. No status shows: this flow
-			// never asked for a draft, and a clean run without an ask is no news.
+			// The user's edit wins over the landed draft. The status still names the
+			// clean run: it rides the run record, not the composer's own ask.
 			expect(
 				(
 					container.querySelector(
@@ -6042,7 +6089,7 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 					) as unknown as HTMLTextAreaElement
 				).value,
 			).toBe("my own edit");
-			expect(container.textContent).not.toContain("New draft ready.");
+			expect(container.textContent).toContain("New draft ready.");
 		} finally {
 			await act(async () => {
 				root.unmount();

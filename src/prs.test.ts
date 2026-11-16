@@ -2797,6 +2797,44 @@ describe("createPrWatcher", () => {
 		expect(s.edges()).toBe(4);
 	});
 
+	test("an explicit request that fails before the review still logs its run on the card", async () => {
+		const s = await setup();
+		s.setOpen([pr(1, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const card = (await s.cards())[0]!;
+		// The same store behind a project whose GitHub id cannot parse: the request
+		// fails before the review starts, and its run still writes the start and
+		// skip lines to the card's log (OTTR-1073 send-back).
+		const broken = createPrWatcher({
+			projects: () => [
+				{
+					name: "p",
+					path: s.store.serverDir,
+					store: s.store,
+					// A space cannot match REPO_RE: repoForProject throws before the
+					// gh refresh, the earliest failure an explicit request can hit.
+					github: "not a repo",
+				},
+			],
+			log: () => {},
+			gh: s.gh,
+			now: s.now,
+			review: async () => "## Summary\nnever",
+			cardLog: async ({ taskId, line }) => {
+				await appendLog(s.store, taskId, line);
+			},
+		});
+		await broken.reviewNow({ project: "p", number: 1, note: "go" });
+		const log = await s.readCardLog(card.id);
+		expect(log).toContain("== pr review draft ");
+		expect(log).toContain("- skipped ");
+		expect(log).toContain("invalid repo id: github.com/not a repo");
+		expect(broken.prRun("p", 1)?.error).toContain("invalid repo id");
+		expect(broken.prRun("p", 1)?.endedAt).not.toBeNull();
+	});
+
 	test("a skipped run logs its start and skip lines on the card", async () => {
 		const s = await setup();
 		s.setOpen([pr(1, sha("a"))]);
