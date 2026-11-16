@@ -3661,6 +3661,129 @@ describe("prPass", () => {
 		await store.close();
 	});
 
+	test("OTTR-1063: a superseded card finishes done when its source PR closes unmerged", async () => {
+		const store = await prModeProject("pr-superseded-close");
+		const t = await prCard(store);
+		await store.updateTask(t.id, { sourcePrSuperseded: true });
+		await store.setSettings({
+			originUrl: "https://github.com/acme/widget.git",
+		});
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? { code: 0, stdout: pullBody({}), stderr: "" }
+					: openList([]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = (await store.getTask(t.id))!;
+		// Done, not parked: the card's work already sits on the target.
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBe(null);
+		// No merge commit exists: pushSha stays null.
+		expect(after.pushSha).toBe(null);
+		expect(after.prNumber).toBe(7);
+		// The card ended: the remote branch delete runs (OTTR-800); no worktree to remove.
+		expect(ops.calls.deletes).toEqual([
+			{
+				mainPath: join(root, "main"),
+				branch: "ottr/552",
+				originUrl: "https://github.com/acme/widget.git",
+				keep: ["main"],
+			},
+		]);
+		expect(ops.calls.remove).toEqual([]);
+		const log = await Bun.file(await store.logPath(t.id)).text();
+		expect(log).toContain(
+			"the card's work was already on the target; card done",
+		);
+		await store.close();
+	});
+
+	test("OTTR-1063: a superseded card stays idle while its source PR is open in conflict", async () => {
+		const store = await prModeProject("pr-superseded-open");
+		const t = await prCard(store);
+		await store.updateTask(t.id, { sourcePrSuperseded: true });
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? {
+							code: 0,
+							stdout: pullBody({ state: "open", mergeable: false }),
+							stderr: "",
+						}
+					: openList([7]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = (await store.getTask(t.id))!;
+		// The stale PR's mergeability cannot park the card: it waits idle for the
+		// close, and the feedback watch never stamps its cutoff either.
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBe(null);
+		expect(after.prWatchAt).toBe(null);
+		expect(ops.calls.scheduled).toBe(0);
+		await store.close();
+	});
+
+	test("OTTR-1063: a superseded card whose source PR merges finishes done like any merge", async () => {
+		const store = await prModeProject("pr-superseded-merged");
+		const t = await prCard(store);
+		await store.updateTask(t.id, { sourcePrSuperseded: true });
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? {
+							code: 0,
+							stdout: pullBody({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: MERGE_SHA,
+							}),
+							stderr: "",
+						}
+					: openList([]),
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = (await store.getTask(t.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.pushSha).toBe(MERGE_SHA);
+		await store.close();
+	});
+
+	test("OTTR-1063: a superseded stamp voids when the card leaves the wait: the close parks", async () => {
+		const store = await prModeProject("pr-superseded-left-wait");
+		const t = await prCard(store);
+		// A re-ship of a superseded card parked needs_you (a failed push, a failed
+		// openPr, an agent question): the stamp from the earlier fixless ship stays
+		// on the row, but the card no longer holds that proof. The source PR's
+		// close must park the card like any other close — never auto-finish it
+		// done over fixes the ship did not deliver.
+		await store.updateTask(t.id, {
+			sourcePrSuperseded: true,
+			state: "needs_you",
+			needsReason:
+				"Opening the follow-up pull request failed: Validation Failed",
+		});
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? { code: 0, stdout: pullBody({}), stderr: "" }
+					: openList([]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = (await store.getTask(t.id))!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("PR #7 closed without merging");
+		// The close park keeps the branch and the worktree: the undelivered fixes stay.
+		expect(ops.calls.deletes).toEqual([]);
+		expect(ops.calls.remove).toEqual([]);
+		const log = await Bun.file(await store.logPath(t.id)).text();
+		expect(log).toContain("PR #7 closed without merging; card parked");
+		await store.close();
+	});
+
 	test("OTTR-799: prPass skips a card whose merge turn is live", async () => {
 		const store = await prModeProject("pr-live-turn");
 		const t = await prCard(store);

@@ -30,6 +30,7 @@ function done(id: string, project: string, commits: number | null): Task {
 		sourcePrHeadSha: null,
 		sourcePrCrossRepo: false,
 		sourcePrDependabot: false,
+		sourcePrSuperseded: false,
 		followUpPrNumber: null,
 		followUpPrUrl: null,
 		images: [],

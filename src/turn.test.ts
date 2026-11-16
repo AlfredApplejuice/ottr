@@ -23374,6 +23374,123 @@ describe("turn PR-mode merge settle", () => {
 		},
 	);
 
+	test("an integrated merge turn whose branch equals the target opens no PR and does not park (OTTR-1063)", async () => {
+		// Real git everywhere the ship reads: a bare origin, an advanced target pushed
+		// to origin, the bot head on refs/pull/30/head, and the card checkout — a real
+		// linked worktree — holding a branch the merge turn's rebase left exactly at the
+		// target tip (CSE-10: main already held newer deps than the source PR, so the
+		// rebase dropped the bump). The branch holds nothing beyond the target, so the
+		// ship pushes nothing and opens no follow-up PR: the card finishes as superseded
+		// and waits only on source PR #30. Before the fix the ship pushed the branch and
+		// opened a PR GitHub answers with "no commits between the branches" (HTTP 422),
+		// parking the card. Only the GitHub calls are stubbed.
+		const run = (cwd: string, ...args: string[]): string => {
+			const r = Bun.spawnSync(["git", ...args], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (r.exitCode !== 0)
+				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+			return r.stdout.toString().trim();
+		};
+		const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+		const dir = mkdtempSync(join(tmpdir(), "ottr-1063-"));
+		const bare = join(dir, "origin.git");
+		const main = join(dir, "main");
+		const wt = join(dir, "wt");
+		try {
+			run(dir, "init", "-q", "--bare", "-b", "main", bare);
+			run(dir, "clone", "-q", bare, main);
+			writeFileSync(join(main, "pkg.json"), '{\n  "v": 1\n}\n');
+			run(main, ...id, "add", ".");
+			run(main, ...id, "commit", "-qm", "base");
+			run(main, "push", "-q", "origin", "main");
+			run(main, "switch", "-q", "-c", "dep");
+			writeFileSync(join(main, "pkg.json"), '{\n  "v": 2\n}\n');
+			run(main, ...id, "commit", "-am", "bump vite from 1 to 2");
+			const botHead = run(main, "rev-parse", "HEAD");
+			run(main, "push", "-q", "origin", `${botHead}:refs/pull/30/head`);
+			// The bot bump's objects must exist before the ship's reads.
+			run(main, "fetch", "-q", "origin", "+refs/pull/30/head:refs/ottr/pr/30");
+			run(main, "switch", "-q", "main");
+			writeFileSync(join(main, "other.txt"), "advance\n");
+			run(main, ...id, "add", ".");
+			run(main, ...id, "commit", "-qm", "advance");
+			run(main, "push", "-q", "origin", "main");
+			// The card checkout: a linked worktree whose branch the merge turn's
+			// rebase left exactly at the target tip — the bump dropped.
+			run(main, "worktree", "add", "-q", "-b", "ott/m", wt, "main");
+
+			const opens: { repo: string; branch: string; base: string }[] = [];
+			const comments: { repo: string; number: number; body: string }[] = [];
+			const pushes: unknown[][] = [];
+			const { store, loop, task } = await prMergeSetup({
+				targetSha: async (_m: string, ref: string) => {
+					const r = Bun.spawnSync(
+						["git", "rev-parse", "--verify", "--quiet", ref],
+						{ cwd: main },
+					);
+					return r.exitCode === 0 ? r.stdout.toString().trim() : null;
+				},
+				targetContains: (_m: string, sha: string, tip: string) =>
+					realTargetContains(main, sha, tip),
+				treesEqual: (_m: string, a: string, b: string) =>
+					realTreesEqual(main, a, b),
+				cleanMergeTree: (_m: string, a: string, b: string) =>
+					realCleanMergeTree(main, a, b),
+				revListCount: (wtPath: string, a: string, b: string) =>
+					realRevListCount(wtPath, a, b),
+				fetchPrHead: async (_m: string, n: number, _url: string) =>
+					realFetchPrHead(main, n, bare),
+				pushBranch: async (...args: unknown[]) => {
+					pushes.push(args);
+					return { status: "pushed" as const, output: "" };
+				},
+				openPr: async (o) => {
+					opens.push(o);
+					return {
+						ok: true as const,
+						pr: { number: 33, url: "https://github.com/acme/repo/pull/33" },
+					};
+				},
+				prComment: async (o) => {
+					comments.push(o);
+					return { ok: true as const };
+				},
+			});
+			await store.setSettings({ prMode: true, originUrl: bare });
+			await store.updateTask(task.id, {
+				worktree: wt,
+				...sourcePr({
+					sourcePrNumber: 30,
+					sourcePrUrl: "https://github.com/acme/repo/pull/30",
+					sourcePrHeadSha: botHead,
+					sourcePrHeadRef: "dep",
+				}),
+			});
+			await loop.runTurn(store.name, task.id);
+			const after = (await store.getTask(task.id))!;
+			// Not parked: the ship finishes the card as superseded, waiting on PR #30.
+			expect(after.stage).toBe("merging");
+			expect(after.state).toBe("idle");
+			expect(after.needsReason).toBe(null);
+			expect(after.prNumber).toBe(30);
+			expect(after.sourcePrSuperseded).toBe(true);
+			expect(after.followUpPrNumber).toBe(null);
+			expect(pushes).toEqual([]);
+			expect(opens).toEqual([]);
+			expect(comments).toEqual([]);
+			const log = await logText(store, task.id);
+			expect(log).toContain(
+				"nothing beyond origin/main; no follow-up pull request",
+			);
+			expect(log).toContain("the card waits only on source PR #30");
+		} finally {
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+
 	test("a fixless cherry-pick onto an advanced target adopts via merge-tree (OTTR-809)", async () => {
 		// The target advanced (an unrelated file), so the cherry-picked bump differs
 		// from the bot head and the rev-list counts the copy — but merging the bump

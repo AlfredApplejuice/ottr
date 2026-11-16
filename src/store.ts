@@ -354,6 +354,7 @@ interface TaskRow {
 	source_pr_head_sha: string | null;
 	source_pr_cross_repo: number;
 	source_pr_dependabot: number;
+	source_pr_superseded: number;
 	follow_up_pr_number: number | null;
 	follow_up_pr_url: string | null;
 	topic: string | null;
@@ -585,6 +586,7 @@ function toListedTask(
 		sourcePrHeadSha: r.source_pr_head_sha,
 		sourcePrCrossRepo: r.source_pr_cross_repo === 1,
 		sourcePrDependabot: r.source_pr_dependabot === 1,
+		sourcePrSuperseded: r.source_pr_superseded === 1,
 		followUpPrNumber: r.follow_up_pr_number,
 		followUpPrUrl: r.follow_up_pr_url,
 		topic: r.topic,
@@ -943,6 +945,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	sourcePrHeadSha: "source_pr_head_sha",
 	sourcePrCrossRepo: "source_pr_cross_repo",
 	sourcePrDependabot: "source_pr_dependabot",
+	sourcePrSuperseded: "source_pr_superseded",
 	followUpPrNumber: "follow_up_pr_number",
 	followUpPrUrl: "follow_up_pr_url",
 	topic: "topic",
@@ -2072,6 +2075,16 @@ export class ProjectStore {
 					cols,
 					"source_pr_dependabot",
 					"ALTER TABLE tasks ADD COLUMN source_pr_dependabot INTEGER NOT NULL DEFAULT 0",
+				);
+				// OTTR-1063: the ship proved the card branch holds nothing beyond the target,
+				// so the card finishes done once its source PR closes. ALTER-only after both
+				// CHECK rebuilds, same reason as pr_number above — a rebuild's explicit
+				// column list would drop it.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"source_pr_superseded",
+					"ALTER TABLE tasks ADD COLUMN source_pr_superseded INTEGER NOT NULL DEFAULT 0",
 				);
 				// OTTR-809: the follow-up PR the ship step opened for a Dependabot card's fixes
 				// beyond the source PR's head. ALTER-only after both CHECK rebuilds, same reason

@@ -1885,6 +1885,7 @@ export function createSupervisor(
 				sourcePrHeadRef: null,
 				sourcePrHeadSha: null,
 				sourcePrCrossRepo: false,
+				sourcePrSuperseded: false,
 			}))
 		)
 			return true;
@@ -2318,12 +2319,13 @@ export function createSupervisor(
 	}
 
 	/** The done write after a PR merge: capture the worktree's status rows for the done
-	 * drawer, then pin pushSha when the merge commit is the fetched origin tip. A stale
-	 * card returns null and stops the pass. */
+	 * drawer, then pin pushSha when the merge commit is the fetched origin tip. A null
+	 * merge commit (a superseded card's close, OTTR-1063) pins nothing. A stale card
+	 * returns null and stops the pass. */
 	async function prPinDone(
 		e: SupervisorEntry,
 		t: ListedTask,
-		mergeCommit: string,
+		mergeCommit: string | null,
 		onOrigin: boolean,
 		settings: ProjectSettings,
 		target: string,
@@ -2350,7 +2352,7 @@ export function createSupervisor(
 				// The card is done: a feedback park's prompt (and flag) is void.
 				pendingPrompt: null,
 				pendingFeedback: false,
-				pushSha: onOrigin ? mergeCommit : null,
+				pushSha: onOrigin && mergeCommit !== null ? mergeCommit : null,
 				uncommittedFiles: uncommitted,
 			});
 		});
@@ -2534,6 +2536,21 @@ export function createSupervisor(
 			);
 			return;
 		}
+		// OTTR-1063: a superseded card's work already sits on the target — the ship
+		// proved the branch empty beyond it — so the close is the card's done, not a
+		// lost delivery to park. No merge commit exists: pushSha stays null. The
+		// stamp governs only the exact wait the ship left (merging/idle): a later
+		// park (a failed re-ship, an agent question) voids the auto-finish, and the
+		// close parks like any other PR close, so fixes the ship never delivered
+		// stay on the card with their branch and worktree.
+		if (
+			t.sourcePrSuperseded === true &&
+			t.stage === "merging" &&
+			t.state === "idle"
+		) {
+			await finishSupersededClose(e, settings, t);
+			return;
+		}
 		if (await wentStale(e.store, t)) return;
 		// The widening (OTTR-1056) keeps an in_progress PR card on the watch, so this
 		// park repeats in every window: the exact-reason guard, the same defense in
@@ -2557,6 +2574,37 @@ export function createSupervisor(
 		await ops.schedule();
 	}
 
+	/** A superseded card's source PR closed unmerged (OTTR-1063): the card's work already
+	 * sits on the target (the ship proved the branch empty beyond it), so the close is
+	 * the card's done — the same write a merge finish makes, minus the merge commit:
+	 * pushSha stays null and no release stamp runs. The worktree goes and the remote
+	 * card branch is deleted like a merge finish. Never throws. */
+	async function finishSupersededClose(
+		e: SupervisorEntry,
+		settings: ProjectSettings,
+		t: ListedTask,
+	): Promise<void> {
+		const target = e.target ?? t.base;
+		if (target === null) {
+			console.error(
+				`supervisor: project ${e.name}: no target branch; superseded close skipped`,
+			);
+			return;
+		}
+		const done = await prPinDone(e, t, null, false, settings, target);
+		if (done === null) return;
+		const wt = done.worktree;
+		if (await wentStale(e.store, done)) return;
+		if (wt !== null && existsSync(wt)) await finishPrMergeRemove(e, done, wt);
+		if (await wentStale(e.store, done)) return;
+		await finishPrDeleteRemote(e, settings, done);
+		await ops.appendLog(
+			e.store,
+			t.id,
+			`supervisor: PR #${t.prNumber} closed without merging; the card's work was already on the target; card done`,
+		);
+	}
+
 	/** GitHub's merge verdict for the open PR of one tracked Merging card (OTTR-789): false
 	 * parks the idle card needs_you with the conflict reason, true returns a card parked with
 	 * exactly that reason to idle. Null (GitHub still computes it) and a card in any other
@@ -2570,6 +2618,15 @@ export function createSupervisor(
 		// prSettleMerging guards the number before prConflictCard gets here; this guard
 		// only narrows the type for the feedback-reason write below.
 		if (t.prNumber === null) return;
+		// OTTR-1063: while a superseded card waits idle on its source PR's closure,
+		// the stale PR's mergeability cannot park it. The stamp governs only the
+		// ship's wait state; a later park keeps the normal verdict rules.
+		if (
+			t.sourcePrSuperseded === true &&
+			t.stage === "merging" &&
+			t.state === "idle"
+		)
+			return;
 		const parked = t.state === "needs_you" && t.needsReason === reason;
 		if (t.state !== "idle" && !parked) return;
 		// A write needs a verdict that contradicts the card: false (conflict) while it waits
@@ -2986,6 +3043,15 @@ export function createSupervisor(
 		repo: string,
 	): Promise<void> {
 		if (t.prNumber === null || t.cancelledAt !== null) return;
+		// OTTR-1063: a superseded card waits only on its source PR's closure; review
+		// feedback on that stale PR must not park it or queue a fix turn. The stamp
+		// governs only the ship's wait state; a later park keeps the normal watch.
+		if (
+			t.sourcePrSuperseded === true &&
+			t.stage === "merging" &&
+			t.state === "idle"
+		)
+			return;
 		const reason = prFeedbackReason(t.prNumber);
 		const conflict = prConflictReason(t.prNumber);
 		const watched =

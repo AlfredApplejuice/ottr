@@ -518,6 +518,8 @@ export interface Task {
 	sourcePrCrossRepo: boolean;
 	/** True when the source PR came from Dependabot: the bot stops updating a branch someone else pushed to, so the board comments "@dependabot rebase" instead of pushing. */
 	sourcePrDependabot: boolean;
+	/** OTTR-1063: true when the ship proved the card branch holds nothing beyond the target (an integrated merge turn rebased it onto a moved target). The card waits only on its source PR and finishes done once that PR closes — merged or closed unmerged; the watch never parks it. */
+	sourcePrSuperseded: boolean;
 	/** OTTR-809: the follow-up pull request the ship step opened for a Dependabot card's
 	 * fixes beyond the source PR's head (base = the Dependabot branch); null otherwise.
 	 * The card waits for this PR and the source PR to merge before it finishes. */

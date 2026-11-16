@@ -257,6 +257,21 @@ step checks the source before it ever opens a PR:
   `follow_up_pr_number`/`follow_up_pr_url` (additive columns migrated like
   the PR fields above) and waits in `merging`/`idle` until both PRs merge; a
   re-ship adopts the open follow-up instead of opening another one.
+- An integrated merge turn can rebase the card branch onto a moved target
+  until it equals it (the target already held newer versions than the
+  source PR's bump), so before the follow-up push the ship reads
+  `git rev-list --count <target>..<card-branch>` (OTTR-1063). An empty
+  count means the work already sits on the target: the ship pushes nothing,
+  opens no PR, logs "nothing beyond the target", and stamps
+  `source_pr_superseded` (an additive column migrated like the PR fields
+  above). The card waits in `merging`/`idle` on its source PR alone and
+  finishes done once that PR closes — merged or closed unmerged; the PR
+  pass never parks it on the stale PR's conflicts or review feedback. The
+  stamp governs that exact wait: a later park — a failed re-ship, an agent
+  question — voids it, and the close then parks the card like any other PR
+  close, so fixes the ship never delivered stay on the card. Git
+  trouble keeps the follow-up delivery: the push stays the safe path for
+  work the ship cannot prove empty.
 - Everything else — a fork head without Dependabot —
   comments on the source PR (a note
   about the parked fixes otherwise) and parks the card `merging`/`needs_you`
@@ -407,29 +422,22 @@ strictly before the source; the source's `merge_commit_sha` then pins the
 watch. Equal or unreadable times are unresolved — the target may not hold
 the fixes — and the card parks needs_you ("Follow-up PR #F merged without
 proof its fixes reached the target ..."). The follow-up closed without
-merge parks the card needs_you ("follow-up PR #F closed without merging").
-The source closed without merge reads the open follow-up's current base.
-On the target branch — GitHub's retarget after the bump merged elsewhere
-included — the follow-up already carries the whole bump, so the card
-adopts it instead of parking: the follow-up becomes the PR of record
-(`pr_number`, `pr_url`, `pr_head_sha`), the source fields name it (its
-branch, its head sha, `source_pr_dependabot` false, so a later fix turn
-ships to the follow-up's branch), the follow-up fields clear, the card
-stays `merging`/`idle`, and one log line records the shift. The
-follow-up's head is the card's own branch, so a keep list never holds it:
-the finish and the cancel delete the branch (OTTR-800), and a foreign
-source-PR head stays refused. The next
-window settles the follow-up alone, and a merged follow-up finishes the
-card with its own merge commit. A park reason that names the follow-up
-(its conflict or feedback) stays; any other reason clears to idle. On the
-bump branch the card parks needs_you ("PR #S closed without merging")
-while the follow-up waits. These three parks redesign (OTTR-809): they set
-`stage` to `in_progress`, keeping `follow_up_pr_number` and the branch, so
-the card leaves the merging watch entirely and the pass neither re-reads
-the PRs nor rewrites the row while the user works. The exact-reason guards
-stay on top (defense in depth): a repeat window with the same answer adds
-no log line.
+merge parks the card needs_you ("follow-up PR #F closed without merging");
+the source closed without merge parks it the same way while the follow-up
+waits. A superseded card (OTTR-1063, `source_pr_superseded`) never holds a
+follow-up: while it still waits `merging`/`idle` as the ship left it, its
+source PR closing finishes the card done — the merge path when the PR
+merged, otherwise the merge-finish write with no commit to pin (`pushSha`
+stays null) — and the conflict verdict and the feedback watch skip it, so
+the stale PR's conflicts or review feedback never park it. A card that
+left that wait carries only a stale stamp: the close parks it like any
+other PR close.
 
+These three parks redesign (OTTR-809): they set `stage` to
+`in_progress`, keeping `follow_up_pr_number` and the branch, so the card
+leaves the merging watch entirely and the pass neither re-reads the PRs nor
+rewrites the row while the user works. The exact-reason guards stay on top
+(defense in depth): a repeat window with the same answer adds no log line.
 A reply re-queues the card, and the next merge turn re-ships and re-judges
 both PRs from fresh REST reads. The remote card-branch delete still runs
 only at the finish: the follow-up PR's head is the card branch, and it may

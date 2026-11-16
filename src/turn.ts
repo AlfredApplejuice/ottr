@@ -7175,7 +7175,7 @@ export function createTurnLoop(
 		// A conflict or a tree mismatch is a fix and ships. Git trouble reads as
 		// fixes, so the follow-up stays the safe delivery for work we cannot prove
 		// empty.
-		const beyond = await commitsBeyondHead(st, head, tip);
+		const beyond = await commitsBeyond(st, head, tip);
 		if (beyond === 0) {
 			await adoptSourcePr(st, n, head, src.url);
 			return;
@@ -7212,20 +7212,20 @@ export function createTurnLoop(
 		await parkOnSourcePr(st, n, src);
 	}
 
-	/** How many commits the card branch holds beyond the source PR's head
-	 * (`rev-list <head>..<tip>` in the card checkout); null on git trouble. The count
-	 * is pure commit graph — no HEAD, no worktree state, no patch shape — so rename,
-	 * mode and binary fixes all count as commits, and neither checkout's position can
-	 * skew it. */
-	async function commitsBeyondHead(
+	/** How many commits `tip` holds beyond `from` (`rev-list <from>..<tip>` in the card
+	 * checkout); null on git trouble. The count is pure commit graph — no HEAD, no
+	 * worktree state, no patch shape — so rename, mode and binary fixes all count as
+	 * commits, and neither checkout's position can skew it. Reads the source PR's head
+	 * at ship time and the target before a follow-up push. */
+	async function commitsBeyond(
 		st: TurnSettle,
-		head: string,
+		from: string,
 		tip: string,
 	): Promise<number | null> {
 		// The card checkout is the subject of the read; when it exists, the count
 		// runs there (same object store, never the main checkout's branch).
 		const path = existsSync(st.loc.wt) ? st.loc.wt : st.e.path;
-		return ops.revListCount(path, head, tip).catch(() => null);
+		return ops.revListCount(path, from, tip).catch(() => null);
 	}
 
 	/** True when merging the source PR's bump onto the target tip reproduces the card
@@ -7384,9 +7384,11 @@ export function createTurnLoop(
 				prNumber: n,
 				prUrl: url,
 				prHeadSha,
-				// A clean bump leaves no follow-up PR; a stale stamp from an earlier ship must go.
+				// A clean bump leaves no follow-up PR and no superseded wait; a stale
+				// stamp from an earlier ship must go.
 				followUpPrNumber: null,
 				followUpPrUrl: null,
+				sourcePrSuperseded: false,
 			});
 		});
 		await appendLog(
@@ -7451,6 +7453,21 @@ export function createTurnLoop(
 		tip: string,
 		onHead: boolean,
 	): Promise<void> {
+		// The merge turn's automatic rebase can land the branch on a moved target until
+		// it equals it (CSE-10: main already held newer deps than the source PR): pushing
+		// it and opening a PR then draws GitHub's "no commits between the branches" 422
+		// and parks the card. Nothing beyond the target finishes the card as superseded
+		// instead — no push, no PR. Git trouble reads as fixes: the push stays the safe
+		// delivery for work we cannot prove empty.
+		const beyondTarget = await commitsBeyond(st, st.header.target, prBranch);
+		if (!(await canShipPr(st))) return;
+		if (beyondTarget === 0) {
+			await st.log(
+				`- nothing beyond ${st.header.target}; no follow-up pull request`,
+			);
+			await finishSuperseded(st, n, src);
+			return;
+		}
 		const pushBranch = ops.pushBranch;
 		if (pushBranch === undefined) {
 			st.prNext = {
@@ -7558,6 +7575,9 @@ export function createTurnLoop(
 				pushSha: null,
 				followUpPrNumber: opened.pr.number,
 				followUpPrUrl: opened.pr.url,
+				// This ship delivered real fixes: any superseded stamp from an
+				// earlier ship must go, the same rule as the follow-up fields above.
+				sourcePrSuperseded: false,
 			});
 		});
 		await appendLog(
@@ -7570,6 +7590,37 @@ export function createTurnLoop(
 			state: "idle",
 			needsReason: null,
 		};
+	}
+
+	/** Finishes a fixless card as superseded: the ship proved its branch holds nothing
+	 * beyond the target, so the work already sits there and a follow-up PR would be
+	 * empty. The card carries its source PR's identity (merging/idle) and waits only on
+	 * that PR; sourcePrSuperseded tells the supervisor's watch to finish the card done
+	 * once the PR closes — merged or closed unmerged — and never to park it. */
+	async function finishSuperseded(
+		st: TurnSettle,
+		n: number,
+		src: SourcePrRef,
+	): Promise<void> {
+		if (!(await canShipPr(st))) return;
+		await st.store.transaction(async () => {
+			if (!(await canShipPr(st))) return;
+			await st.store.updateTask(st.id, {
+				prNumber: n,
+				prUrl: src.url,
+				prHeadSha: src.headSha,
+				pushSha: null,
+				followUpPrNumber: null,
+				followUpPrUrl: null,
+				sourcePrSuperseded: true,
+			});
+		});
+		await appendLog(
+			st.store,
+			st.id,
+			`- the card waits only on source PR #${n}; when that PR closes, merged or not, the card finishes done`,
+		);
+		st.prNext = { stage: "merging", state: "idle", needsReason: null };
 	}
 
 	/** Comments on the source PR and parks the card with the reason: the turn's work must
@@ -7790,6 +7841,9 @@ export function createTurnLoop(
 				prUrl: opened.pr.url,
 				prHeadSha: tip,
 				pushSha: tip,
+				// The card's own PR carries its delivery: a superseded stamp from an
+				// earlier ship must not finish it done on this PR's close.
+				sourcePrSuperseded: false,
 			});
 		});
 		await appendLog(
