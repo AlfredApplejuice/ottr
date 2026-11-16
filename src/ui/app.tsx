@@ -14609,48 +14609,70 @@ function isNoticeDetailToken(token: string): boolean {
 	return /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*-\d+$/.test(token);
 }
 
-/** A notice segment's collapsed copy: detail tokens gone, repeated spaces
- * collapsed, and a trailing connector word popped so the line does not end on a
- * dangling preposition. The last remaining word never pops. */
-function stripNoticeTokens(segment: string): string {
-	let out = segment
-		.split(/\s+/)
-		.filter((t) => t !== "" && !isNoticeDetailToken(t))
-		.join(" ")
-		.trim();
-	while (out.includes(" ")) {
-		const word = out.slice(out.lastIndexOf(" ") + 1);
-		if (!/^(?:in|at|on|from|with|to|for|by|into|under|via)$/.test(word)) break;
-		out = out.slice(0, out.lastIndexOf(" ")).trimEnd();
+/** A notice line's collapsed copy: detail tokens gone, repeated spaces
+ * collapsed, and a connector word popped with a removed token so the line does
+ * not end on a dangling preposition ("in /opt/x" goes as a unit). A removed
+ * token keeps its trailing punctuation so its sentence end survives and the
+ * next sentence does not merge into it; that punctuation drops when no kept
+ * word precedes it (a line of detail tokens alone strips empty). */
+function stripNoticeTokens(line: string): string {
+	let out = "";
+	for (const token of line.split(/\s+/)) {
+		if (token === "") continue;
+		if (isNoticeDetailToken(token)) {
+			const punct = /[.,;:!?]+$/.exec(token)?.[0] ?? "";
+			const head = out.slice(out.lastIndexOf(" ") + 1);
+			if (
+				out.includes(" ") &&
+				/^(?:in|at|on|from|with|to|for|by|into|under|via)$/.test(head)
+			)
+				out = out.slice(0, out.lastIndexOf(" "));
+			if (out !== "" && punct !== "") out += punct;
+			continue;
+		}
+		out += (out === "" ? "" : " ") + token;
 	}
 	return out;
 }
 
-/** The collapsed form of a bell entry's text: the first line, cut at the end of
- * its first sentence when more sentence follows. A cut whose text still holds
- * host detail (isNoticeDetailToken) is skipped for a clean later cut, else the
- * whole line returns stripped; a line that strips empty returns the plain cut.
- * Whatever this drops, the entry's Details disclosure must carry. */
-export function shortNoticeText(text: string): string {
+/** The collapsed form of a bell entry's text: the first line, stripped of host
+ * detail first (stripNoticeTokens) so no cut point can still carry a path or
+ * flag, then cut at the end of its first sentence when more sentence follows,
+ * then capped at maxChars on a word boundary with an ellipsis. The cap is for
+ * the update script's flattened records, which hold no line break to cut at
+ * (SeedFailedLine passes 160); the default leaves the line uncapped. A line
+ * that strips empty returns "". Whatever this drops, the entry's Details
+ * disclosure must carry. */
+export function shortNoticeText(
+	text: string,
+	maxChars = Number.POSITIVE_INFINITY,
+): string {
 	const nl = text.indexOf("\n");
 	const line = nl < 0 ? text : text.slice(0, nl);
-	let plainCut = "";
-	for (let i = 0; i < line.length - 1; i++) {
-		const ch = line[i];
+	const stripped = stripNoticeTokens(line);
+	let out = stripped;
+	for (let i = 0; i < stripped.length - 1; i++) {
+		const ch = stripped[i];
 		if (
 			ch !== undefined &&
 			".!?;:".includes(ch) &&
-			line[i + 1] === " " &&
-			line.slice(i + 2).trim() !== ""
+			stripped[i + 1] === " " &&
+			stripped.slice(i + 2).trim() !== ""
 		) {
-			const cut = line.slice(0, i + 1);
-			if (plainCut === "") plainCut = cut;
-			if (!cut.split(/\s+/).some(isNoticeDetailToken)) return cut;
+			out = stripped.slice(0, i + 1);
+			break;
 		}
 	}
-	const stripped = stripNoticeTokens(line);
-	if (stripped !== "") return stripped;
-	return plainCut === "" ? line : plainCut;
+	if (Number.isFinite(maxChars) && out.length > maxChars) {
+		// Cut at the last whole word that fits; a single word past the cap
+		// hard-cuts mid-word, since there is no boundary to cut at.
+		const space = out.lastIndexOf(" ", maxChars);
+		out =
+			space < 0
+				? `${out.slice(0, maxChars)}…`
+				: `${out.slice(0, space).trimEnd()}…`;
+	}
+	return out;
 }
 
 /** A collapsed bell line shows at most this many card links; the rest hide behind
@@ -14857,7 +14879,9 @@ export function SeedFailedLine({
 				{fail.commit !== "" && <>Tried commit {fail.commit.slice(0, 12)}. </>}
 				{text !== "" && (
 					<NotifText
-						text={shortNoticeText(text)}
+						// Flattened update records hold no line break to cut at; the cap
+						// keeps the collapsed copy to one short line.
+						text={shortNoticeText(text, 160)}
 						hosted={hosted}
 						cards={cards}
 						clampLinks

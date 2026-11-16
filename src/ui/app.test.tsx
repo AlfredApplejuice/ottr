@@ -1941,11 +1941,13 @@ describe("card links in bell text", () => {
 	});
 
 	test("shortNoticeText drops host paths, flags, and container names from the collapsed copy", () => {
+		// Stripping runs before the cut, so the ";" after "(exit 1)" becomes the
+		// first clean sentence end and the tail moves behind Details.
 		expect(
 			shortNoticeText(
 				"SkillSpector rejected /tmp/alate-data-9f34/user/omp/agent/skills/egm-review-loop (exit 1); nothing was installed",
 			),
-		).toBe("SkillSpector rejected (exit 1); nothing was installed");
+		).toBe("SkillSpector rejected (exit 1);");
 		expect(
 			shortNoticeText("bun install failed (exit 1) in /opt/agent-data"),
 		).toBe("bun install failed (exit 1)");
@@ -1966,6 +1968,50 @@ describe("card links in bell text", () => {
 		expect(
 			shortNoticeText("cards ottr#OTTR-1071, alate#ALAT-180 were running"),
 		).toBe("cards ottr#OTTR-1071, alate#ALAT-180 were running");
+	});
+
+	test("shortNoticeText keeps a removed path's period and drops its connector", () => {
+		expect(
+			shortNoticeText(
+				"bun install failed (exit 1) in /opt/agent-data. Run node sync.mjs to repair.",
+			),
+		).toBe("bun install failed (exit 1).");
+	});
+
+	test("shortNoticeText caps a flattened single-line record to one short clean line", () => {
+		const record =
+			"bun install failed (exit 1) in /opt/agent-data container ottr-worker-1 exited before the seed finished temp tree /tmp/ottr-seed-3182 left in place alate snapshot import stopped at step 3 of 5 repair: run node sync.mjs from the alate checkout repair: clear /tmp/ottr-seed-3182 and re-run the update";
+		const short = shortNoticeText(record, 160);
+		expect(short.startsWith("bun install failed")).toBe(true);
+		expect(short).not.toContain("/");
+		expect(short).not.toContain("sync.mjs");
+		expect(short.length).toBeLessThanOrEqual(161);
+		expect(short.length).toBeLessThan(record.length);
+		// The cap cannot engage on this record: the stripped line's first clause
+		// end ("repair:") is a clean cut below 160 chars, so the line ends there
+		// and Details carries the repair steps. No partially cut word: whatever
+		// ends the line is a whole fixture word.
+		const body = short.endsWith("…") ? short.slice(0, -1) : short;
+		const lastWord = body.split(" ").at(-1) ?? "";
+		expect(lastWord !== "" && record.split(/\s+/).includes(lastWord)).toBe(
+			true,
+		);
+	});
+
+	test("shortNoticeText caps a long clean sentence at a word boundary", () => {
+		const sentence = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+		const short = shortNoticeText(sentence, 40);
+		expect(short.length).toBeLessThanOrEqual(41);
+		expect(short.endsWith("…")).toBe(true);
+		const lastWord = short.slice(0, -1).split(" ").at(-1) ?? "";
+		expect(lastWord !== "" && sentence.split(" ").includes(lastWord)).toBe(
+			true,
+		);
+	});
+
+	test("shortNoticeText without a cap returns a long clean sentence whole", () => {
+		const sentence = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+		expect(shortNoticeText(sentence)).toBe(sentence);
 	});
 });
 
