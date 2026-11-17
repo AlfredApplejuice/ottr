@@ -32,7 +32,8 @@ function retryAfter(value: string | null, now: number): number | null {
 		const httpDate =
 			/^(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT|(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \d{2}-[A-Z][a-z]{2}-\d{2} \d{2}:\d{2}:\d{2} GMT|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4})$/;
 		if (!httpDate.test(text)) return null;
-		timestamp = Date.parse(text);
+		// HTTP's zone-less asctime form still denotes GMT, not server local time.
+		timestamp = Date.parse(text.endsWith(" GMT") ? text : `${text} GMT`);
 		if (!Number.isFinite(timestamp)) return null;
 		const date = new Date(timestamp);
 		const canonical = date.toUTCString();

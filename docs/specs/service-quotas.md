@@ -342,6 +342,9 @@ These rules prevent data from one account from appearing under another account.
 | Missing secret | Publish `unconfigured` and make no request. |
 | Disabled or removed source | Stop new reads and omit the source from published state. |
 
+HTTP-date forms of `Retry-After` use GMT, including the `asctime` form without an explicit zone.
+The server's local time zone does not change the retry deadline.
+
 The response budget is an Ottr safety limit, not a documented PixelLab maximum.
 A slow or failed service must not block another source, the model refresh, or the state response.
 Each completed source update uses the existing state publication path.

@@ -381,6 +381,40 @@ describe("service quota HTTP reader", () => {
 		}
 	});
 
+	test("HTTP-date retries use GMT in every server time zone", async () => {
+		const module = new URL("./serviceQuotaHttp.ts", import.meta.url).href;
+		const probe = `
+			import { createServiceQuotaHttpReader } from ${JSON.stringify(module)};
+			const reader = createServiceQuotaHttpReader({
+				endpoint: ${JSON.stringify(endpoint)},
+				credential: crypto.randomUUID(),
+				decode: () => [],
+				now: () => Date.UTC(2026, 0, 1),
+				fetch: async () => new Response(null, {
+					status: 429,
+					headers: { "Retry-After": "Thu Jan  1 00:15:00 2026" },
+				}),
+			});
+			console.log(JSON.stringify(await reader.read({ signal: new AbortController().signal })));
+		`;
+		for (const TZ of ["UTC", "America/New_York", "Asia/Kolkata"]) {
+			const child = Bun.spawn([process.execPath, "-e", probe], {
+				env: { ...process.env, TZ },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [out, err, code] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+			expect({ code, err }).toEqual({ code: 0, err: "" });
+			expect(JSON.parse(out)).toEqual(
+				error("rate_limit", 429, Date.UTC(2026, 0, 1, 0, 15)),
+			);
+		}
+	});
+
 	test("retry seconds obey exact integer arithmetic through the public reader", async () => {
 		await fc.assert(
 			fc.asyncProperty(
