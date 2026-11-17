@@ -1,7 +1,8 @@
 # External service quotas
 
 Status: shared contracts, bounded transport, independent cache, server state integration, and overview display are implemented.
-The PixelLab adapter and approved live activation remain separate steps.
+Step 3 implements the PixelLab v2 adapter and built-in registry.
+Approved live activation remains pending.
 
 This specification implements recommended step 1 from the OTTR-1092 research report carried by OTTR-1101.
 It defines the contract for the later implementation cards.
@@ -612,6 +613,30 @@ The production source list and adapter registry remain empty.
 No server secret source is approved, so this step enables no live provider reads.
 Tests supply isolated readers and generated credentials through the internal dependency.
 Hosted boards neither create readers nor serialize service state.
+
+### Step 3 exports and assumptions
+
+`src/serviceQuotaPixellab.ts` exports `createPixellabQuotaAdapter(options?: Pick<ServiceQuotaHttpReaderOptions, "fetch" | "now">): ServiceQuotaAdapterDefinition`.
+The adapter ID is `pixellab-v2`.
+Each `createReader({ credential })` call creates a fresh `createServiceQuotaHttpReader` with that credential and exactly `https://api.pixellab.ai/v2/balance`.
+The adapter accepts no endpoint option.
+The optional dependencies support tests only. Production callers omit them.
+The decoder remains private and extracts only the fields in the exact mapping above.
+It rejects the whole envelope when either required component is invalid.
+The shared HTTP reader validates normalized metrics and retains its existing response limits, deadline, and safe errors.
+
+The metric IDs are `usd-credits` and `subscription-generations`.
+Their labels are `USD credits` and `Subscription generations`.
+Their units are `{ kind: "currency", code: "USD" }` and `{ kind: "count", name: "generations" }`.
+
+`src/serviceQuotaRegistry.ts` exports `builtInServiceQuotaAdapters: ReadonlyMap<string, ServiceQuotaAdapterDefinition>`.
+It contains the real PixelLab adapter under `pixellab-v2`.
+This separate server-only module avoids a circular dependency between the transport and coordinator.
+Registry creation starts no requests and activates no sources.
+Server credential resolution remains external to the adapter and registry.
+Step 3 adds no runtime state or UI integration, credential source, live activation, or authenticated provider call.
+The README remains unchanged because no feature becomes active.
+The step 5 acceptance checks and both live-read approvals below remain prerequisites.
 
 Step 5 executes all acceptance checks before any live balance read.
 A live read also requires approval for the server secret source and the authenticated read itself.
