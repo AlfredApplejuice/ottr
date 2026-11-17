@@ -187,15 +187,15 @@ Podman Desktop shows no containers, or the board times out after you recreate th
 ### After the first start
 
 After the server binds successfully, foreground `docker compose up` shows a
-**Startup access** banner with the Ottr URL (including a custom `OTTR_PORT`), the
-bundled Alate dashboard URL, and login instructions. At the operator's request,
-the self-hosted banner also prints the Compose `ALATE_API_KEY` for Alate login.
-Keep startup logs private; anyone with that key can use the Alate API. Ottr uses
-the admin name/password created on first visit, not an API key; passwords and
+**Startup access** banner with the Ottr URL (including a custom `OTTR_PORT`) and
+the bundled Alate dashboard URL when `COMPOSE_PROFILES` includes `alate` (or `*`);
+otherwise the Alate row reads `off`. Keep profile selection in `COMPOSE_PROFILES`
+so the banner receives it. Startup logs never print the Alate API key; read
+`ALATE_API_KEY` from your Compose `.env` file to sign in to Alate. Ottr uses the
+admin name/password created on first visit, not an API key; passwords and
 worker/provider tokens are not printed. Detached `up -d` hides application logs;
-read the banner with `docker compose logs --tail 30 server`. The bundled Alate
-service is available when the `alate` profile runs; external servers use their
-own dashboard URL and key.
+read the banner with `docker compose logs --tail 30 server`. External Alate
+servers use their own dashboard URL and key.
 
 With the bundled profile enabled, Compose waits for Alate's `/health` endpoint
 before starting Ottr. This prevents the boot-time `GET http://alate:4570/api/updates`
