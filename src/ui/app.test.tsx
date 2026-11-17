@@ -6,6 +6,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { DeepenCheck } from "../deepen.ts";
 import { DEEPEN_POINTS } from "../prompts.ts";
 import { parseUsage } from "../quota.ts";
+import fc from "../test/properties.ts";
 import type {
 	PerfMetrics,
 	PerfStat,
@@ -77,6 +78,7 @@ const {
 	DeepenReview,
 	ReleaseDialog,
 	AddProjectModal,
+	draftGithubSource,
 	OrphanNotice,
 	SeedFailedLine,
 	ProvisionErrorLine,
@@ -108,7 +110,52 @@ const {
 	ALATE_WATCH_DEADLINE_MS,
 	SETTINGS_TOC,
 	SettingsPage,
+	HostedContext,
 } = await import("./settings.tsx");
+
+describe("draftGithubSource", () => {
+	test("source capability requires the exact configured GitHub host", () => {
+		expect(draftGithubSource("https://github.com/o/r.git", "github.com")).toBe(
+			true,
+		);
+		expect(draftGithubSource("git@github.com:o/r.git", "github.com")).toBe(
+			true,
+		);
+		for (const source of [
+			"https://github.com.evil.test/o/r.git",
+			"https://github.com@evil.test/o/r.git",
+			"https://evil.test/github.com/r.git",
+			"git@github.com.evil.test:o/r.git",
+			"not a remote",
+		]) {
+			expect(draftGithubSource(source, "github.com")).toBe(false);
+		}
+	});
+
+	test("generated source hosts cannot gain GitHub capability through a suffix", () => {
+		const hostLabel = fc
+			.array(fc.constantFrom(..."abcdefghijklmnopqrstuvwxyz"), {
+				minLength: 1,
+				maxLength: 20,
+			})
+			.map((characters) => characters.join(""));
+		fc.assert(
+			fc.property(hostLabel, (label) => {
+				const host = `${label}.example.test`;
+				for (const source of [
+					`https://${host}/o/r.git`,
+					`git@${host}:o/r.git`,
+				]) {
+					expect(draftGithubSource(source, host)).toBe(true);
+					expect(draftGithubSource(source, `${host}.other.test`)).toBe(false);
+				}
+				expect(
+					draftGithubSource(`https://${host}.other.test/o/r.git`, host),
+				).toBe(false);
+			}),
+		);
+	});
+});
 
 describe("windowGone", () => {
 	const H = 3_600_000;
@@ -10195,6 +10242,8 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		window,
 		document: window.document,
 		navigator: window.navigator,
+		localStorage: window.localStorage,
+		sessionStorage: window.sessionStorage,
 		HTMLElement: window.HTMLElement,
 		HTMLInputElement: window.HTMLInputElement,
 		requestAnimationFrame: window.requestAnimationFrame,
@@ -10297,17 +10346,30 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		githubTokenSet,
 	});
 
+	type AddOptions = {
+		tokenChallenge?: boolean;
+		fail?: "create" | "init" | "settings" | "interview" | "checklist";
+		waitForCreate?: Promise<void>;
+		onClose?: () => void;
+		savedSettings?: Partial<ProjectView["settings"]>;
+		hasRules?: boolean;
+		sshAccess?: boolean;
+		hosted?: boolean;
+		createdSource?: Pick<ProjectView, "github" | "gitless">;
+	};
+
 	// The fetch mountAdd serves: gh-status 404, the git-hosts view for the token state,
 	// a first project POST that fails for the missing token, then success; every POST
 	// body lands in `posts`, and the github-token POST answers with the token set.
 	async function addProjectFetch(
 		hostsView: (githubTokenSet: boolean) => Record<string, unknown>,
 		posts: { url: string; body: Record<string, unknown> }[],
-		calls: { project: number },
+		calls: { project: number; settings: number; interview: number },
 		project: ProjectView,
 		githubTokenSet: boolean,
 		input: RequestInfo | URL,
 		init?: RequestInit,
+		options: AddOptions = {},
 	): Promise<Response> {
 		const url = String(input);
 		const method = init?.method ?? "GET";
@@ -10315,9 +10377,37 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			return new Response("{}", { status: 404 });
 		}
 		if (url.endsWith("/api/git-hosts")) {
-			return new Response(JSON.stringify(hostsView(githubTokenSet)), {
-				status: 200,
-			});
+			return new Response(
+				JSON.stringify({
+					...hostsView(githubTokenSet),
+					...(options.sshAccess
+						? {
+								globalKey: {
+									publicKey: "test public key",
+									fingerprint: "SHA256:before",
+								},
+							}
+						: {}),
+				}),
+				{ status: 200 },
+			);
+		}
+		if (url === "/api/git-hosts/ssh/test" && method === "POST") {
+			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			posts.push({ url, body });
+			if (body.trust === undefined) {
+				return new Response(
+					JSON.stringify({
+						error: "Host needs trust",
+						needsTrust: true,
+						host: "github.com",
+						fingerprints: ["SHA256:before"],
+						changed: false,
+					}),
+					{ status: 409 },
+				);
+			}
+			return new Response("{}", { status: 200 });
 		}
 		if (url.endsWith("/api/projects") && method === "POST") {
 			calls.project += 1;
@@ -10325,13 +10415,35 @@ describe("AddProjectModal board GitHub token reuse", () => {
 				url,
 				body: JSON.parse(String(init?.body)) as Record<string, unknown>,
 			});
-			if (calls.project === 1) {
+			if (options.waitForCreate !== undefined) await options.waitForCreate;
+			if (calls.project === 1 && options.fail === "create") {
+				return new Response(JSON.stringify({ error: "Create failed" }), {
+					status: 500,
+				});
+			}
+			if (calls.project === 1 && options.tokenChallenge !== false) {
 				return new Response(
 					JSON.stringify({
 						error: "Authentication failed",
 						needsToken: "github.com",
 					}),
 					{ status: 400 },
+				);
+			}
+			if (
+				options.sshAccess &&
+				JSON.stringify(posts.at(-1)?.body.trust) !==
+					JSON.stringify(["SHA256:after"])
+			) {
+				return new Response(
+					JSON.stringify({
+						error: "Host key changed",
+						needsTrust: true,
+						host: "github.com",
+						fingerprints: ["SHA256:after"],
+						changed: true,
+					}),
+					{ status: 409 },
 				);
 			}
 			return new Response(JSON.stringify({ project }), {
@@ -10347,11 +10459,44 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		}
 		// The wizard's calls once it replaced the form: settings saves return the view,
 		// the interview call files a card, the fork facts answer empty.
+		if (url.endsWith("/init") && method === "POST") {
+			posts.push({ url, body: {} });
+			if (
+				options.fail === "init" &&
+				posts.filter((p) => p.url === url).length === 1
+			) {
+				return new Response(JSON.stringify({ error: "Init failed" }), {
+					status: 500,
+				});
+			}
+			project.gitless = false;
+			return new Response(JSON.stringify({ project }));
+		}
 		if (url.endsWith("/settings") && method === "POST") {
 			posts.push({
 				url,
 				body: JSON.parse(String(init?.body)) as Record<string, unknown>,
 			});
+			if (
+				options.fail === "checklist" &&
+				posts.at(-1)?.body.setupChecklist === false &&
+				posts.filter((p) => p.body.setupChecklist === false).length === 1
+			) {
+				return new Response(JSON.stringify({ error: "Checklist failed" }), {
+					status: 500,
+				});
+			}
+			calls.settings += 1;
+			if (calls.settings === 1 && options.fail === "settings") {
+				return new Response(JSON.stringify({ error: "Settings failed" }), {
+					status: 500,
+				});
+			}
+			const body = posts.at(-1)?.body ?? {};
+			Object.assign(project.settings, body);
+			if (typeof body.retro === "boolean") {
+				project.settings.retroSince = body.retro ? 1 : null;
+			}
 			return new Response(JSON.stringify(project), { status: 200 });
 		}
 		if (url.endsWith("/interview") && method === "POST") {
@@ -10359,8 +10504,18 @@ describe("AddProjectModal board GitHub token reuse", () => {
 				url,
 				body: JSON.parse(String(init?.body)) as Record<string, unknown>,
 			});
+			calls.interview += 1;
+			if (calls.interview === 1 && options.fail === "interview") {
+				return new Response(JSON.stringify({ error: "Interview failed" }), {
+					status: 500,
+				});
+			}
 			return new Response(
-				JSON.stringify({ interview: "queued", id: "WIZ-1" }),
+				JSON.stringify(
+					project.hasRules
+						? { interview: "not-needed", id: null }
+						: { interview: "queued", id: "WIZ-1" },
+				),
 				{ status: 200 },
 			);
 		}
@@ -10376,6 +10531,7 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		githubTokenSet: boolean,
 		projects: ProjectView[] = [],
 		wizardProject?: ProjectView,
+		options: AddOptions = {},
 	): Promise<{
 		container: HTMLDivElement;
 		root: ReturnType<typeof createRoot>;
@@ -10383,17 +10539,19 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		restore: () => void;
 	}> {
 		const posts: { url: string; body: Record<string, unknown> }[] = [];
-		const calls = { project: 0 };
+		const calls = { project: 0, settings: 0, interview: 0 };
 		const realFetch = globalThis.fetch;
+		const responseProject = structuredClone(wizardProject ?? project);
 		globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
 			addProjectFetch(
 				hostsView,
 				posts,
 				calls,
-				wizardProject ?? project,
+				responseProject,
 				githubTokenSet,
 				input,
 				init,
+				options,
 			)) as unknown as typeof fetch;
 
 		const container = window.document.createElement(
@@ -10417,16 +10575,22 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		try {
 			await act(async () => {
 				root.render(
-					<AddProjectModal
-						act={actProp}
-						projects={projects}
-						onClose={() => {}}
-						openTask={() => {}}
-					/>,
+					<HostedContext.Provider value={options.hosted === true}>
+						<AddProjectModal
+							act={actProp}
+							projects={projects}
+							onClose={options.onClose ?? (() => {})}
+							openTask={() => {}}
+						/>
+					</HostedContext.Provider>,
 				);
 			});
 		} catch (e) {
 			globalThis.fetch = realFetch;
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
 			throw e;
 		}
 		return {
@@ -10438,6 +10602,186 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			},
 		};
 	}
+
+	const buttonOf = (
+		container: HTMLDivElement,
+		label: string,
+	): HTMLButtonElement => {
+		const button = [...container.querySelectorAll("button")].find(
+			(node) => node.textContent?.trim() === label,
+		);
+		if (button === undefined) throw new Error(`no ${label} button`);
+		return button;
+	};
+
+	const clickAction = async (
+		container: HTMLDivElement,
+		label: string,
+	): Promise<void> => {
+		await act(async () => {
+			buttonOf(container, label).click();
+		});
+	};
+
+	const changeField = async (
+		field: HTMLInputElement | HTMLTextAreaElement,
+		value: string,
+	): Promise<void> => {
+		await act(async () => {
+			field.value = value;
+			onChangeOf(field)({ target: field, currentTarget: field });
+		});
+	};
+
+	const chooseSource = async (
+		container: HTMLDivElement,
+		mode: "new" | "url",
+	): Promise<void> => {
+		await clickAction(container, mode === "new" ? "New" : "Git URL");
+		const input = container.querySelector(
+			mode === "url" ? "input[data-autofocus]" : "#add-panel-new input",
+		) as HTMLInputElement;
+		await changeField(
+			input,
+			mode === "url" ? "https://github.com/o/wiz.git" : "wiz",
+		);
+	};
+
+	const sourceNext = async (container: HTMLDivElement): Promise<void> => {
+		const form = container.querySelector("form");
+		if (form === null) throw new Error("no Source form");
+		await act(async () => {
+			form.dispatchEvent(submitEvent());
+		});
+	};
+
+	const reachRules = async (container: HTMLDivElement): Promise<void> => {
+		await sourceNext(container);
+		for (let step = 2; step < 5; step += 1) {
+			await clickAction(container, "Next");
+		}
+	};
+
+	const withWizard = async (
+		mode: "new" | "url",
+		run: (args: {
+			container: HTMLDivElement;
+			posts: { url: string; body: Record<string, unknown> }[];
+			closeCount: () => number;
+		}) => Promise<void>,
+		options: AddOptions = {},
+	): Promise<void> => {
+		let closes = 0;
+		const fixture = {
+			...wizardProject,
+			gitless: mode === "new",
+			github: mode === "new" ? null : wizardProject.github,
+			settings: { ...wizardProject.settings, ...options.savedSettings },
+			hasRules: options.hasRules ?? wizardProject.hasRules,
+			...options.createdSource,
+		};
+		const { container, root, posts, restore } = await mountAdd(
+			true,
+			[],
+			fixture,
+			{
+				tokenChallenge: false,
+				...options,
+				onClose: () => {
+					closes += 1;
+				},
+			},
+		);
+		try {
+			await chooseSource(container, mode);
+			await run({ container, posts, closeCount: () => closes });
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+	};
+
+	test("Source stays local until Finish", async () => {
+		const { container, root, posts, restore } = await mountAdd(true);
+		try {
+			const input = container.querySelector(
+				"input[data-autofocus]",
+			) as HTMLInputElement;
+			await act(async () => {
+				typeInto(input, "https://github.com/o/r.git");
+				onChangeOf(input)({ target: input, currentTarget: input });
+			});
+			const form = container.querySelector("form") as HTMLFormElement;
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(0);
+			const steps = [
+				...container.querySelectorAll('[aria-label="Setup steps"] li'),
+			];
+			expect(steps).toHaveLength(5);
+			expect(steps[1]?.getAttribute("aria-current")).toBe("step");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+	});
+
+	test("Cancel discards an unsaved token draft without browser storage", async () => {
+		const draft = "draft-value-not-a-credential";
+		const assertNoStoredDraft = (): void => {
+			for (const storage of [window.localStorage, window.sessionStorage]) {
+				for (let index = 0; index < storage.length; index += 1) {
+					const key = storage.key(index);
+					expect(key).not.toContain(draft);
+					if (key !== null) expect(storage.getItem(key)).not.toContain(draft);
+				}
+			}
+		};
+		await withWizard(
+			"url",
+			async ({ container, posts, closeCount }) => {
+				await reachRules(container);
+				await clickAction(container, "Finish");
+				const token = container.querySelector(
+					'input[type="password"]',
+				) as HTMLInputElement;
+				expect(token).not.toBeNull();
+				await changeField(token, draft);
+				expect(token.value).toBe(draft);
+				assertNoStoredDraft();
+				await clickAction(container, "Cancel");
+				expect(closeCount()).toBe(1);
+				expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(1);
+				expect(posts.some((p) => p.url.endsWith("/tokens"))).toBe(false);
+				expect(posts.some((p) => p.url.endsWith("/interview"))).toBe(false);
+			},
+			{ tokenChallenge: true },
+		);
+		assertNoStoredDraft();
+		await withWizard(
+			"url",
+			async ({ container, posts }) => {
+				await reachRules(container);
+				await clickAction(container, "Finish");
+				const token = container.querySelector(
+					'input[type="password"]',
+				) as HTMLInputElement;
+				expect(token).not.toBeNull();
+				expect(token.value).toBe("");
+				assertNoStoredDraft();
+				expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(1);
+				expect(posts.some((p) => p.url.endsWith("/tokens"))).toBe(false);
+			},
+			{ tokenChallenge: true },
+		);
+	});
 
 	test("the board token button retries Add with the prefilled x-access-token", async () => {
 		const { container, root, posts, restore } = await mountAdd(true);
@@ -10453,12 +10797,9 @@ describe("AddProjectModal board GitHub token reuse", () => {
 					currentTarget: urlInput,
 				});
 			});
-			const form = container.querySelector(
-				"form",
-			) as unknown as HTMLFormElement;
-			await act(async () => {
-				form.dispatchEvent(submitEvent());
-			});
+			await reachRules(container);
+			expect(posts).toHaveLength(0);
+			await clickAction(container, "Finish");
 			// The 400's needsToken opened the token step, pre-filled with the
 			// GitHub host's convention, and the board token button is offered.
 			const user = container.querySelector(
@@ -10478,9 +10819,7 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			expect(posts.filter((p) => p.url.endsWith("/api/projects")).length).toBe(
 				2,
 			);
-			// The add response carries no interview verdict: the wizard replaced the form
-			// and the interview waits for its last step (OTTR-1065).
-			expect(container.textContent).toContain("Set up proj");
+			expect(posts.filter((p) => p.url.endsWith("/interview"))).toHaveLength(1);
 		} finally {
 			await act(async () => {
 				root.unmount();
@@ -10503,12 +10842,8 @@ describe("AddProjectModal board GitHub token reuse", () => {
 					currentTarget: urlInput,
 				});
 			});
-			const form = container.querySelector(
-				"form",
-			) as unknown as HTMLFormElement;
-			await act(async () => {
-				form.dispatchEvent(submitEvent());
-			});
+			await reachRules(container);
+			await clickAction(container, "Finish");
 			expect(container.textContent).toContain("Token for github.com");
 			expect(
 				[...container.querySelectorAll("button")].some(
@@ -10573,12 +10908,9 @@ describe("AddProjectModal board GitHub token reuse", () => {
 					currentTarget: prefixInput,
 				});
 			});
-			const form = container.querySelector(
-				"form",
-			) as unknown as HTMLFormElement;
-			await act(async () => {
-				form.dispatchEvent(submitEvent());
-			});
+			await reachRules(container);
+			expect(posts).toHaveLength(0);
+			await clickAction(container, "Finish");
 			// The mocked answer is the 400 needsToken step; the harness still records the body.
 			expect(posts[0]?.body.taskIdPrefix).toBe("FIX");
 		} finally {
@@ -10665,114 +10997,631 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		}
 	});
 
-	// OTTR-1065: one guided flow — add, board step, Project step, then the interview.
-	/** Types the wizard fixture's URL and submits; the 400's token step retries through
-	 *  the board token button, leaving the wizard in the dialog. */
-	const addThroughDialog = async (container: HTMLDivElement): Promise<void> => {
-		const urlInput = container.querySelector(
-			"input[data-autofocus]",
-		) as unknown as HTMLInputElement;
-		await act(async () => {
-			typeInto(urlInput, "https://github.com/o/wiz.git");
-			onChangeOf(urlInput)({
-				target: urlInput,
-				currentTarget: urlInput,
+	for (const mode of ["new", "url"] as const) {
+		for (let step = 1; step <= 5; step += 1) {
+			test(`${mode}: Cancel at step ${step} leaves no project or interview`, async () => {
+				await withWizard(mode, async ({ container, posts, closeCount }) => {
+					if (step > 1) await sourceNext(container);
+					for (let current = 2; current < step; current += 1) {
+						await clickAction(container, "Next");
+					}
+					const steps = [
+						...container.querySelectorAll('[aria-label="Setup steps"] li'),
+					];
+					expect(steps).toHaveLength(5);
+					expect(steps[step - 1]?.getAttribute("aria-current")).toBe("step");
+					await clickAction(container, "Cancel");
+					expect(closeCount()).toBe(1);
+					expect(posts).toHaveLength(0);
+				});
 			});
-		});
-		const form = container.querySelector("form") as unknown as HTMLFormElement;
-		await act(async () => {
-			form.dispatchEvent(submitEvent());
-		});
-		const boardButton = [...container.querySelectorAll("button")].find(
-			(b) => b.textContent === "Use the board GitHub token",
-		);
-		await act(async () => {
-			onClickOf(boardButton as unknown as Element)({});
-		});
-	};
-
-	const buttonOf = (container: HTMLDivElement, label: string): Element => {
-		const b = [...container.querySelectorAll("button")].find(
-			(x) => x.textContent === label,
-		);
-		if (b === undefined) throw new Error(`no ${label} button`);
-		return b;
-	};
-
-	test("PR mode saves before the interview starts", async () => {
-		const { container, root, posts, restore } = await mountAdd(
-			true,
-			[],
-			wizardProject,
-		);
-		try {
-			await addThroughDialog(container);
-			// The fresh project opens at the board step: retro is off.
-			expect(container.textContent).toContain("Retro");
-			// Skip the board and runner steps: their defaults stay.
-			await act(async () => {
-				onClickOf(buttonOf(container, "Skip, use defaults"))({});
-			});
-			await act(async () => {
-				onClickOf(buttonOf(container, "Skip, use defaults"))({});
-			});
-			// The Project step: PR mode is the step's only checkbox.
-			const pr = container.querySelector(
-				'input[type="checkbox"]',
-			) as unknown as HTMLInputElement;
-			expect(pr).not.toBeNull();
-			await act(async () => {
-				onChangeOf(pr)({ target: { checked: true }, currentTarget: pr });
-			});
-			// Next keeps the target branch at its default; Done starts the interview.
-			await act(async () => {
-				onClickOf(buttonOf(container, "Next"))({});
-			});
-			await act(async () => {
-				onClickOf(buttonOf(container, "Done"))({});
-			});
-			const prSave = posts.findIndex(
-				(p) => p.url.endsWith("/settings") && p.body.prMode === true,
-			);
-			const interview = posts.findIndex((p) => p.url.endsWith("/interview"));
-			expect(prSave).toBeGreaterThanOrEqual(0);
-			// The interview call exists and only follows the PR mode save.
-			expect(interview).toBeGreaterThan(prSave);
-			expect(posts[interview]?.body).toEqual({});
-			// The wizard finished: the checklist flag cleared.
-			expect(
-				posts.some(
-					(p) => p.url.endsWith("/settings") && p.body.setupChecklist === false,
-				),
-			).toBe(true);
-		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			restore();
 		}
+
+		test(`${mode}: Back preserves source and settings drafts without a write`, async () => {
+			await withWizard(mode, async ({ container, posts }) => {
+				const prefix = container.querySelector(
+					'input[aria-label="Task ID prefix"]',
+				) as HTMLInputElement;
+				await changeField(prefix, "DRAFT");
+				await sourceNext(container);
+				const retro = container.querySelector(
+					'input[type="checkbox"]',
+				) as HTMLInputElement;
+				await act(async () => {
+					onChangeOf(retro)({
+						target: { checked: true },
+						currentTarget: retro,
+					});
+				});
+				await clickAction(container, "Next");
+				await changeField(
+					container.querySelector('input[type="number"]') as HTMLInputElement,
+					"3",
+				);
+				await changeField(
+					container.querySelector("textarea") as HTMLTextAreaElement,
+					"config/local.json\n.env.local",
+				);
+				await clickAction(container, "Next");
+				await changeField(
+					container.querySelector(
+						'input[aria-label="Target branch for merges"]',
+					) as HTMLInputElement,
+					"release",
+				);
+				await clickAction(container, "Next");
+				await clickAction(container, "Back");
+				expect(
+					(
+						container.querySelector(
+							'input[aria-label="Target branch for merges"]',
+						) as HTMLInputElement
+					).value,
+				).toBe("release");
+				await clickAction(container, "Back");
+				expect(
+					(container.querySelector('input[type="number"]') as HTMLInputElement)
+						.value,
+				).toBe("3");
+				expect(
+					(container.querySelector("textarea") as HTMLTextAreaElement).value,
+				).toBe("config/local.json\n.env.local");
+				await clickAction(container, "Back");
+				expect(
+					(
+						container.querySelector(
+							'input[type="checkbox"]',
+						) as HTMLInputElement
+					).checked,
+				).toBe(true);
+				await clickAction(container, "Back");
+				expect(
+					(
+						container.querySelector(
+							'input[aria-label="Task ID prefix"]',
+						) as HTMLInputElement
+					).value,
+				).toBe("DRAFT");
+				expect(
+					container
+						.querySelector(`[data-tab="${mode}"]`)
+						?.getAttribute("aria-selected"),
+				).toBe("true");
+				const source = container.querySelector(
+					mode === "url" ? "input[data-autofocus]" : "#add-panel-new input",
+				) as HTMLInputElement;
+				expect(source.value).toBe(
+					mode === "url" ? "https://github.com/o/wiz.git" : "wiz",
+				);
+				expect(posts).toHaveLength(0);
+			});
+		});
+
+		test(`${mode}: Finish creates once and saves all settings before the interview`, async () => {
+			await withWizard(mode, async ({ container, posts, closeCount }) => {
+				await sourceNext(container);
+				const retro = container.querySelector(
+					'input[type="checkbox"]',
+				) as HTMLInputElement;
+				await act(async () => {
+					onChangeOf(retro)({
+						target: { checked: true },
+						currentTarget: retro,
+					});
+				});
+				await clickAction(container, "Next");
+				await changeField(
+					container.querySelector('input[type="number"]') as HTMLInputElement,
+					"3",
+				);
+				await changeField(
+					container.querySelector("textarea") as HTMLTextAreaElement,
+					"config/local.json",
+				);
+				await clickAction(container, "Next");
+				await changeField(
+					container.querySelector(
+						'input[aria-label="Target branch for merges"]',
+					) as HTMLInputElement,
+					"release",
+				);
+				if (mode === "url") {
+					const pr = container.querySelector(
+						'input[type="checkbox"]',
+					) as HTMLInputElement;
+					expect(pr.disabled).toBe(false);
+					await act(async () => {
+						onChangeOf(pr)({ target: { checked: true }, currentTarget: pr });
+					});
+				}
+				await clickAction(container, "Next");
+				expect(posts).toHaveLength(0);
+				await clickAction(container, "Finish");
+				const creates = posts.filter((p) => p.url === "/api/projects");
+				expect(creates).toHaveLength(1);
+				expect(creates[0]?.body).toMatchObject(
+					mode === "url"
+						? { name: "wiz", url: "https://github.com/o/wiz.git" }
+						: { name: "wiz", github: false },
+				);
+				const interview = posts.findIndex(
+					(p) => p.url === "/api/projects/wiz/interview",
+				);
+				expect(interview).toBeGreaterThan(0);
+				const saved = Object.assign(
+					{},
+					...posts
+						.slice(0, interview)
+						.filter((p) => p.url === "/api/projects/wiz/settings")
+						.map((p) => p.body),
+				);
+				expect(saved).toMatchObject({
+					retro: true,
+					maxParallel: 3,
+					copyExtra: ["config/local.json"],
+					targetBranch: "release",
+					...(mode === "url" ? { prMode: true } : {}),
+				});
+				const init = posts.findIndex((p) => p.url === "/api/projects/wiz/init");
+				const settings = posts.findIndex(
+					(p) => p.url === "/api/projects/wiz/settings",
+				);
+				if (mode === "new") {
+					expect(init).toBeGreaterThan(0);
+					expect(settings).toBeGreaterThan(init);
+				} else {
+					expect(init).toBe(-1);
+				}
+				expect(posts.filter((p) => p.url.endsWith("/interview"))).toHaveLength(
+					1,
+				);
+				expect(
+					posts
+						.slice(interview + 1)
+						.some(
+							(p) =>
+								p.url === "/api/projects/wiz/settings" &&
+								p.body.setupChecklist === false,
+						),
+				).toBe(true);
+				expect(closeCount()).toBe(1);
+			});
+		});
+	}
+
+	for (const changed of [false, true]) {
+		test(`clone settings survive Finish with ${changed ? "one explicit change" : "untouched drafts"}`, async () => {
+			await withWizard(
+				"url",
+				async ({ container, posts, closeCount }) => {
+					await sourceNext(container);
+					await clickAction(container, "Next");
+					if (changed) {
+						await changeField(
+							container.querySelector(
+								'input[type="number"]',
+							) as HTMLInputElement,
+							"2",
+						);
+					}
+					await clickAction(container, "Next");
+					await clickAction(container, "Next");
+					expect(posts).toHaveLength(0);
+					await clickAction(container, "Finish");
+					const interview = posts.findIndex((p) =>
+						p.url.endsWith("/interview"),
+					);
+					expect(interview).toBeGreaterThan(0);
+					const saved = Object.assign(
+						{},
+						...posts
+							.slice(0, interview)
+							.filter((p) => p.url.endsWith("/settings"))
+							.map((p) => p.body),
+					);
+					expect(saved).toEqual(changed ? { maxParallel: 2 } : {});
+					expect(closeCount()).toBe(1);
+				},
+				{
+					hasRules: true,
+					savedSettings: {
+						retroSince: 1,
+						retroFilter: true,
+						forkResearch: true,
+						holdUpdateMerges: true,
+						forkMergeHold: true,
+						prMode: true,
+						targetBranch: "stable",
+						maxParallel: 6,
+						copyExtra: ["config/existing.json"],
+					},
+				},
+			);
+		});
+	}
+
+	test("property: Finish preserves ordered nonempty Extra paths after whitespace normalization", async () => {
+		const line = fc
+			.tuple(
+				fc.constantFrom("", " ", "\t", " \t"),
+				fc.string({
+					unit: fc.constantFrom("a", "b", "0", ".", "/", "-", "_", " "),
+					maxLength: 16,
+				}),
+				fc.constantFrom("", " ", "\t", "\t "),
+			)
+			.map((parts) => parts.join(""));
+		await fc.assert(
+			fc.asyncProperty(fc.array(line, { maxLength: 8 }), async (lines) => {
+				await withWizard("url", async ({ container, posts }) => {
+					await sourceNext(container);
+					await clickAction(container, "Next");
+					await changeField(
+						container.querySelector("textarea") as HTMLTextAreaElement,
+						lines.join("\n"),
+					);
+					await clickAction(container, "Next");
+					await clickAction(container, "Next");
+					expect(posts).toHaveLength(0);
+					await clickAction(container, "Finish");
+					const settings = posts.filter((p) => p.url.endsWith("/settings"));
+					expect(settings[0]?.body).toEqual({
+						copyExtra: lines
+							.map((value) => value.trim())
+							.filter((value) => value !== ""),
+					});
+					expect(settings.at(-1)?.body).toEqual({ setupChecklist: false });
+				});
+			}),
+		);
+	}, 30_000);
+
+	for (const originalMode of ["new", "url"] as const) {
+		test(`${originalMode}: source edits after Back reach the final create request`, async () => {
+			await withWizard(originalMode, async ({ container, posts }) => {
+				await sourceNext(container);
+				await clickAction(container, "Next");
+				await changeField(
+					container.querySelector('input[type="number"]') as HTMLInputElement,
+					"3",
+				);
+				await clickAction(container, "Next");
+				await clickAction(container, "Next");
+				for (let step = 5; step > 1; step -= 1) {
+					await clickAction(container, "Back");
+				}
+				const finalMode = originalMode === "new" ? "url" : "new";
+				await chooseSource(container, finalMode);
+				await changeField(
+					container.querySelector(
+						finalMode === "url"
+							? "input[data-autofocus]"
+							: "#add-panel-new input",
+					) as HTMLInputElement,
+					finalMode === "url" ? "https://github.com/o/edited.git" : "edited",
+				);
+				await changeField(
+					container.querySelector(
+						'input[aria-label="Task ID prefix"]',
+					) as HTMLInputElement,
+					"EDITED",
+				);
+				await sourceNext(container);
+				await clickAction(container, "Next");
+				expect(
+					(container.querySelector('input[type="number"]') as HTMLInputElement)
+						.value,
+				).toBe("3");
+				await clickAction(container, "Next");
+				await clickAction(container, "Next");
+				expect(posts).toHaveLength(0);
+				await clickAction(container, "Finish");
+				const creates = posts.filter((p) => p.url === "/api/projects");
+				expect(creates).toHaveLength(1);
+				expect(creates[0]?.body).toMatchObject({
+					name: "edited",
+					taskIdPrefix: "EDITED",
+					...(finalMode === "url"
+						? { url: "https://github.com/o/edited.git" }
+						: { github: false }),
+				});
+				if (finalMode === "new") expect(creates[0]?.body.url).toBeUndefined();
+			});
+		});
+	}
+
+	for (const source of ["new", "non-GitHub URL"] as const) {
+		test(`${source}: changed source blocks selected PR mode before writes and permits correction`, async () => {
+			await withWizard(
+				"url",
+				async ({ container, posts, closeCount }) => {
+					await sourceNext(container);
+					await clickAction(container, "Next");
+					await clickAction(container, "Next");
+					const pr = container.querySelector(
+						'input[type="checkbox"]',
+					) as HTMLInputElement;
+					await act(async () => {
+						onChangeOf(pr)({ target: { checked: true }, currentTarget: pr });
+					});
+					for (let step = 4; step > 1; step -= 1) {
+						await clickAction(container, "Back");
+					}
+					if (source === "new") {
+						await chooseSource(container, "new");
+					} else {
+						await changeField(
+							container.querySelector(
+								"input[data-autofocus]",
+							) as HTMLInputElement,
+							"https://gitlab.com/o/wiz.git",
+						);
+					}
+					await sourceNext(container);
+					await clickAction(container, "Next");
+					await clickAction(container, "Next");
+					await clickAction(container, "Next");
+					if (
+						[...container.querySelectorAll("button")].some(
+							(button) => button.textContent?.trim() === "Finish",
+						)
+					) {
+						await clickAction(container, "Finish");
+					}
+					expect(
+						container.querySelector(
+							'[aria-label="Setup steps"] li[aria-current="step"]',
+						)?.textContent,
+					).toContain("Project");
+					const error = container.querySelector('[role="alert"]')?.textContent;
+					expect(error).toContain("GitHub");
+					expect(error).toContain("PR mode");
+					expect(error).toMatch(/Turn off|Source/);
+					expect(posts).toHaveLength(0);
+					expect(closeCount()).toBe(0);
+					const retained = container.querySelector(
+						'input[type="checkbox"]',
+					) as HTMLInputElement;
+					expect(retained.checked).toBe(true);
+					expect(retained.disabled).toBe(false);
+					await act(async () => {
+						onChangeOf(retained)({
+							target: { checked: false },
+							currentTarget: retained,
+						});
+					});
+					await clickAction(container, "Next");
+					await clickAction(container, "Finish");
+					const creates = posts.filter((p) => p.url === "/api/projects");
+					expect(creates).toHaveLength(1);
+					expect(creates[0]?.body).toMatchObject(
+						source === "new"
+							? { name: "wiz", github: false }
+							: { name: "wiz", url: "https://gitlab.com/o/wiz.git" },
+					);
+					expect(
+						posts.find((p) => p.url.endsWith("/settings"))?.body.prMode,
+					).toBe(false);
+					expect(
+						posts.filter((p) => p.url.endsWith("/interview")),
+					).toHaveLength(1);
+					expect(closeCount()).toBe(1);
+				},
+				{ createdSource: { github: null, gitless: source === "new" } },
+			);
+		});
+	}
+
+	test("a non-GitHub source omits a hidden fork draft and preserves untouched clone settings", async () => {
+		await withWizard(
+			"url",
+			async ({ container, posts, closeCount }) => {
+				await sourceNext(container);
+				const forkLabel = [...container.querySelectorAll("label")].find(
+					(label) => label.textContent?.includes("Fork research"),
+				);
+				if (forkLabel === undefined) throw new Error("no Fork research row");
+				const fork = forkLabel.querySelector("input") as HTMLInputElement;
+				await act(async () => {
+					onChangeOf(fork)({ target: { checked: true }, currentTarget: fork });
+				});
+				await clickAction(container, "Back");
+				await changeField(
+					container.querySelector("input[data-autofocus]") as HTMLInputElement,
+					"https://gitlab.com/o/wiz.git",
+				);
+				await sourceNext(container);
+				expect(container.textContent).not.toContain("Fork research");
+				await clickAction(container, "Next");
+				await clickAction(container, "Next");
+				await clickAction(container, "Next");
+				expect(posts).toHaveLength(0);
+				await clickAction(container, "Finish");
+				expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(1);
+				const settings = posts.filter((p) => p.url.endsWith("/settings"));
+				expect(settings.map((p) => p.body)).toEqual([
+					{ setupChecklist: false },
+				]);
+				expect(posts.filter((p) => p.url.endsWith("/interview"))).toHaveLength(
+					1,
+				);
+				expect(closeCount()).toBe(1);
+			},
+			{
+				createdSource: { github: null, gitless: false },
+				hasRules: true,
+				savedSettings: {
+					retroSince: 1,
+					retroFilter: false,
+					forkResearch: true,
+					holdUpdateMerges: true,
+					forkMergeHold: true,
+					maxParallel: 6,
+					copyExtra: ["config/existing.json"],
+					targetBranch: "stable",
+				},
+			},
+		);
 	});
 
-	test("closing the dialog after the add queues no interview", async () => {
-		const { container, root, posts, restore } = await mountAdd(
-			true,
-			[],
-			wizardProject,
+	test("hosted wizard keeps target branch and omits PR mode", async () => {
+		await withWizard(
+			"url",
+			async ({ container, posts }) => {
+				await sourceNext(container);
+				await clickAction(container, "Next");
+				await clickAction(container, "Next");
+				expect(container.querySelector('input[type="checkbox"]')).toBeNull();
+				const target = container.querySelector(
+					'input[aria-label="Target branch for merges"]',
+				) as HTMLInputElement;
+				expect(target).not.toBeNull();
+				await changeField(target, "release");
+				await clickAction(container, "Next");
+				expect(posts).toHaveLength(0);
+				await clickAction(container, "Finish");
+				expect(posts.some((p) => p.body.targetBranch === "release")).toBe(true);
+				expect(posts.some((p) => "prMode" in p.body)).toBe(false);
+			},
+			{ hosted: true },
 		);
+	});
+
+	for (const failure of [
+		"create",
+		"init",
+		"settings",
+		"interview",
+		"checklist",
+	] as const) {
+		test(`Finish recovers from ${failure} failure without a duplicate project`, async () => {
+			await withWizard(
+				failure === "init" ? "new" : "url",
+				async ({ container, posts, closeCount }) => {
+					await sourceNext(container);
+					await clickAction(container, "Next");
+					await changeField(
+						container.querySelector('input[type="number"]') as HTMLInputElement,
+						"3",
+					);
+					await clickAction(container, "Next");
+					await clickAction(container, "Next");
+					await clickAction(container, "Finish");
+					expect(container.querySelector('[role="alert"]')).not.toBeNull();
+					expect(closeCount()).toBe(0);
+					if (failure !== "interview" && failure !== "checklist") {
+						expect(
+							posts.filter((p) => p.url.endsWith("/interview")),
+						).toHaveLength(0);
+					}
+					if (failure === "interview") {
+						expect(posts.some((p) => p.body.setupChecklist === false)).toBe(
+							false,
+						);
+					}
+					await clickAction(container, "Finish");
+					expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(
+						failure === "create" ? 2 : 1,
+					);
+					const interviewCount = posts.filter((p) =>
+						p.url.endsWith("/interview"),
+					).length;
+					if (failure === "checklist") {
+						expect(interviewCount).toBeGreaterThanOrEqual(1);
+						expect(interviewCount).toBeLessThanOrEqual(2);
+						expect(
+							posts.filter((p) => p.body.setupChecklist === false),
+						).toHaveLength(2);
+					} else {
+						expect(interviewCount).toBe(failure === "interview" ? 2 : 1);
+					}
+					expect(closeCount()).toBe(1);
+				},
+				{ fail: failure },
+			);
+		});
+	}
+
+	test("SSH tests and changed-host approval do not create before Finish", async () => {
+		await withWizard(
+			"url",
+			async ({ container, posts, closeCount }) => {
+				await changeField(
+					container.querySelector("input[data-autofocus]") as HTMLInputElement,
+					"git@github.com:o/wiz.git",
+				);
+				await clickAction(container, "Test key");
+				expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(0);
+				await clickAction(container, "Trust and test key");
+				const tests = posts.filter((p) => p.url === "/api/git-hosts/ssh/test");
+				expect(tests).toHaveLength(2);
+				expect(tests[0]?.body).toMatchObject({
+					url: "git@github.com:o/wiz.git",
+					key: "global",
+				});
+				expect(tests[0]?.body.trust).toBeUndefined();
+				expect(tests[1]?.body.trust).toEqual(["SHA256:before"]);
+				await reachRules(container);
+				expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(0);
+				await clickAction(container, "Finish");
+				expect(closeCount()).toBe(0);
+				expect(posts.filter((p) => p.url.endsWith("/interview"))).toHaveLength(
+					0,
+				);
+				await clickAction(container, "Trust and finish");
+				const creates = posts.filter((p) => p.url === "/api/projects");
+				expect(creates.at(-1)?.body).toMatchObject({
+					url: "git@github.com:o/wiz.git",
+					sshKey: "global",
+					trust: ["SHA256:after"],
+				});
+				expect(
+					creates.filter(
+						(p) =>
+							JSON.stringify(p.body.trust) === JSON.stringify(["SHA256:after"]),
+					),
+				).toHaveLength(1);
+				expect(posts.filter((p) => p.url.endsWith("/interview"))).toHaveLength(
+					1,
+				);
+				expect(closeCount()).toBe(1);
+			},
+			{ sshAccess: true },
+		);
+	});
+
+	test("double Finish sends only one create request", async () => {
+		const { promise: waitForCreate, resolve: release } =
+			Promise.withResolvers<void>();
 		try {
-			await addThroughDialog(container);
-			// The wizard replaced the form and no card is filed yet.
-			expect(container.textContent).toContain("Skip, use defaults");
+			await withWizard(
+				"url",
+				async ({ container, posts, closeCount }) => {
+					await reachRules(container);
+					const finish = buttonOf(container, "Finish");
+					await act(async () => {
+						finish.click();
+						finish.click();
+					});
+					expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(
+						1,
+					);
+					await act(async () => {
+						release();
+					});
+					expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(
+						1,
+					);
+					expect(
+						posts.filter((p) => p.url.endsWith("/interview")),
+					).toHaveLength(1);
+					expect(closeCount()).toBe(1);
+				},
+				{ waitForCreate },
+			);
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			restore();
+			release();
 		}
-		expect(posts.some((p) => p.url.endsWith("/api/projects"))).toBe(true);
-		expect(posts.some((p) => p.url.endsWith("/interview"))).toBe(false);
 	});
 });
 

@@ -6321,6 +6321,82 @@ describe("ProjectSetupSteps step order", () => {
 		// (OTTR-1065 send-back).
 		expect(html.match(/class="done"/g)).toHaveLength(1);
 	});
+
+	test("existing project setup saves choices before Finish later without another create", async () => {
+		const realFetch = globalThis.fetch;
+		const posts: { url: string; body: Record<string, unknown> }[] = [];
+		let closes = 0;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			if (init?.method === "POST") {
+				posts.push({
+					url,
+					body: JSON.parse(String(init.body)) as Record<string, unknown>,
+				});
+			}
+			if (url === "/api/projects/proj/settings") {
+				return okJson({
+					...fresh,
+					settings: { ...fresh.settings, retroSince: 1 },
+				});
+			}
+			return new Response("{}", { status: 404 });
+		}) as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectSetupSteps
+						project={fresh}
+						act={async (fn) => {
+							await fn();
+							return true;
+						}}
+						onClose={() => {
+							closes += 1;
+						}}
+					/>,
+				);
+			});
+			const checkbox = container.querySelector(
+				'input[type="checkbox"]',
+			) as HTMLInputElement;
+			await act(async () => {
+				onChangeOf(checkbox)({
+					target: { checked: true },
+					currentTarget: checkbox,
+				});
+			});
+			expect(posts).toEqual([
+				{ url: "/api/projects/proj/settings", body: { retro: true } },
+			]);
+			const later = [...container.querySelectorAll("button")].find(
+				(button) => button.textContent?.trim() === "Finish later",
+			);
+			if (later === undefined) throw new Error("no Finish later button");
+			await act(async () => {
+				later.click();
+			});
+			expect(closes).toBe(1);
+			expect(posts).toEqual([
+				{ url: "/api/projects/proj/settings", body: { retro: true } },
+				{ url: "/api/projects/proj/settings", body: { setupChecklist: true } },
+			]);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
 });
 
 describe("ProjectSetupSteps gitless init jump", () => {

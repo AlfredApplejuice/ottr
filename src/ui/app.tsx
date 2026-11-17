@@ -225,9 +225,11 @@ import {
 	openSettingsSection,
 	type PendingKeyInfo,
 	PendingKeyRow,
-	ProjectSetupSteps,
 	SETTINGS_TOC,
 	SettingsPage,
+	type SetupFields,
+	SetupSettingsFields,
+	SetupStepsNav,
 	SetupWizardModal,
 	SshTestRow,
 	type TestAnswer,
@@ -7092,8 +7094,7 @@ export function UpdateRowLine({
 		<div className="updates-row">{body}</div>
 	);
 }
-/** The "Git URL" tab of the Add-project dialog: URL and name fields, the SSH key choice,
- * and the token fieldset the server demands on a 400 needsToken. */
+/** The Git URL source fields and independent SSH access controls. */
 function AddUrlPanel({
 	mode,
 	url,
@@ -7109,14 +7110,6 @@ function AddUrlPanel({
 	onPending,
 	runSshTest,
 	onSshTestOk,
-	needsTokenHost,
-	tokUser,
-	onTokUser,
-	tokToken,
-	onTokToken,
-	saveToken,
-	boardTokenUsable,
-	useBoardToken,
 }: {
 	mode: "url" | "new";
 	url: string;
@@ -7132,14 +7125,6 @@ function AddUrlPanel({
 	onPending: (p: PendingKeyInfo | null) => void;
 	runSshTest: (trust?: string[]) => Promise<TestAnswer>;
 	onSshTestOk: () => void;
-	needsTokenHost: string | null;
-	tokUser: string;
-	onTokUser: (u: string) => void;
-	tokToken: string;
-	onTokToken: (t: string) => void;
-	saveToken: () => void;
-	boardTokenUsable: boolean;
-	useBoardToken: () => void;
 }) {
 	return (
 		<div
@@ -7213,45 +7198,8 @@ function AddUrlPanel({
 					)}
 					<SshTestRow send={runSshTest} onOk={onSshTestOk} />
 					<p className="hint">
-						Add stays disabled until the test passed for this URL and key.
+						Next waits until the test passes for this URL and key.
 					</p>
-				</fieldset>
-			)}
-			{needsTokenHost !== null && (
-				<fieldset>
-					<legend>
-						Token for <code>{needsTokenHost}</code>
-					</legend>
-					<label>
-						Username
-						<span className="opt-mark">(optional)</span>
-						<input
-							value={tokUser}
-							onChange={(e) => onTokUser(e.target.value)}
-							placeholder={defaultGitUsername(
-								needsTokenHost ?? "",
-								hosts?.githubHost ?? null,
-							)}
-						/>
-					</label>
-					<label>
-						Token
-						<input
-							type="password"
-							value={tokToken}
-							onChange={(e) => onTokToken(e.target.value)}
-							autoComplete="off"
-							required
-						/>
-					</label>
-					<button type="button" disabled={tokToken === ""} onClick={saveToken}>
-						Save token and retry
-					</button>
-					{boardTokenUsable && (
-						<button type="button" onClick={useBoardToken}>
-							Use the board GitHub token
-						</button>
-					)}
 				</fieldset>
 			)}
 		</div>
@@ -7307,89 +7255,28 @@ function GhRepoHint({
 	);
 }
 
-/** The Add-project POST body shared by both submit paths. */
-function addGitProjectRequest(req: {
-	url: string;
-	name: string;
-	taskIdPrefix: string;
-	sshKey: string | undefined;
-	trust: string[] | undefined;
-}): ReturnType<typeof gitReq> {
-	return gitReq("POST", "/api/projects", {
-		url: req.url,
-		name: req.name === "" ? undefined : req.name,
-		taskIdPrefix: req.taskIdPrefix,
-		sshKey: req.sshKey,
-		trust: req.trust,
-	});
-}
-
-function reportAddedProject(
-	data: unknown,
-	hooks: {
-		setAdded: (v: { project: ProjectView }) => void;
-	},
-): void {
-	const r = data as unknown as AddProjectResponse; // unchecked cast: the server's documented answer shape
-	hooks.setAdded({ project: r.project });
-}
-
-/** The Add submit from the form: success reports the project, otherwise it raises
- * the trust step, the token step or the server's error into the dialog. */
-async function addGitProject(
-	req: {
-		url: string;
-		name: string;
-		taskIdPrefix: string;
-		sshKey: string | undefined;
-		trust: string[] | undefined;
-	},
-	hooks: {
-		setAdded: (v: { project: ProjectView }) => void;
-		setAddTrust: (t: TrustNeeded) => void;
-		setNeedsTokenHost: (h: string) => void;
-	},
-): Promise<void> {
-	const { status, data } = await addGitProjectRequest(req);
-	const t = asTrust(data);
-	if (status < 300) {
-		reportAddedProject(data, hooks);
-		return;
+/** Draft capability uses a validated remote authority, never a hostname substring. */
+export function draftGithubSource(
+	url: string,
+	configuredHost: string | null,
+): boolean {
+	if (
+		configuredHost === null ||
+		url.trim() === "" ||
+		gitUrlProblem(url) !== null
+	)
+		return false;
+	const source = url.trim();
+	const scp = /^[^/@\s]+@([^/:]+):/.exec(source);
+	if (scp !== null)
+		return scp[1]?.toLowerCase() === configuredHost.toLowerCase();
+	try {
+		return (
+			new URL(source).hostname.toLowerCase() === configuredHost.toLowerCase()
+		);
+	} catch {
+		return false;
 	}
-	if (t !== null) {
-		hooks.setAddTrust(t);
-		throw new Error(t.error);
-	}
-	if (typeof data.needsToken === "string") {
-		hooks.setNeedsTokenHost(data.needsToken);
-		throw new Error(asError(data, status, "adding the project"));
-	}
-	throw new Error(asError(data, status, "adding the project"));
-}
-
-/** The Add retry after the user confirmed the trust prompt: success clears the prompt. */
-async function addGitProjectTrusted(
-	req: {
-		url: string;
-		name: string;
-		taskIdPrefix: string;
-		sshKey: string | undefined;
-		trust: string[] | undefined;
-	},
-	hooks: {
-		setAdded: (v: { project: ProjectView }) => void;
-		setAddTrust: (t: TrustNeeded | null) => void;
-	},
-): Promise<TestAnswer> {
-	const { status, data } = await addGitProjectRequest(req);
-	const t = asTrust(data);
-	if (status < 300) {
-		reportAddedProject(data, hooks);
-		hooks.setAddTrust(null);
-		return { ok: true } as const;
-	}
-	if (t !== null) return t;
-	return { error: asError(data, status, "adding the project") };
 }
 
 /** Empty keeps the server's derived default; otherwise 1 to 8 letters and digits. */
@@ -7477,46 +7364,6 @@ function AddTabs({
 	);
 }
 
-/** The dialog's submit row: Add stays disabled until the SSH test passed or the host sign-in blocks it. */
-function AddSubmitButton({
-	busy,
-	failed,
-	mode,
-	ssh,
-	sshTested,
-	noGitHost,
-}: {
-	busy: boolean;
-	failed: boolean;
-	mode: "url" | "new";
-	ssh: boolean;
-	sshTested: boolean;
-	noGitHost: boolean;
-}) {
-	const untested = mode === "url" && ssh && !sshTested;
-	return (
-		<div className="dialog-actions">
-			<button
-				type="submit"
-				disabled={busy || untested || noGitHost}
-				className={`primary${failed ? " failed" : ""}`}
-				aria-busy={busy || undefined}
-				title={
-					untested
-						? "Run the SSH test first"
-						: noGitHost
-							? "Sign in to a Git host in Settings, or uncheck the repo box"
-							: undefined
-				}
-			>
-				{busy && <span className="spinner" aria-hidden="true" />}
-				<Icon name="plus" />
-				Add project
-			</button>
-		</div>
-	);
-}
-
 /** The "new" tab of the Add dialog: the project name plus the optional private repo
  * push, with host sign-in hints when the repo box is checked. */
 function AddNewPanel({
@@ -7579,66 +7426,146 @@ function AddNewPanel({
 	);
 }
 
+/** Credentials belong to the Git host, not the local project draft. */
+function AddTokenFields({
+	needsTokenHost,
+	hosts,
+	tokUser,
+	onTokUser,
+	tokToken,
+	onTokToken,
+	saveToken,
+	boardTokenUsable,
+	useBoardToken,
+}: {
+	needsTokenHost: string | null;
+	hosts: GitHostsView | null;
+	tokUser: string;
+	onTokUser: (value: string) => void;
+	tokToken: string;
+	onTokToken: (value: string) => void;
+	saveToken: () => void;
+	boardTokenUsable: boolean;
+	useBoardToken: () => void;
+}) {
+	return (
+		<>
+			{needsTokenHost !== null && (
+				<fieldset>
+					<legend>
+						Token for <code>{needsTokenHost}</code>
+					</legend>
+					<label>
+						Username
+						<span className="opt-mark">(optional)</span>
+						<input
+							value={tokUser}
+							onChange={(e) => onTokUser(e.target.value)}
+							placeholder={defaultGitUsername(
+								needsTokenHost ?? "",
+								hosts?.githubHost ?? null,
+							)}
+						/>
+					</label>
+					<label>
+						Token
+						<input
+							type="password"
+							value={tokToken}
+							onChange={(e) => onTokToken(e.target.value)}
+							autoComplete="off"
+						/>
+					</label>
+					<button type="button" disabled={tokToken === ""} onClick={saveToken}>
+						Save token and retry
+					</button>
+					{boardTokenUsable && (
+						<button type="button" onClick={useBoardToken}>
+							Use the board GitHub token
+						</button>
+					)}
+				</fieldset>
+			)}
+		</>
+	);
+}
+
 export function AddProjectModal({
 	act,
 	onClose,
 	openTask,
 	projects,
+	onNotice,
 }: {
 	act: Act;
 	onClose: () => void;
-	/** Opens the rules interview card in the board drawer: the wizard's "Open rules task". */
 	openTask: (id: string) => void;
 	projects: ProjectView[];
+	onNotice?: (message: string) => void;
 }) {
 	const [mode, setMode] = useState<"url" | "new">("url");
 	const [url, setUrl] = useState("");
 	const [name, setName] = useState("");
 	const [ghRepo, setGhRepo] = useState(false);
 	const [err, setErr] = useState<string | null>(null);
-	const add = useBusy();
-	// Git-URL flow: a client-side name mirror, the hosts view, the SSH key choice and
-	// the token step the server demands on a 400 needsToken.
+	const [step, setStep] = useState(1);
+	const [changes, setChanges] = useState<Partial<SetupFields>>({});
+	const values: SetupFields = {
+		retro: false,
+		retroFilter: true,
+		forkResearch: false,
+		holdUpdateMerges: false,
+		forkMergeHold: true,
+		maxParallel: "",
+		copyExtra: "",
+		prMode: false,
+		targetBranch: "",
+		...changes,
+	};
+	const change = (next: Partial<SetupFields>): void =>
+		setChanges((previous) => ({ ...previous, ...next }));
+	const [busy, setBusy] = useState(false);
+	const finishing = useRef(false);
+	const created = useRef<ProjectView | null>(null);
+	const [project, setProject] = useState<ProjectView | null>(null);
+	const [progress, setProgress] = useState("");
 	const [nameTouched, setNameTouched] = useState(false);
-	// The task ID prefix: follows the derived value from the name until the user edits it.
 	const [prefix, setPrefix] = useState("");
 	const [prefixTouched, setPrefixTouched] = useState(false);
 	const [hosts, setHosts] = useState<GitHostsView | null>(null);
 	const [sshMode, setSshMode] = useState<"global" | "new">("global");
 	const [pendingKey, setPendingKey] = useState<PendingKeyInfo | null>(null);
 	const [trusted, setTrusted] = useState<string[] | undefined>(undefined);
-	const [tested, setTested] = useState<string | null>(null); // "url\0key" that passed
+	const [tested, setTested] = useState<string | null>(null);
 	const [addTrust, setAddTrust] = useState<TrustNeeded | null>(null);
 	const [needsTokenHost, setNeedsTokenHost] = useState<string | null>(null);
 	const [tokUser, setTokUser] = useState("oauth2");
-	// When the hosts view lands and names the configured GitHub host, prefill the
-	// host's token convention ("x-access-token") instead of the generic "oauth2".
-	useEffect(() => {
-		if (needsTokenHost !== null && hosts !== null) {
-			setTokUser(defaultGitUsername(needsTokenHost, hosts.githubHost));
-		}
-	}, [needsTokenHost, hosts]);
 	const [tokToken, setTokToken] = useState("");
-	const repoName = name.trim();
-	// The effective handle: uppercase, and empty keeps the server's derived default.
-	const prefixOut = prefix.trim().toUpperCase();
-	const trimmedUrl = url.trim();
-	// The URL field's own error (The Error-Says-Fix Rule): shown while the URL tab
-	// holds a value that cannot parse, under the field it names.
-	const urlProblem = gitUrlProblem(trimmedUrl);
-	const ssh = isSshUrl(trimmedUrl);
-	const sshKey = ssh
-		? sshMode === "global"
-			? "global"
-			: `pending:${pendingKey?.id ?? ""}`
-		: undefined;
-	// gh facts for the New tab's hints: auth state, login, projects root, name check.
 	const [gh, setGh] = useState<GhStatus | null>(null);
 	const [free, setFree] = useState<boolean | null>(null);
-	// A checked repo box needs a signed-in Git host; Add waits until one is (or the box clears).
-	// A failed probe (gh null) blocks nothing: the server still answers at submit.
+	const repoName = name.trim();
+	const prefixOut = prefix.trim().toUpperCase();
+	const trimmedUrl = url.trim();
+	const urlProblem = gitUrlProblem(trimmedUrl);
+	const ssh = isSshUrl(trimmedUrl);
+	const selectedSshKey =
+		sshMode === "global" ? "global" : `pending:${pendingKey?.id ?? ""}`;
+	const sshKey = ssh ? selectedSshKey : undefined;
 	const noGitHost = mode === "new" && ghRepo && gh?.authed === false;
-	// One probe per dialog open; a failed probe leaves the hints out, the form still works.
+	const sshTested =
+		ssh &&
+		(sshKey === "global"
+			? (hosts?.globalKey ?? null) !== null
+			: pendingKey !== null) &&
+		tested === `${trimmedUrl}\0${sshKey ?? ""}`;
+	let github = draftGithubSource(trimmedUrl, hosts?.githubHost ?? null);
+	if (mode === "new")
+		github = ghRepo && gh?.authed === true && gh.host !== null;
+	if (project !== null) github = project.github !== null;
+	useEffect(() => {
+		if (needsTokenHost !== null && hosts !== null)
+			setTokUser(defaultGitUsername(needsTokenHost, hosts.githubHost));
+	}, [needsTokenHost, hosts]);
 	useEffect(() => {
 		let alive = true;
 		fetch("/api/gh-status")
@@ -7652,7 +7579,6 @@ export function AddProjectModal({
 			.then((s) => {
 				if (!alive) return;
 				setHosts(s);
-				// The server rejects "global" when no global key exists: start on a new key.
 				if (s.globalKey === null) setSshMode("new");
 			})
 			.catch(() => {});
@@ -7660,56 +7586,185 @@ export function AddProjectModal({
 			alive = false;
 		};
 	}, []);
-	// The name mirror: propose the URL's last path segment until the user edits it.
 	const onName = (n: string): void => {
 		setName(n);
 		if (!prefixTouched) setPrefix(derivedTaskPrefix(n));
 	};
 	const onUrl = (u: string): void => {
 		setUrl(u);
-		if (!nameTouched) {
-			const seg = (
-				u.trim().replace(/\/+$/, "").split(/[:/]/).pop() ?? ""
-			).replace(/\.git$/, "");
-			onName(seg);
-		}
+		setTrusted(undefined);
+		setAddTrust(null);
+		if (!nameTouched)
+			onName(
+				(u.trim().replace(/\/+$/, "").split(/[:/]/).pop() ?? "").replace(
+					/\.git$/,
+					"",
+				),
+			);
 	};
-	// The prefix must stay a short handle of letters and digits; the server
-	// normalizes case itself, but the client rejects other characters early.
-	const prefixValid = prefixUsable(prefixOut);
-	// The Add call: ssh URLs carry the key choice; the server answers with trust or token steps.
-	const addProject = (trust?: string[]): void => {
-		if (!prefixValid) {
-			setErr("The task ID prefix must be 1 to 8 letters and digits.");
+	useEffect(() => {
+		if (
+			mode !== "new" ||
+			!ghRepo ||
+			gh?.authed !== true ||
+			!/^[A-Za-z0-9_.-]+$/.test(repoName)
+		) {
+			setFree(null);
 			return;
 		}
-		add.start(() =>
-			act(
-				async () =>
-					await addGitProject(
-						{
-							url: trimmedUrl,
-							name: repoName,
-							taskIdPrefix: prefixOut,
-							sshKey,
-							trust,
-						},
-						{
-							setAdded,
-							setAddTrust: (t) => setAddTrust(t),
-							setNeedsTokenHost: (h) => setNeedsTokenHost(h),
-						},
-					),
-				setErr,
-			),
-		);
+		let alive = true;
+		const timer = setTimeout(() => {
+			fetch(`/api/gh-status?name=${encodeURIComponent(repoName)}`)
+				.then((res) => unwrap<GhStatus>(res))
+				.then((s) => {
+					if (alive) setFree(s.free);
+				})
+				.catch(() => {});
+		}, 500);
+		return () => {
+			alive = false;
+			clearTimeout(timer);
+		};
+	}, [mode, ghRepo, gh?.authed, repoName]);
+	const validate = (validateProject = step >= 4): boolean => {
+		if (
+			created.current === null &&
+			(repoName === "" ||
+				!prefixUsable(prefixOut) ||
+				(mode === "url" &&
+					(trimmedUrl === "" || urlProblem !== null || (ssh && !sshTested))) ||
+				noGitHost)
+		) {
+			setStep(1);
+			setErr(
+				!prefixUsable(prefixOut)
+					? "The task ID prefix must be 1 to 8 letters and digits."
+					: "Check the source fields and Git host access before you continue.",
+			);
+			return false;
+		}
+		const parallel =
+			values.maxParallel.trim() === "" ? null : Number(values.maxParallel);
+		if (
+			parallel !== null &&
+			(!Number.isInteger(parallel) || parallel < 1 || parallel > 8)
+		) {
+			setStep(3);
+			setErr(
+				"Runner cap must be a whole number from 1 to 8, or empty for no cap.",
+			);
+			return false;
+		}
+		if (validateProject && values.prMode && !github) {
+			setStep(4);
+			setErr(
+				"PR mode requires a GitHub repository. Turn off PR mode here, or return to Source and select GitHub.",
+			);
+			return false;
+		}
+		return true;
 	};
-	// The created project: once set, the dialog shows the setup wizard instead of the form.
-	// The rules interview waits for the wizard's last step (docs/specs/add-project-wizard.md).
-	const [added, setAdded] = useState<{ project: ProjectView } | null>(null);
-	// A token save for the host the server named, then the retry of Add.
+	// The ref guards the whole pipeline, including access recovery. Retain identity before any later request.
+	const finish = async (
+		trust = trusted,
+		access?: () => Promise<void>,
+	): Promise<boolean> => {
+		if (finishing.current || !validate(true)) return false;
+		finishing.current = true;
+		setBusy(true);
+		setErr(null);
+		try {
+			return await act(async () => {
+				if (access !== undefined) {
+					setProgress("Save Git host access");
+					await access();
+				}
+				let current = created.current;
+				if (current === null) {
+					setProgress(
+						mode === "url"
+							? "1 of 5: Clone repository"
+							: "1 of 5: Create project",
+					);
+					const { status, data } = await gitReq(
+						"POST",
+						"/api/projects",
+						mode === "url"
+							? {
+									url: trimmedUrl,
+									name: repoName || undefined,
+									taskIdPrefix: prefixOut,
+									sshKey,
+									trust,
+								}
+							: { name: repoName, taskIdPrefix: prefixOut, github: ghRepo },
+					);
+					if (status >= 300) {
+						setAddTrust(asTrust(data));
+						if (typeof data.needsToken === "string")
+							setNeedsTokenHost(data.needsToken);
+						throw new Error(asError(data, status, "adding the project"));
+					}
+					current = (data as unknown as AddProjectResponse).project;
+					created.current = current;
+					setProject(current);
+					setAddTrust(null);
+					setNeedsTokenHost(null);
+				}
+				const base = `/api/projects/${encodeURIComponent(current.name)}`;
+				if (current.gitless) {
+					setProgress("2 of 5: Create git repository");
+					const result = await post<AddProjectResponse>(`${base}/init`, {});
+					current = result.project;
+					created.current = current;
+					setProject(current);
+				}
+				setProgress("3 of 5: Save project settings");
+				const {
+					maxParallel,
+					copyExtra,
+					targetBranch,
+					forkResearch,
+					...switches
+				} = changes;
+				const body: Record<string, unknown> = { ...switches };
+				if (forkResearch !== undefined && current.github !== null)
+					body.forkResearch = forkResearch;
+				if (maxParallel !== undefined)
+					body.maxParallel =
+						maxParallel.trim() === "" ? null : Number(maxParallel);
+				if (copyExtra !== undefined)
+					body.copyExtra = copyExtra
+						.split("\n")
+						.map((s) => s.trim())
+						.filter((s) => s.length > 0);
+				if (targetBranch !== undefined)
+					body.targetBranch = targetBranch.trim() || null;
+				if (Object.keys(body).length > 0) {
+					current = await post<ProjectView>(`${base}/settings`, body);
+					created.current = current;
+					setProject(current);
+				}
+				setProgress("4 of 5: Check project rules");
+				const result = await post<{ interview: string; id: string | null }>(
+					`${base}/interview`,
+					{},
+				);
+				onNotice?.(interviewMsg(result.interview));
+				setProgress("5 of 5: Complete setup");
+				await post(`${base}/settings`, { setupChecklist: false });
+				refreshState();
+				onClose();
+				if (result.id !== null) openTask(result.id);
+			}, setErr);
+		} finally {
+			finishing.current = false;
+			setBusy(false);
+			setProgress("");
+		}
+	};
 	const saveToken = (): void => {
-		void act(async () => {
+		void finish(trusted, async () => {
 			const { status, data } = await gitReq("POST", "/api/git-hosts/tokens", {
 				host: needsTokenHost ?? "",
 				username:
@@ -7724,35 +7779,26 @@ export function AddProjectModal({
 				);
 			setNeedsTokenHost(null);
 			setTokToken("");
-			addProject(trusted);
-		}, setErr);
+		});
 	};
-	// One click opts the board GitHub token in for this host: the server stores it as the
-	// host's entry (username x-access-token) and the Add retries.
 	const useBoardToken = (): void => {
-		void act(async () => {
+		void finish(trusted, async () => {
 			const { status, data } = await gitReq(
 				"POST",
 				"/api/git-hosts/github-token",
-				{
-					testUrl: trimmedUrl,
-				},
+				{ testUrl: trimmedUrl },
 			);
 			if (status !== 200)
 				throw new Error(asError(data, status, "saving the board GitHub token"));
 			setNeedsTokenHost(null);
 			setTokToken("");
-			addProject(trusted);
-		}, setErr);
+		});
 	};
-	// The board token can stand in only when the dialog's host IS the configured
-	// GitHub host and the board actually has one.
 	const boardTokenUsable =
 		needsTokenHost !== null &&
 		hosts?.githubTokenSet === true &&
 		hosts.githubHost !== null &&
 		needsTokenHost.toLowerCase() === hosts.githubHost;
-	// The SSH pre-test: Add stays disabled until the current url+key pair passed it.
 	const runSshTest = (trust?: string[]): Promise<TestAnswer> => {
 		if (trust !== undefined) setTrusted(trust);
 		return gitReq("POST", "/api/git-hosts/ssh/test", {
@@ -7760,179 +7806,234 @@ export function AddProjectModal({
 			key: sshKey,
 			trust,
 		}).then(({ status, data }) => {
-			const t = asTrust(data);
 			if (status === 200) return { ok: true } as const;
-			if (t !== null) return t;
-			return { error: asError(data, status, "the SSH key test") };
+			return (
+				asTrust(data) ?? { error: asError(data, status, "the SSH key test") }
+			);
 		});
 	};
-	const sshTested =
-		ssh &&
-		(sshKey === "global"
-			? (hosts?.globalKey ?? null) !== null
-			: pendingKey !== null) &&
-		tested === `${trimmedUrl}\0${sshKey ?? ""}`;
-	// Availability while typing: check 500ms after the last keystroke; a stale
-	// in-flight answer is dropped, so the hint always names the current input.
-	useEffect(() => {
-		if (
-			mode !== "new" ||
-			!ghRepo ||
-			gh?.authed !== true ||
-			!/^[A-Za-z0-9_.-]+$/.test(repoName)
-		) {
-			setFree(null);
-			return;
-		}
-		let alive = false;
-		const t = setTimeout(() => {
-			alive = true;
-			fetch(`/api/gh-status?name=${encodeURIComponent(repoName)}`)
-				.then((res) => unwrap<GhStatus>(res))
-				.then((s) => {
-					if (alive) setFree(s.free);
-				})
-				.catch(() => {});
-		}, 500);
-		return () => {
-			alive = false;
-			clearTimeout(t);
-		};
-	}, [mode, ghRepo, gh?.authed, repoName]);
-
+	const close = (): void => {
+		if (!finishing.current) onClose();
+	};
 	return (
-		<Modal onClose={onClose} label="Add project" className="dialog">
+		<Modal
+			onClose={close}
+			dismissible={!busy}
+			label="Add project"
+			className="dialog add-project-dialog"
+		>
 			<div className="dialog-body">
 				<div className="dialog-head">
-					<h2>
-						{added === null
-							? "Add project"
-							: `Set up ${projectLabel(added.project)}`}
-					</h2>
-					<CloseButton />
+					<h2>Add project</h2>
+					<CloseButton disabled={busy} />
 				</div>
-				{added === null ? (
-					<form
-						className="add-form"
-						onSubmit={(e) => {
-							e.preventDefault();
-							if (mode === "url") {
-								// The field error already says why; a known-bad URL never posts.
-								if (urlProblem !== null) return;
-								addProject(trusted);
-								return;
-							}
-							if (!prefixValid) {
-								setErr("The task ID prefix must be 1 to 8 letters and digits.");
-								return;
-							}
-							add.start(() =>
-								act(async () => {
-									const r = await post<AddProjectResponse>("/api/projects", {
-										name: name.trim(),
-										taskIdPrefix: prefixOut,
-										github: ghRepo,
-									});
-									setAdded({ project: r.project });
-								}, setErr),
-							);
-						}}
-					>
-						<AddTabs mode={mode} setMode={setMode} />
-						<AddUrlPanel
-							mode={mode}
-							url={url}
-							onUrl={onUrl}
-							urlProblem={urlProblem}
-							name={name}
-							onName={(n) => {
-								setNameTouched(true);
-								setName(n);
-								if (!prefixTouched) setPrefix(derivedTaskPrefix(n));
-							}}
-							ssh={ssh}
-							sshMode={sshMode}
-							setSshMode={setSshMode}
-							hosts={hosts}
-							pendingKey={pendingKey}
-							onPending={(p) => {
-								setPendingKey(p);
-								setTested(null);
-							}}
-							runSshTest={runSshTest}
-							onSshTestOk={() => setTested(`${trimmedUrl}\0${sshKey ?? ""}`)}
-							needsTokenHost={needsTokenHost}
-							tokUser={tokUser}
-							onTokUser={setTokUser}
-							tokToken={tokToken}
-							onTokToken={setTokToken}
-							saveToken={saveToken}
-							boardTokenUsable={boardTokenUsable}
-							useBoardToken={useBoardToken}
-						/>
-						<AddNewPanel
-							mode={mode}
-							name={name}
-							setName={(n) => onName(n)}
-							ghRepo={ghRepo}
-							setGhRepo={setGhRepo}
-							gh={gh}
-							free={free}
-							repoName={repoName}
-							onClose={onClose}
-						/>
-						<AddPrefixField
-							prefix={prefix}
-							setPrefix={(v) => {
-								setPrefixTouched(true);
-								setPrefix(v);
-							}}
-							prefixOut={prefixOut}
-							projects={projects}
-						/>
-						{err !== null && (
-							<p className="auth-error" role="alert">
-								{err}
+				<SetupStepsNav step={step} seenUpTo={step} />
+				<form
+					className="add-wizard"
+					onSubmit={(e) => {
+						e.preventDefault();
+						if (finishing.current || !validate()) return;
+						setErr(null);
+						if (step === 5) void finish();
+						else setStep(step + 1);
+					}}
+				>
+					<fieldset className="setup-fields" disabled={busy}>
+						{step === 1 && (
+							<fieldset
+								className="add-form setup-source"
+								disabled={project !== null}
+							>
+								<legend className="sr">Source</legend>
+								<AddTabs mode={mode} setMode={setMode} />
+								<AddUrlPanel
+									mode={mode}
+									url={url}
+									onUrl={onUrl}
+									urlProblem={urlProblem}
+									name={name}
+									onName={(n) => {
+										setNameTouched(true);
+										onName(n);
+									}}
+									ssh={ssh}
+									sshMode={sshMode}
+									setSshMode={setSshMode}
+									hosts={hosts}
+									pendingKey={pendingKey}
+									onPending={(p) => {
+										setPendingKey(p);
+										setTested(null);
+									}}
+									runSshTest={runSshTest}
+									onSshTestOk={() =>
+										setTested(`${trimmedUrl}\0${sshKey ?? ""}`)
+									}
+								/>
+								<AddNewPanel
+									mode={mode}
+									name={name}
+									setName={onName}
+									ghRepo={ghRepo}
+									setGhRepo={setGhRepo}
+									gh={gh}
+									free={free}
+									repoName={repoName}
+									onClose={close}
+								/>
+								<AddPrefixField
+									prefix={prefix}
+									setPrefix={(v) => {
+										setPrefixTouched(true);
+										setPrefix(v);
+									}}
+									prefixOut={prefixOut}
+									projects={projects}
+								/>
+								{project === null && (
+									<p className="hint">
+										Next keeps the source local. Finish creates the project.
+									</p>
+								)}
+								{ssh && (
+									<p className="hint">
+										Host access tests, keys, tokens, and trust can remain after
+										Cancel. They do not create a project.
+									</p>
+								)}
+							</fieldset>
+						)}
+						{mode === "url" && step > 1 && step < 5 && (
+							<p className="hint">
+								These are proposed settings. Unchanged fields keep the clone's
+								values after Finish.
 							</p>
 						)}
-						{addTrust !== null && (
-							<SshTestRow
-								label="Add project"
-								success="Project added"
-								send={(trust) =>
-									addGitProjectTrusted(
-										{
-											url: trimmedUrl,
-											name: repoName,
-											taskIdPrefix: prefixOut,
-											sshKey,
-											trust,
-										},
-										{
-											setAdded,
-											setAddTrust: (t) => setAddTrust(t),
-										},
-									)
-								}
-							/>
-						)}
-						<AddSubmitButton
-							busy={add.busy}
-							failed={add.failed}
-							mode={mode}
-							ssh={ssh}
-							sshTested={sshTested}
-							noGitHost={noGitHost}
+						<SetupSettingsFields
+							step={step}
+							values={values}
+							github={github}
+							onForkDraft={(v) => change({ forkResearch: v })}
+							onChange={change}
+							savePrMode={async (v) => {
+								change({ prMode: v });
+								return true;
+							}}
+							act={act}
+							draft
 						/>
-					</form>
-				) : (
-					<ProjectSetupSteps
-						project={added.project}
-						openTask={openTask}
-						act={act}
-						onClose={onClose}
-					/>
-				)}
+						{step === 5 && (
+							<section className="setup-sec">
+								<h3>Rules</h3>
+								<p className="hint">
+									{project === null
+										? "Finish creates the project, saves your selected settings, then checks its actual rules."
+										: "Finish saves your selected settings, then checks this project's actual rules."}
+								</p>
+								<p className="hint">
+									If rules are absent, the rules interview starts as a card.
+									Existing rules and live rules tasks keep their current
+									behavior.
+								</p>
+							</section>
+						)}
+						{project !== null && (
+							<p className="hint" role="status">
+								The project {projectLabel(project)} exists. Retry uses this
+								project. Close does not undo its creation.
+							</p>
+						)}
+						{needsTokenHost !== null && (
+							<div className="add-form">
+								<p className="hint">
+									Host credentials remain after Cancel. The token save retries
+									the same Finish operation.
+								</p>
+								<AddTokenFields
+									needsTokenHost={needsTokenHost}
+									hosts={hosts}
+									tokUser={tokUser}
+									onTokUser={setTokUser}
+									tokToken={tokToken}
+									onTokToken={setTokToken}
+									saveToken={saveToken}
+									boardTokenUsable={boardTokenUsable}
+									useBoardToken={useBoardToken}
+								/>
+							</div>
+						)}
+						{addTrust !== null && (
+							<div className={addTrust.changed ? "trust-warn" : undefined}>
+								<p>
+									{addTrust.changed ? "Warning: the host key changed. " : ""}
+									Check these fingerprints with your host admin for{" "}
+									<code>{addTrust.host}</code>:
+								</p>
+								<ul>
+									{addTrust.fingerprints.map((fingerprint) => (
+										<li key={fingerprint}>
+											<code>{fingerprint}</code>
+										</li>
+									))}
+								</ul>
+								<button
+									type="button"
+									onClick={() => {
+										setTrusted(addTrust.fingerprints);
+										void finish(addTrust.fingerprints);
+									}}
+								>
+									Trust and finish
+								</button>
+							</div>
+						)}
+					</fieldset>
+					{err !== null && (
+						<p className="auth-error" role="alert">
+							{err}
+						</p>
+					)}
+					{busy && (
+						<p className="hint" role="status">
+							{progress}. Keep this dialog open until the operation ends.
+						</p>
+					)}
+					<div className="dialog-actions setup-actions">
+						<button
+							type="button"
+							className="ghost"
+							disabled={busy}
+							onClick={close}
+						>
+							{project === null ? "Cancel" : "Close"}
+						</button>
+						{step > 1 && (
+							<button
+								type="button"
+								disabled={busy}
+								onClick={() => {
+									setErr(null);
+									setStep(step - 1);
+								}}
+							>
+								Back
+							</button>
+						)}
+						<button
+							type="submit"
+							className="primary"
+							disabled={
+								busy ||
+								(step === 1 &&
+									((mode === "url" && ssh && !sshTested) || noGitHost))
+							}
+							aria-busy={busy || undefined}
+						>
+							{busy && <span className="spinner" aria-hidden="true" />}
+							{step === 5 ? "Finish" : "Next"}
+						</button>
+					</div>
+				</form>
 			</div>
 		</Modal>
 	);
@@ -16527,6 +16628,7 @@ function AppOverlays(p: {
 	tasks: TaskCard[];
 	act: Act;
 	openTask: (id: string) => void;
+	onNotice: (message: string) => void;
 	setShowAdd: (v: boolean) => void;
 	setShowUpdates: (v: boolean) => void;
 }) {
@@ -16541,6 +16643,7 @@ function AppOverlays(p: {
 		tasks,
 		act,
 		openTask,
+		onNotice,
 		setShowAdd,
 		setShowUpdates,
 	} = p;
@@ -16565,6 +16668,7 @@ function AppOverlays(p: {
 					projects={state?.projects ?? []}
 					onClose={() => setShowAdd(false)}
 					openTask={openTask}
+					onNotice={onNotice}
 				/>
 			)}
 
@@ -17641,6 +17745,7 @@ export function App() {
 				tasks={tasks}
 				act={act}
 				openTask={openTask}
+				onNotice={setNotice}
 				setShowAdd={setShowAdd}
 				setShowUpdates={setShowUpdates}
 			/>

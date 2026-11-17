@@ -13,6 +13,7 @@ import {
 	type InstantSave,
 	interviewMsg,
 	LiveElapsed,
+	Modal,
 	Skeleton,
 	unwrap,
 	useInstantSave,
@@ -243,6 +244,59 @@ describe("ZoomableImage", () => {
 		expect(img.style.transform).toBe("translate(0px, 0px) scale(1)");
 		act(() => root.unmount());
 		container.remove();
+	});
+});
+
+describe("Modal native close", () => {
+	test("reopens after native close while dismissal is disabled and closes normally after release", async () => {
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.append(container as unknown as HappyNode);
+		const root = createRoot(container);
+		let closes = 0;
+		const render = (dismissible: boolean): void => {
+			root.render(
+				<Modal
+					label="Busy operation"
+					dismissible={dismissible}
+					onClose={() => {
+						closes += 1;
+					}}
+				>
+					<p>Save project</p>
+				</Modal>,
+			);
+		};
+		try {
+			await act(async () => {
+				render(false);
+			});
+			const dialog = container.querySelector("dialog");
+			if (dialog === null) throw new Error("no modal dialog");
+			expect(dialog.open).toBe(true);
+			for (let attempt = 0; attempt < 2; attempt += 1) {
+				await act(async () => {
+					dialog.open = false;
+					dialog.dispatchEvent(new window.Event("close") as unknown as Event);
+				});
+				expect(dialog.open).toBe(true);
+				expect(closes).toBe(0);
+			}
+			await act(async () => {
+				render(true);
+			});
+			await act(async () => {
+				dialog.close();
+			});
+			expect(dialog.open).toBe(false);
+			expect(closes).toBe(1);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+		}
 	});
 });
 

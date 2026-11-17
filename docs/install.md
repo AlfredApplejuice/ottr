@@ -243,7 +243,13 @@ bun install
 bun start
 ```
 
-Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`, `git@host:…`, `ssh://host[:port]/…`) or creates a new project, sets up `.tasks/` and `.worktrees/`, and walks a setup dialog (automation, runners, project settings, rules). Projects on hosts other than GitHub work with plain git; the GitHub extras (releases, CI watch, Dependabot cards, fork research, GHCR) stay GitHub-only and hide for other hosts. The dialog's last step files a rules interview card for a project without `AGENTS.md`; the card writes one with you. A dialog closed early leaves the same start on the setup checklist. Keep projects in a project folder: after a restart the board finds projects in Ottr's parent folder or in `OMP_TRACKER_ROOTS`.
+Open <http://127.0.0.1:4747>. **Add project** opens a wizard with Source as its first step. Select **New** or **Git URL** (`https://…`, `git@host:…`, `ssh://host[:port]/…`). **Next** and **Back** retain your drafts. Before **Finish**, **Cancel**, the close button, or Escape discard those drafts without a project or clone.
+
+**Finish** creates or clones the project, prepares `.tasks/` and `.worktrees/`, and saves the settings you explicitly change. It then starts a rules interview card if needed. For a project without `AGENTS.md`, the card writes the file with you. An existing project's **Open setup** still offers **Finish later**.
+
+Projects on hosts other than GitHub work with plain git. The GitHub extras (releases, CI watch, Dependabot cards, fork research, GHCR) stay GitHub-only and hide for other hosts.
+
+Keep projects in a project folder. After a restart, the board finds projects in Ottr's parent folder or in `OMP_TRACKER_ROOTS`.
 
 ## Alate
 

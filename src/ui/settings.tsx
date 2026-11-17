@@ -121,9 +121,7 @@ function SaveLabel({ saved }: { saved: boolean }) {
 	);
 }
 
-/** The five wizard steps; the Source step lives in the Add project form, the rest here.
- *  The rules interview is last: the settings steps save first, so PR mode and the target
- *  branch hold for the interview's first commit (docs/specs/add-project-wizard.md). */
+/** The five steps share one strip for local drafts and existing project setup. */
 const SETUP_STEPS = [
 	"Source",
 	"Automation",
@@ -140,9 +138,24 @@ const PR_MODE_DESC =
 /** Step strip styled like .add-tabs: steel underline on the current step, a check on
  *  settled ones (`seenUpTo` bounds them: a gitless start at the rules step must not
  *  claim the settings steps the user never saw). */
-function SetupStepsNav({ step, seenUpTo }: { step: number; seenUpTo: number }) {
+export function SetupStepsNav({
+	step,
+	seenUpTo,
+}: {
+	step: number;
+	seenUpTo: number;
+}) {
+	const nav = useRef<HTMLOListElement | null>(null);
+	useLayoutEffect(() => {
+		nav.current
+			?.querySelector<HTMLElement>('[aria-current="step"]')
+			?.scrollIntoView?.({
+				block: "nearest",
+				inline: "nearest",
+			});
+	}, [step]);
 	return (
-		<ol className="setup-steps" aria-label="Setup steps">
+		<ol ref={nav} className="setup-steps" aria-label="Setup steps">
 			{SETUP_STEPS.map((name, i) => {
 				const n = i + 1;
 				return (
@@ -264,14 +277,12 @@ type GithubFactsState =
 
 /** Step 3's fork-research panel: the checkbox, the GitHub facts, and the recent-forks table. */
 function SetupForkSection({
-	view,
 	facts,
 	forkEffective,
 	forkTouched,
 	onForkDraft,
 }: {
-	view: ProjectView;
-	facts: GithubFactsState;
+	facts?: GithubFactsState;
 	forkEffective: boolean;
 	forkTouched: boolean;
 	onForkDraft: (checked: boolean) => void;
@@ -288,15 +299,16 @@ function SetupForkSection({
 				/>
 				Fork research
 				<span className="hint">
-					{!forkTouched &&
-					facts?.kind === "ok" &&
-					facts.facts.active > 0 &&
-					!view.settings.forkResearch
+					{!forkTouched && facts?.kind === "ok" && facts.facts.active > 0
 						? `${facts.facts.active} of ${facts.facts.forks} forks pushed in the last 90 days, so this starts checked.`
 						: "Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval."}
 				</span>
 			</label>
-			{facts === null ? (
+			{facts === undefined ? (
+				<p className="hint">
+					Fork facts become available after Finish creates the project.
+				</p>
+			) : facts === null ? (
 				<Skeleton shape="stats" rows={2} label="Loading GitHub facts" />
 			) : facts.kind === "error" ? (
 				<p className="hint" role="alert">
@@ -331,6 +343,186 @@ function SetupForkSection({
 				</>
 			)}
 		</section>
+	);
+}
+
+/** Only the settings fields that the wizard edits; a draft is not a ProjectView. */
+export type SetupFields = {
+	retro: boolean;
+	retroFilter: boolean;
+	forkResearch: boolean;
+	holdUpdateMerges: boolean;
+	forkMergeHold: boolean;
+	maxParallel: string;
+	copyExtra: string;
+	prMode: boolean;
+	targetBranch: string;
+};
+
+/** Shared forms: the caller owns draft changes or immediate project saves. */
+export function SetupSettingsFields({
+	step,
+	values,
+	github,
+	facts,
+	forkTouched = true,
+	onForkDraft,
+	onChange,
+	savePrMode,
+	act,
+	draft = false,
+}: {
+	step: number;
+	values: SetupFields;
+	github: boolean;
+	facts?: GithubFactsState;
+	forkTouched?: boolean;
+	onForkDraft: (checked: boolean) => void;
+	onChange: (changes: Partial<SetupFields>) => void;
+	savePrMode: (value: boolean) => Promise<boolean>;
+	act: Act;
+	draft?: boolean;
+}) {
+	const hosted = useContext(HostedContext);
+	return (
+		<>
+			{step === 2 && (
+				<>
+					<section className="setup-sec">
+						<label className="add-check">
+							<input
+								type="checkbox"
+								checked={values.retro}
+								onChange={(e) => {
+									onChange({ retro: e.target.checked });
+								}}
+							/>
+							Retro
+							<span className="hint">
+								After each done task the supervisor proposes follow-up cards
+								from its retro.
+							</span>
+						</label>
+						<label className="add-check setup-sub">
+							<input
+								type="checkbox"
+								checked={values.retroFilter}
+								disabled={!values.retro}
+								onChange={(e) => {
+									onChange({ retroFilter: e.target.checked });
+								}}
+							/>
+							Friction filter
+							<span className="hint">
+								Keep only retro proposals that fix a friction the task hit.
+							</span>
+						</label>
+					</section>
+					{github && (
+						<SetupForkSection
+							facts={facts}
+							forkEffective={values.forkResearch}
+							forkTouched={forkTouched}
+							onForkDraft={onForkDraft}
+						/>
+					)}
+					<section className="setup-sec">
+						<label className="add-check">
+							<input
+								type="checkbox"
+								checked={values.holdUpdateMerges}
+								onChange={(e) => {
+									onChange({ holdUpdateMerges: e.target.checked });
+								}}
+							/>
+							Hold merges of update cards until you approve
+							<span className="hint">
+								Update cards wait at needs_you after a ready turn; your reply
+								approves the merge.
+							</span>
+						</label>
+						<label className="add-check">
+							<input
+								type="checkbox"
+								checked={values.forkMergeHold}
+								onChange={(e) => {
+									onChange({ forkMergeHold: e.target.checked });
+								}}
+							/>
+							Hold merges of fork-born cards until you approve
+							<span className="hint">
+								Fork-born cards wait at needs_you after a ready turn; your reply
+								approves the merge of the card's work.
+							</span>
+						</label>
+					</section>
+				</>
+			)}
+			{step === 3 && (
+				<section className="setup-sec">
+					<h3>Runners</h3>
+					<label className="settings-field">
+						Runner cap
+						<span className="hint">empty = no cap</span>
+						<input
+							type="number"
+							min={1}
+							max={8}
+							value={values.maxParallel}
+							onChange={(e) => onChange({ maxParallel: e.target.value })}
+						/>
+					</label>
+					<label className="settings-field">
+						Extra paths
+						<span className="hint">
+							copied into new worktrees, one per line
+						</span>
+						<textarea
+							rows={3}
+							value={values.copyExtra}
+							onChange={(e) => onChange({ copyExtra: e.target.value })}
+							placeholder="scripts/release.mjs"
+						/>
+					</label>
+				</section>
+			)}
+			{step === 4 && (
+				<section className="setup-sec settings-sec">
+					<h3>Project</h3>
+					{!hostedHidden(hosted, "project-merging-section") && (
+						<div className="alate-def-rows">
+							<CheckRow
+								name="PR mode"
+								desc={`${!github ? "Needs a GitHub remote. " : ""}${PR_MODE_DESC}`}
+								checked={values.prMode}
+								disabled={!github && !values.prMode}
+								save={savePrMode}
+								act={act}
+								onDraftChange={
+									draft ? (v) => onChange({ prMode: v }) : undefined
+								}
+							/>
+						</div>
+					)}
+					<label className="settings-field">
+						Target branch
+						<span className="hint">
+							the branch on origin that finished cards merge into; empty = the
+							repo's default branch.{" "}
+							{draft ? "Saved on Finish." : "Saved on Next."}
+						</span>
+						<input
+							type="text"
+							maxLength={200}
+							placeholder="main"
+							aria-label="Target branch for merges"
+							value={values.targetBranch}
+							onChange={(e) => onChange({ targetBranch: e.target.value })}
+						/>
+					</label>
+				</section>
+			)}
+		</>
 	);
 }
 
@@ -400,7 +592,6 @@ export function ProjectSetupSteps({
 	const [extra, setExtra] = useState(project.settings.copyExtra.join("\n"));
 	// Project step's target branch draft: persisted on Next.
 	const [tb, setTb] = useState(project.settings.targetBranch ?? "");
-	const hosted = useContext(HostedContext);
 
 	/** Saves one settings patch, refreshes the board's project state, and shows errors inline. */
 	const patch = (body: Record<string, unknown>): Promise<boolean> =>
@@ -540,142 +731,37 @@ export function ProjectSetupSteps({
 					{err}
 				</p>
 			)}
-			{step === 2 && (
-				<>
-					<section className="setup-sec">
-						<label className="add-check">
-							<input
-								type="checkbox"
-								checked={view.settings.retroSince !== null}
-								onChange={(e) => {
-									void patch({ retro: e.target.checked });
-								}}
-							/>
-							Retro
-							<span className="hint">
-								After each done task the supervisor proposes follow-up cards
-								from its retro.
-							</span>
-						</label>
-						<label className="add-check setup-sub">
-							<input
-								type="checkbox"
-								checked={view.settings.retroFilter}
-								disabled={view.settings.retroSince === null}
-								onChange={(e) => {
-									void patch({ retroFilter: e.target.checked });
-								}}
-							/>
-							Friction filter
-							<span className="hint">
-								Keep only retro proposals that fix a friction the task hit.
-							</span>
-						</label>
-					</section>
-					{view.github !== null && (
-						<SetupForkSection
-							view={view}
-							facts={facts}
-							forkEffective={forkEffective}
-							forkTouched={forkTouched.current}
-							onForkDraft={(checked) => {
-								forkTouched.current = true;
-								setForkDraft(checked);
-							}}
-						/>
-					)}
-					<section className="setup-sec">
-						<label className="add-check">
-							<input
-								type="checkbox"
-								checked={view.settings.holdUpdateMerges}
-								onChange={(e) => {
-									void patch({ holdUpdateMerges: e.target.checked });
-								}}
-							/>
-							Hold merges of update cards until you approve
-							<span className="hint">
-								Update cards wait at needs_you after a ready turn; your reply
-								approves the merge.
-							</span>
-						</label>
-						<label className="add-check">
-							<input
-								type="checkbox"
-								checked={view.settings.forkMergeHold}
-								onChange={(e) => {
-									void patch({ forkMergeHold: e.target.checked });
-								}}
-							/>
-							Hold merges of fork-born cards until you approve
-							<span className="hint">
-								Fork-born cards wait at needs_you after a ready turn; your reply
-								approves the merge of the card's work.
-							</span>
-						</label>
-					</section>
-				</>
-			)}
-			{step === 3 && (
-				<section className="setup-sec">
-					<h3>Runners</h3>
-					<label className="settings-field">
-						Runner cap
-						<span className="hint">empty = no cap</span>
-						<input
-							type="number"
-							min={1}
-							max={8}
-							value={mp}
-							onChange={(e) => setMp(e.target.value)}
-						/>
-					</label>
-					<label className="settings-field">
-						Extra paths
-						<span className="hint">
-							copied into new worktrees, one per line
-						</span>
-						<textarea
-							rows={3}
-							value={extra}
-							onChange={(e) => setExtra(e.target.value)}
-							placeholder="scripts/release.mjs"
-						/>
-					</label>
-				</section>
-			)}
-			{step === 4 && (
-				<section className="setup-sec settings-sec">
-					<h3>Project</h3>
-					{!hostedHidden(hosted, "project-merging-section") && (
-						<div className="alate-def-rows">
-							<CheckRow
-								name="PR mode"
-								desc={`${view.github === null ? "Needs a GitHub remote. " : ""}${PR_MODE_DESC}`}
-								checked={view.settings.prMode}
-								disabled={view.github === null && !view.settings.prMode}
-								save={(v) => patch({ prMode: v })}
-								act={act}
-							/>
-						</div>
-					)}
-					<label className="settings-field">
-						Target branch
-						<span className="hint">
-							the branch on origin that finished cards merge into; empty = the
-							repo's default branch. Saved on Next.
-						</span>
-						<input
-							type="text"
-							maxLength={200}
-							placeholder="main"
-							aria-label="Target branch for merges"
-							value={tb}
-							onChange={(e) => setTb(e.target.value)}
-						/>
-					</label>
-				</section>
-			)}
+			<SetupSettingsFields
+				step={step}
+				values={{
+					retro: view.settings.retroSince !== null,
+					retroFilter: view.settings.retroFilter,
+					forkResearch: forkEffective,
+					holdUpdateMerges: view.settings.holdUpdateMerges,
+					forkMergeHold: view.settings.forkMergeHold,
+					maxParallel: mp,
+					copyExtra: extra,
+					prMode: view.settings.prMode,
+					targetBranch: tb,
+				}}
+				github={view.github !== null}
+				facts={facts}
+				forkTouched={forkTouched.current || view.settings.forkResearch}
+				onForkDraft={(checked) => {
+					forkTouched.current = true;
+					setForkDraft(checked);
+				}}
+				onChange={(changes) => {
+					const { maxParallel, copyExtra, targetBranch, ...immediate } =
+						changes;
+					if (maxParallel !== undefined) setMp(maxParallel);
+					if (copyExtra !== undefined) setExtra(copyExtra);
+					if (targetBranch !== undefined) setTb(targetBranch);
+					if (Object.keys(immediate).length > 0) void patch(immediate);
+				}}
+				savePrMode={(v) => patch({ prMode: v })}
+				act={act}
+			/>
 			{step === 5 && (
 				<SetupRulesSection
 					gitless={gitless}
@@ -7607,6 +7693,7 @@ function CheckRow({
 	action,
 	save,
 	act,
+	onDraftChange,
 }: {
 	settingKey?: string;
 	name: string;
@@ -7623,6 +7710,8 @@ function CheckRow({
 	action?: ReactNode;
 	save: (checked: boolean) => Promise<unknown>;
 	act: Act;
+	/** A wizard draft changes locally and must not show a server save confirmation. */
+	onDraftChange?: (checked: boolean) => void;
 }) {
 	const id = useId();
 	const s = useOptimisticValue(checked, act);
@@ -7634,10 +7723,14 @@ function CheckRow({
 			<input
 				id={id}
 				type="checkbox"
-				checked={s.value}
+				checked={onDraftChange === undefined ? s.value : checked}
 				disabled={disabled || s.busy}
 				onChange={(e) => {
 					const v = e.target.checked;
+					if (onDraftChange !== undefined) {
+						onDraftChange(v);
+						return;
+					}
 					s.set(v);
 					s.run(() => save(v));
 				}}
@@ -7651,12 +7744,14 @@ function CheckRow({
 							{tag}
 						</span>
 					)}
-					<SaveTick
-						busy={s.busy}
-						saved={s.saved}
-						failed={s.failed}
-						reason={s.reason}
-					/>
+					{onDraftChange === undefined && (
+						<SaveTick
+							busy={s.busy}
+							saved={s.saved}
+							failed={s.failed}
+							reason={s.reason}
+						/>
+					)}
 				</b>
 				<span id={`${id}-desc`}>{desc}</span>
 			</div>

@@ -1008,12 +1008,15 @@ export function Modal({
 	onClose,
 	label,
 	className,
+	dismissible = true,
 	children,
 }: {
 	open?: boolean;
 	onClose: () => void;
 	label: string;
 	className?: string;
+	/** False blocks Escape and backdrop dismissal while an irreversible operation runs. */
+	dismissible?: boolean;
 	children: ReactNode;
 }) {
 	const ref = useRef<HTMLDialogElement | null>(null);
@@ -1031,9 +1034,20 @@ export function Modal({
 			ref={ref}
 			className={className}
 			aria-label={label}
-			onClose={onClose}
+			onCancel={(e) => {
+				if (!dismissible) e.preventDefault();
+			}}
+			onClose={(e) => {
+				if (open && !dismissible) {
+					// Chrome can close on a second Escape without a cancelable event.
+					if (!e.currentTarget.open) e.currentTarget.showModal();
+					return;
+				}
+				onClose();
+			}}
 			onClick={(e) => {
-				if (e.target === e.currentTarget) e.currentTarget.close(); // the backdrop; content sits in an inner wrapper
+				if (dismissible && e.target === e.currentTarget)
+					e.currentTarget.close(); // the backdrop; content sits in an inner wrapper
 			}}
 		>
 			{children}
@@ -1042,12 +1056,13 @@ export function Modal({
 }
 
 /** Closes the enclosing dialog natively, so its close event and focus return run. */
-export function CloseButton() {
+export function CloseButton({ disabled = false }: { disabled?: boolean }) {
 	return (
 		<button
 			type="button"
 			className="icon"
 			aria-label="Close"
+			disabled={disabled}
 			onClick={(e) => e.currentTarget.closest("dialog")?.close()}
 		>
 			<Icon name="x" />

@@ -6507,6 +6507,151 @@ dialog.confirm-dialog {
 	}
 }
 
+/* Local Add project drafts share the existing setup sections without fieldset chrome. */
+.add-wizard,
+.setup-fields {
+	display: grid;
+	gap: 12px;
+	min-width: 0;
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+.setup-source {
+	min-width: 0;
+	margin: 0;
+}
+/* A fixed frame keeps the title, step indicator, and actions at the same position.
+   Only the draft fields scroll. The existing Open setup layout stays unchanged. */
+.dialog.add-project-dialog {
+	height: min(720px, calc(100dvh - 24px));
+	max-height: calc(100dvh - 24px);
+	overflow: hidden;
+}
+.add-project-dialog[open] {
+	display: flex;
+	flex-direction: column;
+}
+.add-project-dialog > .dialog-body,
+.add-project-dialog .add-wizard {
+	flex: 1;
+	min-height: 0;
+	min-width: 0;
+}
+.add-project-dialog > .dialog-body {
+	overflow: hidden;
+}
+.add-project-dialog .dialog-head,
+.add-project-dialog .setup-steps,
+.add-project-dialog .dialog-actions {
+	flex: none;
+}
+.add-project-dialog .add-wizard {
+	display: flex;
+	flex-direction: column;
+}
+.add-project-dialog .setup-fields {
+	flex: 1;
+	grid-template-columns: minmax(0, 1fr);
+	align-content: start;
+	min-height: 0;
+	overflow-y: auto;
+	overflow-wrap: anywhere;
+	scrollbar-gutter: stable;
+	padding: 4px;
+	margin: -4px;
+}
+.add-project-dialog .setup-source {
+	grid-template-columns: minmax(0, 1fr);
+}
+.add-project-dialog .setup-source > [role="tabpanel"][hidden] {
+	display: none;
+}
+.add-project-dialog :is(input, textarea, select, label) {
+	min-width: 0;
+	max-width: 100%;
+}
+.add-project-dialog .settings-field {
+	max-width: none;
+}
+.add-project-dialog textarea {
+	width: 100%;
+}
+.add-project-dialog .setup-sec > h3 {
+	margin: 0;
+}
+.add-project-dialog input:is([type="checkbox"], [type="radio"]) {
+	flex: none;
+	width: 15px;
+	height: 15px;
+	accent-color: var(--accent);
+}
+.add-project-dialog .setup-steps {
+	min-width: 0;
+}
+.add-project-dialog .setup-steps li {
+	flex: 1 1 0;
+	flex-wrap: wrap;
+	justify-content: center;
+	gap: 2px 4px;
+	min-width: 0;
+	min-height: 48px;
+	padding: 6px 4px;
+	font-size: 12.5px;
+}
+.add-project-dialog .setup-steps .step-n {
+	flex-basis: 100%;
+	text-align: center;
+}
+.add-project-dialog .dialog-actions {
+	margin-top: 0;
+	padding-top: 12px;
+	border-top: 1px solid var(--line-soft);
+}
+.add-project-dialog .add-wizard > :is(.auth-error, [role="status"]) {
+	flex: none;
+	max-height: 20dvh;
+	overflow-y: auto;
+	overflow-wrap: anywhere;
+}
+@media (max-width: 600px) {
+	/* The current step and its count replace the strip, not a clipped label run. */
+	.add-project-dialog .setup-steps {
+		overflow: visible;
+	}
+	.add-project-dialog .setup-steps li:not([aria-current="step"]) {
+		display: none;
+	}
+	.add-project-dialog .setup-steps li[aria-current="step"] {
+		justify-content: space-between;
+		min-height: 40px;
+		padding: 0 8px;
+	}
+	.add-project-dialog .setup-steps .step-n {
+		display: inline;
+		flex-basis: auto;
+	}
+	body:has(.add-project-dialog[open]) .fab {
+		visibility: hidden;
+	}
+}
+@media (max-width: 440px) {
+	.add-project-dialog .dialog-actions > .primary {
+		flex: 1 0 100%;
+	}
+}
+@media (pointer: coarse) {
+	.add-project-dialog label.add-check {
+		min-height: 44px;
+	}
+	.add-project-dialog .check-row .alate-def-name label {
+		display: flex;
+		align-items: center;
+		min-height: 44px;
+		margin: -10px 0;
+	}
+}
+
 /* ---- Project setup wizard (Add project steps 2-4, Open setup) ---- */
 .setup-steps {
 	display: flex;
