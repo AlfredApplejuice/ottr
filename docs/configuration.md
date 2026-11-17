@@ -2,6 +2,13 @@
 
 ## Configuration
 
+Use **Search settings** on General or a project's settings page.
+The filter checks labels, keys, and descriptions.
+The filter ignores letter case.
+For example, `firecracker` finds **Run work turns in microVMs** on a project's page.
+Use **Clear search** to restore the full page.
+Search does not change settings or discard unsaved field values.
+
 | Setting | Default | How to change |
 |---|---|---|
 | Port | 4747 | env `PORT` |

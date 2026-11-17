@@ -94,6 +94,9 @@ Open <http://127.0.0.1:4747>.
 
 The full column list, research cards, backlog drafts, the second-model check and the review and release workflows: [How a task moves](docs/how-it-works.md#how-a-task-moves).
 
+Use **Search settings** to find a setting by label, key, or description on the current settings page.
+For example, `firecracker` finds the microVM setting.
+
 ## How it works
 
 | Stage | What happens |

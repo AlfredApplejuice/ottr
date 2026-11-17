@@ -2509,8 +2509,8 @@ async function mountHindsight(view: HindsightView) {
 	};
 }
 
-/** Mounts General settings with an optional fetch mock and act. By default, requests stay
- * pending and act runs nothing, so sections remain idle. Cleanup unmounts and restores fetch. */
+/** Mounts settings with optional page, fetch, and action fixtures. By default,
+ * requests stay pending. Cleanup unmounts and restores fetch. */
 async function mountPage(
 	trendingStatus: TrendingStatus = {
 		lastRunAt: null,
@@ -2520,8 +2520,14 @@ async function mountPage(
 	},
 	fetchMock?: typeof fetch,
 	actFn: (fn: () => Promise<void>) => Promise<boolean> = async () => true,
+	options: {
+		projects?: ProjectView[];
+		view?: string;
+		hosted?: boolean;
+	} = {},
 ): Promise<{
 	container: HTMLDivElement;
+	setView: (view: string) => Promise<void>;
 	unmount: () => Promise<void>;
 }> {
 	const realFetch = globalThis.fetch;
@@ -2533,10 +2539,10 @@ async function mountPage(
 	) as unknown as HTMLDivElement;
 	window.document.body.appendChild(container as unknown as HappyNode);
 	const root = createRoot(container);
-	await act(async () => {
+	const renderPage = (view: string) =>
 		root.render(
 			<SettingsPage
-				projects={[]}
+				projects={options.projects ?? []}
 				tasks={[]}
 				maxTotal={null}
 				reviewCheck={false}
@@ -2546,13 +2552,19 @@ async function mountPage(
 				commitIdentity={null}
 				trendingStatus={trendingStatus}
 				act={actFn}
-				view="settings"
+				view={view}
 				openTask={() => {}}
+				hosted={options.hosted}
 			/>,
 		);
+	await act(async () => {
+		renderPage(options.view ?? "settings");
 	});
 	return {
 		container,
+		setView: async (view) => {
+			await act(async () => renderPage(view));
+		},
 		unmount: async () => {
 			await act(async () => {
 				root.unmount();
@@ -2562,6 +2574,594 @@ async function mountPage(
 		},
 	};
 }
+
+describe("settings search", () => {
+	const project = {
+		name: "search-project",
+		icon: null,
+		remote: null,
+		github: null,
+		vmRunner: { configured: true, ok: true, reason: null },
+		hasRules: true,
+		gitless: false,
+		taskPrefix: "SEARCH",
+		settings: {
+			maxParallel: 2,
+			copyExtra: [],
+			displayName: null,
+			releaseCommand: null,
+			archReviewCap: 30,
+			maxImages: 4,
+			keptWorktreeDays: 7,
+			autoTend: false,
+			autoTendLimit: 5,
+			tendChurnGlobs: [],
+			holdUpdateMerges: false,
+			forkMergeHold: true,
+			retroSince: null,
+			retroFilter: true,
+			forkResearch: false,
+			prReviews: false,
+			prMode: false,
+			microVm: false,
+			pushSyncCommits: false,
+			setupChecklist: false,
+			targetBranch: null,
+			originUrl: null,
+			taskIdPrefix: null,
+		},
+	} as unknown as ProjectView;
+
+	const searchField = (container: HTMLElement): HTMLInputElement => {
+		const label = [...container.querySelectorAll("label")].find(
+			(node) => node.textContent?.trim() === "Search settings",
+		);
+		const field = label?.control ?? label?.querySelector("input");
+		if (!(field instanceof window.HTMLInputElement))
+			throw new Error("Search settings needs a visible input label");
+		return field as unknown as HTMLInputElement;
+	};
+
+	const search = async (
+		container: HTMLElement,
+		query: string,
+	): Promise<void> => {
+		const field = searchField(container);
+		await act(async () => {
+			typeInto(field, query);
+			onChangeOf(field)({ target: field });
+		});
+	};
+
+	const clearSearch = async (container: HTMLElement): Promise<void> => {
+		const button = [
+			...container.querySelectorAll<HTMLButtonElement>("button"),
+		].find(
+			(node) =>
+				node.closest("[hidden]") === null &&
+				(node.textContent?.trim() === "Clear search" ||
+					node.getAttribute("aria-label") === "Clear search"),
+		);
+		if (button === undefined) throw new Error("Clear search button missing");
+		await act(async () => button.click());
+	};
+
+	const visibleNames = (container: HTMLElement, selector: string): string[] =>
+		[...container.querySelectorAll(selector)]
+			.filter((node) => node.closest("[hidden]") === null)
+			.map((node) => node.textContent?.trim() ?? "");
+
+	const visibleSettings = (container: HTMLElement): string[] =>
+		[...container.querySelectorAll(".alate-def-row")]
+			.filter((row) => row.closest("[hidden]") === null)
+			.map((row) => {
+				const name = row.querySelector(".alate-def-name > b");
+				return (
+					name?.querySelector("label")?.textContent ??
+					name?.firstChild?.textContent ??
+					""
+				).trim();
+			});
+
+	const emptyStatus = (container: HTMLElement): Element | undefined =>
+		[...container.querySelectorAll('[role="status"]')].find(
+			(node) =>
+				node.closest("[hidden]") === null &&
+				/no .*settings.*match|no .*match.*settings/i.test(
+					node.textContent ?? "",
+				),
+		);
+
+	test("project search matches descriptions, keys, and labels without unrelated rows or groups", async () => {
+		const { container, unmount } = await mountPage(
+			undefined,
+			undefined,
+			undefined,
+			{
+				projects: [project],
+				view: `settings/${project.name}`,
+			},
+		);
+		try {
+			for (const query of [
+				"firecracker",
+				"FIRECRACKER",
+				"  firecracker  ",
+				"microVm",
+				"Run work turns",
+			]) {
+				await search(container, query);
+				expect(visibleSettings(container)).toEqual([
+					"Run work turns in microVMs",
+				]);
+				expect(visibleNames(container, ".settings-group-title")).toEqual([
+					"Work",
+				]);
+				expect(visibleNames(container, ".settings-sec h3")).toEqual([
+					"Runners",
+				]);
+				const map = visibleNames(container, ".settings-nav .smap-row");
+				expect(map.length).toBeGreaterThan(0);
+				expect(map.every((name) => name === "Work" || name === "Runners")).toBe(
+					true,
+				);
+			}
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("General search finds a description without the other row in its card", async () => {
+		const { container, unmount } = await mountPage();
+		try {
+			await search(container, "before they become cards");
+			expect(visibleSettings(container)).toEqual(["Review check"]);
+			expect(visibleNames(container, ".settings-group-title")).toEqual([
+				"Workflow",
+			]);
+			expect(visibleNames(container, ".settings-sec h3")).toEqual(["Checks"]);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("General githubHost search finds Host despite its different label", async () => {
+		const { container, unmount } = await mountPage(undefined, (async (
+			input: RequestInfo | URL,
+		) => {
+			const url = String(input);
+			if (url === "/api/git-hosts")
+				return Response.json({
+					tokens: [],
+					globalKey: null,
+					githubApp: null,
+					githubHost: "git.example.com",
+					githubTokenSet: false,
+					githubTokenReadable: true,
+				});
+			if (url === "/api/settings/github-token")
+				return Response.json({ tokenSet: false, expiresAt: null });
+			if (url === "/api/settings/turn-github-token")
+				return Response.json({ host: "git.example.com", tokens: [] });
+			return new Promise<Response>(() => {});
+		}) as typeof fetch);
+		try {
+			const field = container.querySelector<HTMLInputElement>(
+				'input[aria-label="GitHub host"]',
+			);
+			if (field === null) throw new Error("GitHub host input missing");
+			expect(field.value).toBe("git.example.com");
+			await search(container, "githubHost");
+			expect(visibleSettings(container)).toEqual(["Host"]);
+			expect(visibleNames(container, ".settings-sec h3")).toEqual(["GitHub"]);
+			expect(visibleNames(container, ".settings-group-title")).toEqual([
+				"Git and integrations",
+			]);
+			expect(field.closest("[hidden]")).toBeNull();
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("an Env response filters new rows and refreshes the map without a reset", async () => {
+		const response = Promise.withResolvers<Response>();
+		const reads: { method: string; url: string }[] = [];
+		const { container, unmount } = await mountPage(undefined, (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			if (String(input) === "/api/settings/env") {
+				reads.push({
+					method: init?.method ?? "GET",
+					url: String(input),
+				});
+				return response.promise;
+			}
+			return new Promise<Response>(() => {});
+		}) as typeof fetch);
+		try {
+			const card = container.querySelector("#env-section");
+			if (card === null) throw new Error("Env card missing");
+			const filter = searchField(container);
+			await search(container, "SERVICE_HOST");
+			expect(card.closest("[hidden]")).not.toBeNull();
+			expect(visibleNames(container, ".settings-nav .smap-row")).toEqual([]);
+			expect(emptyStatus(container)).toBeDefined();
+
+			await act(async () => {
+				response.resolve(
+					Response.json({
+						names: [
+							{
+								name: "SERVICE_HOST",
+								projects: ["search-project"],
+								plain: true,
+								set: true,
+								readable: true,
+								value: "plain-value-only-marker",
+							},
+							{
+								name: "LOG_LEVEL",
+								projects: ["search-project"],
+								plain: true,
+								set: true,
+								readable: true,
+								value: "debug",
+							},
+						],
+					}),
+				);
+			});
+			await act(async () => {
+				await window.happyDOM.waitUntilComplete();
+			});
+
+			const field = card.querySelector<HTMLInputElement>(
+				'input[aria-label="Env value for SERVICE_HOST"]',
+			);
+			const unrelated = card.querySelector(
+				'input[aria-label="Env value for LOG_LEVEL"]',
+			);
+			if (field === null || unrelated === null)
+				throw new Error("Deferred Env rows missing");
+			expect(container.querySelector("#env-section")).toBe(card);
+			expect(searchField(container)).toBe(filter);
+			expect(filter.value).toBe("SERVICE_HOST");
+			expect(field.closest("[hidden]")).toBeNull();
+			expect(unrelated.closest("[hidden]")).not.toBeNull();
+			expect(visibleNames(container, ".settings-sec h3")).toEqual(["Env"]);
+			expect(visibleNames(container, ".settings-group-title")).toEqual([
+				"Agent environment",
+			]);
+			expect(visibleNames(container, ".settings-nav .smap-row")).toContain(
+				"Env",
+			);
+			expect(emptyStatus(container)).toBeUndefined();
+
+			await search(container, "plain-value-only-marker");
+			expect(emptyStatus(container)).toBeDefined();
+			expect(visibleNames(container, ".settings-nav .smap-row")).toEqual([]);
+			expect(field.isConnected).toBe(true);
+			await clearSearch(container);
+			expect(
+				card.querySelector('input[aria-label="Env value for SERVICE_HOST"]'),
+			).toBe(field);
+			expect(field.closest("[hidden]")).toBeNull();
+			expect(unrelated.closest("[hidden]")).toBeNull();
+			expect(field.value).toBe("plain-value-only-marker");
+			expect(reads).toEqual([{ method: "GET", url: "/api/settings/env" }]);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("clear, whitespace, and no-match recovery retain the same unsaved draft without requests", async () => {
+		const requests: string[] = [];
+		const save = jest.fn(async (fn: () => Promise<void>) => {
+			await fn();
+			return true;
+		});
+		const { container, unmount } = await mountPage(
+			undefined,
+			(async (input: RequestInfo | URL) => {
+				requests.push(String(input));
+				return new Promise<Response>(() => {});
+			}) as typeof fetch,
+			save,
+			{ projects: [project], view: `settings/${project.name}` },
+		);
+		try {
+			const draft = container.querySelector<HTMLInputElement>(
+				'input[aria-label="Display name"]',
+			);
+			if (draft === null) throw new Error("Display name input missing");
+			const originalNames = visibleSettings(container);
+			const originalGroups = visibleNames(container, ".settings-group-title");
+			await act(async () => {
+				typeInto(draft, "draft-only-marker");
+				onChangeOf(draft)({ target: draft });
+			});
+			const baseline = [...requests];
+			await search(container, "firecracker");
+			expect(draft.closest("[hidden]")).not.toBeNull();
+			expect(draft.isConnected).toBe(true);
+			await clearSearch(container);
+			expect(searchField(container).value).toBe("");
+			expect(document.activeElement).toBe(searchField(container));
+			expect(visibleSettings(container)).toEqual(originalNames);
+			expect(visibleNames(container, ".settings-group-title")).toEqual(
+				originalGroups,
+			);
+			expect(container.querySelector('input[aria-label="Display name"]')).toBe(
+				draft,
+			);
+			expect(draft.value).toBe("draft-only-marker");
+
+			// A draft value is not a setting name, key, or description.
+			await search(container, "draft-only-marker");
+			expect(visibleSettings(container)).toEqual([]);
+			expect(visibleNames(container, ".settings-group-title")).toEqual([]);
+			expect(visibleNames(container, ".settings-sec h3")).toEqual([]);
+			expect(visibleNames(container, ".settings-nav .smap-row")).toEqual([]);
+			expect(emptyStatus(container)).toBeDefined();
+			await clearSearch(container);
+			expect(emptyStatus(container)).toBeUndefined();
+			expect(visibleSettings(container)).toEqual(originalNames);
+			await search(container, "firecracker");
+			await search(container, " \t ");
+			expect(visibleSettings(container)).toEqual(originalNames);
+			expect(visibleNames(container, ".settings-group-title")).toEqual(
+				originalGroups,
+			);
+			expect(draft.closest("[hidden]")).toBeNull();
+			expect(container.querySelector('input[aria-label="Display name"]')).toBe(
+				draft,
+			);
+			expect(draft.value).toBe("draft-only-marker");
+			await act(async () => {
+				await Bun.sleep(700);
+			});
+			expect(requests).toEqual(baseline);
+			expect(save).not.toHaveBeenCalled();
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("hosted project search cannot reveal the absent microVM setting", async () => {
+		const { container, unmount } = await mountPage(
+			undefined,
+			undefined,
+			undefined,
+			{
+				projects: [project],
+				view: `settings/${project.name}`,
+				hosted: true,
+			},
+		);
+		try {
+			const labels = () =>
+				[...container.querySelectorAll("label")].map(
+					(node) => node.textContent,
+				);
+			expect(labels()).not.toContain("Run work turns in microVMs");
+			for (const query of ["firecracker", "microVm"]) {
+				await search(container, query);
+				expect(visibleSettings(container)).toEqual([]);
+				expect(emptyStatus(container)).toBeDefined();
+				expect(labels()).not.toContain("Run work turns in microVMs");
+			}
+			await clearSearch(container);
+			expect(visibleSettings(container)).toContain("Runner cap");
+			expect(labels()).not.toContain("Run work turns in microVMs");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a valid deep link clears the filter before it reveals its card", async () => {
+		const originalUrl = window.location.href;
+		const { container, unmount } = await mountPage();
+		try {
+			await search(container, "before they become cards");
+			expect(
+				container.querySelector("#env-section")?.closest("[hidden]"),
+			).not.toBeNull();
+			await act(async () => {
+				window.location.hash = "#env-section";
+				window.dispatchEvent(
+					new window.PopStateEvent("popstate", { state: null }),
+				);
+			});
+			expect(searchField(container).value).toBe("");
+			expect(
+				container.querySelector("#env-section")?.closest("[hidden]"),
+			).toBeNull();
+			expect(pinnedRow(container)).toBe("Env");
+		} finally {
+			await unmount();
+			window.history.replaceState(null, "", originalUrl);
+		}
+	});
+
+	test("page navigation clears the filter on General and project pages", async () => {
+		const { container, setView, unmount } = await mountPage(
+			undefined,
+			undefined,
+			undefined,
+			{
+				projects: [project],
+			},
+		);
+		try {
+			await search(container, "before they become cards");
+			await setView(`settings/${project.name}`);
+			expect(searchField(container).value).toBe("");
+			expect(visibleSettings(container)).toContain("Display name");
+			expect(visibleSettings(container)).toContain("Runner cap");
+			await search(container, "firecracker");
+			await setView("settings");
+			expect(searchField(container).value).toBe("");
+			expect(visibleSettings(container)).toContain("Review check");
+			expect(visibleSettings(container)).toContain("Work check");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("General search stays empty after a project round trip without a query edit", async () => {
+		const { container, setView, unmount } = await mountPage(
+			undefined,
+			undefined,
+			undefined,
+			{
+				projects: [project],
+			},
+		);
+		try {
+			const originalNames = visibleSettings(container);
+			const originalGroups = visibleNames(container, ".settings-group-title");
+			const originalCards = visibleNames(container, ".settings-sec h3");
+			await search(container, "before they become cards");
+			expect(searchField(container).value).toBe("before they become cards");
+			expect(visibleSettings(container)).toEqual(["Review check"]);
+
+			await setView(`settings/${project.name}`);
+			expect(searchField(container).value).toBe("");
+			expect(visibleSettings(container)).toContain("Display name");
+			expect(visibleSettings(container)).toContain("Runner cap");
+			expect(emptyStatus(container)).toBeUndefined();
+
+			await setView("settings");
+			expect(searchField(container).value).toBe("");
+			expect(visibleSettings(container)).toEqual(originalNames);
+			expect(visibleNames(container, ".settings-group-title")).toEqual(
+				originalGroups,
+			);
+			expect(visibleNames(container, ".settings-sec h3")).toEqual(
+				originalCards,
+			);
+			expect(emptyStatus(container)).toBeUndefined();
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("Worktrees has a real Save that submits its exact patch after targetBranch search", async () => {
+		const posts: { url: string; method: string; body: unknown }[] = [];
+		const { container, unmount } = await mountPage(
+			undefined,
+			(async (input: RequestInfo | URL, init?: RequestInit) => {
+				if (init?.method === "POST") {
+					posts.push({
+						url: String(input),
+						method: init.method,
+						body: JSON.parse(String(init.body)),
+					});
+					return Response.json(project);
+				}
+				return new Promise<Response>(() => {});
+			}) as typeof fetch,
+			async (fn) => {
+				await fn();
+				return true;
+			},
+			{ projects: [project], view: `settings/${project.name}` },
+		);
+		try {
+			const card = container.querySelector("#project-worktrees-section");
+			const field = card?.querySelector<HTMLInputElement>(
+				'input[aria-label="Target branch for merges"]',
+			);
+			if (field === null || field === undefined)
+				throw new Error("Target branch input missing");
+			await act(async () => {
+				typeInto(field, "develop");
+				onChangeOf(field)({ target: field });
+			});
+			const save = [
+				...(card?.querySelectorAll<HTMLButtonElement>("button") ?? []),
+			].find((button) => button.textContent?.trim() === "Save");
+			if (save === undefined) throw new Error("Worktrees Save button missing");
+			expect(save.type).toBe("submit");
+			expect(save.disabled).toBe(false);
+			await search(container, "targetBranch");
+			expect(visibleSettings(container)).toEqual(["Target branch"]);
+			expect(save.closest("[hidden]")).toBeNull();
+			await act(async () => save.click());
+			expect(posts).toEqual([
+				{
+					url: "/api/projects/search-project/settings",
+					method: "POST",
+					body: {
+						targetBranch: "develop",
+						copyExtra: [],
+						keptWorktreeDays: 7,
+					},
+				},
+			]);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a Commit name match retains the shared Save while Commit email stays hidden", async () => {
+		const posts: { url: string; method: string; body: unknown }[] = [];
+		const { container, unmount } = await mountPage(
+			undefined,
+			(async (input: RequestInfo | URL, init?: RequestInit) => {
+				if (init?.method === "POST") {
+					posts.push({
+						url: String(input),
+						method: init.method,
+						body: JSON.parse(String(init.body)),
+					});
+					return Response.json({});
+				}
+				return new Promise<Response>(() => {});
+			}) as typeof fetch,
+			async (fn) => {
+				await fn();
+				return true;
+			},
+		);
+		try {
+			await search(container, "Commit name");
+			expect(visibleSettings(container)).toEqual(["Commit name"]);
+			const block = container.querySelector("#commit-identity-block");
+			const field = block?.querySelector<HTMLInputElement>(
+				'input[aria-label="Commit name (empty = Ottr)"]',
+			);
+			const email = block?.querySelector(
+				'input[aria-label="Commit email (empty = ottr@localhost)"]',
+			);
+			if (field === null || field === undefined)
+				throw new Error("Commit name input missing");
+			expect(email?.closest("[hidden]")).not.toBeNull();
+			await act(async () => {
+				typeInto(field, "Search author");
+				onChangeOf(field)({ target: field });
+			});
+			const save = [
+				...(block?.querySelectorAll<HTMLButtonElement>("button") ?? []),
+			].find((button) => button.textContent?.trim() === "Save");
+			if (save === undefined)
+				throw new Error("Commit identity Save button missing");
+			expect(save.closest("[hidden]")).toBeNull();
+			expect(save.disabled).toBe(false);
+			await act(async () => save.click());
+			expect(posts).toEqual([
+				{
+					url: "/api/settings",
+					method: "POST",
+					body: { commitName: "Search author", commitEmail: null },
+				},
+			]);
+		} finally {
+			await unmount();
+		}
+	});
+});
 
 describe("provider sign-in actions", () => {
 	for (const [active, label] of [

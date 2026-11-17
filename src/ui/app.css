@@ -5621,6 +5621,38 @@ dialog.confirm-dialog {
 .settings-content > h1 {
 	margin: 0;
 }
+.settings-search {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	min-width: 0;
+}
+.settings-search > label {
+	color: var(--text-strong);
+	font-size: 13px;
+	font-weight: 600;
+}
+.settings-search-controls {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: flex-end;
+	gap: 8px;
+}
+.settings-search-controls > input {
+	flex: 1 1 180px;
+	min-width: 0;
+	width: 100%;
+}
+.settings-search-controls > button {
+	flex: none;
+}
+.settings-search-status {
+	margin: 0;
+	color: var(--dim);
+}
+.settings-search-status:empty {
+	margin-top: -8px;
+}
 /* A project page stacks its sections inside one form; give the form the same column gap. */
 .settings-content > form {
 	display: flex;
@@ -8973,6 +9005,10 @@ button.log-mode[aria-pressed="true"] {
 .check-row > input:disabled + .alate-def-name label {
 	cursor: default;
 }
+.check-row .alate-def-name > b > .save-tick:empty {
+	min-width: 0;
+	margin-left: 0;
+}
 /* A muted pill after a row's name, e.g. "Not needed: private repo". */
 .check-row .alate-def-name b .state-chip {
 	margin-left: 8px;
@@ -9858,4 +9894,9 @@ dialog.updates {
 }
 .notify-hint {
 	color: var(--dim);
+}
+
+/* Keep native and filter-owned hidden elements outside the settings layout. */
+.settings-page .settings-content [hidden] {
+	display: none;
 }

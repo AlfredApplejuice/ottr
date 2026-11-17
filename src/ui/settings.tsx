@@ -6,6 +6,7 @@ import {
 	useContext,
 	useEffect,
 	useId,
+	useLayoutEffect,
 	useRef,
 	useState,
 } from "react";
@@ -95,6 +96,7 @@ import {
 	settingsPath,
 	settingsSub,
 } from "./route.ts";
+import { filterSettings } from "./settingsSearch.ts";
 import { refreshState } from "./socket.ts";
 import { age, stamp } from "./time.ts";
 
@@ -891,7 +893,7 @@ function TotalRunnersForm({
 			}
 		>
 			<form className="alate-def-rows" onSubmit={(e) => e.preventDefault()}>
-				<div className="alate-def-row cap-row">
+				<div className="alate-def-row cap-row" data-setting-key="maxTotal">
 					<div className="alate-def-name">
 						<b>
 							Runner cap
@@ -979,6 +981,7 @@ function ChecksSection({
 		>
 			<div className="alate-def-rows">
 				<CheckRow
+					settingKey="reviewCheck"
 					name="Review check"
 					desc="Check a review's findings with a second model before they become cards"
 					checked={reviewCheck}
@@ -986,6 +989,7 @@ function ChecksSection({
 					act={act}
 				/>
 				<CheckRow
+					settingKey="workCheck"
 					name="Work check"
 					desc="Check a work card with a second model before it enters the merge queue"
 					checked={workCheck}
@@ -1044,6 +1048,7 @@ function AutomationSection({
 		>
 			<div className="alate-def-rows">
 				<CheckRow
+					settingKey="idleReviews"
 					name="Run due reviews while idle"
 					desc="After two hours without input, and while no turn runs, the board files the architecture review card of the first project whose review is due, by itself"
 					checked={idleReviews}
@@ -1053,6 +1058,7 @@ function AutomationSection({
 				{/* The checkbox is the weekly schedule only; Scan trending now runs a scan
 				    whether or not it is checked. */}
 				<CheckRow
+					settingKey="trendingScan"
 					name="Weekly trending scan"
 					desc={
 						<>
@@ -1147,7 +1153,7 @@ function GitIdentitySection({
 						);
 					}}
 				>
-					<div className="alate-def-row">
+					<div className="alate-def-row" data-setting-key="commitName">
 						<div className="alate-def-name">
 							<b>
 								Commit name
@@ -1169,7 +1175,7 @@ function GitIdentitySection({
 							</label>
 						</div>
 					</div>
-					<div className="alate-def-row">
+					<div className="alate-def-row" data-setting-key="commitEmail">
 						<div className="alate-def-name">
 							<b>
 								Commit email
@@ -1189,8 +1195,10 @@ function GitIdentitySection({
 									aria-label="Commit email (empty = ottr@localhost)"
 								/>
 							</label>
-							<SaveButton form={formId} s={s} dirty={dirty} />
 						</div>
+					</div>
+					<div className="alate-def-actions">
+						<SaveButton form={formId} s={s} dirty={dirty} />
 					</div>
 				</form>
 			</div>
@@ -1642,6 +1650,7 @@ export function NotificationsSection({
 					{CLASS_ROWS.map((r) => (
 						<CheckRow
 							key={r.cls}
+							settingKey={`classes.${r.cls}`}
 							name={r.name}
 							desc={r.desc}
 							checked={classes[r.cls]}
@@ -1670,6 +1679,7 @@ export function NotificationsSection({
 					{byLabel(projects).map((p) => (
 						<CheckRow
 							key={p.name}
+							settingKey="mutedProjects"
 							name={`Mute ${projectLabel(p)}`}
 							desc="No push from this project; the bell still shows it"
 							checked={muted.includes(p.name)}
@@ -2448,7 +2458,7 @@ function SecretTokenForm<
 				}}
 			>
 				<div className="alate-def-rows">
-					<div className="alate-def-row">
+					<div className="alate-def-row" data-setting-key="token">
 						<div className="alate-def-name">
 							<b>
 								{title}
@@ -2802,6 +2812,7 @@ export function PendingKeyRow({
 	return (
 		<div className="pending-key">
 			<DefRow
+				settingKey="privateKey"
 				name="Private key"
 				help="Paste a private key without a passphrase and press Import, or press Generate for a new key made on the server. Ottr never shows the private key again."
 				shape="OpenSSH · no passphrase"
@@ -2995,6 +3006,7 @@ function GitHubAppBlock({
 				>
 					<div className="alate-def-rows">
 						<DefRow
+							settingKey="id"
 							name="App ID"
 							help="The numeric ID on the GitHub App's settings page."
 							shape="digits"
@@ -3012,6 +3024,7 @@ function GitHubAppBlock({
 							</label>
 						</DefRow>
 						<DefRow
+							settingKey="key"
 							name="Private key"
 							help="The app's private key, in PEM form, from the app's settings page. Ottr stores it and never shows it again."
 							shape="PEM · stored, never shown"
@@ -3097,6 +3110,7 @@ function GitHubConnectionBlock({
 			>
 				<div className="alate-def-rows">
 					<DefRow
+						settingKey="githubHost"
 						name="Host"
 						help="Where GitHub lives for this board: github.com, a *.ghe.com Enterprise Cloud host, or an Enterprise Server host. It steers the API calls, gh, PR links, releases and fork research. A saved value wins over the OTTR_GITHUB_HOST env. Empty resets to the env value or github.com."
 						shape="bare hostname"
@@ -3113,6 +3127,7 @@ function GitHubConnectionBlock({
 					</DefRow>
 					<div id="github-token-block" tabIndex={-1}>
 						<DefRow
+							settingKey="githubToken"
 							name="Token"
 							help="The board uses this token for its own git fetches, pushes and GitHub releases. Agents on workers never get it."
 							shape={`secret · stored, never shown${expiry === null ? "" : ` · ${expiry}`}`}
@@ -3338,6 +3353,7 @@ function TurnTokenBlock() {
 					>
 						<div className="alate-def-rows">
 							<DefRow
+								settingKey="token"
 								name={h}
 								shape="secret · stored, never shown"
 								action={
@@ -3461,6 +3477,7 @@ function GlobalKeyBlock({
 			<PendingKeyRow pending={pending} onPending={setPending} />
 			<div className="alate-def-rows">
 				<DefRow
+					settingKey="testUrl"
 					name="Test URL"
 					help="A repository that this key can read over SSH. Test checks access with the new key, or with the key in use, and saves nothing. Save key runs the same test and stores the new key only when it passes."
 					shape="SSH git URL"
@@ -3861,6 +3878,7 @@ export function GitHostsSection({
 					>
 						<div className="alate-def-rows">
 							<DefRow
+								settingKey="testUrl"
 								name="Test URL"
 								help="A repository on the host that the token can read. Ottr runs git ls-remote against it before it saves."
 								shape="https URL"
@@ -3941,6 +3959,7 @@ export function GitHostsSection({
 			>
 				<div className="alate-def-rows">
 					<DefRow
+						settingKey="host"
 						name="Host"
 						help="The git host this token is for. Ottr keeps one token for each host."
 						shape="hostname"
@@ -3963,6 +3982,7 @@ export function GitHostsSection({
 						</label>
 					</DefRow>
 					<DefRow
+						settingKey="username"
 						name="Username"
 						optional
 						help="The username that git sends with the token. GitHub hosts use x-access-token; most other hosts accept oauth2."
@@ -3983,6 +4003,7 @@ export function GitHostsSection({
 						</label>
 					</DefRow>
 					<DefRow
+						settingKey="token"
 						name="Token"
 						help="An HTTPS access token for the host. Ottr stores it and never shows it again."
 						shape="secret · stored, never shown"
@@ -4000,6 +4021,7 @@ export function GitHostsSection({
 						</label>
 					</DefRow>
 					<DefRow
+						settingKey="testUrl"
 						name="Test URL"
 						help="A repository that the token can read. Ottr runs git ls-remote against it before it saves the token."
 						shape="https URL"
@@ -4349,6 +4371,7 @@ export function JiraConnectionsSection() {
 				>
 					<div className="alate-def-rows">
 						<DefRow
+							settingKey="name"
 							name="Name"
 							help="The name that projects pick in their settings, for example work. It cannot change after the save."
 							shape="unique name"
@@ -4366,6 +4389,7 @@ export function JiraConnectionsSection() {
 							</label>
 						</DefRow>
 						<DefRow
+							settingKey="site"
 							name="Site URL"
 							help="The Jira address, with a context path when Jira has one. Ottr asks the site for its type when you leave the field."
 							shape="https URL"
@@ -4414,6 +4438,7 @@ export function JiraConnectionsSection() {
 							</div>
 						</DefRow>
 						<DefRow
+							settingKey="type"
 							name="Type"
 							help="Cloud signs in with an email and an API token. Data Center signs in with a personal access token."
 						>
@@ -4430,6 +4455,7 @@ export function JiraConnectionsSection() {
 						</DefRow>
 						{type === "cloud" && (
 							<DefRow
+								settingKey="email"
 								name="Email"
 								help="The email of the Atlassian account that owns the API token."
 								shape="email"
@@ -4448,6 +4474,7 @@ export function JiraConnectionsSection() {
 							</DefRow>
 						)}
 						<DefRow
+							settingKey="token"
 							name="Token"
 							help={
 								type === "cloud"
@@ -4483,6 +4510,7 @@ export function JiraConnectionsSection() {
 							</div>
 						</DefRow>
 						<DefRow
+							settingKey="customFields"
 							name="Custom field IDs"
 							help="Jira fields to copy into each card prompt, comma-separated, for example customfield_10042."
 							shape="empty = none"
@@ -4649,6 +4677,7 @@ function SshKeySection({ project }: { project: ProjectView }) {
 			<PendingKeyRow pending={pending} onPending={setPending} />
 			<div className="alate-def-rows">
 				<DefRow
+					settingKey="testUrl"
 					name="Test URL"
 					help="A repository that this key can read over SSH. Test checks access with the new key, or with the key in use, and saves nothing. Save key runs the same test and stores the new key only when it passes."
 					shape="SSH git URL"
@@ -4827,7 +4856,7 @@ export function EnvSection() {
 						</thead>
 						<tbody>
 							{byState(rows).map((row) => (
-								<tr key={row.name}>
+								<tr key={row.name} data-setting-key={row.name}>
 									<td>
 										<code>{row.name}</code>
 										{row.plain && <span className="env-kind">plain</span>}
@@ -5808,7 +5837,7 @@ function RoleRow({
 	const notesId =
 		field !== undefined || warnings.length > 0 ? `${uid}-${index}` : undefined;
 	return (
-		<div className="alate-def-row role-row">
+		<div className="alate-def-row role-row" data-setting-key={name}>
 			<b className="role-name">{name}</b>
 			<RoleModelPicker
 				label={`Model for ${name}`}
@@ -6695,7 +6724,7 @@ export function HindsightSection() {
 				}}
 			>
 				<div className="alate-def-rows">
-					<div className="alate-def-row">
+					<div className="alate-def-row" data-setting-key="url">
 						<div className="alate-def-name">
 							<b>
 								Server URL
@@ -6920,7 +6949,7 @@ function StoredKeyRow({
 	onRegenerate: () => void;
 }) {
 	return (
-		<div className="alate-def-row">
+		<div className="alate-def-row" data-setting-key="key">
 			<div className="alate-def-name">
 				<b>
 					Stored API key
@@ -7394,7 +7423,7 @@ export function AlateSection() {
 				}}
 			>
 				<div className="alate-def-rows">
-					<div className="alate-def-row">
+					<div className="alate-def-row" data-setting-key="url">
 						<div className="alate-def-name">
 							<b>
 								Alate server URL
@@ -7417,7 +7446,7 @@ export function AlateSection() {
 							/>
 						</label>
 					</div>
-					<div className="alate-def-row">
+					<div className="alate-def-row" data-setting-key="key">
 						<div className="alate-def-name">
 							<b>
 								Alate API key
@@ -7486,6 +7515,7 @@ type ChipTone = "ok" | "warn" | "off";
  *  `action` sits on the value's line at the right (the Save of a card's one typed field).
  *  DefRow, CheckRow and SaveCard implement DESIGN.md's Settings-Row Rule: follow it for new settings. */
 function DefRow({
+	settingKey,
 	name,
 	desc,
 	shape,
@@ -7494,6 +7524,7 @@ function DefRow({
 	action,
 	children,
 }: {
+	settingKey?: string;
 	name: string;
 	desc?: string;
 	shape?: string;
@@ -7505,7 +7536,7 @@ function DefRow({
 	children: ReactNode;
 }) {
 	return (
-		<div className="alate-def-row">
+		<div className="alate-def-row" data-setting-key={settingKey}>
 			<div className="alate-def-name">
 				<b>
 					{name}
@@ -7566,6 +7597,7 @@ function SaveTick({
  *  sit to its right. A change saves at once; the box shows the new value until the board
  *  state catches up, and rolls back if the save fails. `sub` indents a dependent option. */
 function CheckRow({
+	settingKey,
 	name,
 	tag,
 	desc,
@@ -7576,6 +7608,7 @@ function CheckRow({
 	save,
 	act,
 }: {
+	settingKey?: string;
 	name: string;
 	/** Text or nodes; a dependent row puts its link to the master switch here. */
 	desc: ReactNode;
@@ -7596,6 +7629,7 @@ function CheckRow({
 	return (
 		<div
 			className={`alate-def-row check-row${sub === true ? " check-sub" : ""}`}
+			data-setting-key={settingKey}
 		>
 			<input
 				id={id}
@@ -8065,6 +8099,10 @@ const pickActiveToc = (
 	ids: readonly string[],
 	setActive: (id: string | null) => void,
 ): void => {
+	ids = ids.filter((id) => {
+		const target = document.getElementById(id);
+		return target !== null && target.closest("[hidden]") === null;
+	});
 	const root = scrollerOf(document.getElementById(ids[0] ?? "")?.parentElement);
 	const r = root ?? document.documentElement;
 	const box = root?.getBoundingClientRect() ?? {
@@ -8119,13 +8157,15 @@ function GeneralSettingsContent({
 		pageToc(general, host).some((g) => g.id === id);
 	return (
 		<>
-			<details className="settings-toc-mobile">
-				<summary>
-					On this page
-					<Icon name="chevron-right" size={16} />
-				</summary>
-				{map}
-			</details>
+			{map !== null && (
+				<details className="settings-toc-mobile">
+					<summary>
+						On this page
+						<Icon name="chevron-right" size={16} />
+					</summary>
+					{map}
+				</details>
+			)}
 			{groupShown("board-group") && (
 				<section
 					className="settings-group"
@@ -8279,12 +8319,59 @@ export function SettingsPage({
 	const general = project === null;
 	const host = hosted === true;
 	const [active, setActive] = useState<string | null>(null);
+	const [search, setSearch] = useState({ view, query: "" });
+	const query = search.view === view ? search.query : "";
+	const searchId = useId();
+	const searchInput = useRef<HTMLInputElement>(null);
+	const content = useRef<HTMLDivElement>(null);
+	const [visible, setVisible] = useState<{
+		view: string;
+		ids: ReadonlySet<string>;
+	} | null>(null);
+	const clearSearch = () => {
+		pinned.current = null;
+		setSearch({ view, query: "" });
+		searchInput.current?.focus();
+	};
+	useEffect(() => {
+		setSearch((previous) =>
+			previous.view === view ? previous : { view, query: "" },
+		);
+	}, [view]);
 	// The clicked entry stays current until the user scrolls, because the end of the page can show several cards.
 	const pinned = useRef<string | null>(null);
 	const onPick = (id: string) => {
 		pinned.current = id;
 		setActive(id);
 	};
+	useLayoutEffect(() => {
+		const root = content.current;
+		if (root === null) return;
+		const apply = () => {
+			const ids = filterSettings(root, query);
+			setVisible((previous) =>
+				previous?.view === view &&
+				previous.ids.size === ids.size &&
+				[...ids].every((id) => previous.ids.has(id))
+					? previous
+					: { view, ids },
+			);
+			if (pinned.current === null)
+				pickActiveToc(
+					tocIds(pageToc(general, host).flatMap((g) => g.sections)),
+					setActive,
+				);
+		};
+		apply();
+		// Async settings can add rows. Attributes are not observed, so hiding cannot loop.
+		const observer = new window.MutationObserver(apply);
+		observer.observe(root, {
+			childList: true,
+			characterData: true,
+			subtree: true,
+		});
+		return () => observer.disconnect();
+	}, [general, host, query, view]);
 	// Scroll-spy: the last card whose top passed a reading line near the scroll root's top is current; at the bottom, the last card.
 	// The line stays above the shortest card's height, so a short card scrolled to the top never hands over to the next one.
 	useEffect(() => {
@@ -8336,6 +8423,8 @@ export function SettingsPage({
 				).includes(id)
 			)
 				return;
+			setSearch({ view, query: "" });
+			if (content.current !== null) filterSettings(content.current, "");
 			pinned.current = id;
 			setActive(id);
 			cancel = scrollToSectionWhenPresent(id);
@@ -8347,14 +8436,26 @@ export function SettingsPage({
 			cancel?.();
 		};
 	}, [general, host, view]);
-	const map = (
-		<SettingsMap
-			groups={pageToc(general, host)}
-			hash={general ? SETTINGS_HASH : view}
-			active={active}
-			onPick={onPick}
-		/>
-	);
+	const groups = pageToc(general, host)
+		.map((group) => ({
+			...group,
+			sections: group.sections.filter(
+				(section) =>
+					query.trim() === "" ||
+					visible?.view !== view ||
+					visible.ids.has(section.id),
+			),
+		}))
+		.filter((group) => group.sections.length > 0);
+	const map =
+		groups.length === 0 ? null : (
+			<SettingsMap
+				groups={groups}
+				hash={general ? SETTINGS_HASH : view}
+				active={active}
+				onPick={onPick}
+			/>
+		);
 	return (
 		<div className="settings-page">
 			<nav className="settings-nav" aria-label="Settings sections">
@@ -8387,8 +8488,37 @@ export function SettingsPage({
 					</Fragment>
 				))}
 			</nav>
-			<div className="settings-content" key={view}>
+			<div className="settings-content" key={view} ref={content}>
 				<h1>Settings</h1>
+				<div className="settings-search">
+					<label htmlFor={searchId}>Search settings</label>
+					<div className="settings-search-controls">
+						<input
+							ref={searchInput}
+							id={searchId}
+							type="search"
+							autoComplete="off"
+							spellCheck={false}
+							value={query}
+							onChange={(event) => {
+								pinned.current = null;
+								setSearch({ view, query: event.target.value });
+							}}
+						/>
+						{query !== "" && (
+							<button type="button" className="ghost" onClick={clearSearch}>
+								Clear search
+							</button>
+						)}
+					</div>
+					<p className="settings-search-status" role="status">
+						{query.trim() !== "" &&
+						visible?.view === view &&
+						visible.ids.size === 0
+							? "No settings match your search. Clear search to show all settings."
+							: ""}
+					</p>
+				</div>
 				{project === null ? (
 					<GeneralSettingsContent
 						map={map}
@@ -8406,13 +8536,15 @@ export function SettingsPage({
 					/>
 				) : (
 					<>
-						<details className="settings-toc-mobile">
-							<summary>
-								On this page
-								<Icon name="chevron-right" size={16} />
-							</summary>
-							{map}
-						</details>
+						{map !== null && (
+							<details className="settings-toc-mobile">
+								<summary>
+									On this page
+									<Icon name="chevron-right" size={16} />
+								</summary>
+								{map}
+							</details>
+						)}
 						<ProjectSettingsForm
 							key={project.name}
 							project={project}
@@ -8524,6 +8656,7 @@ function ProjectMergingCard({
 		>
 			<div className="alate-def-rows">
 				<CheckRow
+					settingKey="prMode"
 					name="PR mode"
 					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${PR_MODE_DESC}`}
 					checked={st.prMode}
@@ -8533,6 +8666,7 @@ function ProjectMergingCard({
 				/>
 				{/* U7: hold update-card merges at needs_you until a reply approves them. */}
 				<CheckRow
+					settingKey="holdUpdateMerges"
 					name="Hold update merges"
 					desc="Update cards wait at needs_you after a ready turn; your reply approves the merge"
 					checked={st.holdUpdateMerges}
@@ -8541,6 +8675,7 @@ function ProjectMergingCard({
 				/>
 				{/* OTTR-689: hold fork-born card merges at needs_you until a reply approves them. */}
 				<CheckRow
+					settingKey="forkMergeHold"
 					name="Hold fork-born merges"
 					desc="Fork-born cards wait at needs_you; your reply approves the merge of the card's work before it reaches the target branch. Turning this off does not release parked cards"
 					checked={st.forkMergeHold}
@@ -8548,6 +8683,7 @@ function ProjectMergingCard({
 					act={act}
 				/>
 				<CheckRow
+					settingKey="pushSyncCommits"
 					name="Push sync commits"
 					desc="When the local target branch holds commits origin lacks, the board pushes it to origin on its own (OTTR-531); off needs the board's Push to origin button"
 					checked={st.pushSyncCommits}
@@ -8619,6 +8755,7 @@ function ProjectWatchesCard({
 		>
 			<div className="alate-def-rows">
 				<CheckRow
+					settingKey="issueWatch"
 					name="Issue watch"
 					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("issues to watch")}Hourly watch of GitHub issues opened after you turn this on; each new issue becomes a backlog card and gets the ottr-tracked label`}
 					tag={privateTag}
@@ -8628,6 +8765,7 @@ function ProjectWatchesCard({
 					act={act}
 				/>
 				<CheckRow
+					settingKey="prReviews"
 					name="PR reviews"
 					desc={
 						<>
@@ -8655,6 +8793,7 @@ function ProjectWatchesCard({
 					}
 				/>
 				<CheckRow
+					settingKey="prReviewNotify"
 					sub
 					name="PR review notifications"
 					desc="Bell and push when a review draft arrives or is rewritten, and when new comments land after a posted review; needs PR reviews"
@@ -8664,6 +8803,7 @@ function ProjectWatchesCard({
 					act={act}
 				/>
 				<CheckRow
+					settingKey="prReviewApprove"
 					sub
 					name="PR review approvals"
 					desc="The Post click also approves the PR (one APPROVE review with the comment as its body) when the draft has no blocking findings; needs PR reviews"
@@ -8673,6 +8813,7 @@ function ProjectWatchesCard({
 					act={act}
 				/>
 				<CheckRow
+					settingKey="prReviewRequestChanges"
 					sub
 					name="PR review request changes"
 					desc="When the draft has a blocking finding, the Post click requests changes on GitHub instead of commenting; needs PR reviews"
@@ -8682,6 +8823,7 @@ function ProjectWatchesCard({
 					act={act}
 				/>
 				<CheckRow
+					settingKey="forkResearch"
 					name="Fork research"
 					desc={`${privateNote("forks to watch")}Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval`}
 					tag={privateTag}
@@ -8690,6 +8832,7 @@ function ProjectWatchesCard({
 					act={act}
 				/>
 				<CheckRow
+					settingKey="ompWatch"
 					name="omp watch"
 					desc="Hourly, a model reads each new omp release's notes. A fail files a card and holds the pin. A pass files a card that bumps Dockerfile.worker."
 					checked={st.ompWatch}
@@ -8697,6 +8840,7 @@ function ProjectWatchesCard({
 					act={act}
 				/>
 				<CheckRow
+					settingKey="dependabotWarn"
 					name="Dependabot warning"
 					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Warns on the project page when Dependabot alerts are off for the repo on GitHub; the warning links to GitHub's page to turn them on. Probed at boot and hourly`}
 					checked={st.dependabotWarn}
@@ -8738,6 +8882,7 @@ function ProjectProposalsCard({
 		>
 			<div className="alate-def-rows">
 				<CheckRow
+					settingKey="retro"
 					name="Retro"
 					desc="After each done task the supervisor proposes follow-up cards from its retro"
 					checked={st.retroSince !== null}
@@ -8745,6 +8890,7 @@ function ProjectProposalsCard({
 					act={act}
 				/>
 				<CheckRow
+					settingKey="retroFilter"
 					sub
 					name="Friction filter"
 					desc="Keep only retro proposals that fix a friction the task hit; needs Retro"
@@ -8754,6 +8900,7 @@ function ProjectProposalsCard({
 					act={act}
 				/>
 				<CheckRow
+					settingKey="trendingScout"
 					name="Trending scout"
 					desc={
 						<>
@@ -8869,6 +9016,7 @@ function ProjectIdentitySection({
 				{(save, ident) => (
 					<>
 						<DefRow
+							settingKey="displayName"
 							name="Display name"
 							optional
 							help="A friendly name for the board. The folder and the repo keep their real names."
@@ -8901,6 +9049,7 @@ function ProjectIdentitySection({
 							</div>
 						</DefRow>
 						<DefRow
+							settingKey="taskIdPrefix"
 							name="Task ID prefix"
 							help="The handle in task ids, like OTTR in OTTR-429. Empty uses the folder-derived handle. Cards that already exist keep their ids."
 							shape="empty = from folder name"
@@ -8971,6 +9120,7 @@ function ProjectIdentitySection({
 			>
 				<div className="alate-def-rows">
 					<DefRow
+						settingKey="icon"
 						name="Project icon"
 						help="An image that replaces the project's letters on the board. Without one, Ottr uses the repo owner's avatar or the host's favicon, and then the letters."
 						shape="PNG, JPEG, WebP or GIF"
@@ -9039,6 +9189,7 @@ function ProjectIdentitySection({
 						</div>
 					</DefRow>
 					<DefRow
+						settingKey="iconText"
 						name="Text marker"
 						action={
 							<SaveButton
@@ -9165,6 +9316,7 @@ function ProjectSlotsSection({
 				{(save) => (
 					<>
 						<DefRow
+							settingKey="maxParallel"
 							name="Runner cap"
 							action={save}
 							help="The most tasks of this project that run at the same time. The board-wide runner cap still applies."
@@ -9182,6 +9334,7 @@ function ProjectSlotsSection({
 						</DefRow>
 						{!hosted && (
 							<CheckRow
+								settingKey="microVm"
 								name="Run work turns in microVMs"
 								desc={microVmDesc(project, st.microVm)}
 								checked={st.microVm}
@@ -9221,9 +9374,10 @@ function ProjectSlotsSection({
 					'A card that kept its worktree ("Kept the worktree: …" after a turn, "Cancel kept the worktree: …" after a cancel) sits until you answer it. After the idle days below (0 = immediately) the supervisor quarantines its untracked files into .tasks/quarantine and removes the worktree — but only when no tracked change or unpushed commit would be lost.'
 				}
 			>
-				{(_save, wtS) => (
+				{(save, wtS) => (
 					<>
 						<DefRow
+							settingKey="targetBranch"
 							name="Target branch"
 							help="The branch on origin that finished cards merge into. Leave empty to use the repo's default branch (origin/HEAD), or the main checkout's upstream when origin/HEAD is missing."
 							shape="branch name · empty = default"
@@ -9256,6 +9410,7 @@ function ProjectSlotsSection({
 							</div>
 						</DefRow>
 						<DefRow
+							settingKey="copyExtra"
 							name="Extra paths"
 							help="Files that git ignores but agents need, for example local config. Ottr copies them into each new worktree."
 							shape="one path per line"
@@ -9271,6 +9426,7 @@ function ProjectSlotsSection({
 							</label>
 						</DefRow>
 						<DefRow
+							settingKey="keptWorktreeDays"
 							name="Quarantine after"
 							help="How long a kept worktree can stay idle. Then Ottr moves its untracked files to .tasks/quarantine and removes the worktree, but only when no work would be lost."
 							shape="days · 0 = immediately"
@@ -9287,6 +9443,7 @@ function ProjectSlotsSection({
 								/>
 							</label>
 						</DefRow>
+						<div className="alate-def-actions">{save}</div>
 					</>
 				)}
 			</SaveCard>
@@ -9304,6 +9461,7 @@ function ProjectSlotsSection({
 				{(save) => (
 					<>
 						<DefRow
+							settingKey="maxImages"
 							name="Max images"
 							action={save}
 							help="The most images you can attach to one message: a new task, a reply, a follow-up or a steer."
@@ -9375,6 +9533,7 @@ function ProjectJiraSection({
 		>
 			<div className="alate-def-rows">
 				<DefRow
+					settingKey="jiraConnection"
 					name="Jira connection"
 					help="The board connection that Import from Jira on this board searches. None hides the button."
 					shape="empty = none"
@@ -9475,6 +9634,7 @@ function ProjectReviewsCards({
 				{(save) => (
 					<>
 						<DefRow
+							settingKey="releaseCommand"
 							name="Release command"
 							action={save}
 							help="A script that publishes the release after the review approves it. Empty: Ottr makes the git tag and the GitHub release itself."
@@ -9508,6 +9668,7 @@ function ProjectReviewsCards({
 				{(save) => (
 					<>
 						<DefRow
+							settingKey="archReviewCap"
 							name="Review interval"
 							action={save}
 							help="Ottr marks a review as due after this many new commits on the target branch."
