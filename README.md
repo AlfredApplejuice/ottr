@@ -97,6 +97,12 @@ Open <http://127.0.0.1:4747>.
 Use **Search settings** to find a setting by label, key, or description on the current settings page.
 For example, `firecracker` finds the microVM setting.
 
+The agent overview keeps model quotas separate from external service balances and usage windows.
+External service sources are internal server configuration, not a user setting.
+The default source list is empty.
+Live activation requires a separately approved server secret source.
+See the [service quota specification](docs/specs/service-quotas.md) for the integration boundary.
+
 ## How it works
 
 | Stage | What happens |

@@ -214,6 +214,7 @@ import {
 	taskPath,
 	viewPath,
 } from "./route.ts";
+import { ServiceQuotas } from "./serviceQuotas.tsx";
 import {
 	alateHint,
 	asError,
@@ -1332,16 +1333,18 @@ function systemQuotaSection(quota: QuotaState | null): ReactNode {
 
 /** Overview indicators in the app bar; the button opens the detail popover (agents and quota).
  *  While any container warns, a warning link to the System view sits beside the button. */
-function SystemBar({
+export function SystemBar({
 	tasks,
 	maxTotal,
 	quota,
+	serviceQuotas,
 	navigate,
 	hosted,
 }: {
 	tasks: TaskCard[];
 	maxTotal: number | null;
 	quota: QuotaState | null;
+	serviceQuotas?: StateResponse["serviceQuotas"];
 	/** Plain-click navigation to a view path (see navClick). */
 	navigate: (path: string) => void;
 	/** Hosted mode has no System view, so no warning link. */
@@ -1394,6 +1397,7 @@ function SystemBar({
 				    Running counts preparing todo slots too. */}
 				{systemAgents(slots, maxTotal, used, waiting)}
 				{!hosted && systemQuotaSection(quota)}
+				{!hosted && <ServiceQuotas sources={serviceQuotas} now={Date.now()} />}
 			</div>
 			{/* Outside the meters button: a link cannot nest in a button. Rendered only while a
 			    container warns, so the bar stays grey at rest. */}
@@ -17476,6 +17480,7 @@ export function App() {
 						tasks={tasks}
 						maxTotal={state.maxTotal}
 						quota={state.quota}
+						serviceQuotas={state.serviceQuotas}
 						navigate={navigate}
 						hosted={hosted}
 					/>

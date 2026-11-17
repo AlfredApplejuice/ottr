@@ -15,6 +15,8 @@ import type {
 	PrReviewView,
 	PrRunState,
 	ReleasePlan,
+	ServiceQuotaMetric,
+	ServiceQuotaSourceState,
 	StateResponse,
 	Task,
 	TaskCard,
@@ -33,6 +35,7 @@ import {
 import { resetCatalogCache } from "./models.ts";
 // Static: notify.ts reads localStorage only when called, never at load.
 import { loadAskDrafts, saveAskDraft } from "./notify.ts";
+import { ServiceQuotas } from "./serviceQuotas.tsx";
 
 // app.tsx reads sessionStorage at module load; bun test has no browser storage.
 globalThis.sessionStorage = {
@@ -93,6 +96,7 @@ const {
 	appInboxMeta,
 	AppInboxBell,
 	AppInboxPanel,
+	SystemBar,
 } = await import("./app.tsx");
 const {
 	monogram,
@@ -14325,5 +14329,372 @@ describe("Inbox panel ack footer", () => {
 		const meta = askedMeta(17);
 		expect(meta.inbox.fresh.length).toBe(1);
 		expect(footerButton(meta)).toBe(false);
+	});
+});
+
+describe("service quotas in the overview", () => {
+	const observedAt = 1_700_000_000_000;
+	const balance: ServiceQuotaMetric = {
+		id: "balance",
+		label: "Credits",
+		kind: "balance",
+		unit: { kind: "currency", code: "EUR" },
+		remaining: -0.125,
+		reportedTotal: null,
+		resetsAt: null,
+		providerStatus: null,
+		plan: null,
+	};
+	const windowMetric: ServiceQuotaMetric = {
+		id: "window",
+		label: "Requests",
+		kind: "window",
+		unit: { kind: "count", name: "requests" },
+		used: 25,
+		limit: 100,
+		startsAt: null,
+		resetsAt: null,
+	};
+	const source = (
+		id = "account-a",
+		metrics: readonly ServiceQuotaMetric[] = [balance],
+	): ServiceQuotaSourceState => ({
+		id,
+		adapterId: "service-v2",
+		label: "anthropic",
+		status: "ok",
+		lastAttemptAt: observedAt,
+		nextAttemptAt: observedAt + 60_000,
+		sample: { observedAt, metrics },
+		error: null,
+	});
+	const documentOf = (html: string) => {
+		const document = new Window().document;
+		document.body.innerHTML = html;
+		return document;
+	};
+	const services = (
+		sources: readonly ServiceQuotaSourceState[] | undefined,
+		now = observedAt,
+	) =>
+		documentOf(
+			renderToStaticMarkup(<ServiceQuotas sources={sources} now={now} />),
+		);
+	const quota: StateResponse["quota"] = {
+		at: observedAt,
+		error: null,
+		limits: [
+			{
+				provider: "anthropic",
+				label: "Model window",
+				window: null,
+				windowLabel: null,
+				plan: null,
+				usedPct: 42,
+				resetsAt: null,
+			},
+		],
+	};
+	const overview = (
+		modelQuota: StateResponse["quota"],
+		sources: StateResponse["serviceQuotas"],
+		hosted = false,
+	) =>
+		documentOf(
+			renderToStaticMarkup(
+				<SystemBar
+					tasks={[]}
+					maxTotal={3}
+					quota={modelQuota}
+					serviceQuotas={sources}
+					hosted={hosted}
+					navigate={() => {}}
+				/>,
+			),
+		);
+
+	test("model quotas coexist with ordered service identities and equal labels", () => {
+		const document = overview(quota, [
+			source("account-b"),
+			source("account-a"),
+		]);
+		expect(document.querySelector("#system-detail")?.textContent).toContain(
+			"Provider quota",
+		);
+		expect(document.querySelector(".qt")?.textContent).toContain(
+			"Model window",
+		);
+		expect(document.querySelector(".qt")?.textContent).toContain("42 %");
+		expect(
+			[...document.querySelectorAll(".service-source h3")].map(
+				(node) => node.textContent,
+			),
+		).toEqual(["anthropic", "anthropic"]);
+		const identities = [
+			...document.querySelectorAll(".service-source > .caption:first-of-type"),
+		].map((node) => node.textContent);
+		expect(identities).toEqual([
+			"Source: account-b · Adapter: service-v2",
+			"Source: account-a · Adapter: service-v2",
+		]);
+		expect(document.querySelector(".meters")?.outerHTML).toBe(
+			overview(quota, undefined).querySelector(".meters")?.outerHTML,
+		);
+		expect(
+			document.querySelector("#system-detail")?.getAttribute("popover"),
+		).toBe("auto");
+		expect(
+			document.querySelector(".meters")?.getAttribute("popovertarget"),
+		).toBe("system-detail");
+	});
+
+	test("services remain visible without model quota and never supply the bar metric", () => {
+		const document = overview(null, [source()]);
+		expect(document.querySelector("#system-detail")?.textContent).toContain(
+			"Checking omp usage",
+		);
+		expect(document.querySelector(".service-quotas")?.textContent).toContain(
+			"EUR -0.125 remaining",
+		);
+		expect(document.querySelector(".meters")?.outerHTML).toBe(
+			overview(null, undefined).querySelector(".meters")?.outerHTML,
+		);
+	});
+
+	test("absent and empty services stay hidden and hosted mode hides supplied service data", () => {
+		expect(services(undefined).body.textContent).toBe("");
+		expect(services([]).body.textContent).toBe("");
+		const document = overview(quota, [source()], true);
+		expect(document.querySelector(".service-quotas")).toBeNull();
+		expect(document.querySelector("#system-detail")?.textContent).not.toContain(
+			"Provider quota",
+		);
+	});
+
+	test("balances preserve signed fractions and count units without percentages or invented resets", () => {
+		const document = services([
+			source("account-a", [
+				balance,
+				{
+					...balance,
+					id: "generations",
+					label: "Generations",
+					unit: { kind: "count", name: "generations" },
+					remaining: 12.75,
+					reportedTotal: 2_000,
+					providerStatus: "active",
+					plan: "Monthly",
+				},
+			]),
+		]);
+		expect(document.body.textContent).toContain("EUR -0.125 remaining");
+		expect(document.body.textContent).toContain("12.75 generations remaining");
+		expect(document.body.textContent).toContain(
+			"Provider total: 2,000 generations",
+		);
+		expect(document.body.textContent).toContain("Provider status: active");
+		expect(document.body.textContent).toContain("Plan: Monthly");
+		expect(document.body.textContent).not.toContain("%");
+		expect(document.body.textContent).not.toContain("Resets");
+		expect(document.body.textContent).not.toContain("Starts");
+		expect(document.querySelector(".mark")).toBeNull();
+	});
+
+	test("zero windows show raw values and positive windows retain over-limit percentages", () => {
+		for (const [used, limit, expected] of [
+			[3, 0, null],
+			[25, 100, "25 % used"],
+			[125, 100, "125 % used"],
+		] as const) {
+			const document = services([
+				source("account-a", [{ ...windowMetric, used, limit }]),
+			]);
+			expect(
+				document.querySelector(".service-metric dd > div:first-child")
+					?.textContent,
+			).toBe(`Used: ${used} requests`);
+			expect(
+				document.querySelector(".service-metric dd > div:nth-child(2)")
+					?.textContent,
+			).toBe(`Limit: ${limit} requests`);
+			if (expected === null)
+				expect(document.body.textContent).not.toContain("%");
+			else expect(document.body.textContent).toContain(expected);
+			expect(document.querySelector(".mark")).toBeNull();
+		}
+	});
+
+	test("equal metric labels retain their order and only reported dates appear", () => {
+		const document = services([
+			source("account-a", [
+				{ ...balance, label: "Allowance", reportedTotal: 0 },
+				{
+					...windowMetric,
+					label: "Allowance",
+					startsAt: observedAt,
+					resetsAt: observedAt + 60_000,
+				},
+			]),
+		]);
+		expect(
+			[...document.querySelectorAll("dt")].map((node) => node.textContent),
+		).toEqual(["Allowance", "Allowance"]);
+		const rows = document.querySelectorAll(".service-metric");
+		expect(rows[0]?.textContent).toContain("Provider total: EUR 0");
+		expect(rows[0]?.textContent).not.toContain("Resets");
+		expect(rows[1]?.textContent).toContain("Starts");
+		expect(rows[1]?.textContent).toContain("Resets");
+	});
+
+	test("service-only state updates survive card reuse without changing model quota", () => {
+		const task = cardFixture({ id: "service-state" });
+		const prev = {
+			tasks: [task],
+			quota,
+			serviceQuotas: [],
+		} as unknown as StateResponse;
+		const next = { ...prev, tasks: [{ ...task }], serviceQuotas: [source()] };
+		const merged = reuseCards(prev, next);
+		expect(merged.serviceQuotas).toBe(next.serviceQuotas);
+		expect(merged.quota).toBe(quota);
+		expect(merged.tasks).toBe(prev.tasks);
+	});
+
+	test("old frames become stale at the five-minute boundary and retain observed age", () => {
+		const frame = [source()];
+		expect(services(frame, observedAt + 299_999).body.textContent).toContain(
+			"Current · Observed 4m ago",
+		);
+		for (const elapsed of [300_000, 300_001, 360_000]) {
+			const text = services(frame, observedAt + elapsed).body.textContent;
+			expect(text).toContain(
+				`Stale · Observed ${Math.floor(elapsed / 60_000)}m ago`,
+			);
+			expect(text).toContain("EUR -0.125 remaining");
+		}
+	});
+
+	test("unconfigured pending and first-read errors stay explicit without fake balances", () => {
+		const identity = {
+			id: "account-a",
+			adapterId: "service-v2",
+			label: "anthropic",
+		};
+		const states: ServiceQuotaSourceState[] = [
+			{
+				...identity,
+				status: "unconfigured",
+				sample: null,
+				lastAttemptAt: null,
+				nextAttemptAt: null,
+				error: { code: "configuration" },
+			},
+			{
+				...identity,
+				id: "pending",
+				status: "pending",
+				sample: null,
+				lastAttemptAt: null,
+				nextAttemptAt: observedAt,
+				error: null,
+			},
+			{
+				...identity,
+				id: "error",
+				status: "error",
+				sample: null,
+				lastAttemptAt: observedAt,
+				nextAttemptAt: null,
+				error: { code: "authentication", httpStatus: 401, retryAfterAt: null },
+			},
+		];
+		const document = services(states);
+		expect(document.body.textContent).toContain("Unconfigured");
+		expect(document.body.textContent).toContain(
+			"Server configuration is missing or invalid",
+		);
+		expect(document.body.textContent).toContain("Pending");
+		expect(document.body.textContent).toContain(
+			"The first provider read has not completed",
+		);
+		expect(document.body.textContent).toContain("Error");
+		expect(document.body.textContent).toContain(
+			"The provider refused the server credentials. HTTP 401.",
+		);
+		expect(document.body.textContent).toContain("Automatic reads are paused");
+		expect(document.querySelectorAll(".service-metric")).toHaveLength(0);
+		const statusRows = document.querySelectorAll(".service-status");
+		expect(statusRows[0]?.getAttribute("data-level")).toBe("needs");
+		expect(statusRows[0]?.querySelector(".mark-needs")).not.toBeNull();
+		expect(statusRows[1]?.querySelector(".mark")).toBeNull();
+		expect(statusRows[2]?.getAttribute("data-level")).toBe("crit");
+		expect(statusRows[2]?.querySelector(".mark-crit")).not.toBeNull();
+	});
+
+	test("refresh errors retain stale samples and their original observed age", () => {
+		const stale: ServiceQuotaSourceState = {
+			...source(),
+			status: "stale",
+			staleReason: "refresh_error",
+			sample: { observedAt, metrics: [balance] },
+			lastAttemptAt: observedAt + 60_000,
+			nextAttemptAt: observedAt + 120_000,
+			error: { code: "network", httpStatus: null, retryAfterAt: null },
+		};
+		for (const elapsed of [60_000, 360_000]) {
+			const document = services([stale], observedAt + elapsed);
+			expect(document.body.textContent).toContain(
+				`Stale · Observed ${elapsed / 60_000}m ago`,
+			);
+			expect(document.body.textContent).toContain("EUR -0.125 remaining");
+			expect(document.body.textContent).toContain(
+				"The server could not reach the provider.",
+			);
+			expect(document.body.textContent).toContain(
+				"The server will retry automatically.",
+			);
+			expect(document.querySelector(".mark")).toBeNull();
+		}
+	});
+
+	test("provider labels status and plan remain plain text", () => {
+		const unsafe = '<img src=x onerror="alert(1)"><script>alert(2)</script>';
+		const document = services([
+			{
+				...source("account-a", [
+					{ ...balance, label: unsafe, plan: unsafe, providerStatus: unsafe },
+				]),
+				label: unsafe,
+			},
+		]);
+		expect(document.querySelectorAll("img, script")).toHaveLength(0);
+		expect(document.querySelector(".service-source h3")?.textContent).toBe(
+			unsafe,
+		);
+		expect(document.querySelector("dt")?.textContent).toBe(unsafe);
+		expect(document.body.textContent).toContain(`Provider status: ${unsafe}`);
+		expect(document.body.textContent).toContain(`Plan: ${unsafe}`);
+	});
+
+	test("generated balances preserve numeric values without a percentage denominator", () => {
+		fc.assert(
+			fc.property(fc.integer({ min: -1_000_000, max: 1_000_000 }), (n) => {
+				const remaining = n / 8;
+				const document = services([
+					source("account-a", [{ ...balance, remaining, reportedTotal: 1 }]),
+				]);
+				const value =
+					document.querySelector(".service-metric dd > div")?.textContent ?? "";
+				expect(
+					Number(
+						value
+							.replace("EUR ", "")
+							.replace(" remaining", "")
+							.replaceAll(",", ""),
+					),
+				).toBe(remaining);
+				expect(document.body.textContent).not.toContain("%");
+			}),
+		);
 	});
 });

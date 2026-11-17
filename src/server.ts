@@ -1001,6 +1001,15 @@ const app = await createApp({
 	vmTokens,
 	llmGateway: () => llmGateway,
 	hosted,
+	// No live secret source is approved. Keep internal bindings empty and server-only.
+	serviceQuotas:
+		hosted === undefined
+			? {
+					sources: [],
+					registry: new Map(),
+					resolveCredential: () => undefined,
+				}
+			: undefined,
 	secretBox,
 	ompStats: { info: ompStatsInfo, dashboard: ompStatsDashboard },
 });
@@ -1078,6 +1087,9 @@ if (backup.keep !== 0) {
 	every(backupNow, 3_600_000);
 }
 
+// Service due checks never wait for statistics or model quota work.
+app.checkServiceQuotas();
+every(() => app.checkServiceQuotas(), 30_000);
 // System sampler, one for all tabs (and for /api/system in polling mode): container and VM
 // readings, self-update checks and the usage quota live behind sampleStats() in the request layer.
 runWork(() => app.sampleStats());

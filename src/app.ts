@@ -326,6 +326,10 @@ import {
 } from "./scheduler.ts";
 import { migrateSealedConfig, sealStoredConfigRow } from "./sealedConfig.ts";
 import { isSealed, type SecretBox } from "./secretBox.ts";
+import {
+	createServiceQuotaCoordinator,
+	type ServiceQuotaCoordinatorOptions,
+} from "./serviceQuotas.ts";
 import { sessionContext } from "./session.ts";
 import {
 	type AskDraft,
@@ -633,8 +637,9 @@ interface AppDeps {
 		id: string,
 	): { text: string; at?: number } | null;
 	schedule: () => void | Promise<void>;
-	/** Node env style clock for the idle-review logic only; tests inject a fixed clock.
-	 * Defaults to Date.now. */
+	/** Internal service bindings only. The app owns their clock and publication lifecycle. */
+	serviceQuotas?: Omit<ServiceQuotaCoordinatorOptions, "now" | "onChange">;
+	/** Clock for idle reviews and service quota freshness; defaults to Date.now. */
 	now?: () => number;
 	/** OTTR-1071: the server wiring's next regular hourly PR poll (its grid), for the
 	 * Settings watches row. Absent in narrow test mounts, so the state payload then
@@ -1880,9 +1885,7 @@ function createAppClockDefaults(deps: AppDeps): {
 	slowApiMs: number;
 } {
 	return {
-		// Idle clock (docs/specs/mutation-delta.md §7): only the idle-review logic reads it,
-		// and tests inject a fixed clock. It initializes at createApp, so a board restart
-		// counts as input and never starts a review right after boot.
+		// Idle reviews and service quotas share the app clock. A restart counts as input.
 		now: deps.now ?? Date.now,
 		// OTTR-715: the slow-request log ceiling (see api()).
 		slowApiMs: deps.slowApiMs ?? 500,
@@ -5710,6 +5713,9 @@ export async function createApp(deps: AppDeps) {
 			},
 			serverVersion: deps.serverVersion,
 			quota,
+			...(deps.hosted === undefined && {
+				serviceQuotas: serviceQuotas?.getState() ?? [],
+			}),
 			// Absent on self-hosted boards, so their payload stays as before.
 			...(deps.hosted !== undefined && { hosted: true }),
 			// Hosted mode has no admin login: the proxy authenticates, so setup never opens.
@@ -6921,6 +6927,19 @@ export async function createApp(deps: AppDeps) {
 	}
 	let quota: QuotaState | null = null;
 	let refreshingQuota = false;
+	const serviceQuotas =
+		deps.hosted === undefined && deps.serviceQuotas !== undefined
+			? createServiceQuotaCoordinator({
+					...deps.serviceQuotas,
+					now,
+					onChange: publishSoon,
+				})
+			: null;
+
+	/** Independent of the statistics sampler and model quota refresh guards. */
+	function checkServiceQuotas(): void {
+		if (!closing) serviceQuotas?.checkDue();
+	}
 
 	// Push layer: one WebSocket topic per board tab. Null until the port is bound; every publish
 	// path below must be a no-op before that (boot-time schedule() runs first).
@@ -6980,6 +6999,7 @@ export async function createApp(deps: AppDeps) {
 	function close(): Promise<void> {
 		if (closePromise !== null) return closePromise;
 		closing = true;
+		serviceQuotas?.dispose();
 		if (stateTimer !== null) {
 			clearTimeout(stateTimer);
 			stateTimer = null;
@@ -14603,6 +14623,7 @@ export async function createApp(deps: AppDeps) {
 		},
 		socketCount: () => sockets,
 		sampleStats,
+		checkServiceQuotas,
 		alateProvisionTick: () =>
 			backgroundTick("alate provision", alateProvisionTick),
 		idleReviewTick: () => backgroundTick("idle review", idleReviewTick),

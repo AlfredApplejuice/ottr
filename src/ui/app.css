@@ -1634,6 +1634,66 @@ textarea {
 	font-weight: 600;
 	color: var(--text);
 }
+/* Services keep account identities and raw balances separate from model quota meters. */
+.service-source + .service-source {
+	margin-top: 14px;
+	padding-top: 12px;
+	border-top: 1px solid var(--line-soft);
+}
+.service-source {
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+.service-source h3 {
+	margin: 0;
+	font-size: 12.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.service-status {
+	display: flex;
+	align-items: baseline;
+	gap: 4px;
+}
+.service-status .mark {
+	align-self: center;
+}
+.service-status[data-level="needs"] {
+	color: var(--alarm);
+}
+.service-status[data-level="crit"] {
+	color: var(--crit-text);
+}
+.service-metrics {
+	margin: 8px 0 0;
+	font-size: 12.5px;
+}
+.service-metric {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+	gap: 8px;
+}
+.service-metric + .service-metric {
+	margin-top: 8px;
+}
+.service-metric dt {
+	color: var(--dim);
+}
+.service-metric dd {
+	margin: 0;
+	text-align: right;
+	font-variant-numeric: tabular-nums;
+	color: var(--text-strong);
+}
+.service-metric .caption {
+	margin-top: 4px;
+}
+@media (max-width: 480px) {
+	.service-metric {
+		grid-template-columns: minmax(0, 1fr);
+		gap: 4px;
+	}
+}
 .project-id h1,
 .overview h1,
 .system-view h1,

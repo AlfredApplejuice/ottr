@@ -1,7 +1,7 @@
 # External service quotas
 
-Status: shared contracts, bounded transport, and independent cache implemented in step 2.
-The PixelLab adapter, runtime state integration, and UI remain pending.
+Status: shared contracts, bounded transport, independent cache, server state integration, and overview display are implemented.
+The PixelLab adapter and approved live activation remain separate steps.
 
 This specification implements recommended step 1 from the OTTR-1092 research report carried by OTTR-1101.
 It defines the contract for the later implementation cards.
@@ -605,6 +605,13 @@ The transport catches decoder exceptions as `internal` and never publishes excep
 Step 2 tests use generated, harmless credential values.
 They require no real credential, provider account, or approved secret name.
 The README needs no setup change because this step does not activate the feature.
+
+Step 4 connects the cache to the shared state builder and independent boot and 30-second due checks.
+The overview separates service balances and windows from model quotas.
+The production source list and adapter registry remain empty.
+No server secret source is approved, so this step enables no live provider reads.
+Tests supply isolated readers and generated credentials through the internal dependency.
+Hosted boards neither create readers nor serialize service state.
 
 Step 5 executes all acceptance checks before any live balance read.
 A live read also requires approval for the server secret source and the authenticated read itself.

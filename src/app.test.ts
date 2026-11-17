@@ -46,7 +46,12 @@ import {
 	workerSignInWarnings,
 	workerTmpWarnings,
 } from "./app.ts";
-import { hashPassword, signIdentity, signSession } from "./auth.ts";
+import {
+	hashPassword,
+	SESSION_COOKIE,
+	signIdentity,
+	signSession,
+} from "./auth.ts";
 import type { DeepenCheck } from "./deepen.ts";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import type { GhFn } from "./forks.ts";
@@ -80,6 +85,7 @@ import {
 	WORK_CHECK_SENDBACK_OPENING,
 } from "./prompts.ts";
 import { PR_GATES } from "./prs.ts";
+import { forModel, tightestFor, usageReset } from "./quota.ts";
 import { createRunSink } from "./runner.ts";
 import {
 	archReviewDue,
@@ -98,6 +104,7 @@ import {
 	workCheckDivergeReason,
 } from "./scheduler.ts";
 import { loadSecretBox, type SecretBox } from "./secretBox.ts";
+import { createServiceQuotaHttpReader } from "./serviceQuotaHttp.ts";
 import { ProjectStore } from "./store.ts";
 import { prFeedbackReason } from "./supervisor.ts";
 import fc from "./test/properties.ts";
@@ -110,7 +117,16 @@ import {
 	MERGE_HOLD_MISMATCH_REASON,
 	UPDATE_HOLD_REASON,
 } from "./turn.ts";
-import type { QuotaLimit, QuotaState, TaskCard } from "./types.ts";
+import type {
+	QuotaLimit,
+	QuotaState,
+	ServiceQuotaAdapterDefinition,
+	ServiceQuotaMetric,
+	ServiceQuotaReadResult,
+	ServiceQuotaSourceConfig,
+	StateResponse,
+	TaskCard,
+} from "./types.ts";
 import {
 	type AddProjectResponse,
 	answeredCard,
@@ -543,6 +559,8 @@ async function mount(
 		latestRelease?: Parameters<typeof createApp>[0]["latestRelease"];
 		/** Idle-review clock seam (docs/specs/mutation-delta.md §7); defaults to Date.now. */
 		now?: () => number;
+		serviceQuotas?: Parameters<typeof createApp>[0]["serviceQuotas"];
+		prod?: boolean;
 		schedule?: () => void;
 		runnerTurns?: Parameters<typeof createApp>[0]["runnerTurns"];
 		runners?: Parameters<typeof createApp>[0]["runners"];
@@ -610,6 +628,8 @@ async function mount(
 		claimedPids: () => new Set<number>(),
 		schedule: input.schedule ?? (() => {}),
 		now: input.now,
+		serviceQuotas: input.serviceQuotas,
+		prod: input.prod,
 		serverVersion: input.serverVersion ?? "test",
 		port: 0,
 		publicHosts: input.publicHosts ?? [],
@@ -23843,5 +23863,584 @@ describe("app fixture shutdown", () => {
 		expect(order).toEqual(["fetch", "sample", "close"]);
 		await closeTestStore(g);
 		await closeTestStore(projectStore);
+	});
+});
+
+describe("service quota runtime integration", () => {
+	const interval = 300_000;
+	const metrics: readonly ServiceQuotaMetric[] = [
+		{
+			id: "credits",
+			label: "Credits",
+			kind: "balance",
+			unit: { kind: "currency", code: "USD" },
+			remaining: -2.75,
+			reportedTotal: 12.5,
+			resetsAt: null,
+			providerStatus: null,
+			plan: null,
+		},
+		{
+			id: "generations",
+			label: "Generations",
+			kind: "window",
+			unit: { kind: "count", name: "images" },
+			used: 12,
+			limit: 10,
+			startsAt: null,
+			resetsAt: null,
+		},
+	];
+	const success: ServiceQuotaReadResult = { ok: true, metrics };
+	const source = (id: string): ServiceQuotaSourceConfig => ({
+		id,
+		adapterId: "fixture",
+		label: id,
+		credentialEnv: `fixture-${crypto.randomUUID()}`,
+	});
+	const options = (
+		sources: ServiceQuotaSourceConfig[],
+		createReader: ServiceQuotaAdapterDefinition["createReader"],
+	): NonNullable<Parameters<typeof createApp>[0]["serviceQuotas"]> => ({
+		sources,
+		registry: new Map([["fixture", { id: "fixture", createReader }]]),
+		resolveCredential: () => crypto.randomUUID(),
+	});
+	// Unlike mount.call, this never invalidates the state cache for the code under test.
+	const rawState = async (m: { server: Server<undefined> }) => {
+		const response = await fetch(new URL("/api/state", m.server.url), {
+			headers: { Host: "127.0.0.1:0" },
+		});
+		expect(response.status).toBe(200);
+		return (await response.json()) as StateResponse;
+	};
+	const socketState = (
+		server: Server<undefined>,
+		headers: Record<string, string> = {},
+	) => {
+		const url = new URL("/api/ws", server.url);
+		url.protocol = "ws:";
+		const BunWebSocket = WebSocket as typeof WebSocket & {
+			new (url: string | URL, options: Bun.WebSocketOptions): WebSocket;
+		};
+		const socket = new BunWebSocket(url, {
+			headers: { Origin: server.url.origin, ...headers },
+		});
+		const nextState = (
+			matches: (state: StateResponse) => boolean = () => true,
+		) => {
+			const received = Promise.withResolvers<StateResponse>();
+			const message = (event: MessageEvent) => {
+				const frame = JSON.parse(String(event.data)) as {
+					type: string;
+					state?: StateResponse;
+				};
+				if (frame.type === "state" && frame.state && matches(frame.state))
+					received.resolve(frame.state);
+			};
+			const failed = () =>
+				received.reject(new Error("service state socket failed"));
+			socket.addEventListener("message", message);
+			socket.addEventListener("error", failed);
+			socket.addEventListener("close", failed);
+			// This deadline bounds real socket I/O, not a guessed completion wait.
+			const timer = setTimeout(
+				() => received.reject(new Error("service state socket timed out")),
+				5_000,
+			);
+			return received.promise.finally(() => {
+				clearTimeout(timer);
+				socket.removeEventListener("message", message);
+				socket.removeEventListener("error", failed);
+				socket.removeEventListener("close", failed);
+			});
+		};
+		return { socket, state: nextState(), nextState };
+	};
+
+	test("state requests read only cache and a fast source publishes while a slow source stays active", async () => {
+		const slow = Promise.withResolvers<ServiceQuotaReadResult>();
+		const fast = Promise.withResolvers<ServiceQuotaReadResult>();
+		const reads = [mock(() => slow.promise), mock(() => fast.promise)];
+		let factories = 0;
+		const m = await mount({
+			serviceQuotas: options([source("slow"), source("fast")], () => ({
+				read: reads[factories++]!,
+			})),
+		});
+		const initial = await Promise.all(
+			Array.from({ length: 8 }, () => rawState(m)),
+		);
+		for (const state of initial)
+			expect(state.serviceQuotas?.map((s) => s.status)).toEqual([
+				"pending",
+				"pending",
+			]);
+		expect(reads.map((read) => read.mock.calls.length)).toEqual([0, 0]);
+		expect(m.app.checkServiceQuotas()).toBeUndefined();
+		m.app.checkServiceQuotas();
+		expect(reads.map((read) => read.mock.calls.length)).toEqual([1, 1]);
+		fast.resolve(success);
+		await fast.promise;
+		const updated = await rawState(m);
+		expect(updated.serviceQuotas?.map((s) => s.status)).toEqual([
+			"pending",
+			"ok",
+		]);
+		expect(updated.serviceQuotas?.[1]?.sample?.metrics).toEqual(metrics);
+		await Promise.all(Array.from({ length: 8 }, () => rawState(m)));
+		expect(reads.map((read) => read.mock.calls.length)).toEqual([1, 1]);
+		slow.resolve(success);
+		await slow.promise;
+		expect((await rawState(m)).serviceQuotas?.map((s) => s.status)).toEqual([
+			"ok",
+			"ok",
+		]);
+	});
+
+	test("five-minute expiration publishes during an active refresh and errors retry only when due", async () => {
+		let now = 1_800_000_000_000;
+		const firstAt = now;
+		const attempts = Array.from({ length: 3 }, () =>
+			Promise.withResolvers<ServiceQuotaReadResult>(),
+		);
+		let calls = 0;
+		const m = await mount({
+			now: () => now,
+			serviceQuotas: options([source("account")], () => ({
+				read: () => attempts[calls++]!.promise,
+			})),
+		});
+		m.app.checkServiceQuotas();
+		attempts[0]!.resolve(success);
+		await attempts[0]!.promise;
+		expect((await rawState(m)).serviceQuotas?.[0]?.status).toBe("ok");
+		now += interval - 1;
+		m.app.checkServiceQuotas();
+		expect(calls).toBe(1);
+		now++;
+		m.app.checkServiceQuotas();
+		expect(calls).toBe(2);
+		const expired = (await rawState(m)).serviceQuotas?.[0];
+		expect(expired).toMatchObject({
+			status: "stale",
+			staleReason: "expired",
+			error: null,
+			sample: { observedAt: firstAt, metrics },
+		});
+		m.app.checkServiceQuotas();
+		expect(calls).toBe(2);
+		attempts[1]!.resolve({
+			ok: false,
+			error: { code: "http", httpStatus: 503, retryAfterAt: null },
+		});
+		await attempts[1]!.promise;
+		expect((await rawState(m)).serviceQuotas?.[0]).toMatchObject({
+			status: "stale",
+			staleReason: "refresh_error",
+			lastAttemptAt: now,
+			nextAttemptAt: now + interval,
+			sample: { observedAt: firstAt, metrics },
+			error: { code: "http", httpStatus: 503 },
+		});
+		now += interval - 1;
+		m.app.checkServiceQuotas();
+		expect(calls).toBe(2);
+		now++;
+		m.app.checkServiceQuotas();
+		expect(calls).toBe(3);
+		attempts[2]!.resolve(success);
+		await attempts[2]!.promise;
+		expect((await rawState(m)).serviceQuotas?.[0]).toMatchObject({
+			status: "ok",
+			lastAttemptAt: now,
+			nextAttemptAt: now + interval,
+			sample: { observedAt: now, metrics },
+			error: null,
+		});
+	});
+
+	test("missing credentials preserve configuration order and send zero requests to the bound listener", async () => {
+		let requests = 0;
+		const listener = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch() {
+				requests++;
+				return Response.json(metrics);
+			},
+		});
+		mounted.push(listener);
+		const createReader = mock(({ credential }: { credential: string }) =>
+			createServiceQuotaHttpReader({
+				endpoint: `https://${listener.url.host}/quota`,
+				credential,
+				decode: (body) => body,
+				fetch: Object.assign(
+					(_input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+						fetch(new URL("/quota", listener.url), init),
+					{ preconnect: fetch.preconnect },
+				),
+			}),
+		);
+		const config = options([source("second"), source("first")], createReader);
+		config.resolveCredential = () => undefined;
+		const m = await mount({ serviceQuotas: config });
+		m.app.checkServiceQuotas();
+		m.app.checkServiceQuotas();
+		const state = await rawState(m);
+		expect(state.serviceQuotas?.map((s) => [s.id, s.status])).toEqual([
+			["second", "unconfigured"],
+			["first", "unconfigured"],
+		]);
+		expect(
+			state.serviceQuotas?.every(
+				(s) =>
+					s.sample === null &&
+					s.lastAttemptAt === null &&
+					s.nextAttemptAt === null &&
+					s.error?.code === "configuration",
+			),
+		).toBe(true);
+		expect(createReader).not.toHaveBeenCalled();
+		expect(requests).toBe(0);
+	});
+
+	test("the real HTTP reader publishes raw balance and window metrics without secret data", async () => {
+		const credential = crypto.randomUUID();
+		const configSource = source("account");
+		const endpoint = "https://quota.example.test/v2/balance";
+		const requests: { method: string; url: string }[] = [];
+		const listener = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(req) {
+				expect(req.method).toBe("GET");
+				expect(new URL(req.url).pathname).toBe("/v2/balance");
+				expect(req.headers.get("authorization")).toBe(`Bearer ${credential}`);
+				expect(req.headers.get("accept")).toBe("application/json");
+				expect(await req.text()).toBe("");
+				// Synthetic adapter fixture, not a provider-specific schema decoder.
+				return Response.json(metrics);
+			},
+		});
+		mounted.push(listener);
+		const logs: unknown[][] = [];
+		const log = spyOn(console, "log").mockImplementation((...args) =>
+			logs.push(args),
+		);
+		const error = spyOn(console, "error").mockImplementation((...args) =>
+			logs.push(args),
+		);
+		let readCompleted: Promise<ServiceQuotaReadResult> | undefined;
+		try {
+			const config = options([configSource], ({ credential: bound }) => {
+				const reader = createServiceQuotaHttpReader({
+					endpoint,
+					credential: bound,
+					decode: (body) => body,
+					fetch: Object.assign(
+						(input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+							requests.push({
+								method: init?.method ?? "GET",
+								url: String(input),
+							});
+							expect(String(input)).toBe(endpoint);
+							expect(init?.method).toBe("GET");
+							expect(init?.redirect).toBe("manual");
+							return fetch(new URL("/v2/balance", listener.url), init);
+						},
+						{ preconnect: fetch.preconnect },
+					),
+				});
+				return {
+					read(context) {
+						readCompleted = reader.read(context);
+						return readCompleted;
+					},
+				};
+			});
+			config.resolveCredential = () => credential;
+			const m = await mount({ serviceQuotas: config });
+			m.app.checkServiceQuotas();
+			expect(readCompleted).toBeDefined();
+			await readCompleted;
+			const state = await rawState(m);
+			expect(state.serviceQuotas?.[0]).toMatchObject({
+				status: "ok",
+				sample: { metrics },
+			});
+			expect(requests).toEqual([{ method: "GET", url: endpoint }]);
+			const serialized = JSON.stringify({ state, logs });
+			expect(serialized).not.toContain(credential);
+			expect(serialized).not.toContain(configSource.credentialEnv);
+			expect(serialized).not.toContain("credentialEnv");
+			expect(JSON.stringify(state.serviceQuotas)).not.toContain("revision");
+		} finally {
+			log.mockRestore();
+			error.mockRestore();
+		}
+	});
+
+	test("service labels cannot release model holds, schedule work, or change model selection", async () => {
+		const template = projects.get("p1");
+		if (template === undefined) throw new Error("missing project fixture");
+		const store = await ProjectStore.open(
+			join(root, `service-hold-${crypto.randomUUID()}`),
+		);
+		const entry: Entry = {
+			...template,
+			name: "service-hold",
+			path: store.path,
+			store,
+		};
+		const task = await store.createTask(
+			"model quota hold",
+			"zai/glm-5.3-flash",
+		);
+		const holdUntil = Date.now() + 3_600_000;
+		await store.updateTask(task.id, {
+			holdUntil,
+			holdProvider: "zai",
+			holdWindow: "7d",
+			holdSetAt: Date.now(),
+		});
+		const schedule = mock(() => {});
+		const m = await mount({
+			projects: new Map([[entry.name, entry]]),
+			schedule,
+			serviceQuotas: options([{ ...source("zai"), label: "zai" }], () => ({
+				read: async () => success,
+			})),
+		});
+		const before = await rawState(m);
+		const roles = modelRoles();
+		m.app.checkServiceQuotas();
+		await Promise.resolve();
+		const after = await rawState(m);
+		expect(after.serviceQuotas?.[0]?.status).toBe("ok");
+		expect(after.quota).toEqual(before.quota);
+		expect(after.quota).toBeNull();
+		for (const model of ["zai/glm-5.3-flash", "unknown/model"]) {
+			const limits = after.quota?.limits ?? [];
+			expect(forModel(limits, model)).toEqual([]);
+			expect(tightestFor(limits, model)).toBeNull();
+			expect(usageReset(limits, model, Date.now())).toBeNull();
+		}
+		expect(modelRoles()).toEqual(roles);
+		expect(await store.getTask(task.id)).toMatchObject({
+			model: "zai/glm-5.3-flash",
+			holdUntil,
+			holdProvider: "zai",
+			holdWindow: "7d",
+		});
+		expect(schedule).not.toHaveBeenCalled();
+	});
+
+	test("service reads complete while a statistics sampler request remains active", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const localProjects = new Map<string, Entry>();
+		let hold = false;
+		let finished = false;
+		const read = mock(async () => success);
+		const m = await mount({
+			projects: localProjects,
+			serviceQuotas: options([source("account")], () => ({ read })),
+			githubAppFetch: async () => {
+				if (hold) {
+					entered.resolve();
+					await release.promise;
+				}
+				return new Response("{}", { status: 404 });
+			},
+		});
+		const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+		const key = privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+		expect(
+			(await m.call("/api/git-hosts/github-app", { id: "1234", key })).status,
+		).toBe(200);
+		const template = projects.get("p1");
+		if (template === undefined) throw new Error("missing project fixture");
+		localProjects.set("sampler", {
+			...template,
+			name: "sampler",
+			github: "https://github.com/acme/sampler",
+		});
+		hold = true;
+		const sampling = m.app.sampleStats().then(() => {
+			finished = true;
+		});
+		try {
+			await entered.promise;
+			m.app.checkServiceQuotas();
+			await Promise.resolve();
+			expect((await rawState(m)).serviceQuotas?.[0]?.status).toBe("ok");
+			expect(read).toHaveBeenCalledTimes(1);
+			expect(finished).toBe(false);
+		} finally {
+			release.resolve();
+			await sampling;
+		}
+	});
+
+	test("hosted HTTP and development WebSocket omit sources without resolver, factory, or reader calls", async () => {
+		const secret = crypto.randomUUID();
+		const read = mock(async () => success);
+		const createReader = mock(() => ({ read }));
+		const config = options([source("account")], createReader);
+		const resolveCredential = mock(() => crypto.randomUUID());
+		config.resolveCredential = resolveCredential;
+		const m = await mount({
+			realPort: true,
+			serviceQuotas: config,
+			hosted: {
+				config: {
+					tenant: "service-test",
+					secret,
+					controlUrl: "http://127.0.0.1:9",
+					wording: {
+						workSuffix: "",
+						mergeSuffix: "",
+						resumeSuffix: "",
+						creditReason: "No credit.",
+					},
+				},
+				hooks: {
+					reportUsage: () => {},
+					creditOk: async () => true,
+					gitToken: async () => null,
+				},
+			},
+		});
+		m.app.checkServiceQuotas();
+		const headers = {
+			"x-ottr-identity": signIdentity(secret, "service-test", "owner"),
+		};
+		expect((await m.call("/api/state")).status).toBe(401);
+		const response = await m.call("/api/state", undefined, headers);
+		expect(response.status).toBe(200);
+		expect(await response.json()).not.toHaveProperty("serviceQuotas");
+		const ws = socketState(m.server, {
+			"x-ottr-identity": signIdentity(secret, "service-test", "owner"),
+		});
+		try {
+			expect(await ws.state).not.toHaveProperty("serviceQuotas");
+			m.app.checkServiceQuotas();
+			expect(resolveCredential).not.toHaveBeenCalled();
+			expect(createReader).not.toHaveBeenCalled();
+			expect(read).not.toHaveBeenCalled();
+		} finally {
+			ws.socket.close();
+		}
+	});
+
+	test("development WebSocket publishes the same cached service sample as HTTP", async () => {
+		const pending = Promise.withResolvers<ServiceQuotaReadResult>();
+		const read = mock(() => pending.promise);
+		const m = await mount({
+			realPort: true,
+			serviceQuotas: options([source("account")], () => ({ read })),
+		});
+		const initial = socketState(m.server);
+		try {
+			expect((await initial.state).serviceQuotas?.[0]?.status).toBe("pending");
+			const next = initial.nextState(
+				(state) => state.serviceQuotas?.[0]?.status === "ok",
+			);
+			m.app.checkServiceQuotas();
+			pending.resolve(success);
+			const published = await next;
+			const response = await fetch(new URL("/api/state", m.server.url));
+			expect(response.status).toBe(200);
+			const state = (await response.json()) as StateResponse;
+			expect(published.serviceQuotas).toEqual(state.serviceQuotas);
+			expect(published.serviceQuotas?.[0]?.sample?.metrics).toEqual(metrics);
+			expect(read).toHaveBeenCalledTimes(1);
+		} finally {
+			initial.socket.close();
+		}
+	});
+
+	test("service state keeps direct-loopback and public auth rules and production WebSocket refusal", async () => {
+		const g = await GlobalStore.open(
+			join(root, `service-auth-${crypto.randomUUID()}`),
+		);
+		mountStores.push(g);
+		const apiKey = crypto.randomUUID();
+		const sessionSecret = crypto.randomUUID();
+		await g.set("config", {
+			apiKey,
+			sessionSecret,
+			admin: { name: "owner", passHash: hashPassword(crypto.randomUUID()) },
+		});
+		const m = await mount({
+			gstore: g,
+			prod: true,
+			publicHosts: ["board.example"],
+			serviceQuotas: options([source("account")], () => ({
+				read: async () => success,
+			})),
+		});
+		m.app.checkServiceQuotas();
+		await Promise.resolve();
+		expect((await rawState(m)).serviceQuotas?.[0]?.status).toBe("ok");
+		const walls: Record<string, string>[] = [
+			{ Host: "board.example" },
+			{ Host: "127.0.0.1:0", "x-forwarded-for": "192.0.2.2" },
+		];
+		for (const headers of walls) {
+			expect((await m.call("/api/state", undefined, headers)).status).toBe(401);
+			const allowed = await m.call("/api/state", undefined, {
+				...headers,
+				"x-api-key": apiKey,
+			});
+			expect(allowed.status).toBe(200);
+			expect(
+				((await allowed.json()) as StateResponse).serviceQuotas?.[0]?.status,
+			).toBe("ok");
+		}
+		const cookie = signSession(sessionSecret, "owner", 60_000);
+		expect(
+			(
+				await m.call("/api/state", undefined, {
+					Host: "board.example",
+					Cookie: `${SESSION_COOKIE}=${cookie}`,
+				})
+			).status,
+		).toBe(200);
+		const refused = await m.call("/api/ws", undefined, {
+			Upgrade: "websocket",
+			Connection: "Upgrade",
+			"Sec-WebSocket-Key": btoa(crypto.randomUUID().slice(0, 16)),
+			"Sec-WebSocket-Version": "13",
+		});
+		expect(refused.status).toBe(404);
+	});
+
+	test("an empty self-hosted configuration publishes an empty source list", async () => {
+		const m = await mount();
+		m.app.checkServiceQuotas();
+		expect((await rawState(m)).serviceQuotas).toEqual([]);
+	});
+
+	test("closing the app aborts an active source and prevents future reads", async () => {
+		const signals: AbortSignal[] = [];
+		const pending = Promise.withResolvers<ServiceQuotaReadResult>();
+		const read = mock((context: { signal: AbortSignal }) => {
+			signals.push(context.signal);
+			return pending.promise;
+		});
+		const m = await mount({
+			serviceQuotas: options([source("account")], () => ({ read })),
+		});
+		m.app.checkServiceQuotas();
+		expect(signals[0]?.aborted).toBe(false);
+		await m.app.close();
+		expect(signals[0]?.aborted).toBe(true);
+		pending.resolve(success);
+		await pending.promise;
+		m.app.checkServiceQuotas();
+		expect(read).toHaveBeenCalledTimes(1);
 	});
 });
