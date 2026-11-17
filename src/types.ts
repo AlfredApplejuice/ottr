@@ -1346,6 +1346,7 @@ export interface StateResponse {
 	serverVersion: string;
 	/** Provider usage limits from `omp usage --json`; null until the first check. */
 	quota: QuotaState | null;
+	serviceQuotas?: readonly ServiceQuotaSourceState[];
 	/** Hosted mode (docs/specs/hosted-mode.md): the UI hides host-level panels and identity surfaces. Absent or false on every self-hosted board. */
 	hosted?: boolean;
 	/** True until the single admin exists (/api/setup); the UI shows the setup dialog then. */
@@ -1451,6 +1452,128 @@ export interface QuotaState {
 	/** Epoch ms of the last check. */
 	at: number;
 }
+
+export type ServiceQuotaUnit =
+	| { kind: "currency"; code: string }
+	| { kind: "count"; name: string };
+
+export type ServiceQuotaMetric = {
+	id: string;
+	label: string;
+	unit: ServiceQuotaUnit;
+} & (
+	| {
+			kind: "window";
+			used: number;
+			limit: number;
+			startsAt: number | null;
+			resetsAt: number | null;
+	  }
+	| {
+			kind: "balance";
+			remaining: number;
+			reportedTotal: number | null;
+			resetsAt: number | null;
+			providerStatus: string | null;
+			plan: string | null;
+	  }
+);
+
+export interface ServiceQuotaConfigurationError {
+	code: "configuration";
+}
+
+export interface ServiceQuotaReadError {
+	code:
+		| "authentication"
+		| "rate_limit"
+		| "timeout"
+		| "network"
+		| "http"
+		| "invalid_response"
+		| "internal";
+	httpStatus: number | null;
+	retryAfterAt: number | null;
+}
+
+export type ServiceQuotaReadResult =
+	| { ok: true; metrics: readonly ServiceQuotaMetric[] }
+	| { ok: false; error: ServiceQuotaReadError };
+
+export interface ServiceQuotaReader {
+	read(context: { signal: AbortSignal }): Promise<ServiceQuotaReadResult>;
+}
+
+export interface ServiceQuotaAdapterDefinition {
+	readonly id: string;
+	createReader(context: { credential: string }): ServiceQuotaReader;
+}
+
+export interface ServiceQuotaSourceConfig {
+	id: string;
+	adapterId: string;
+	label: string;
+	credentialEnv: string;
+}
+
+export interface ServiceQuotaSample {
+	observedAt: number;
+	metrics: readonly ServiceQuotaMetric[];
+}
+
+export interface ServiceQuotaSourceIdentity {
+	id: string;
+	adapterId: string;
+	label: string;
+}
+
+export type ServiceQuotaSourceState = ServiceQuotaSourceIdentity &
+	(
+		| {
+				status: "unconfigured";
+				lastAttemptAt: null;
+				nextAttemptAt: null;
+				sample: null;
+				error: ServiceQuotaConfigurationError;
+		  }
+		| {
+				status: "pending";
+				lastAttemptAt: null;
+				nextAttemptAt: number;
+				sample: null;
+				error: null;
+		  }
+		| {
+				status: "ok";
+				lastAttemptAt: number;
+				nextAttemptAt: number;
+				sample: ServiceQuotaSample;
+				error: null;
+		  }
+		| {
+				status: "stale";
+				staleReason: "refresh_error";
+				lastAttemptAt: number;
+				nextAttemptAt: number | null;
+				sample: ServiceQuotaSample;
+				error: ServiceQuotaReadError;
+		  }
+		| {
+				status: "stale";
+				staleReason: "expired";
+				lastAttemptAt: number;
+				nextAttemptAt: number;
+				sample: ServiceQuotaSample;
+				error: null;
+		  }
+		| {
+				status: "error";
+				lastAttemptAt: number;
+				nextAttemptAt: number | null;
+				sample: null;
+				error: ServiceQuotaReadError;
+		  }
+	);
 
 /** Context-window reading from a task's omp session transcript; null = no session data. */
 export interface SessionContext {

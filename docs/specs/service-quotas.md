@@ -1,6 +1,7 @@
 # External service quotas
 
-Status: specification only. Runtime implementation remains pending.
+Status: shared contracts, bounded transport, and independent cache implemented in step 2.
+The PixelLab adapter, runtime state integration, and UI remain pending.
 
 This specification implements recommended step 1 from the OTTR-1092 research report carried by OTTR-1101.
 It defines the contract for the later implementation cards.
@@ -537,6 +538,70 @@ Its lifecycle owns due checks, rebind, removal, and the account-isolation rules 
 Step 3 supplies an adapter definition through that registry.
 Step 4 consumes the cache and shared types without PixelLab-specific state logic.
 Steps 3 and 4 can therefore run in parallel after step 2.
+
+### Step 2 exports
+
+`src/types.ts` exports all named types in the two contract blocks above.
+It adds the optional `StateResponse.serviceQuotas` field, without runtime state integration.
+Source configuration and reader types are server-only contracts, not serialized state.
+
+`src/serviceQuotas.ts` exports these functions and types:
+
+- `validateServiceQuotaMetrics(input: unknown, previous?: readonly ServiceQuotaMetric[]): readonly ServiceQuotaMetric[] | null`.
+  It returns a detached snapshot of known fields, or `null` for an invalid snapshot.
+  The coordinator retains each metric ID's unit across successful samples in one source binding, including samples that omit that ID.
+  It retains unit history only, not earlier metric values.
+  Rebind clears that history.
+- `ServiceQuotaCoordinatorOptions` contains `sources`, `registry`, and `resolveCredential`.
+  `sources` is a readonly source configuration list.
+  `registry` is a `ReadonlyMap<string, ServiceQuotaAdapterDefinition>`.
+  `resolveCredential(reference: string): string | undefined` reads server-only secret input.
+  Optional `now(): number` supplies the clock, and optional `onChange(): void` publishes cache changes.
+- `createServiceQuotaCoordinator(options: ServiceQuotaCoordinatorOptions): ServiceQuotaCoordinator`.
+  Construction resolves source bindings but starts no requests.
+- `ServiceQuotaCoordinator.getState(): readonly ServiceQuotaSourceState[]` returns detached cached state without provider I/O.
+  It applies the sample age rule at read time.
+- `ServiceQuotaCoordinator.checkDue(): void` starts eligible reads without awaiting them.
+  Completion starts queued eligible sources within the four-request limit.
+  Each due check also publishes any freshness transition.
+- `ServiceQuotaCoordinator.setSources(sources: readonly ServiceQuotaSourceConfig[]): void` replaces the ordered configuration list.
+  Unchanged bindings retain state.
+  Changed, added, and duplicate bindings use the rebind rules.
+  Each duplicate ID appears once as `unconfigured`, at its first position.
+  All duplicate IDs are detected before credential resolution or reader creation.
+- `ServiceQuotaCoordinator.rebind(source: ServiceQuotaSourceConfig): void` replaces or adds one binding, even when its configuration is unchanged.
+- `ServiceQuotaCoordinator.remove(id: string): void` removes one binding and aborts its active attempt.
+- `ServiceQuotaCoordinator.dispose(): void` permanently stops reads, aborts attempts, and clears cached state.
+  Later lifecycle calls do nothing.
+  A new coordinator represents a server restart.
+
+An obsolete attempt retains its concurrency slot until it settles.
+An ignored abort cannot permit more than four outstanding reads or two outstanding reads for the same source ID.
+Rebind clears public state before it calls the resolver or reader factory.
+The coordinator never reads ambient environment values itself.
+Resolver and reader-factory exceptions produce `unconfigured`, because no provider attempt completed.
+Missing adapters, blank credentials, and credentials with control characters also produce `unconfigured`.
+An invalid source label produces a configuration error and the fixed label `Invalid source label`.
+Source IDs and adapter IDs retain their identity.
+Publication callback failures produce a fixed diagnostic without exception details.
+
+`src/serviceQuotaHttp.ts` exports `createServiceQuotaHttpReader(options: ServiceQuotaHttpReaderOptions): ServiceQuotaReader`.
+`ServiceQuotaHttpReaderOptions` contains `endpoint: string`, `credential: string`, and `decode(body: unknown): unknown`.
+The trusted adapter supplies the fixed endpoint and bound credential.
+The decoder returns normalized metrics or `null` for an invalid provider response.
+The reader validates decoded metrics and returns only the specified read-result union.
+The reader sends GET with bearer authorization and `Accept: application/json`.
+It accepts HTTPS endpoints without URL credentials or fragments.
+Source configuration cannot supply an endpoint.
+Optional `fetch?: typeof globalThis.fetch` and `now?: () => number` dependencies support isolated transport tests.
+The injected fetch can route the fixed HTTPS request to a local fixture listener.
+Production callers omit those dependencies.
+No transport option changes the ten-second deadline or 64-KiB response limit.
+The transport catches decoder exceptions as `internal` and never publishes exception text.
+
+Step 2 tests use generated, harmless credential values.
+They require no real credential, provider account, or approved secret name.
+The README needs no setup change because this step does not activate the feature.
 
 Step 5 executes all acceptance checks before any live balance read.
 A live read also requires approval for the server secret source and the authenticated read itself.
