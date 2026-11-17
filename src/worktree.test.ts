@@ -2643,6 +2643,8 @@ describe("headVersion", () => {
 describe("describeVersion", () => {
 	test("release tag at HEAD, tag-plus-commits form past it, short sha on dev, timestamp without commits", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-desc-"));
+		const old = process.env.OTTR_VERSION;
+		delete process.env.OTTR_VERSION;
 		try {
 			await must(dir, "init", "-q", "-b", "main");
 			expect(await describeVersion(dir)).toMatch(/^\d+$/); // no commits yet: boot-time fallback
@@ -2658,6 +2660,8 @@ describe("describeVersion", () => {
 			await must(dir, "tag", "notarelease");
 			expect(await describeVersion(dir)).toBe(past); // non-release tags are ignored
 		} finally {
+			if (old === undefined) delete process.env.OTTR_VERSION;
+			else process.env.OTTR_VERSION = old;
 			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
 		}
 	}, 60_000);
@@ -2682,9 +2686,13 @@ describe("describeVersion", () => {
 
 	test("a directory without .git falls back to the boot-time stamp (the image shape)", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-nogit-"));
+		const old = process.env.OTTR_VERSION;
+		delete process.env.OTTR_VERSION;
 		try {
 			expect(await describeVersion(dir)).toMatch(/^\d+$/);
 		} finally {
+			if (old === undefined) delete process.env.OTTR_VERSION;
+			else process.env.OTTR_VERSION = old;
 			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
 		}
 	}, 60_000);
