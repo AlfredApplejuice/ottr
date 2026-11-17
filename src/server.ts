@@ -921,6 +921,10 @@ const ompStatsDashboard = createOmpStatsDashboard({
 // process.exit, which runs this handler too.
 process.on("exit", () => ompStatsDashboard.stop());
 every(() => ompStatsDashboard.tick(), 60_000);
+// OTTR-1071: the PR poll grid for the Settings watches row; the hourly wiring
+// below moves it forward each regular poll. The boot poll is irregular, so the
+// grid starts one hour out.
+const prPollGrid = { nextAt: Date.now() + 3_600_000 };
 const app = await createApp({
 	gstore,
 	defaultDir: resolve(ROOTS[0] ?? resolve(import.meta.dir, "..", "..")),
@@ -958,6 +962,8 @@ const app = await createApp({
 	// OTTR-548: the /signins tick probes the same urls the loop dispatches work turns to.
 	workerTarget,
 	runnerTurns: () => loop.runnerTurns(),
+	// OTTR-1071: the Settings watches row shows when the next regular PR poll runs.
+	prPollNextAt: () => prPollGrid.nextAt,
 	// OTTR-763: the checkout guard's ambiguous-change notices for the bell.
 	checkoutNotices: () => loop.checkoutNotices(),
 	// The /system view's live runs: the loop keys entries `${project}/${id}`; split at the first "/".
@@ -1086,8 +1092,14 @@ runWork(() => app.forkResearchTick());
 every(() => app.forkResearchTick(), 3_600_000);
 
 // PR reviews: hourly poll; the watcher gates which open PRs start a review turn.
+// OTTR-1071: the quiet-time timer starts a review between polls, and the grid
+// feeds the state payload's nextPollAt for the Settings watches row.
 runWork(() => app.prReviewTick());
-every(() => app.prReviewTick(), 3_600_000);
+every(() => {
+	prPollGrid.nextAt = Date.now() + 3_600_000;
+	// Returned, not voided: runWork's chain awaits and logs the tick's rejections.
+	return app.prReviewTick();
+}, 3_600_000);
 
 // Issue watch: hourly poll; files new open GitHub issues as backlog cards, capped per day.
 runWork(() => app.issueWatchTick());

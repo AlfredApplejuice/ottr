@@ -22306,6 +22306,78 @@ describe("turn PR-mode merge settle", () => {
 		);
 	});
 
+	// OTTR-1055: the agent writes the pull request body in report_outcome's prBody
+	// field; the report text itself stays on the card and never reaches the PR.
+	const AGENT_PR_BODY =
+		"## What\nThe trending scan reuses the stored github.com token.\n\n## Check\nbun run check and bun test exit 0";
+
+	async function prMergeSetupWithOutcome(overrides: FixtureOps = {}) {
+		return prMergeSetup({
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
+				await o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "integrated",
+								summary: "rebased",
+								details: "gates green",
+								prBody: AGENT_PR_BODY,
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+			...overrides,
+		});
+	}
+
+	test("a prBody in the merge turn's report becomes the pull request body", async () => {
+		const opens: { repo: string; body: string }[] = [];
+		const { store, loop, task } = await prMergeSetupWithOutcome({
+			openPr: async (o) => {
+				opens.push(o);
+				return {
+					ok: true as const,
+					pr: { number: 12, url: "https://github.com/acme/repo/pull/12" },
+				};
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(opens).toHaveLength(1);
+		expect(opens[0]!.body.startsWith(AGENT_PR_BODY)).toBe(true);
+		expect(opens[0]!.body).toContain(`Task: ${task.id}`);
+		expect(opens[0]!.body).toContain("Opened by [Ottr]");
+		// The merge report stays on the card; the PR body never carries it.
+		expect(opens[0]!.body).not.toContain("rebased");
+		expect(opens[0]!.body).not.toContain("gates green");
+		expect(await logText(store, task.id)).not.toContain("falls back");
+	});
+
+	test("without prBody the pull request body stays the integrated report and the log names the fallback", async () => {
+		const opens: { repo: string; body: string }[] = [];
+		const { store, loop, task } = await prMergeSetup({
+			openPr: async (o) => {
+				opens.push(o);
+				return {
+					ok: true as const,
+					pr: { number: 12, url: "https://github.com/acme/repo/pull/12" },
+				};
+			},
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(opens).toHaveLength(1);
+		expect(opens[0]!.body).toBe(
+			`rebased\n\ngates green\n\nTask: ${task.id}\n\n---\n<sub>Opened by [Ottr](https://github.com/ottr-ai/ottr), an AI coding-agent tracker.</sub>`,
+		);
+		expect(await logText(store, task.id)).toContain("falls back");
+	});
+
 	// OTTR-914: a merge turn that pauses on the ask tool must park the card with the
 	// agent's question and options, not with the lost-receipt text, and a reply must
 	// resume the merge turn.
@@ -22950,6 +23022,35 @@ describe("turn PR-mode merge settle", () => {
 		expect(await logText(store, task.id)).toContain(
 			"follow-up PR #33 opened (base dependabot/npm_and_yarn/vite-7.1.2)",
 		);
+	});
+
+	test("a follow-up fix PR carries the prBody from the merge turn's report", async () => {
+		const opens: { repo: string; body: string }[] = [];
+		const { store, loop, task } = await prMergeSetupWithOutcome({
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
+			targetContains: async (_m: string, sha: string, tip: string) =>
+				sha === "pr-head" && tip === "sha-fixed",
+			treesEqual: async () => false,
+			pushBranch: async () => ({ status: "pushed" as const, output: "" }),
+			openPr: async (o) => {
+				opens.push(o);
+				return {
+					ok: true as const,
+					pr: { number: 33, url: "https://github.com/acme/repo/pull/33" },
+				};
+			},
+			prComment: async () => ({ ok: true as const }),
+		});
+		await store.updateTask(task.id, sourcePr());
+		await loop.runTurn(store.name, task.id);
+		expect(opens).toHaveLength(1);
+		expect(opens[0]!.body.startsWith(AGENT_PR_BODY)).toBe(true);
+		expect(opens[0]!.body).toContain(`Task: ${task.id}`);
+		expect(opens[0]!.body).toContain("Fixes beyond source PR #20");
+		expect(opens[0]!.body).not.toContain("rebased");
+		expect(opens[0]!.body).not.toContain("gates green");
+		expect(await logText(store, task.id)).not.toContain("falls back");
 	});
 
 	test("a diverged legacy Dependabot card opens the follow-up on the target (OTTR-809)", async () => {
@@ -27010,6 +27111,15 @@ describe("stored review findings", () => {
 		);
 		await store.updateTask(review.id, { base: "shaR" });
 		await store.updateTask(review.id, { stage: "done", state: "idle" });
+		// The done stamp freezes doneAt, and the findings closure reads
+		// `createdAt <= doneAt`: a child this test files in the SAME millisecond
+		// counts as an open finding and holds every queued merge (CI 43875479904:
+		// the OTTR-1047 assertions read mergeHold/reviewBlocked/findingsHold, and
+		// a fast runner filed the validation card within doneAt's millisecond).
+		// Fake timers cannot drive this: runTaskUpdate stamps the real clock
+		// internally. Cross the boundary so every child below is strictly
+		// younger than doneAt.
+		await Bun.sleep(2);
 		return review;
 	};
 

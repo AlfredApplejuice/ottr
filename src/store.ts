@@ -94,6 +94,7 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	prReviews: false,
 	prReviewNotify: true,
 	prReviewApprove: false,
+	prReviewRequestChanges: false,
 	prMode: false,
 	issueWatch: false,
 	issueWatchSince: null,
@@ -238,6 +239,7 @@ CREATE TABLE IF NOT EXISTS pr_review (
   posted_head TEXT,
   posted_url TEXT,
   posted_login TEXT,
+  posted_event TEXT,
   state TEXT NOT NULL CHECK (state IN ('open','closed','merged')),
   draft INTEGER NOT NULL,
   title TEXT NOT NULL,
@@ -474,6 +476,7 @@ interface PrReviewDbRow {
 	posted_head: string | null;
 	posted_url: string | null;
 	posted_login: string | null;
+	posted_event: string | null;
 	state: string;
 	draft: number;
 	title: string;
@@ -492,6 +495,7 @@ function toPrReview(r: PrReviewDbRow): PrReviewRow {
 		postedHead: r.posted_head,
 		postedUrl: r.posted_url,
 		postedLogin: r.posted_login,
+		postedEvent: r.posted_event ?? null,
 		state: r.state as PrState,
 		draft: r.draft !== 0,
 		title: r.title,
@@ -1252,6 +1256,7 @@ const SETTINGS_SHAPES = {
 	prReviews: "boolean",
 	prReviewNotify: "boolean",
 	prReviewApprove: "boolean",
+	prReviewRequestChanges: "boolean",
 	prMode: "boolean",
 	issueWatch: "boolean",
 	issueWatchSince: "number",
@@ -2469,6 +2474,16 @@ export class ProjectStore {
 					"posted_login",
 					"ALTER TABLE pr_review ADD COLUMN posted_login TEXT",
 				);
+				// posted_event landed with the request-changes posts: same additive convergence, so an
+				// older database still reads and posts without a rebuild; null reads as "not a
+				// request-changes review", the state of every older row (older builds never sent
+				// REQUEST_CHANGES).
+				await ProjectStore.addColumn(
+					db,
+					prCols,
+					"posted_event",
+					"ALTER TABLE pr_review ADD COLUMN posted_event TEXT",
+				);
 				// The comment watch landed with the PR review notifications: same additive
 				// convergence, so an older database still sweeps and alerts without a rebuild.
 				await ProjectStore.addColumn(
@@ -3525,16 +3540,35 @@ export class ProjectStore {
 		});
 	}
 
-	/** Stores the posted review's html_url and posting login after a successful Post; null clears both. */
+	/** Stores the posted review's html_url, posting login, and decided event after a successful
+	 * Post; null clears url and login; an undefined event leaves the stored event untouched. */
 	async setPrPostedUrl(
 		number: number,
 		url: string | null,
 		login: string | null = null,
+		event?: string | null,
 	): Promise<void> {
 		return this.queue.run(async () => {
+			if (event === undefined) {
+				await this.db.run(
+					"UPDATE pr_review SET posted_url = ?, posted_login = ? WHERE number = ?",
+					[url, login, number],
+				);
+				return;
+			}
 			await this.db.run(
-				"UPDATE pr_review SET posted_url = ?, posted_login = ? WHERE number = ?",
-				[url, login, number],
+				"UPDATE pr_review SET posted_url = ?, posted_login = ?, posted_event = ? WHERE number = ?",
+				[url, login, event, number],
+			);
+		});
+	}
+
+	/** Writes post_error only: a failed dismissal after a successful post keeps the posted head. */
+	async setPrPostError(number: number, error: string | null): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run(
+				"UPDATE pr_review SET post_error = ? WHERE number = ?",
+				[error, number],
 			);
 		});
 	}
@@ -3643,28 +3677,6 @@ export class ProjectStore {
 						)
 						.get(number, head)
 				)?.n !== 0
-			);
-		});
-	}
-
-	/**
-	 * The latest done run's start for this number+head: a never-posted draft's re-review cutoff.
-	 * null when none (a null head was never reviewed); undone runs count as no review yet.
-	 */
-	async lastPrRunAt(
-		number: number,
-		head: string | null,
-	): Promise<number | null> {
-		return this.queue.run(async () => {
-			if (head === null) return null;
-			return (
-				(
-					await this.db
-						.query<{ started_at: number }, [number, string]>(
-							"SELECT started_at FROM pr_review_runs WHERE number = ? AND head = ? AND done = 1 ORDER BY started_at DESC LIMIT 1",
-						)
-						.get(number, head)
-				)?.started_at ?? null
 			);
 		});
 	}

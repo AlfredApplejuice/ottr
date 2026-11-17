@@ -174,6 +174,8 @@ export interface Outcome {
 	shots?: string[];
 	/** Cards this turn waits for (report_outcome dependsOn): the tracker restarts the card when each is done or cancelled. */
 	dependsOn?: string[];
+	/** PR mode only: the pull request body the merge turn wrote for the PR the server opens; missing or blank = the PR body falls back to the report text. */
+	prBody?: string;
 }
 
 /** Repo facts for the onboarding fork panel; built by forkSummary (src/forks.ts). */
@@ -236,6 +238,8 @@ export interface ProjectSettings {
 	prReviewNotify: boolean;
 	/** Post also approves the PR when the run found no blocking findings; off by default. */
 	prReviewApprove: boolean;
+	/** Post requests changes when the run found blocking findings; off by default. */
+	prReviewRequestChanges: boolean;
 	/** Per-project PR mode: integration pushes the card branch and opens a GitHub pull request instead of merging into the target branch (off by default). */
 	prMode: boolean;
 	/** Run work turns in a Firecracker microVM via vm-runner instead of a worker container (off by default; docs/adr/0009-microvm-workers.md). */
@@ -331,6 +335,19 @@ export interface TrendingStatus {
 	tokenPresent: boolean;
 }
 
+/** One project's PR watch poll facts, shipped in the project's view for the Settings
+ * Watches card (OTTR-1071). In-memory only: a restart clears the times and the next
+ * polls refill them. */
+export interface PrWatchStatus {
+	/** Clock value when the project's last poll completed; null before the first. */
+	lastPollAt: number | null;
+	/** The last poll's failure reason; null when it completed clean or never ran. */
+	lastError: string | null;
+	/** Clock value of the next regular hourly poll (the server's interval grid);
+	 * null when the wiring names no grid. */
+	nextPollAt: number | null;
+}
+
 /** U7: an update card parked by holdUpdateMerges; the reply recognizes it by this reason. Shared by the turn loop and the drawer's hold action bar. */
 export const UPDATE_HOLD_REASON =
 	"Update card: read the summary, then reply to approve the merge.";
@@ -390,6 +407,8 @@ export interface PrReviewRow {
 	postedUrl: string | null;
 	/** GitHub login the review was posted as (app bot or person); null when unknown. */
 	postedLogin: string | null;
+	/** The event the posted review used (REQUEST_CHANGES); null for COMMENT/APPROVE or no post. */
+	postedEvent: string | null;
 	state: PrState;
 	draft: boolean;
 	title: string;
@@ -398,6 +417,17 @@ export interface PrReviewRow {
 	commentsAt: number | null;
 	/** The current comment wave is unseen: the bell row and the `pr:` alert are live. */
 	commentsUnseen: boolean;
+}
+
+/** The watcher's in-memory record of a PR's last draft run; a restart drops it. */
+export interface PrRunState {
+	startedAt: number;
+	/** null while the run is in flight. */
+	endedAt: number | null;
+	/** The skip reason or error text; null when the run saved a draft. */
+	error: string | null;
+	/** The review model the watcher ran: `@plan` on the default path, `custom` when injected. */
+	model: string;
 }
 
 /** The PR facts a pr_review card's drawer shows. */
@@ -412,6 +442,8 @@ export interface PrReviewView {
 	/** GitHub login the review was posted as (app bot or person); null when unknown. */
 	postedLogin: string | null;
 	postError: string | null;
+	/** The PR's last draft run; null when none ran since the server started. */
+	run: PrRunState | null;
 }
 
 export interface Task {
@@ -1019,6 +1051,9 @@ export interface ProjectView {
 	/** Open pull requests on the GitHub repo, newest first; null with no GitHub remote,
 	 * before the first probe, or when gh fails. */
 	openPrs: OpenPrsView | null;
+	/** OTTR-1071: the PR watch's poll facts (last check, its error, next regular check),
+	 * shown by the Settings Watches card's PR reviews row. */
+	prWatch: PrWatchStatus;
 	settings: ProjectSettings;
 	/** Effective task id handle: the taskIdPrefix override or the folder-derived default. */
 	taskPrefix: string;
@@ -1042,6 +1077,8 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	prReview?: PrReviewView;
 	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and the unseen comment stamp that key the bell occurrences. */
 	prOccurrence?: { draft: number | null; comments: number | null };
+	/** OTTR-1073: set only for kind "pr_review". The watcher's last draft run; its start and end change the board row, so an open drawer refetches the detail and the composer's run status moves. */
+	prRun?: PrRunState | null;
 	/** Present on the drawer detail of a release card waiting for approval; commits between the reviewed base and the target head. */
 	lateCommits?: LateCommit[];
 	/** The retro card filed after this card (kind "retro", followUpOf this card); this card's
@@ -1427,13 +1464,11 @@ export interface SessionContext {
 	at: number;
 }
 
+/** POST /api/projects and POST /api/projects/:project/init: the fresh project view. The
+ *  rules interview starts through POST /api/projects/:project/interview after the wizard's
+ *  settings steps (docs/specs/add-project-wizard.md). */
 export interface AddProjectResponse {
 	project: ProjectView;
-	/** "queued" | "not-needed" | "gitless" */
-	interview: string;
-	/** The rules interview card's id when the answer queued one; null when no card exists
-	 * ("not-needed", "gitless"). The setup wizard turns it into an "Open rules task" action. */
-	id: string | null;
 }
 
 /** GET /api/gh-status: gh auth facts for the Add project form's New tab. */

@@ -16,7 +16,9 @@ import {
 	type JobProcess,
 	type JobSpawn,
 	type JobSpawnOptions,
+	LIMITS_PROBE_ARGV,
 	parseJobSpec,
+	parseLimitsReadback,
 	promoteArtifacts,
 	runJob,
 	runSelfCheck,
@@ -105,10 +107,17 @@ const envText = (): string =>
 		.sort()
 		.join("\n");
 
-/** The limits probe's stdout: every line the limits check reads back, at the limit values. */
-const limitsText = (): string =>
+/**
+ * The limits probe's stdout: every line the limits check reads back, at the limit
+ * values. The limits table is the /proc/self/limits format the probe prints (head -30
+ * of the file); `limit` defaults to the configured value so the check passes.
+ */
+const limitsText = (limit: number = VM_VALIDATE.maxProcesses): string =>
 	[
-		String(VM_VALIDATE.maxProcesses),
+		"Limit                     Soft Limit           Hard Limit           Units",
+		"Max cpu time              unlimited            unlimited            seconds",
+		"Max file size             1073741824           1073741824           bytes",
+		`Max processes             ${limit}                  ${limit}                  processes`,
 		String(VM_VALIDATE.vcpus),
 		"MemTotal:       524288 kB",
 		"Filesystem     1K-blocks    Used Available Use% Mounted on",
@@ -355,14 +364,37 @@ describe("runSelfCheck", () => {
 		await failing((deps) => {
 			deps.spawn = (argv) => {
 				const inner = argv.slice(argv.indexOf("--") + 1);
-				if (inner[0] === "sh")
-					return textProc(
-						`999\n${limitsText().split("\n").slice(1).join("\n")}`,
-						0,
-					);
+				if (inner[0] === "sh") return textProc(limitsText(999), 0); // the limit reads back wrong
 				return textProc(inner[0] === "env" ? envText() : "", 0);
 			};
 		}, MISSING_CONTROL.limits);
+	});
+
+	test("the real limits probe reads back under this image's /bin/sh (dash)", async () => {
+		// The acceptance run: the exported probe argv, the job's prlimit prefix, and the
+		// real /bin/sh of the worker image the guest rootfs is built from — dash, which
+		// has no `ulimit -u`. Before the /proc/self/limits fix the chain died at
+		// `ulimit -u` with exit 2 and empty stdout, so every parsed field was null and
+		// this test failed. The prlimit prefix sets exactly the configured soft limit,
+		// so the first field must read it back; the other three fields must parse on
+		// this host, whose CPU count and memory differ from VM_VALIDATE's on purpose.
+		const proc = Bun.spawn([...prlimit(), ...LIMITS_PROBE_ARGV], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const stdout = await new Response(proc.stdout).text();
+		const stderr = await new Response(proc.stderr).text();
+		const exitCode = await proc.exited;
+		expect(exitCode).toBe(0);
+		expect(stderr).toBe("");
+		const readback = parseLimitsReadback(stdout);
+		expect(readback.nprocLimit).toBe(String(VM_VALIDATE.maxProcesses));
+		expect(readback.cpus).not.toBeNull();
+		expect(readback.memKb).not.toBeNull();
+		// scratchKb is deliberately not asserted here: a host's /tmp can sit on the
+		// overlay root, whose df data line names no /dev/ device, so the parser's
+		// null is correct there. The guest's /tmp is the /dev/vdc scratch ext4, and
+		// the fixture tests cover that line's parsing.
 	});
 });
 

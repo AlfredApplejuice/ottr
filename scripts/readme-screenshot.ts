@@ -1,3 +1,4 @@
+// 2>/dev/null; exec bun "$0" "$@"
 // Regenerates the README screenshot (.github/assets/screenshot.png) from the demo board.
 // `bun run readme-screenshot` in a work turn refreshes the shot a board-visible src/ui
 // change made stale (AGENTS.md work turn). The script drives headless Chrome over CDP
@@ -44,17 +45,27 @@ function verifyPng(png: Buffer): void {
 }
 
 const chromePath = findChrome("readme-screenshot");
-const port = await freePort();
-const boardUrl = `http://127.0.0.1:${port}/#lumen`;
+let port = await freePort();
 
-// Demo board only: src/dev.ts seeds a unique scratch root under .dev/ per spawn (OTTR_DEV_ROOT pins it) and never touches a real board. Production
-// asset mode: the dev-mode HMR server stalls the first request while it bundles the app.
-const board = Bun.spawn(["bun", "src/dev.ts"], {
-	cwd: REPO,
-	env: { ...process.env, NODE_ENV: "production", PORT: String(port) },
-	stdout: "ignore",
-	stderr: "pipe",
-});
+// Each demo board uses a fresh root and state directory. Production mode avoids HMR bundle delays.
+function spawnBoard() {
+	const root = mkdtempSync(join(tmpdir(), "ottr-shot-board-"));
+	return Bun.spawn(["bun", "src/dev.ts"], {
+		cwd: REPO,
+		env: {
+			...process.env,
+			// Demo boards never use the host's microVM runner.
+			OTTR_VM_RUNNER_URL: undefined,
+			NODE_ENV: "production",
+			PORT: String(port),
+			OTTR_DEV_ROOT: root,
+			OTTR_STATE_DIR: join(root, "state"),
+		},
+		stdout: "ignore",
+		stderr: "pipe",
+	});
+}
+let board = spawnBoard();
 
 const userDir = mkdtempSync(join(tmpdir(), "ottr-shot-"));
 const chrome = Bun.spawn(
@@ -103,21 +114,35 @@ async function capture(): Promise<void> {
 
 	// Ready poll: the server answers the home page once the bundle is served.
 	let ready = false;
-	for (let waited = 0; waited < 30_000; waited += 250) {
-		if (board.exitCode !== null) throw new Error("the demo board exited early");
-		try {
-			const res = await fetch(`http://127.0.0.1:${port}/`, {
-				signal: AbortSignal.timeout(1_000),
-			});
-			await res.body?.cancel();
-			if (res.ok) {
-				ready = true;
-				break;
+	for (let attempt = 0; attempt < 2 && !ready; attempt++) {
+		const deadline = Date.now() + 30_000;
+		while (true) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) break;
+			if (board.exitCode !== null)
+				throw new Error("the demo board exited early");
+			try {
+				const res = await fetch(`http://127.0.0.1:${port}/`, {
+					signal: AbortSignal.timeout(Math.min(1_000, remaining)),
+				});
+				await res.body?.cancel();
+				if (res.ok && Date.now() < deadline) {
+					ready = true;
+					break;
+				}
+			} catch {
+				// not listening yet
 			}
-		} catch {
-			// not listening yet
+			const delay = Math.min(250, deadline - Date.now());
+			if (delay > 0) await Bun.sleep(delay);
 		}
-		await Bun.sleep(250);
+		if (!ready && board.exitCode !== null)
+			throw new Error("the demo board exited early");
+		if (!ready && attempt === 0) {
+			await stopChildren(board);
+			port = await freePort();
+			board = spawnBoard();
+		}
 	}
 	if (!ready)
 		throw new Error("the demo board did not become ready within 30 s");
@@ -156,7 +181,11 @@ async function capture(): Promise<void> {
 	);
 	await client.send("Page.enable", undefined, sessionId);
 	await withTimeout(
-		client.send("Page.navigate", { url: boardUrl }, sessionId),
+		client.send(
+			"Page.navigate",
+			{ url: `http://127.0.0.1:${port}/#lumen` },
+			sessionId,
+		),
 		15_000,
 		"Page.navigate",
 	);

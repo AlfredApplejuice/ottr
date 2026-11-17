@@ -7,6 +7,7 @@ import type {
 } from "react";
 import {
 	Fragment,
+	isValidElement,
 	memo,
 	useCallback,
 	useContext,
@@ -3350,7 +3351,9 @@ function releaseSummary(
 	);
 }
 
-/** The notes editor: the proposal textarea, the full-commit-list toggle and its list. */
+/** The notes editor: the proposal textarea, the consolidation review under it, the
+ *  consolidate button, the full-commit-list toggle and its list. The button and the
+ *  toggle are absent before the first release: there is nothing to consolidate then. */
 function releaseNotes(
 	plan: ReleasePlan,
 	notesDraft: string | null,
@@ -3358,6 +3361,8 @@ function releaseNotes(
 	setNotesDraft: (v: string | null) => void,
 	showCommits: boolean,
 	setShowCommits: React.Dispatch<React.SetStateAction<boolean>>,
+	consolidate?: ReactNode,
+	review?: ReactNode,
 ): ReactNode {
 	return (
 		<>
@@ -3373,15 +3378,19 @@ function releaseNotes(
 					edited.current = e.target.value !== plan.notes;
 				}}
 			/>
+			{review}
 			{plan.from !== null && (
-				<button
-					type="button"
-					className="release-notes-toggle"
-					aria-pressed={showCommits}
-					onClick={() => setShowCommits((v) => !v)}
-				>
-					{showCommits ? "Hide full commit list" : "Show full commit list"}
-				</button>
+				<div className="release-notes-actions">
+					{consolidate}
+					<button
+						type="button"
+						className="release-notes-toggle"
+						aria-pressed={showCommits}
+						onClick={() => setShowCommits((v) => !v)}
+					>
+						{showCommits ? "Hide full commit list" : "Show full commit list"}
+					</button>
+				</div>
 			)}
 			{showCommits && (
 				<div className="release-notes">
@@ -3463,24 +3472,71 @@ function releaseActions(
 	);
 }
 
-/** The release summary reply: draft the notes, or record why none came. */
-function summaryReply(
-	res: { summary: string | null; reason: string | null },
-	alive: boolean,
-	edited: { current: boolean },
-	setNotesDraft: (v: string | null) => void,
-	setSummaryReason: (v: string | null) => void,
-): void {
-	if (!alive) return;
-	if (res.summary !== null) {
-		if (!edited.current) setNotesDraft(res.summary);
-	} else {
-		setSummaryReason(res.reason);
-	}
+/** The consolidation review: the line diff of the commit-history notes vs the model's
+ * consolidated proposal, each row with a +/- glyph, plus Use and Discard. Shown only
+ * after the user clicks Consolidate notes; nothing changes the draft until they accept,
+ * and Discard keeps the deterministic notes. The diff reuses the deepen review's
+ * classes and glyphs, so the accept-or-discard language stays the board's one pattern. */
+export function ConsolidationReview({
+	original,
+	consolidated,
+	onUse,
+	onDiscard,
+}: {
+	original: string;
+	consolidated: string;
+	onUse: () => void;
+	onDiscard: () => void;
+}) {
+	const rows = lineDiff(original, consolidated);
+	const changed = rows.some((r) => r.kind !== "same");
+	return (
+		<section className="deepen-review" aria-label="Consolidation review">
+			<p className="hint">Proposed notes</p>
+			{changed ? (
+				<div className="deepen-diff">
+					{rows.map((r, i) => (
+						<div
+							key={i}
+							className={
+								r.kind === "add"
+									? "dl-add"
+									: r.kind === "del"
+										? "dl-del"
+										: undefined
+							}
+						>
+							<span className="deepen-glyph" aria-hidden="true">
+								{r.kind === "add" ? "+" : r.kind === "del" ? "\u2212" : ""}
+							</span>
+							{/* An empty line keeps its row height, so the before and after
+							    views line up with the textarea above. */}
+							<span className="dl-text">
+								{r.text === "" ? "\u00a0" : r.text}
+							</span>
+						</div>
+					))}
+				</div>
+			) : (
+				<p className="hint">
+					The consolidated notes match the commit list line for line; nothing to
+					change.
+				</p>
+			)}
+			<div className="dialog-actions">
+				<button type="button" onClick={onDiscard}>
+					Discard
+				</button>
+				<button type="button" className="primary" onClick={onUse}>
+					Use consolidated notes
+				</button>
+			</div>
+		</section>
+	);
 }
 
 /** "Create release" preview: what accumulated on the target since the last tag, and the Start button. Refetches on every open. */
-function ReleaseDialog({
+export function ReleaseDialog({
 	project,
 	open,
 	onClose,
@@ -3501,6 +3557,15 @@ function ReleaseDialog({
 	/** When the notes consolidation call started; the busy line ticks its elapsed time. */
 	const [summarySince, setSummarySince] = useState<number | null>(null);
 	const [summaryReason, setSummaryReason] = useState<string | null>(null);
+	/** Consolidation awaiting accept: the commit-history notes beside the model's proposal;
+	 *  null while closed. Set only by the Consolidate notes button, never on open. */
+	const [review, setReview] = useState<{
+		original: string;
+		consolidated: string;
+	} | null>(null);
+	/** Bumped on every dialog open; a consolidation reply whose captured epoch differs
+	 *  belongs to an earlier open (maybe another project) and must not set state. */
+	const summaryEpoch = useRef(0);
 	const [showCommits, setShowCommits] = useState(false);
 	const edited = useRef(false);
 	const catalog = useModels();
@@ -3520,8 +3585,10 @@ function ReleaseDialog({
 		setSummaryBusy(false);
 		setSummarySince(null);
 		setSummaryReason(null);
+		setReview(null);
 		setShowCommits(false);
 		edited.current = false;
+		summaryEpoch.current += 1;
 		setLoading(true);
 		let alive = true;
 		// unwrap: a non-JSON 200 must surface as a load error, not an empty dialog.
@@ -3531,31 +3598,54 @@ function ReleaseDialog({
 				if (!alive) return;
 				setPlan(data);
 				setVersion(data.version);
-				if (data.from !== null) {
-					setSummaryBusy(true);
-					setSummarySince(Date.now());
-					post<{ summary: string | null; reason: string | null }>(
-						`/api/projects/${encodeURIComponent(project.name)}/release-summary`,
-						{ sha: data.sha },
-					)
-						.then((res) =>
-							summaryReply(res, alive, edited, setNotesDraft, setSummaryReason),
-						)
-						.catch((e) => {
-							if (alive)
-								setSummaryReason(e instanceof Error ? e.message : String(e));
-						})
-						.finally(() => {
-							if (alive) setSummaryBusy(false);
-						});
-				}
 			})
 			.catch((e) => setLoadError(e instanceof Error ? e.message : String(e)))
 			.finally(() => setLoading(false));
 		return () => {
 			alive = false;
+			// A reply landing in the closed window belongs to no open session.
+			summaryEpoch.current += 1;
 		};
 	}, [open, project.name]);
+	// The consolidation runs only on this button: opening the dialog never asks the
+	// model anything, and the deterministic notes stay in the editor until the user
+	// accepts a proposal. The diff bases on the live draft (the deepen pattern), so
+	// an accepted proposal can never drop the user's own edits without showing the
+	// removal in the review first.
+	const consolidate = (): void => {
+		if (plan === null || plan.from === null || summaryBusy) return;
+		const base = notesDraft ?? plan.notes;
+		const epoch = summaryEpoch.current;
+		setSummaryReason(null);
+		setSummaryBusy(true);
+		setSummarySince(Date.now());
+		post<{ summary: string | null; reason: string | null }>(
+			`/api/projects/${encodeURIComponent(project.name)}/release-summary`,
+			{ sha: plan.sha },
+		)
+			.then((res) => {
+				if (summaryEpoch.current !== epoch) return;
+				if (res.summary !== null)
+					setReview({ original: base, consolidated: res.summary });
+				else setSummaryReason(res.reason);
+			})
+			.catch((e) => {
+				if (summaryEpoch.current === epoch)
+					setSummaryReason(e instanceof Error ? e.message : String(e));
+			})
+			.finally(() => {
+				if (summaryEpoch.current === epoch) setSummaryBusy(false);
+			});
+	};
+	// Through the draft path: the textarea holds the proposal, still editable. Discard
+	// closes the review and keeps the commit-history notes; Start still sends `notes`
+	// only when the draft differs from plan.notes.
+	const useConsolidated = (): void => {
+		if (review === null || plan === null) return;
+		setNotesDraft(review.consolidated);
+		edited.current = review.consolidated !== plan.notes;
+		setReview(null);
+	};
 	const start = (): void => {
 		if (plan === null || plan.blocked !== null || !versionOk) return;
 		const proposal = notesDraft ?? plan.notes;
@@ -3617,6 +3707,29 @@ function ReleaseDialog({
 							setNotesDraft,
 							showCommits,
 							setShowCommits,
+							plan.from !== null && (
+								<button
+									type="button"
+									disabled={summaryBusy || review !== null}
+									aria-busy={summaryBusy || undefined}
+									onClick={consolidate}
+								>
+									{summaryBusy ? (
+										<span className="spinner" aria-hidden="true" />
+									) : (
+										<Icon name="list-checks" size={14} />
+									)}
+									Consolidate notes
+								</button>
+							),
+							review !== null && (
+								<ConsolidationReview
+									original={review.original}
+									consolidated={review.consolidated}
+									onUse={useConsolidated}
+									onDiscard={() => setReview(null)}
+								/>
+							),
 						)}
 						{releaseHint(plan, project, short)}
 						<ModelField
@@ -3638,6 +3751,10 @@ function ReleaseDialog({
 						{err}
 					</p>
 				)}
+			</div>
+			{/* Pinned under the scrolling body, so Cancel and Start release stay
+			    reachable however tall the consolidation review makes the body. */}
+			<div className="release-dialog-foot">
 				{releaseActions(plan, versionOk, send, start)}
 			</div>
 		</Modal>
@@ -3999,6 +4116,9 @@ function ProjectAdvisories(p: {
 	pushMain: () => Promise<boolean>;
 	saveCheck: (patchBody: Record<string, unknown>) => Promise<boolean>;
 	interview: (path: string, body: Record<string, unknown>) => Promise<boolean>;
+	/** Creates the git repository (POST /init); no interview verdict to report since
+	 *  OTTR-1065 — the interview starts from the rules advisory or the wizard. */
+	initGit: () => Promise<boolean>;
 	rulesTask: TaskCard | null;
 	openTask: (id: string) => void;
 }) {
@@ -4110,9 +4230,7 @@ function ProjectAdvisories(p: {
 				<p className="advisory">
 					<Icon name="info" size={14} />
 					Not a git repository yet, so every action waits.
-					<BusyButton run={() => p.interview("/init", {})}>
-						Create git repo
-					</BusyButton>
+					<BusyButton run={p.initGit}>Create git repo</BusyButton>
 				</p>
 			)}
 			{q !== "" && p.shown.length === 0 && (
@@ -4291,6 +4409,13 @@ export function ProjectBoard({
 			);
 			onNotice(interviewMsg(r.interview));
 		});
+	/** Creates the git repository; no interview starts here since OTTR-1065 — the
+	 *  wizard's last step and the checklist's rules item call POST /interview. */
+	const initGit = () =>
+		act(async () => {
+			await post(`/api/projects/${encodeURIComponent(project.name)}/init`, {});
+			refreshState();
+		});
 	// The live rules interview card, if any: the no-rules advisory then offers opening it
 	// instead of a second "Discuss rules" that would only answer "queued".
 	const rulesTask = liveCardOf(tasks, "interview");
@@ -4446,6 +4571,7 @@ export function ProjectBoard({
 				pushMain={pushMain}
 				saveCheck={saveCheck}
 				interview={interview}
+				initGit={initGit}
 				rulesTask={rulesTask}
 				openTask={open}
 			/>
@@ -4453,6 +4579,10 @@ export function ProjectBoard({
 				<SetupChecklist
 					project={project}
 					save={saveCheck}
+					rulesTask={rulesTask}
+					openTask={open}
+					interview={interview}
+					initGit={initGit}
 					onOpenSetup={() => setSetupOpen(true)}
 				/>
 			)}
@@ -7197,21 +7327,11 @@ function addGitProjectRequest(req: {
 function reportAddedProject(
 	data: unknown,
 	hooks: {
-		onAdded: (interview: string) => void;
-		setAdded: (v: {
-			project: ProjectView;
-			interview: string;
-			id: string | null;
-		}) => void;
+		setAdded: (v: { project: ProjectView }) => void;
 	},
 ): void {
 	const r = data as unknown as AddProjectResponse; // unchecked cast: the server's documented answer shape
-	hooks.onAdded(r.interview);
-	hooks.setAdded({
-		project: r.project,
-		interview: r.interview,
-		id: r.id ?? null,
-	});
+	hooks.setAdded({ project: r.project });
 }
 
 /** The Add submit from the form: success reports the project, otherwise it raises
@@ -7225,12 +7345,7 @@ async function addGitProject(
 		trust: string[] | undefined;
 	},
 	hooks: {
-		onAdded: (interview: string) => void;
-		setAdded: (v: {
-			project: ProjectView;
-			interview: string;
-			id: string | null;
-		}) => void;
+		setAdded: (v: { project: ProjectView }) => void;
 		setAddTrust: (t: TrustNeeded) => void;
 		setNeedsTokenHost: (h: string) => void;
 	},
@@ -7262,12 +7377,7 @@ async function addGitProjectTrusted(
 		trust: string[] | undefined;
 	},
 	hooks: {
-		onAdded: (interview: string) => void;
-		setAdded: (v: {
-			project: ProjectView;
-			interview: string;
-			id: string | null;
-		}) => void;
+		setAdded: (v: { project: ProjectView }) => void;
 		setAddTrust: (t: TrustNeeded | null) => void;
 	},
 ): Promise<TestAnswer> {
@@ -7472,13 +7582,11 @@ function AddNewPanel({
 export function AddProjectModal({
 	act,
 	onClose,
-	onAdded,
 	openTask,
 	projects,
 }: {
 	act: Act;
 	onClose: () => void;
-	onAdded: (interview: string) => void;
 	/** Opens the rules interview card in the board drawer: the wizard's "Open rules task". */
 	openTask: (id: string) => void;
 	projects: ProjectView[];
@@ -7587,7 +7695,6 @@ export function AddProjectModal({
 							trust,
 						},
 						{
-							onAdded,
 							setAdded,
 							setAddTrust: (t) => setAddTrust(t),
 							setNeedsTokenHost: (h) => setNeedsTokenHost(h),
@@ -7598,11 +7705,8 @@ export function AddProjectModal({
 		);
 	};
 	// The created project: once set, the dialog shows the setup wizard instead of the form.
-	const [added, setAdded] = useState<{
-		project: ProjectView;
-		interview: string;
-		id: string | null;
-	} | null>(null);
+	// The rules interview waits for the wizard's last step (docs/specs/add-project-wizard.md).
+	const [added, setAdded] = useState<{ project: ProjectView } | null>(null);
 	// A token save for the host the server named, then the retry of Add.
 	const saveToken = (): void => {
 		void act(async () => {
@@ -7729,12 +7833,7 @@ export function AddProjectModal({
 										taskIdPrefix: prefixOut,
 										github: ghRepo,
 									});
-									onAdded(r.interview);
-									setAdded({
-										project: r.project,
-										interview: r.interview,
-										id: r.id ?? null,
-									});
+									setAdded({ project: r.project });
 								}, setErr),
 							);
 						}}
@@ -7810,7 +7909,6 @@ export function AddProjectModal({
 											trust,
 										},
 										{
-											onAdded,
 											setAdded,
 											setAddTrust: (t) => setAddTrust(t),
 										},
@@ -7830,8 +7928,6 @@ export function AddProjectModal({
 				) : (
 					<ProjectSetupSteps
 						project={added.project}
-						interview={added.interview}
-						rulesTask={added.id}
 						openTask={openTask}
 						act={act}
 						onClose={onClose}
@@ -7962,16 +8058,49 @@ function customChosen(q: AskQuestion, selected: string | null): boolean {
 }
 
 /** Board panel above the lanes while setupChecklist is set: only the still-open items. */
-function SetupChecklist({
+export function SetupChecklist({
 	project,
 	save,
+	rulesTask,
+	openTask,
+	interview,
+	initGit,
 	onOpenSetup,
 }: {
 	project: ProjectView;
 	save: (patch: Record<string, unknown>) => Promise<boolean>;
+	/** The live rules interview card, when one runs: the rules item then opens it. */
+	rulesTask: TaskCard | null;
+	openTask: (id: string) => void;
+	interview: (path: string, body: Record<string, unknown>) => Promise<boolean>;
+	initGit: () => Promise<boolean>;
 	onOpenSetup: () => void;
 }) {
 	const items: ReactNode[] = [];
+	// The rules interview first: tasks wait on AGENTS.md. The add wizard queues it only
+	// on its last step, so a project closed mid-way finds its way back here (OTTR-1065).
+	if (!project.hasRules)
+		items.push(
+			<li key="rules">
+				<span>No AGENTS.md yet, so tasks wait in Todo</span>
+				{project.gitless ? (
+					<BusyButton run={initGit}>Create git repo</BusyButton>
+				) : rulesTask !== null ? (
+					<BusyButton
+						run={async () => {
+							openTask(rulesTask.id);
+							return true;
+						}}
+					>
+						Open rules task
+					</BusyButton>
+				) : (
+					<BusyButton run={() => interview("/interview", {})}>
+						Start rules interview
+					</BusyButton>
+				)}
+			</li>,
+		);
 	if (project.settings.retroSince === null)
 		items.push(
 			<li key="retro">
@@ -8704,13 +8833,22 @@ export function PrReviewSection({
 }) {
 	const [body, setBody] = useState(draft ?? "");
 	const [error, setError] = useState<string | null>(null);
-	// Second composer: a note asking for a fresh draft of the current head. `noteFor` holds
-	// what was sent plus the draft at send time, so the hint disappears once new text is
-	// typed or a new draft lands on the card.
+	// A landed draft rewrites the card's details: an unedited box follows the new
+	// draft, an edited one keeps the user's text. Render-phase reset with the guard
+	// React documents for adjusting state on a prop change.
+	const lastDraft = useRef(draft);
+	if (draft !== lastDraft.current) {
+		if (body === lastDraft.current) setBody(draft ?? "");
+		lastDraft.current = draft;
+	}
+	// Second composer: a note asking for a fresh draft of the current head. On success the
+	// field clears and `noteFor` holds the cleared text, so the instant waiting state
+	// lives until new text is typed; the run record itself carries the result.
 	const [note, setNote] = useState("");
 	const [noteFor, setNoteFor] = useState<{
 		text: string;
-		draft: string | null;
+		/** The run record the ask started from: its startedAt, or -1 with none. Only a newer record's end can be this ask's result. */
+		runAt: number;
 	} | null>(null);
 	const taskUrl = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}`;
 	const { postedLabel, blocked } = prPostState(
@@ -8721,6 +8859,25 @@ export function PrReviewSection({
 	);
 	const inlineCount = parseReviewDraft(body).comments.length;
 	const shownError = error ?? pr.postError;
+	// The ask composer mirrors the card's last draft run (docs/specs/pr-reviews.md,
+	// "Draft runs"). The run record alone drives the result: an in-flight run shows
+	// the spinner line (asked or watcher-run), a clean end names the draft ready,
+	// a failed end shows its error. `noteFor` only bridges the gap between the ask
+	// click and the record's arrival. The wait is exclusive: while this ask waits
+	// for its own run — the run record may still be an older run's, and explicit
+	// requests serialize — the stale result of that earlier run stays hidden.
+	const run = pr.run;
+	const waiting =
+		(run !== null && run.endedAt === null) ||
+		(noteFor !== null &&
+			note === noteFor.text &&
+			(run === null || run.startedAt <= noteFor.runAt));
+	const freshDraft =
+		!waiting && run !== null && run.endedAt !== null && run.error === null;
+	const runError =
+		!waiting && run !== null && run.endedAt !== null && run.error !== null
+			? run.error
+			: null;
 	return (
 		<>
 			<p>
@@ -8795,13 +8952,18 @@ export function PrReviewSection({
 						onChange={(e) => setNote(e.target.value)}
 					/>
 					<div className="reply-actions">
-						{noteFor !== null &&
-							note === noteFor.text &&
-							draft === noteFor.draft && (
-								<span className="dim">
-									The new draft will appear here when it is ready.
-								</span>
-							)}
+						{waiting && (
+							<span className="dim">
+								<span className="spinner" aria-hidden="true" /> Writing a new
+								draft...
+							</span>
+						)}
+						{freshDraft && <span className="dim">New draft ready.</span>}
+						{runError !== null && (
+							<span className="auth-error" role="alert">
+								{runError}
+							</span>
+						)}
 						<BusyButton
 							// Plain, not primary: a done drawer keeps exactly one primary (Post review).
 							disabled={note.trim() === ""}
@@ -8809,8 +8971,12 @@ export function PrReviewSection({
 								act(async () => {
 									setError(null);
 									await post(`${taskUrl}/reply`, { text: note });
-									setNoteFor({ text: note, draft });
 									setNote("");
+									// noteFor.text stays the cleared field: the instant waiting
+									// state lives while nothing new is typed. runAt is the record
+									// this ask started from, so a stale ended record never masks
+									// the wait for this ask's own run.
+									setNoteFor({ text: "", runAt: run?.startedAt ?? -1 });
 								}, setError)
 							}
 						>
@@ -11299,7 +11465,19 @@ function DrawerSteps(p: {
 				{detail === null ? (
 					<DrawerLoading label="Loading the steps" />
 				) : (
-					steps.length === 0 && <p className="dim">No turns yet.</p>
+					steps.length === 0 &&
+					// A pr_review card never runs turns: its Work steps are the card log
+					// itself (the draft-run lines), through the same log view turns use.
+					(task.prReview !== undefined ? (
+						<LogView
+							project={project}
+							taskId={task.id}
+							startedAt={task.createdAt}
+							logOffset={0}
+						/>
+					) : (
+						<p className="dim">No turns yet.</p>
+					))
 				)}
 				<ul className="turns">
 					{steps.map((s, idx) => (
@@ -14299,12 +14477,15 @@ const SETTINGS_LABELS = [...SETTINGS_LABEL_IDS.keys()]
 	.sort((a, b) => b.length - a.length)
 	.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
 	.join("|");
-/** One scan for both link rules: a https:// URL, or a settings phrase — the word
- * plus one or more `<separator> <label>` steps. The trailing lookahead keeps a
- * longer word ("Settings - Envelope") from matching the "Env" label, and sentence
- * punctuation can never join a label, so it stays outside the anchor naturally. */
+/** A card reference id: an optional uppercase prefix, then digits — "OTTR-1071"
+ * or a legacy "748", never the sha in "ottr#7f78beca". */
+const CARD_REF_ID = String.raw`(?:[A-Z][A-Z0-9]*-)?\d+`;
+/** One scan for all link rules: a https:// URL (m[1]), a settings phrase (m[2]),
+ * or a card reference — `project#ID` (m[3]/m[4]), a lone `#ID` (m[5]), or a bare
+ * `PREFIX-N` (m[6]). The trailing lookaheads keep sentence punctuation outside
+ * the match and reject a sha like "ottr#7f78beca". */
 const WARNING_LINK_RE = new RegExp(
-	`(https://\\S+)|(\\bSettings(?:${SETTINGS_SEP}(?:${SETTINGS_LABELS}))+)(?![A-Za-z0-9])`,
+	`(https://\\S+)|(\\bSettings(?:${SETTINGS_SEP}(?:${SETTINGS_LABELS}))+)(?![A-Za-z0-9])|([A-Za-z][A-Za-z0-9_-]{0,40})#(${CARD_REF_ID})(?![A-Za-z0-9-])|#(${CARD_REF_ID})(?![A-Za-z0-9-])|\\b([A-Z][A-Z0-9]*-\\d+)(?![A-Za-z0-9-])`,
 	"g",
 );
 /** The label steps of a matched settings phrase, for the deepest-id walk. */
@@ -14327,12 +14508,30 @@ function settingsPhraseId(phrase: string): string {
 	return "";
 }
 
+/** Resolver and opener the bell lines hand to warningLinks: resolve turns a card
+ * reference into the card's wire ref — null when no card carries the id, or the
+ * named project is not one the board knows — and open moves to the card. */
+export type CardLinkCtx = {
+	resolve(
+		id: string,
+		project: string | null,
+	): { project: string; id: string } | null;
+	open(id: string): void;
+};
+
 /** Links inside a server warning: https:// URLs open in a new tab, and a
  * `Settings <sep> <label>` phrase opens that General settings section in-tab (a
  * chain like `Settings → GitHub → GitHub token` anchors the whole phrase to
  * the deepest step). A trailing sentence period stays outside the anchor so the
- * href stays valid. In hosted mode a phrase that names a hidden card stays plain text. */
-export function warningLinks(text: string, hosted = false): ReactNode {
+ * href stays valid. In hosted mode a phrase that names a hidden card stays plain text.
+ * A card reference — `project#ID`, `#ID`, or a bare `PREFIX-N` — becomes a drawer
+ * link through `cards`; an unknown id, a foreign project, or a sha keeps its text.
+ * Without `cards` every reference stays text, so existing callers render as before. */
+export function warningLinks(
+	text: string,
+	hosted = false,
+	cards?: CardLinkCtx | null,
+): ReactNode {
 	const out: ReactNode[] = [];
 	let last = 0;
 	for (const m of text.matchAll(WARNING_LINK_RE)) {
@@ -14355,7 +14554,7 @@ export function warningLinks(text: string, hosted = false): ReactNode {
 					{url.slice(link.length)}
 				</Fragment>,
 			);
-		} else {
+		} else if (m[2] !== undefined) {
 			const id = settingsPhraseId(phrase);
 			if (hostedHidden(hosted, id)) out.push(phrase);
 			else
@@ -14372,26 +14571,226 @@ export function warningLinks(text: string, hosted = false): ReactNode {
 						{phrase}
 					</a>,
 				);
-		}
+		} else if (cards != null) {
+			// The resolver decides; the regex only shaped the reference.
+			const id = m[4] ?? m[5] ?? m[6] ?? "";
+			const ref = cards.resolve(id, m[3] ?? null);
+			if (ref === null) out.push(m[0]);
+			else
+				out.push(
+					<a
+						key={out.length}
+						className="notif-link"
+						data-card-link="1"
+						href={taskPath(ref.project, ref.id)}
+						title={`Open card ${ref.id}`}
+						onClick={(e) => {
+							navClick(e, () => cards.open(ref.id));
+						}}
+					>
+						{m[0]}
+					</a>,
+				);
+		} else out.push(m[0]);
 		last = index + m[0].length;
 	}
 	if (last < text.length) out.push(text.slice(last));
 	return out;
 }
 
+/** True for a whitespace-delimited token whose shape is host detail the collapsed
+ * line must not carry (OTTR-1084): a path (holds "/", but an http(s) link stays),
+ * a CLI flag ("-d", "--no-deps"), or a container-style name ("ottr-worker-1").
+ * Card refs ("OTTR-1071", "ottr#OTTR-1071") match no shape. The tests run on the
+ * token's bare core: sentence punctuation and brackets ride on the token
+ * ("ottr-worker-1.", "(alate-seed-2)") and must not hide the shape from the
+ * anchored tests. */
+function isNoticeDetailToken(token: string): boolean {
+	const core = token.replace(/^[^\w/@#-]+/, "").replace(/[^\w/@#-]+$/, "");
+	if (/^https?:\/\//i.test(core)) return false;
+	if (core.includes("/")) return true;
+	if (/^-{1,2}[a-zA-Z0-9]/.test(core)) return true;
+	return /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*-\d+$/.test(core);
+}
+
+/** A notice line's collapsed copy: detail tokens gone, repeated spaces
+ * collapsed, and a connector word popped with a removed token so the line does
+ * not end on a dangling preposition ("in /opt/x" goes as a unit). A removed
+ * token keeps its trailing punctuation so its sentence end survives and the
+ * next sentence does not merge into it; that punctuation drops when no kept
+ * word precedes it (a line of detail tokens alone strips empty). */
+function stripNoticeTokens(line: string): string {
+	let out = "";
+	for (const token of line.split(/\s+/)) {
+		if (token === "") continue;
+		if (isNoticeDetailToken(token)) {
+			const punct = /[.,;:!?]+$/.exec(token)?.[0] ?? "";
+			const head = out.slice(out.lastIndexOf(" ") + 1);
+			if (
+				out.includes(" ") &&
+				/^(?:in|at|on|from|with|to|for|by|into|under|via)$/.test(head)
+			)
+				out = out.slice(0, out.lastIndexOf(" "));
+			if (out !== "" && punct !== "") out += punct;
+			continue;
+		}
+		out += (out === "" ? "" : " ") + token;
+	}
+	return out;
+}
+
+/** The collapsed form of a bell entry's text: the first line, stripped of host
+ * detail first (stripNoticeTokens) so no cut point can still carry a path or
+ * flag, then cut at the end of its first sentence when more sentence follows,
+ * then capped at maxChars on a word boundary with an ellipsis. The cap is for
+ * the update script's flattened records, which hold no line break to cut at
+ * (SeedFailedLine passes 160); the default leaves the line uncapped. A line
+ * that strips empty returns "". Whatever this drops, the entry's Details
+ * disclosure must carry. */
+export function shortNoticeText(
+	text: string,
+	maxChars = Number.POSITIVE_INFINITY,
+): string {
+	const nl = text.indexOf("\n");
+	const line = nl < 0 ? text : text.slice(0, nl);
+	const stripped = stripNoticeTokens(line);
+	let out = stripped;
+	for (let i = 0; i < stripped.length - 1; i++) {
+		const ch = stripped[i];
+		if (
+			ch !== undefined &&
+			".!?;:".includes(ch) &&
+			stripped[i + 1] === " " &&
+			stripped.slice(i + 2).trim() !== ""
+		) {
+			out = stripped.slice(0, i + 1);
+			break;
+		}
+	}
+	if (Number.isFinite(maxChars) && out.length > maxChars) {
+		// Cut at the last whole word that fits; a single word past the cap
+		// hard-cuts mid-word, since there is no boundary to cut at.
+		const space = out.lastIndexOf(" ", maxChars);
+		out =
+			space < 0
+				? `${out.slice(0, maxChars)}…`
+				: `${out.slice(0, space).trimEnd()}…`;
+	}
+	return out;
+}
+
+/** A collapsed bell line shows at most this many card links; the rest hide behind
+ * a "+N more" control until it expands. */
+const MAX_CARD_LINKS = 3;
+
+/** True for the card anchors warningLinks builds above: they alone carry the
+ * data-card-link marker. React's element type loses the props shape, and the
+ * anchors are module-internal, so this one cast sees only our own output. */
+function isCardLink(node: ReactNode | undefined): boolean {
+	if (!isValidElement(node)) return false;
+	const props = node.props as { "data-card-link"?: string };
+	return props["data-card-link"] === "1";
+}
+
+/** Bell text, linkified. With clampLinks, a run of more than MAX_CARD_LINKS card
+ * links renders only the nodes up to the third link plus a "+N more" button, and
+ * expanding it swaps in the full node list in place. */
+function NotifText({
+	text,
+	hosted,
+	cards,
+	clampLinks = false,
+}: {
+	text: string;
+	hosted: boolean;
+	cards?: CardLinkCtx | null;
+	clampLinks?: boolean;
+}) {
+	const [expanded, setExpanded] = useState(false);
+	// warningLinks always returns its node array; the declared ReactNode type is the
+	// public one existing callers see.
+	const nodes = warningLinks(text, hosted, cards) as ReactNode[];
+	if (clampLinks && !expanded) {
+		let cardCount = 0;
+		// The node the third card link ends at; the slice then keeps the text
+		// between the links, which belongs with them.
+		let cut = -1;
+		for (let i = 0; i < nodes.length; i++) {
+			if (!isCardLink(nodes[i])) continue;
+			cardCount++;
+			if (cardCount === MAX_CARD_LINKS) cut = i;
+		}
+		if (cardCount > MAX_CARD_LINKS && cut >= 0) {
+			const rest = cardCount - MAX_CARD_LINKS;
+			// The text between the last kept link and the next one is the list
+			// separator; without it the button glues onto the third reference.
+			let sepEnd = cut + 1;
+			while (sepEnd < nodes.length && !isValidElement(nodes[sepEnd])) sepEnd++;
+			// The unclamped line's trailing punctuation closes the sentence even
+			// though the words it belongs to stay hidden behind the button.
+			const last = nodes[nodes.length - 1];
+			const tail =
+				typeof last === "string"
+					? (last.match(/[\s)\].,;:!?]+$/)?.[0] ?? "")
+					: "";
+			return (
+				<>
+					{nodes.slice(0, sepEnd)}
+					<button
+						type="button"
+						className="notif-more"
+						aria-expanded={false}
+						aria-label={`Show ${rest} more cards`}
+						onClick={() => setExpanded(true)}
+					>
+						+{rest} more
+					</button>
+					{tail}
+				</>
+			);
+		}
+	}
+	return <>{nodes}</>;
+}
+
 /** Server warnings (unseeded agent layer, provider without an active sign-in), one line each.
- * No dismiss: state recomputes per poll, so a fixed condition drops its own line. */
-export function WarningLines({ warnings }: { warnings: string[] }) {
+ * No dismiss: state recomputes per poll, so a fixed condition drops its own line. A long
+ * warning keeps its first line and sentence in the row and moves the tail into a Details
+ * disclosure; the card references link through `cards` when given. */
+export function WarningLines({
+	warnings,
+	cards,
+}: {
+	warnings: string[];
+	cards?: CardLinkCtx | null;
+}) {
 	const hosted = useContext(HostedContext);
 	if (warnings.length === 0) return null;
 	return (
 		<>
-			{warnings.map((w, i) => (
-				<p className="notif-line" role="note" key={`warn:${i}`}>
-					<Mark kind="warn" />
-					<span>{warningLinks(w, hosted)}</span>
-				</p>
-			))}
+			{warnings.map((w, i) => {
+				const short = shortNoticeText(w);
+				return (
+					// A div: the Details disclosure is flow content, which a <p> cannot hold.
+					<div className="notif-line" role="note" key={`warn:${i}`}>
+						<Mark kind="warn" />
+						<span>
+							<NotifText
+								text={short}
+								hosted={hosted}
+								cards={cards}
+								clampLinks
+							/>
+							{short !== w && (
+								<details className="notif-details">
+									<summary>Details</summary>
+									<NotifText text={w} hosted={hosted} cards={cards} />
+								</details>
+							)}
+						</span>
+					</div>
+				);
+			})}
 		</>
 	);
 }
@@ -14399,31 +14798,43 @@ export function WarningLines({ warnings }: { warnings: string[] }) {
 /** OTTR-625: the update task defers the restart while the board runs an older commit than
  * the image it built. One amber line: the user can act (restart on the host), and the board
  * cannot restart itself (no docker in the image), so the notice names the exact command —
- * that naming is the danger confirmation, it says what dies. Null renders nothing. */
+ * that naming is the danger confirmation, it says what dies. The command lives behind the
+ * Details disclosure so the collapsed line stays short; the held turns link through `cards`
+ * when given. Null renders nothing. */
 export function RestartWaitLine({
 	wait,
 	inboxKey,
 	fresh,
+	cards,
 }: {
 	wait: RestartWaitView | null;
 	inboxKey?: string;
 	fresh: boolean;
+	cards?: CardLinkCtx | null;
 }) {
+	const hosted = useContext(HostedContext);
 	if (wait === null) return null;
+	const turns =
+		wait.turns.length > 0
+			? `The restart waits for: ${wait.turns.join(", ")}. Restarting now stops those turns.`
+			: "Restarting now stops the running turns.";
 	return (
-		<p className="notif-line" role="note" data-inbox-key={inboxKey}>
+		// A div: the Details disclosure is flow content, which a <p> cannot hold.
+		<div className="notif-line" role="note" data-inbox-key={inboxKey}>
 			<Mark kind="warn" />
 			<span>
 				The board runs {wait.running.slice(0, 7)}; the image holds{" "}
 				{wait.commit.slice(0, 7)} ({wait.commits} commit
 				{wait.commits === 1 ? "" : "s"} newer).{" "}
-				{wait.turns.length > 0
-					? `The restart waits for: ${wait.turns.join(", ")}. Restarting now stops those turns.`
-					: "Restarting now stops the running turns."}{" "}
-				On the host, run <code>{wait.command}</code> from the stack's checkout.
+				<NotifText text={turns} hosted={hosted} cards={cards} clampLinks />{" "}
+				<details className="notif-details">
+					<summary>Details</summary>
+					On the host, run <code>{wait.command}</code> from the stack's
+					checkout.
+				</details>
 			</span>
 			{fresh && <span className="new-tag">New</span>}
-		</p>
+		</div>
 	);
 }
 
@@ -14436,17 +14847,21 @@ export function seedFailSkill(text: string): string | null {
 
 /** OTTR-753: the update script's hourly seed of the agent layer failed (the record it
  *  writes next to the board home). One red line: the first failure's time, the commit
- *  it tried, the redacted failure text, and the next step. A SkillSpector rejection
- *  names the skill folder and its baseline file. Null renders nothing. */
+ *  it tried, and the recorded text's first sentence; the full text and the next step
+ *  live behind the Details disclosure. A SkillSpector rejection names the skill folder
+ *  and its baseline file. Null renders nothing. */
 export function SeedFailedLine({
 	fail,
 	inboxKey,
 	fresh,
+	cards,
 }: {
 	fail: SeedFailedView | null;
 	inboxKey?: string;
 	fresh: boolean;
+	cards?: CardLinkCtx | null;
 }) {
+	const hosted = useContext(HostedContext);
 	if (fail === null) return null;
 	const skill = seedFailSkill(fail.text);
 	// The recorded tail often ends mid-sentence (the script cuts it), so the next
@@ -14455,19 +14870,37 @@ export function SeedFailedLine({
 		fail.text !== "" && !/[.!?;:]$/.test(fail.text)
 			? `${fail.text}.`
 			: fail.text;
+	const next =
+		skill !== null
+			? `Fix the skill ${skill}, or accept the findings in its .skillspector-baseline.yaml in the data repo.`
+			: "The next update run seeds the agent layer again.";
 	return (
-		<p className="notif-line" role="note" data-inbox-key={inboxKey}>
+		// A div: the Details disclosure is flow content, which a <p> cannot hold.
+		<div className="notif-line" role="note" data-inbox-key={inboxKey}>
 			<Mark kind="crit" />
 			<span>
 				Agent layer seed failed since {stamp(fail.since)}.{" "}
 				{fail.commit !== "" && <>Tried commit {fail.commit.slice(0, 12)}. </>}
-				{text !== "" && <>{text} </>}
-				{skill !== null
-					? `Fix the skill ${skill}, or accept the findings in its .skillspector-baseline.yaml in the data repo.`
-					: "The next update run seeds the agent layer again."}
+				{text !== "" && (
+					<NotifText
+						// Flattened update records hold no line break to cut at; the cap
+						// keeps the collapsed copy to one short line.
+						text={shortNoticeText(text, 160)}
+						hosted={hosted}
+						cards={cards}
+						clampLinks
+					/>
+				)}
+				<details className="notif-details">
+					<summary>Details</summary>
+					{text !== "" && (
+						<NotifText text={text} hosted={hosted} cards={cards} />
+					)}{" "}
+					{next}
+				</details>
 			</span>
 			{fresh && <span className="new-tag">New</span>}
-		</p>
+		</div>
 	);
 }
 
@@ -14478,18 +14911,24 @@ export function ProvisionErrorLine({
 	error,
 	inboxKey,
 	fresh,
+	cards,
 }: {
 	error: string | null;
 	inboxKey?: string;
 	fresh: boolean;
+	cards?: CardLinkCtx | null;
 }) {
+	const hosted = useContext(HostedContext);
 	if (error === null) return null;
 	return (
 		<p className="notif-line" role="note" data-inbox-key={inboxKey}>
 			<Mark kind="crit" />
 			<span>
-				Agent layer provision failed: {error} Run Provision again, and check
-				that the alate server is up.
+				<NotifText
+					text={`Agent layer provision failed: ${error} Run Provision again, and check that the alate server is up.`}
+					hosted={hosted}
+					cards={cards}
+				/>
 			</span>
 			{fresh && <span className="new-tag">New</span>}
 		</p>
@@ -15070,6 +15509,25 @@ export function AppInboxPanel(p: {
 		setError,
 		setNotice,
 	} = p;
+	// Card references in the lines resolve against the live frame; open hides the
+	// panel first so the drawer lands unobstructed, like the alarm rows below.
+	const cardCtx: CardLinkCtx | null =
+		state === null
+			? null
+			: {
+					resolve(id, project) {
+						if (project !== null && !projects.some((pr) => pr.name === project))
+							return null;
+						const task = state.tasks.find((t) => t.id === id);
+						return task === undefined
+							? null
+							: { project: task.project, id: task.id };
+					},
+					open(id) {
+						document.getElementById("inbox")?.hidePopover();
+						openTask(id);
+					},
+				};
 	const critLine =
 		error !== null ? (
 			<p className="notif-line" data-inbox-key={critKey ?? undefined}>
@@ -15197,6 +15655,7 @@ export function AppInboxPanel(p: {
 					setNotice={setNotice}
 					updateCycle={state?.updateCycle ?? null}
 					nowMs={nowMs}
+					cards={cardCtx}
 				/>
 				<AppAdvisoryLines
 					state={state}
@@ -15212,6 +15671,7 @@ export function AppInboxPanel(p: {
 					nowMs={nowMs}
 					openTask={openTask}
 					isNew={isNew}
+					cards={cardCtx}
 				/>
 				{inbox.total === 0 && (
 					<section>
@@ -15372,6 +15832,7 @@ function AppInfoLines(p: {
 	setNotice: (v: string | null) => void;
 	updateCycle: UpdateCycleView | null;
 	nowMs: number;
+	cards?: CardLinkCtx | null;
 }) {
 	const {
 		notice,
@@ -15391,6 +15852,7 @@ function AppInfoLines(p: {
 		isNew,
 		setNotice,
 	} = p;
+	const hosted = useContext(HostedContext);
 	const showRestartControl = behind <= 0 && restartWait !== null;
 	if (
 		!(
@@ -15409,7 +15871,9 @@ function AppInfoLines(p: {
 			{notice !== null && (
 				<p className="notif-line" data-inbox-key={noticeKey ?? undefined}>
 					<Icon name="info" size={16} />
-					<span>{notice}</span>
+					<span>
+						<NotifText text={notice} hosted={hosted} cards={p.cards} />
+					</span>
 					{noticeKey !== null && isNew(noticeKey) && (
 						<span className="new-tag">New</span>
 					)}
@@ -15456,6 +15920,7 @@ function AppInfoLines(p: {
 				wait={restartWait}
 				inboxKey={restartWaitKey ?? undefined}
 				fresh={restartWaitKey !== null && isNew(restartWaitKey)}
+				cards={p.cards}
 			/>
 			{showRestartControl && (
 				<div className="update-cycle-restart">
@@ -15466,11 +15931,13 @@ function AppInfoLines(p: {
 				fail={seedFailed}
 				inboxKey={seedFailKey ?? undefined}
 				fresh={seedFailKey !== null && isNew(seedFailKey)}
+				cards={p.cards}
 			/>
 			<ProvisionErrorLine
 				error={provisionError}
 				inboxKey={provisionErrKey ?? undefined}
 				fresh={provisionErrKey !== null && isNew(provisionErrKey)}
+				cards={p.cards}
 			/>
 		</section>
 	);
@@ -15544,6 +16011,7 @@ function AppAdvisoryLines(p: {
 	nowMs: number;
 	openTask: (id: string) => void;
 	isNew: (key: string) => boolean;
+	cards?: CardLinkCtx | null;
 }) {
 	const {
 		state,
@@ -15573,7 +16041,7 @@ function AppAdvisoryLines(p: {
 	return (
 		<section>
 			<h2>Advisories</h2>
-			<WarningLines warnings={warnings} />
+			<WarningLines warnings={warnings} cards={p.cards} />
 			{orphansError !== null && (
 				<p className="notif-line" data-inbox-key={orphansErrorKey ?? undefined}>
 					<Icon name="info" size={16} />
@@ -16061,7 +16529,6 @@ function AppOverlays(p: {
 	openTask: (id: string) => void;
 	setShowAdd: (v: boolean) => void;
 	setShowUpdates: (v: boolean) => void;
-	setNotice: (v: string | null) => void;
 }) {
 	const {
 		showAdd,
@@ -16076,7 +16543,6 @@ function AppOverlays(p: {
 		openTask,
 		setShowAdd,
 		setShowUpdates,
-		setNotice,
 	} = p;
 	// The retry countdown recounts every second while the banner shows.
 	const [, setRetryTick] = useState(0);
@@ -16098,7 +16564,6 @@ function AppOverlays(p: {
 					act={act}
 					projects={state?.projects ?? []}
 					onClose={() => setShowAdd(false)}
-					onAdded={(i) => setNotice(interviewMsg(i))}
 					openTask={openTask}
 				/>
 			)}
@@ -17178,7 +17643,6 @@ export function App() {
 				openTask={openTask}
 				setShowAdd={setShowAdd}
 				setShowUpdates={setShowUpdates}
-				setNotice={setNotice}
 			/>
 		</HostedContext.Provider>
 	);

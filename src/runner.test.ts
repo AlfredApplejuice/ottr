@@ -3306,6 +3306,79 @@ describe("startRun", () => {
 		}
 	});
 
+	test("the board's project scopes the overlay: bundle skills ride, others stay out", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-plugin-proj-"));
+		const dataDir = join(dir, "data");
+		mkdirSync(dataDir, { recursive: true });
+		// The fixture home stands in for the run's home: alate provisioned a
+		// project-skills bundle for "proj" only
+		// (docs/specs/turn-home-plugin-skills.md).
+		const home = join(dir, "home");
+		const bundleDir = join(home, ".ottr", "project-skills", "proj");
+		mkdirSync(join(bundleDir, "bundle-skill"), { recursive: true });
+		writeFileSync(
+			join(bundleDir, "bundle-skill", "SKILL.md"),
+			"---\ndescription: probe\n---\nbody\n",
+		);
+		const ambientDataDir = process.env.OTTR_DATA_DIR;
+		process.env.OTTR_DATA_DIR = dataDir;
+		try {
+			const seen: (readonly string[])[] = [];
+			const launcher: RunLauncher = (_c, args) => {
+				seen.push(args);
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const board = {
+				url: "http://127.0.0.1:1",
+				token: "t",
+				project: "proj",
+				taskId: "T-1",
+			};
+			const base = {
+				cwd: dir,
+				prompt: "do the thing",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				launcher,
+				pluginSkillsHome: home,
+			};
+			const overlayOf = (): string => {
+				const args = seen[0]!;
+				return args[args.indexOf(NO_DISCOVERY_CONFIG) + 2]!;
+			};
+			// The run's project resolves its bundle: the overlay lists the dir.
+			await (await startRun({ ...base, board })).done;
+			const projOverlay = overlayOf();
+			expect(readFileSync(projOverlay, "utf8")).toContain(
+				JSON.stringify(bundleDir),
+			);
+			// A project without a bundle keeps the unscoped overlay, in its own
+			// file: two projects on one home write two files, so the second run
+			// cannot overwrite the first run's list between write and omp read.
+			seen.length = 0;
+			await (await startRun({ ...base, board: { ...board, project: "other" } }))
+				.done;
+			const otherOverlay = overlayOf();
+			expect(otherOverlay).not.toBe(projOverlay);
+			expect(readFileSync(otherOverlay, "utf8")).not.toContain(
+				"project-skills",
+			);
+			// A stripBoard run carries no OTTR_PROJECT: no scoping either.
+			seen.length = 0;
+			await (await startRun({ ...base, board, stripBoard: true })).done;
+			expect(readFileSync(overlayOf(), "utf8")).not.toContain("project-skills");
+		} finally {
+			if (ambientDataDir === undefined) delete process.env.OTTR_DATA_DIR;
+			else process.env.OTTR_DATA_DIR = ambientDataDir;
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("a local run settles with the provision drift its audit reports", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-provision-drift-"));
 		try {

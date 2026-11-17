@@ -6,7 +6,7 @@ import {
 	expect,
 	test,
 } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SpawnFn } from "./forkAnalysis.ts";
@@ -28,10 +28,12 @@ import {
 	parsePullPage,
 	prUrl,
 	pullState,
+	QUIET_RUN_SLACK_MS,
 	reviewUserMessage,
 } from "./prs.ts";
 import { ProjectStore } from "./store.ts";
 import fc from "./test/properties.ts";
+import { appendLog } from "./turn.ts";
 import type { PrReviewRow } from "./types.ts";
 
 describe("prUrl", () => {
@@ -212,6 +214,8 @@ async function setup(
 		github?: string | null;
 		spawn?: SpawnFn;
 		perfScan?: (diff: string, labels: string[]) => PerfFinding[];
+		/** OTTR-1071: the host's background-work hook for the quiet-time tick. */
+		runQuiet?: (project: string) => Promise<void> | void;
 	} = {},
 ) {
 	const dir = join(root, `p${++seq}`);
@@ -233,6 +237,8 @@ async function setup(
 	};
 	const calls: string[] = [];
 	let fail = false;
+	/** Fails only the diff fetch (the `-H` calls), so a run reaches the review's catch path. */
+	let failDiff = false;
 	let reviewFail = false;
 
 	/** The model's answer; null gives the numbered default. */
@@ -242,10 +248,14 @@ async function setup(
 	/** Card ids the watcher un-read on a re-review (the board's seen-set drop). */
 	const forgotten: string[] = [];
 	let t = 1_000_000_000;
+	/** Run-record edges the board would publish on (OTTR-1073). */
+	let edges = 0;
 	const gh: GhFn = async (args) => {
 		const path = args.at(-1) ?? "";
 		calls.push(path);
 		if (fail) return { code: 1, stdout: "", stderr: "HTTP 401" };
+		if (failDiff && args.includes("-H"))
+			return { code: 1, stdout: "", stderr: "HTTP 401" };
 		const m = path.match(/pulls\/(\d+)$/);
 		if (m && args.includes("-H"))
 			return {
@@ -257,6 +267,24 @@ async function setup(
 		if (m) return pullRoute(state, Number(m[1]));
 		const routed = reviewRoute(state, path);
 		return routed ?? ghJson(state.open);
+	};
+	// OTTR-1071 fake clock: schedule records one entry per quiet-time timer. fire
+	// runs the handler (and marks the entry gone, as the factory's map delete does);
+	// cancel marks it cleared without firing.
+	const timers: { fire: () => void; delay: number; cancelled: boolean }[] = [];
+	const schedule = (fn: () => void, ms: number) => {
+		const entry = {
+			fire: () => {
+				entry.cancelled = true;
+				fn();
+			},
+			delay: ms,
+			cancelled: false,
+		};
+		timers.push(entry);
+		return () => {
+			entry.cancelled = true;
+		};
 	};
 	const watcher = createPrWatcher({
 		projects: () => [
@@ -272,9 +300,17 @@ async function setup(
 		forgetSeen: (id) => {
 			forgotten.push(id);
 		},
+		cardLog: async ({ taskId, line }) => {
+			await appendLog(store, taskId, line);
+		},
+		runEdge: () => {
+			edges++;
+		},
 		now: () => t,
 		spawn: opts.spawn,
 		perfScan: opts.perfScan,
+		schedule,
+		runQuiet: opts.runQuiet,
 		review: opts.spawn
 			? undefined
 			: async (messages) => {
@@ -292,6 +328,10 @@ async function setup(
 		logs,
 		prompts,
 		forgotten,
+		timers,
+		/** The quiet-time timers still pending. */
+		pendingTimers: () => timers.filter((x) => !x.cancelled),
+		edges: () => edges,
 		closed: state.closed,
 		diffs: state.diffs,
 		setOpen: (v: { number: number; head: { sha: string } }[]) => {
@@ -299,6 +339,9 @@ async function setup(
 		},
 		setFail: (v: boolean) => {
 			fail = v;
+		},
+		setFailDiff: (v: boolean) => {
+			failDiff = v;
 		},
 		setReviewFail: (v: boolean) => {
 			reviewFail = v;
@@ -332,6 +375,14 @@ async function setup(
 		},
 		cards: async () =>
 			(await store.listTasks()).filter((x) => x.kind === "pr_review"),
+		/** A card's log file contents; "" when the card logged nothing yet. */
+		readCardLog: async (id: string) => {
+			try {
+				return readFileSync(await store.logPath(id), "utf8");
+			} catch {
+				return "";
+			}
+		},
 	};
 }
 
@@ -805,7 +856,7 @@ describe("review prompt and draft", () => {
 		expect(parseDraft("  ok \n")).toBe("ok");
 		expect(parseDraft("x".repeat(70_000)).length).toBeLessThanOrEqual(65_536);
 	});
-	test("fetchReReviewContext: same head means no range diff, a draft is the fallback, a first review gives null", async () => {
+	test("fetchReReviewContext: same head means no range diff, an unposted draft is no fallback, a first review gives null", async () => {
 		const gh: GhFn = async (args) => {
 			const path = args.at(-1) ?? "";
 			if (path.includes("/reviews"))
@@ -830,10 +881,10 @@ describe("review prompt and draft", () => {
 				postedLogin: null,
 				reviewedHead: sha("a"),
 				head: sha("a"),
-				draftBody: null,
-				draftAt: null,
 			}),
 		).toEqual({ review: "earlier", comments: [], rangeDiff: "" });
+		// An unposted draft is never the earlier review: the reply runs like a
+		// first review, whatever the saved draft holds.
 		expect(
 			await fetchReReviewContext({
 				...base,
@@ -842,10 +893,8 @@ describe("review prompt and draft", () => {
 				postedLogin: null,
 				reviewedHead: sha("a"),
 				head: sha("c"),
-				draftBody: "saved draft",
-				draftAt: 1234,
 			}),
-		).toEqual({ review: "saved draft", comments: [], rangeDiff: null });
+		).toBeNull();
 		expect(
 			await fetchReReviewContext({
 				...base,
@@ -854,8 +903,6 @@ describe("review prompt and draft", () => {
 				postedLogin: null,
 				reviewedHead: null,
 				head: sha("a"),
-				draftBody: null,
-				draftAt: null,
 			}),
 		).toBeNull();
 	});
@@ -905,8 +952,6 @@ describe("review prompt and draft", () => {
 			postedLogin: null,
 			reviewedHead: sha("a"),
 			head: sha("a"),
-			draftBody: null,
-			draftAt: null,
 		};
 		expect((await fetchReReviewContext(o))?.review).toBe(
 			"earlier\n\n<!-- inline src/a.ts:4 -->\nCheck this.\n<!-- /inline -->",
@@ -955,8 +1000,6 @@ describe("review prompt and draft", () => {
 			postedLogin: null,
 			reviewedHead: sha("a"),
 			head: sha("a"),
-			draftBody: null,
-			draftAt: null,
 		});
 		expect(ctx?.review).toBe(
 			`earlier\n\n<!-- inline src/a.ts:4 -->\n${body}\n<!-- /inline -->`,
@@ -1012,8 +1055,6 @@ describe("review prompt and draft", () => {
 			postedLogin: null,
 			reviewedHead: sha("a"),
 			head: sha("a"),
-			draftBody: null,
-			draftAt: null,
 		});
 		expect(ctx?.review).toContain("Finding 1.");
 		expect(ctx?.review).toContain(
@@ -1112,6 +1153,133 @@ describe("review prompt and draft", () => {
 });
 
 describe("createPrWatcher", () => {
+	test("a quiet-time timer starts the review when the quiet gate ends, without a poll", async () => {
+		const s = await setup();
+		s.setOpen([pr(1, sha("a"))]);
+		await s.watcher.tick();
+		// The scan only recorded the PR; no hourly tick ran the review.
+		expect(s.prompts).toHaveLength(0);
+		expect((await s.cards()).length).toBe(0);
+		// Exactly one timer is pending, at the quiet gate plus the slack.
+		const pending = s.pendingTimers();
+		expect(pending).toHaveLength(1);
+		expect(
+			Math.abs(pending[0]!.delay - (PR_GATES.QUIET_MS + QUIET_RUN_SLACK_MS)),
+		).toBeLessThanOrEqual(100);
+		// The timer fires; the review starts on its own.
+		s.advance(PR_GATES.QUIET_MS + QUIET_RUN_SLACK_MS);
+		pending[0]!.fire();
+		// Joins the fired tick's in-flight promise; it is the await, not a second scan trigger.
+		await s.watcher.tick({ manual: "p" });
+		expect(s.prompts).toHaveLength(1);
+		expect((await s.cards()).length).toBe(1);
+		// Nothing waits anymore: the head is reviewed.
+		expect(s.pendingTimers()).toHaveLength(0);
+	});
+
+	test("a watch that is off schedules nothing, and turning it off clears a pending timer", async () => {
+		const s = await setup({ on: false });
+		s.setOpen([pr(1, sha("a"))]);
+		await s.watcher.tick();
+		expect(s.pendingTimers()).toHaveLength(0);
+		expect(s.prompts).toHaveLength(0);
+		// On, a timer pends; off between polls clears it, and firing it starts no review.
+		await s.store.setSettings({ prReviews: true });
+		await s.watcher.tick();
+		const pending = s.pendingTimers();
+		expect(pending).toHaveLength(1);
+		await s.store.setSettings({ prReviews: false });
+		await s.watcher.tick();
+		expect(s.pendingTimers()).toHaveLength(0);
+		pending[0]!.fire();
+		await s.watcher.tick({ manual: "p" });
+		expect(s.prompts).toHaveLength(0);
+		expect((await s.cards()).length).toBe(0);
+	});
+
+	test("the daily cap holds when the quiet-time timer fires", async () => {
+		const s = await setup();
+		s.setOpen([pr(1, sha("a"))]);
+		await s.watcher.tick();
+		// The day's slots are spent before the timer fires.
+		for (let i = 0; i < PR_GATES.PROJECT_DAILY_RUNS; i++)
+			await s.store.startPrRun(99, sha("f"), s.now());
+		const pending = s.pendingTimers();
+		expect(pending).toHaveLength(1);
+		s.advance(PR_GATES.QUIET_MS + QUIET_RUN_SLACK_MS);
+		pending[0]!.fire();
+		await s.watcher.tick({ manual: "p" });
+		// The gate held: no run landed and no card exists.
+		expect(s.prompts).toHaveLength(0);
+		expect((await s.cards()).length).toBe(0);
+		expect(await s.store.prReviewRunsSince(0)).toBe(
+			PR_GATES.PROJECT_DAILY_RUNS,
+		);
+		expect(
+			s.logs.some((m) => m.includes("daily cap of 5 reviews reached")),
+		).toBe(true);
+	});
+
+	test("one timer waits for the earliest PR, and a later poll re-arms it at the new earliest", async () => {
+		const s = await setup();
+		s.setOpen([pr(1, sha("a")), pr(2, sha("b"))]);
+		await s.watcher.tick();
+		// Both PRs are fresh: one timer waits at the shared gate.
+		const first = s.pendingTimers();
+		expect(first).toHaveLength(1);
+		// PR 1 was seen ten minutes earlier than PR 2; the next poll re-arms earlier.
+		await s.store.savePrReview({
+			...(await s.store.getPrReview(1))!,
+			firstSeenAt: s.now() - 10 * 60_000,
+		});
+		await s.watcher.tick();
+		const second = s.pendingTimers();
+		expect(second).toHaveLength(1);
+		expect(first[0]!.cancelled).toBe(true);
+		expect(second[0]).not.toBe(first[0]);
+		expect(second[0]!.delay).toBe(
+			PR_GATES.QUIET_MS - 10 * 60_000 + QUIET_RUN_SLACK_MS,
+		);
+		// The first PR's head gets reviewed; the next poll re-arms at PR 2's later gate.
+		await s.store.savePrDraft({
+			run: await s.store.startPrRun(1, sha("a"), s.now()),
+			number: 1,
+			head: sha("a"),
+			draft: "draft",
+			prompt: "review",
+			blocking: true,
+		});
+		await s.watcher.tick();
+		const third = s.pendingTimers();
+		expect(third).toHaveLength(1);
+		expect(second[0]!.cancelled).toBe(true);
+		expect(third[0]).not.toBe(second[0]);
+		expect(third[0]!.delay).toBe(PR_GATES.QUIET_MS + QUIET_RUN_SLACK_MS);
+	});
+
+	test("the fired quiet timer runs under the host's background control", async () => {
+		// The board passes backgroundTick, so shutdown neither starts the scan nor
+		// loses its rejection; the watcher must delegate to it, not scan directly.
+		const quietRuns: string[] = [];
+		const s = await setup({
+			runQuiet: (project) => {
+				quietRuns.push(project);
+				return s.watcher.tick({ manual: project });
+			},
+		});
+		s.setOpen([pr(1, sha("a"))]);
+		await s.watcher.tick();
+		const pending = s.pendingTimers();
+		expect(pending).toHaveLength(1);
+		s.advance(PR_GATES.QUIET_MS + QUIET_RUN_SLACK_MS);
+		pending[0]!.fire();
+		await s.watcher.tick({ manual: "p" });
+		// The hook got the project, and the review it ran produced the draft.
+		expect(quietRuns).toEqual(["p"]);
+		expect(s.prompts).toHaveLength(1);
+		expect((await s.cards()).length).toBe(1);
+	});
+
 	test("concurrent review requests share the final daily slot", async () => {
 		const s = await setup();
 		s.setOpen([pr(1, sha("a")), pr(2, sha("a"))]);
@@ -2545,6 +2713,217 @@ describe("createPrWatcher", () => {
 		);
 		expect(s.logs.some((m) => m.includes("daily cap"))).toBe(true);
 		expect(s.prompts).toHaveLength(PR_GATES.PROJECT_DAILY_RUNS);
+	});
+
+	test("a reply on an unposted draft runs a first review; a posted review re-reviews", async () => {
+		const s = await setup();
+		s.setOpen([pr(1, sha("a"))]);
+		await s.watcher.tick();
+		// A first review saved a draft that was never posted: the card waits.
+		await s.store.savePrReview({
+			...(await s.store.getPrReview(1))!,
+			reviewedHead: sha("a"),
+			postedHead: null,
+		});
+		await s.store.savePrDraft({
+			run: await s.store.startPrRun(1, sha("a"), s.now()),
+			number: 1,
+			head: sha("a"),
+			draft: "## Summary\nearlier draft",
+			prompt: "review 1",
+			blocking: true,
+		});
+		await s.watcher.reviewNow({
+			project: "p",
+			number: 1,
+			note: "redo the review",
+		});
+		await s.watcher.reviewIdle();
+		const msg = s.prompts.at(-1)!;
+		// The unposted draft is no earlier review: the reply runs like a first review.
+		expect(msg).not.toContain("already reviewed at an earlier head");
+		expect(msg).not.toContain("EARLIER REVIEW");
+		expect(msg).not.toContain(
+			"no code changes since the earlier review's head",
+		);
+		expect(msg).toContain("redo the review");
+		// After the head is posted, the same reply carries the earlier review.
+		s.setReviews([
+			ghReview(
+				1,
+				sha("a"),
+				"Earlier: the error panel leaks state",
+				"2026-01-01T00:00:00Z",
+			),
+		]);
+		await s.store.savePrReview({
+			...(await s.store.getPrReview(1))!,
+			postedHead: sha("a"),
+			postedUrl: `${prUrl("o/r", 1)}#pullrequestreview-1`,
+			postedLogin: "bot",
+		});
+		await s.watcher.reviewNow({
+			project: "p",
+			number: 1,
+			note: "look again",
+		});
+		await s.watcher.reviewIdle();
+		const reMsg = s.prompts.at(-1)!;
+		expect(reMsg).toContain("already reviewed at an earlier head");
+		expect(reMsg).toContain("EARLIER REVIEW");
+	});
+
+	test("a saved run logs its start and draft-saved lines on the card", async () => {
+		const s = await setup();
+		s.setOpen([pr(1, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const card = (await s.cards())[0]!;
+		// The first review's run had no card yet when it started: no card log.
+		expect(await s.readCardLog(card.id)).toBe("");
+		await s.watcher.reviewNow({ project: "p", number: 1, note: "again" });
+		const log = await s.readCardLog(card.id);
+		expect(log).toContain("== pr review draft ");
+		expect(log).toContain("(model custom)");
+		expect(log).toContain("- draft saved ");
+		expect(log).toContain("(took 0s)");
+		const run = s.watcher.prRun("p", 1);
+		expect(run?.endedAt).not.toBeNull();
+		expect(run?.error).toBeNull();
+		expect(run?.model).toBe("custom");
+		// Each real start and end is an edge the board publishes on: the scan run's
+		// two, then the reply run's two.
+		expect(s.edges()).toBe(4);
+	});
+
+	test("an explicit request that fails before the review still logs its run on the card", async () => {
+		const s = await setup();
+		s.setOpen([pr(1, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const card = (await s.cards())[0]!;
+		// The same store behind a project whose GitHub id cannot parse: the request
+		// fails before the review starts, and its run still writes the start and
+		// skip lines to the card's log (OTTR-1073 send-back).
+		const broken = createPrWatcher({
+			projects: () => [
+				{
+					name: "p",
+					path: s.store.serverDir,
+					store: s.store,
+					// A space cannot match REPO_RE: repoForProject throws before the
+					// gh refresh, the earliest failure an explicit request can hit.
+					github: "not a repo",
+				},
+			],
+			log: () => {},
+			gh: s.gh,
+			now: s.now,
+			review: async () => "## Summary\nnever",
+			cardLog: async ({ taskId, line }) => {
+				await appendLog(s.store, taskId, line);
+			},
+		});
+		await broken.reviewNow({ project: "p", number: 1, note: "go" });
+		const log = await s.readCardLog(card.id);
+		expect(log).toContain("== pr review draft ");
+		expect(log).toContain("- skipped ");
+		expect(log).toContain("invalid repo id: github.com/not a repo");
+		expect(broken.prRun("p", 1)?.error).toContain("invalid repo id");
+		expect(broken.prRun("p", 1)?.endedAt).not.toBeNull();
+	});
+
+	test("a skipped run logs its start and skip lines on the card", async () => {
+		const s = await setup();
+		s.setOpen([pr(1, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const card = (await s.cards())[0]!;
+		// The diff fetch fails before the model call: the run starts, then skips.
+		s.setFailDiff(true);
+		await s.watcher.reviewNow({ project: "p", number: 1, note: "again" });
+		const log = await s.readCardLog(card.id);
+		expect(log).toContain("== pr review draft ");
+		expect(log).toContain("- skipped ");
+		expect(log).toContain("HTTP 401");
+		const run = s.watcher.prRun("p", 1);
+		expect(run?.endedAt).not.toBeNull();
+		expect(run?.error).toContain("HTTP 401");
+		expect(run?.model).toBe("custom");
+	});
+
+	test("a failed run logs its start and failed lines on the card", async () => {
+		const s = await setup();
+		s.setOpen([pr(1, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const card = (await s.cards())[0]!;
+		// A new head whose model call throws: the run starts, then fails.
+		s.setOpen([pr(1, sha("c"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		s.setReviewFail(true);
+		await s.watcher.tick();
+		const log = await s.readCardLog(card.id);
+		expect(log).toContain("== pr review draft ");
+		expect(log).toContain("! failed ");
+		expect(log).toContain("gateway down");
+		const run = s.watcher.prRun("p", 1);
+		expect(run?.endedAt).not.toBeNull();
+		expect(run?.error).toBe("gateway down");
+		expect(run?.model).toBe("custom");
+	});
+
+	test("a cap-stopped run logs its start and stopped lines on the card", async () => {
+		const s = await setup();
+		s.setOpen([pr(1, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const card = (await s.cards())[0]!;
+		// The first review spent one slot; the dummy PR spends the rest.
+		for (let i = PR_GATES.PROJECT_DAILY_RUNS - 1; i > 0; i--)
+			await s.store.startPrRun(99, sha("f"), s.now());
+		await s.watcher.reviewNow({ project: "p", number: 1, note: "again" });
+		const log = await s.readCardLog(card.id);
+		expect(log).toContain("== pr review draft ");
+		expect(log).toContain("- stopped ");
+		expect(
+			log.includes(
+				`daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
+			),
+		).toBe(true);
+		const run = s.watcher.prRun("p", 1);
+		expect(run?.endedAt).not.toBeNull();
+		expect(run?.error).toContain("daily cap");
+		expect(run?.model).toBe("custom");
+	});
+
+	test("reviewNow on the project's own PR ends the run with the skip reason", async () => {
+		const s = await setup();
+		const card = await s.store.createTask("parent");
+		await s.store.updateTask(card.id, {
+			stage: "merging",
+			state: "idle",
+			prNumber: 7,
+			prUrl: prUrl("o/r", 7),
+			prHeadSha: sha("a"),
+			pushSha: sha("a"),
+			branch: "ottr/7",
+			base: "main",
+		});
+		s.setOpen([pr(7, sha("a"), false, "Board PR")]);
+		await s.watcher.tick();
+		await s.watcher.reviewNow({ project: "p", number: 7, note: "look" });
+		await s.watcher.reviewIdle();
+		const run = s.watcher.prRun("p", 7);
+		expect(run?.endedAt).not.toBeNull();
+		expect(run?.error).toContain("own PR");
+		expect(s.prompts).toHaveLength(0);
 	});
 
 	/** Posts PR `n`'s review by hand and returns the row; the card id rides on the row. */

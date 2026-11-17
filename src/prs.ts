@@ -19,7 +19,7 @@ import {
 } from "./prInline.ts";
 import { ownerRepo, runGh } from "./release.ts";
 import { singleFlightTick } from "./singleFlight.ts";
-import type { OpenPrsView, PrReviewRow } from "./types.ts";
+import type { OpenPrsView, PrReviewRow, PrRunState } from "./types.ts";
 
 export type ReviewFn = (
 	messages: Array<{ role: "system" | "user"; content: string }>,
@@ -34,6 +34,10 @@ export const PR_GATES = {
 	PROJECT_DAILY_RUNS: 5,
 	DAY_MS: 24 * 60 * 60 * 1000,
 } as const;
+
+/** OTTR-1071: the few extra seconds a quiet-time run waits past the quiet gate, so
+ * the timer never fires a tick before the gate the last poll recorded is over. */
+export const QUIET_RUN_SLACK_MS = 10_000;
 
 /** OTTR-942: most skip notices the watcher keeps; one broken repo cannot flood the bell. */
 const PR_SKIP_NOTICE_MAX = 20;
@@ -440,7 +444,7 @@ export interface PrComment {
 
 /** What the model needs to re-review a PR it already reviewed at an earlier head. */
 export interface ReReviewContext {
-	/** The board's earlier review body (posted on GitHub, or the saved draft when never posted). */
+	/** The board's posted earlier review body. */
 	review: string;
 	/** Conversation and review comments newer than the earlier review, oldest first. */
 	comments: PrComment[];
@@ -748,13 +752,11 @@ interface ReReviewInput {
 	postedLogin: string | null;
 	reviewedHead: string | null;
 	head: string;
-	draftBody: string | null;
-	draftAt: number | null;
 }
 
 /** The earlier review a re-review checks the diff against. */
 interface EarlierReview {
-	/** The posted review's body with its inline comments, or the saved draft. */
+	/** The posted review's body with its inline comments. */
 	review: string;
 	/** Comments at or before this timestamp are already answered; null keeps every comment. */
 	cutoff: number | null;
@@ -768,7 +770,7 @@ interface EarlierReview {
  * last match wins so a review edited on GitHub keeps its latest body. */
 function pickReview(
 	list: unknown,
-	wantId: string | undefined,
+	wantId: string | null | undefined,
 	postedHead: string,
 ): { id: unknown; body: unknown; submittedAt: unknown } | null {
 	if (!Array.isArray(list)) return null;
@@ -780,12 +782,19 @@ function pickReview(
 		if (
 			typeof x.body !== "string" ||
 			x.body === "" ||
-			(wantId !== undefined ? `${x.id}` !== wantId : x.commit_id !== postedHead)
+			(wantId !== undefined && wantId !== null
+				? `${x.id}` !== wantId
+				: x.commit_id !== postedHead)
 		)
 			continue;
 		picked = { id: x.id, body: x.body, submittedAt: x.submitted_at };
 	}
 	return picked;
+}
+
+/** The review id in a posted review's html_url fragment; null when the URL carries none. */
+export function postedReviewId(url: string | null): string | null {
+	return /#pullrequestreview-(\d+)/.exec(url ?? "")?.[1] ?? null;
 }
 
 /** The posted-review branch: read the review, then its inline comments; null when GitHub no
@@ -809,7 +818,7 @@ async function postedReview(
 	} catch {
 		throw new Error("reviews: bad JSON");
 	}
-	const wantId = /#pullrequestreview-(\d+)/.exec(postedUrl ?? "")?.[1];
+	const wantId = postedReviewId(postedUrl);
 	const picked = pickReview(list, wantId, postedHead);
 	if (picked === null || typeof picked.body !== "string") return null;
 	const ts =
@@ -832,19 +841,11 @@ async function postedReview(
 	};
 }
 
-/** The board's earlier review, or null on a first review (and on a first draft-less one). */
+/** The board's posted earlier review, or null on a first review: an unposted draft never
+ * re-enters the prompt, so a reply to an unposted draft runs like a first review. */
 async function earlierReview(o: ReReviewInput): Promise<EarlierReview | null> {
-	if (o.postedHead !== null)
-		return postedReview(o.gh, o.repo, o.number, o.postedHead, o.postedUrl);
-	if (o.reviewedHead !== null && o.draftBody !== null && o.draftBody !== "") {
-		return {
-			review: o.draftBody,
-			cutoff: o.draftAt,
-			reviewId: null,
-			head: o.reviewedHead,
-		};
-	}
-	return null;
+	if (o.postedHead === null) return null;
+	return postedReview(o.gh, o.repo, o.number, o.postedHead, o.postedUrl);
 }
 
 /** One usable comment, or null when the entry is malformed, already answered, or the posted
@@ -901,10 +902,9 @@ async function commentsAfter(
 }
 
 /**
- * What a re-review of `head` needs: the board's earlier review (the posted GitHub review, or the
- * saved draft when the first review was never posted), the comments newer than it, and the code
- * range between the earlier and the current head. null on a first review, or when the posted
- * review cannot be found on GitHub anymore.
+ * What a re-review of `head` needs: the board's posted earlier review, the comments newer
+ * than it, and the code range between the earlier and the current head. null on a first
+ * review, or when the posted review cannot be found on GitHub anymore.
  */
 export async function fetchReReviewContext(
 	o: ReReviewInput,
@@ -948,6 +948,27 @@ interface PrWatcherCtx {
 	gh: GhFn;
 	now: () => number;
 	review: ReviewFn;
+	/** Starts the PR's run record when none is active; an active record keeps its start. A new record writes the card's start log line. */
+	prRunStart: (project: string, number: number, taskId?: string | null) => void;
+	/** Ends the active run record and writes its card-log end line; a later end is a no-op and returns null. */
+	prRunEnd: (
+		project: string,
+		number: number,
+		outcome: {
+			kind: "saved" | "skipped" | "failed" | "cap";
+			text: string | null;
+		},
+		taskId?: string | null,
+	) => PrRunState | null;
+	/** The PR's last run record, or null when none ran since the watcher started. */
+	prRun: (project: string, number: number) => PrRunState | null;
+	/** Appends one run line to the PR card's log; optional (absent in bare watchers). */
+	cardLog?: (o: {
+		project: string;
+		taskId: string;
+		number: number;
+		line: string;
+	}) => void | Promise<void>;
 	/** The deterministic lens over one PR diff; defaults to perfFindings. */
 	perfScan: (diff: string, labels: string[]) => PerfFinding[];
 	/** Called with the card id when a re-review rewrites a draft the user may have read. */
@@ -966,6 +987,11 @@ interface PrWatcherCtx {
 		head: string,
 		dropped: string[],
 	) => void;
+	/** OTTR-1071: (re)arms the project's one quiet-time run at `at`; null clears a
+	 * pending one. Optional: the factory always sets it, tests may not. */
+	scheduleQuietRun?: (project: string, at: number | null) => void;
+	/** OTTR-1071: records a finished poll's clock value and error for the state payload. */
+	recordPoll?: (project: string, at: number, error: string | null) => void;
 }
 
 /** The repo id of a project's GitHub remote; throws on a malformed id. */
@@ -1003,6 +1029,7 @@ async function syncSeenPulls(
 				postedHead: null,
 				postedUrl: null,
 				postedLogin: null,
+				postedEvent: null,
 				state: "open",
 				draft: p.draft,
 				title: p.title,
@@ -1124,6 +1151,41 @@ async function dueReviewRows(
 	return due;
 }
 
+/** OTTR-1071: the earliest quiet-gate end among the rows a review still waits for;
+ * null when no row waits. Mirrors dueReviewRows' filters, but selects the rows the
+ * quiet period has not released yet. */
+async function nextQuietDueAt(
+	store: ForkProject["store"],
+	t: number,
+	pulls: PullInfo[],
+): Promise<number | null> {
+	const byNumber = new Map(pulls.map((p) => [p.number, p]));
+	const own = await ownPulls(store);
+	let next: number | null = null;
+	for (const row of await store.listPrReviews()) {
+		if (
+			row.state !== "open" ||
+			row.draft ||
+			(await store.prHeadReviewed(row.number, row.head)) ||
+			row.firstSeenAt + PR_GATES.QUIET_MS <= t
+		)
+			continue;
+		const card = row.taskId ? await store.getTask(row.taskId) : null;
+		// A cancelled card is the user's "never review this PR".
+		if (card?.cancelledAt != null) continue;
+		const info = byNumber.get(row.number);
+		if (
+			own.numbers.has(row.number) ||
+			own.sourcePrNumbers.has(row.number) ||
+			(info?.headRef != null && own.branches.has(info.headRef))
+		)
+			continue;
+		const due = row.firstSeenAt + PR_GATES.QUIET_MS;
+		if (next === null || due < next) next = due;
+	}
+	return next;
+}
+
 /** The comment watch: every posted open PR reads the comments since its cutoff. */
 async function sweepNotifiedRows(
 	ctx: PrWatcherCtx,
@@ -1179,19 +1241,18 @@ async function scanProject(
 	const source = new Map(
 		(await store.listPrReviews()).map((row) => [row.number, row]),
 	);
-	let pulls: PullInfo[];
-	try {
-		pulls = await listPulls(repo, ctx.gh);
-	} catch (e) {
-		ctx.log(`prs: ${project.name}: ${(e as Error).message}`);
-		return;
-	}
+	// A failure here propagates: scanTick logs it and records the poll error.
+	const pulls = await listPulls(repo, ctx.gh);
 	const t = ctx.now();
 	const seen = await store.transaction(async () => {
 		if ((await store.getSettings()).prReviews !== true) return null;
 		return syncSeenPulls(store, pulls, t, source);
 	});
-	if (seen === null) return;
+	if (seen === null) {
+		// The watch turned off between polls: a pending timer must not fire.
+		ctx.scheduleQuietRun?.(project.name, null);
+		return;
+	}
 	await closeGonePulls(ctx, project, repo, seen, source);
 	// Converges every card to its row: a reopened PR, or a card an older build left in Done.
 	await store.transaction(async () => {
@@ -1202,6 +1263,8 @@ async function scanProject(
 	if ((await store.getSettings()).prReviewNotify === true)
 		await sweepNotifiedRows(ctx, project, repo);
 	await runDueReviews(ctx, project, repo, store, t, pulls);
+	// OTTR-1071: arm the next quiet-time run at the earliest gate that still waits.
+	ctx.scheduleQuietRun?.(project.name, await nextQuietDueAt(store, t, pulls));
 }
 
 /**
@@ -1338,6 +1401,10 @@ async function reviewOnce(
 	reviewsEnabled = true,
 ): Promise<void> {
 	const store = project.store;
+	// The scan flow starts the run record here; an explicit request already started
+	// it, and that record's start time stands. Every exit ends the record and, when
+	// the run has a card, writes its one card-log line (the record machinery does).
+	ctx.prRunStart(project.name, row.number, row.taskId);
 	const source = await store.transaction(async () => {
 		const current = await store.getPrReview(row.number);
 		const card = row.taskId === null ? null : await store.getTask(row.taskId);
@@ -1352,12 +1419,17 @@ async function reviewOnce(
 			card?.cancelledAt != null
 		)
 			return null;
-		return {
-			card,
-			draftAt: await store.lastPrRunAt(row.number, row.reviewedHead),
-		};
+		return { card };
 	});
-	if (source === null) return;
+	if (source === null) {
+		ctx.prRunEnd(
+			project.name,
+			row.number,
+			{ kind: "skipped", text: "the pull request or the card changed" },
+			row.taskId,
+		);
+		return;
+	}
 	// Diff fetch and prompt budget fail the same way for the same head on
 	// every tick: run them before the attempt takes a cap slot, so one such PR cannot
 	// starve the others of the project.
@@ -1372,6 +1444,12 @@ async function reviewOnce(
 		const data = await pullData(repo, row.number, row.head, ctx.gh);
 		if (data === null) {
 			ctx.log(`prs: ${project.name}: #${row.number} moved; next tick`);
+			ctx.prRunEnd(
+				project.name,
+				row.number,
+				{ kind: "skipped", text: "the head moved on GitHub" },
+				row.taskId,
+			);
 			return;
 		}
 		diff = data.diff;
@@ -1395,8 +1473,6 @@ async function reviewOnce(
 			postedLogin: row.postedLogin,
 			reviewedHead: row.reviewedHead,
 			head: row.head,
-			draftBody: source.card?.details ?? null,
-			draftAt: source.draftAt,
 		});
 		user = reviewUserMessage({
 			repo,
@@ -1417,10 +1493,17 @@ async function reviewOnce(
 		// OTTR-942: the skip shows on the board, not only in this log line.
 		ctx.recordSkipNotice(project.name, row.number, row.head, reason);
 		ctx.log(`prs: ${project.name}: #${row.number} review skipped: ${reason}`);
+		ctx.prRunEnd(
+			project.name,
+			row.number,
+			{ kind: "skipped", text: reason },
+			row.taskId,
+		);
 		return;
 	}
 	// The model attempt counts against the cap before the slow call; only a saved draft
 	// marks the head reviewed, so a failed attempt retries on a later tick.
+	let capReached = false;
 	const claim = await store.transaction(async () => {
 		const t = ctx.now();
 		const current = await store.getPrReview(row.number);
@@ -1443,6 +1526,7 @@ async function reviewOnce(
 			(await store.prReviewRunsSince(t - PR_GATES.DAY_MS)) >=
 			PR_GATES.PROJECT_DAILY_RUNS
 		) {
+			capReached = true;
 			ctx.log(
 				`prs: ${project.name}: daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
 			);
@@ -1453,7 +1537,20 @@ async function reviewOnce(
 			revision: card?.revision,
 		};
 	});
-	if (claim === null) return;
+	if (claim === null) {
+		ctx.prRunEnd(
+			project.name,
+			row.number,
+			capReached
+				? {
+						kind: "cap",
+						text: `daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
+					}
+				: { kind: "skipped", text: "the pull request or the card changed" },
+			row.taskId,
+		);
+		return;
+	}
 	const { run } = claim;
 	try {
 		// The verdict comes out before the fit, so a block the fit moves can never carry
@@ -1503,12 +1600,31 @@ async function reviewOnce(
 			});
 			return true;
 		});
-		if (!saved) return;
+		if (!saved) {
+			ctx.prRunEnd(
+				project.name,
+				row.number,
+				{ kind: "skipped", text: "the pull request or the card changed" },
+				row.taskId,
+			);
+			return;
+		}
 		// Notify only after the guarded draft transaction succeeds.
 		if (row.taskId !== null) await ctx.forgetSeen?.(row.taskId);
+		ctx.prRunEnd(
+			project.name,
+			row.number,
+			{ kind: "saved", text: null },
+			row.taskId,
+		);
 	} catch (e) {
-		ctx.log(
-			`prs: ${project.name}: #${row.number} review failed: ${(e as Error).message}`,
+		const error = (e as Error).message;
+		ctx.log(`prs: ${project.name}: #${row.number} review failed: ${error}`);
+		ctx.prRunEnd(
+			project.name,
+			row.number,
+			{ kind: "failed", text: error },
+			row.taskId,
 		);
 	}
 }
@@ -1525,12 +1641,18 @@ async function scanTick(
 		if (
 			(await project.store.getSettings()).prReviews !== true ||
 			github === null
-		)
+		) {
+			// OTTR-1071: a stale timer must not fire against a watch that is off.
+			ctx.scheduleQuietRun?.(project.name, null);
 			continue;
+		}
 		try {
 			await scanProject(ctx, project, github);
+			ctx.recordPoll?.(project.name, ctx.now(), null);
 		} catch (e) {
-			ctx.log(`prs: ${project.name}: ${(e as Error).message}`);
+			const message = (e as Error).message;
+			ctx.log(`prs: ${project.name}: ${message}`);
+			ctx.recordPoll?.(project.name, ctx.now(), message);
 		}
 	}
 }
@@ -1570,8 +1692,31 @@ async function requestReview(
 	o: { project: string; number: number; note: string },
 ): Promise<void> {
 	const project = [...ctx.projects()].find((p) => p.name === o.project);
-	if (!project || project.github === null) {
+	if (project === undefined) {
+		// No project, so no card can exist: the record ends without log lines.
+		ctx.prRunStart(o.project, o.number);
 		ctx.log(`prs: ${o.project}: no such project with GitHub reviews`);
+		ctx.prRunEnd(o.project, o.number, {
+			kind: "skipped",
+			text: "no such project with GitHub reviews",
+		});
+		return;
+	}
+	// The explicit request is one run from here on: every early exit ends it as a
+	// skip and writes its card-log line, and reviewOnce carries it to the end. The
+	// card id comes from an early row read: the row may move during the gh refresh,
+	// so this is the best available id for the lines.
+	const store = project.store;
+	const taskId = (await store.getPrReview(o.number))?.taskId ?? null;
+	ctx.prRunStart(o.project, o.number, taskId);
+	if (project.github === null) {
+		ctx.log(`prs: ${o.project}: no such project with GitHub reviews`);
+		ctx.prRunEnd(
+			o.project,
+			o.number,
+			{ kind: "skipped", text: "no such project with GitHub reviews" },
+			taskId,
+		);
 		return;
 	}
 	let repo: string;
@@ -1579,9 +1724,14 @@ async function requestReview(
 		repo = repoForProject(project.github);
 	} catch (e) {
 		ctx.log(`prs: ${project.name}: ${(e as Error).message}`);
+		ctx.prRunEnd(
+			o.project,
+			o.number,
+			{ kind: "skipped", text: (e as Error).message },
+			taskId,
+		);
 		return;
 	}
-	const store = project.store;
 	// Explicit replies work even when the background watcher is disabled.
 	const { original, reviewsEnabled } = await store.transaction(async () => ({
 		original: await store.getPrReview(o.number),
@@ -1591,6 +1741,15 @@ async function requestReview(
 	if (r.code !== 0) {
 		ctx.log(
 			`prs: ${project.name}: #${o.number} failed (${r.code}): ${r.stderr.slice(0, 300)}`,
+		);
+		ctx.prRunEnd(
+			o.project,
+			o.number,
+			{
+				kind: "skipped",
+				text: `failed (${r.code}): ${r.stderr.slice(0, 300)}`,
+			},
+			taskId,
 		);
 		return;
 	}
@@ -1602,10 +1761,22 @@ async function requestReview(
 		({ head, draft, title, ref } = prHeadInfo(r.stdout));
 	} catch (e) {
 		ctx.log(`prs: ${project.name}: #${o.number}: ${(e as Error).message}`);
+		ctx.prRunEnd(
+			o.project,
+			o.number,
+			{ kind: "skipped", text: (e as Error).message },
+			taskId,
+		);
 		return;
 	}
 	if (original === null) {
 		ctx.log(`prs: ${project.name}: #${o.number} is not watched`);
+		ctx.prRunEnd(
+			o.project,
+			o.number,
+			{ kind: "skipped", text: "is not watched" },
+			taskId,
+		);
 		return;
 	}
 	// The project's own PR-mode work: a review here would answer the board itself.
@@ -1614,8 +1785,15 @@ async function requestReview(
 		ctx.log(
 			`prs: ${project.name}: #${o.number} is this project's own PR; not reviewed`,
 		);
+		ctx.prRunEnd(
+			o.project,
+			o.number,
+			{ kind: "skipped", text: "is this project's own PR; not reviewed" },
+			taskId,
+		);
 		return;
 	}
+	let cancelled = false;
 	const updated = await store.transaction(async () => {
 		const row = await store.getPrReview(o.number);
 		if (
@@ -1628,6 +1806,7 @@ async function requestReview(
 			return null;
 		const card = row.taskId === null ? null : await store.getTask(row.taskId);
 		if (card?.cancelledAt != null) {
+			cancelled = true;
 			ctx.log(`prs: ${project.name}: #${o.number} card is cancelled`);
 			return null;
 		}
@@ -1642,7 +1821,20 @@ async function requestReview(
 		await store.savePrReview(next);
 		return next;
 	});
-	if (updated === null) return;
+	if (updated === null) {
+		ctx.prRunEnd(
+			o.project,
+			o.number,
+			{
+				kind: "skipped",
+				text: cancelled
+					? "card is cancelled"
+					: "the pull request or the card changed",
+			},
+			taskId,
+		);
+		return;
+	}
 	await reviewOnce(ctx, project, repo, updated, o.note, reviewsEnabled);
 }
 
@@ -1659,6 +1851,23 @@ export function createPrWatcher(deps: {
 	spawn?: SpawnFn;
 	/** The deterministic perf lens over one PR diff; defaults to perfFindings. */
 	perfScan?: (diff: string, labels: string[]) => PerfFinding[];
+	/** OTTR-1071: timer seam for the quiet-time runs; defaults to setTimeout. Tests inject
+	 * a fake clock, so no test waits on a real timer. */
+	schedule?: (fn: () => void, ms: number) => () => void;
+	/** OTTR-1071: the host's background-work control for the timer-fired tick (the board
+	 * passes backgroundTick: no new scan once it closes, the run is tracked so close()
+	 * drains it, rejections are logged). Defaults to a direct tick whose rejection the
+	 * watcher logs. */
+	runQuiet?: (project: string) => Promise<void> | void;
+	/** Appends one draft-run line to the card's log so the drawer live-updates; the card exists only when the row has a task. */
+	cardLog?: (o: {
+		project: string;
+		taskId: string;
+		number: number;
+		line: string;
+	}) => void | Promise<void>;
+	/** OTTR-1073: called when a run record actually starts or ends. The record is in-memory state, so a quiet board needs this edge to rebuild the frame the drawer compares. */
+	runEdge?: () => void;
 }): {
 	tick(opts?: { manual?: string }): Promise<void>;
 	reviewNow(o: {
@@ -1667,15 +1876,97 @@ export function createPrWatcher(deps: {
 		note: string;
 	}): Promise<void>;
 	reviewIdle(): Promise<void>;
+	/** OTTR-1071: the project's last finished poll; null before this process polled it. */
+	pollStatus(project: string): { at: number; error: string | null } | null;
 	/** OTTR-942: the board's notice lines for skipped PR reviews, one per PR and
 	 * head ("p: PR #N review skipped: <reason>"), oldest first. */
 	skipNotices(): string[];
+	/** The PR's last draft run in memory, or null when none ran since the watcher started. */
+	prRun(project: string, number: number): PrRunState | null;
 } {
 	const gh = deps.gh ?? runGh;
 	const log = deps.log;
 	const now = deps.now ?? Date.now;
 	const review: ReviewFn =
 		deps.review ?? ((m) => runGateway(m, deps.spawn, undefined, "@plan"));
+	// The run records name the review model: "custom" only on an injected review.
+	const model = deps.review !== undefined ? "custom" : "@plan";
+	// The in-memory record of each PR's last draft run: a start keeps an active
+	// record's start time, the first end wins, and a later start overwrites the
+	// ended record. A restart drops every record; the card log keeps the history.
+	const prRuns = new Map<string, PrRunState>();
+	/** One card-log line per record transition; a card-less run (taskId null) writes
+	 * none. A failed write reaches the [pr] server log, never the run's outcome. */
+	const emit = (
+		taskId: string | null | undefined,
+		project: string,
+		number: number,
+		line: string,
+	): void => {
+		if (taskId === null || taskId === undefined || deps.cardLog === undefined)
+			return;
+		void Promise.resolve(deps.cardLog({ project, taskId, number, line })).catch(
+			(e) =>
+				log(
+					`prs: ${project}: #${number} card log failed: ${(e as Error).message}`,
+				),
+		);
+	};
+	const prRunStart = (
+		project: string,
+		number: number,
+		taskId?: string | null,
+	): void => {
+		const key = `${project}/${number}`;
+		const active = prRuns.get(key);
+		if (active !== undefined && active.endedAt === null) return;
+		const startedAt = now();
+		prRuns.set(key, {
+			startedAt,
+			endedAt: null,
+			error: null,
+			model,
+		});
+		emit(
+			taskId,
+			project,
+			number,
+			`== pr review draft ${new Date(startedAt).toISOString()} (model ${model})`,
+		);
+		deps.runEdge?.();
+	};
+	const prRunEnd = (
+		project: string,
+		number: number,
+		outcome: {
+			kind: "saved" | "skipped" | "failed" | "cap";
+			text: string | null;
+		},
+		taskId?: string | null,
+	): PrRunState | null => {
+		const active = prRuns.get(`${project}/${number}`);
+		if (active === undefined || active.endedAt !== null) return null;
+		active.endedAt = now();
+		active.error = outcome.kind === "saved" ? null : outcome.text;
+		const took = Math.max(
+			0,
+			Math.round((active.endedAt - active.startedAt) / 1000),
+		);
+		const iso = new Date(active.endedAt).toISOString();
+		const line =
+			outcome.kind === "saved"
+				? `- draft saved ${iso} (took ${took}s)`
+				: outcome.kind === "failed"
+					? `! failed ${iso}: ${outcome.text}`
+					: outcome.kind === "cap"
+						? `- stopped ${iso}: ${outcome.text}`
+						: `- skipped ${iso}: ${outcome.text}`;
+		emit(taskId, project, number, line);
+		deps.runEdge?.();
+		return active;
+	};
+	const prRun = (project: string, number: number): PrRunState | null =>
+		prRuns.get(`${project}/${number}`) ?? null;
 	// OTTR-942: one board notice per skipped PR review, keyed by project, number and
 	// head, so a second scan of the same head writes no second notice. The list is
 	// bounded and holds no TTL: the notice stays while the same head keeps skipping,
@@ -1722,10 +2013,60 @@ export function createPrWatcher(deps: {
 		gh,
 		now,
 		review,
+		prRunStart,
+		prRunEnd,
+		prRun,
+		cardLog: deps.cardLog,
 		perfScan: deps.perfScan ?? perfFindings,
 		forgetSeen: deps.forgetSeen,
 		recordSkipNotice,
 		logDropped,
+	};
+	// OTTR-1071: in-memory quiet-run timers and last-poll facts, keyed by project
+	// name. A restart loses both; the start-up poll (server.ts runs one tick at
+	// boot) refills them.
+	const quietTimers = new Map<string, { at: number; cancel: () => void }>();
+	const polls = new Map<string, { at: number; error: string | null }>();
+	const schedule =
+		deps.schedule ??
+		((fn: () => void, ms: number) => {
+			const h = setTimeout(fn, ms);
+			return () => clearTimeout(h);
+		});
+	// The quiet-time run reuses the same single-flight tick as the hourly poll and
+	// the check route, so every gate holds at fire time: prReviews on, daily cap,
+	// cancelled card, head already reviewed.
+	const tick = singleFlightTick((opts) => scanTick(ctx, opts));
+	// The board's backgroundTick: no new scan once the app closes, the run is tracked
+	// so close() drains it, and a rejection lands in the error log. Without the hook
+	// (standalone watchers, tests), the tick runs directly and a rejection is logged.
+	const runQuiet =
+		deps.runQuiet ??
+		((project: string) =>
+			tick({ manual: project }).catch((e) =>
+				log(`prs: ${project}: quiet-time run failed: ${(e as Error).message}`),
+			));
+	const scheduleQuietRun = (project: string, at: number | null): void => {
+		const pending = quietTimers.get(project);
+		if (pending && pending.at === at) return;
+		if (pending) {
+			pending.cancel();
+			quietTimers.delete(project);
+		}
+		if (at === null) return;
+		const cancel = schedule(
+			() => {
+				// Delete first: a scan that runs inside the handler must not see a stale entry.
+				quietTimers.delete(project);
+				void runQuiet(project);
+			},
+			Math.max(0, at + QUIET_RUN_SLACK_MS - now()),
+		);
+		quietTimers.set(project, { at, cancel });
+	};
+	ctx.scheduleQuietRun = scheduleQuietRun;
+	ctx.recordPoll = (project, at, error) => {
+		polls.set(project, { at, error });
 	};
 	// Review requests serialize through one chain per watcher; reviewIdle resolves when it drains.
 	let tail: Promise<void> = Promise.resolve();
@@ -1735,11 +2076,17 @@ export function createPrWatcher(deps: {
 		return run;
 	};
 	return {
-		tick: singleFlightTick((opts) => scanTick(ctx, opts)),
+		tick,
 		// An explicit request never rejects: requestReview logs every failure and swallows it.
 		reviewNow: (o) => enqueue(() => requestReview(ctx, o).catch(() => {})),
 		reviewIdle: () => tail,
+		/** OTTR-1071: the Settings row's poll facts; a copy, so callers cannot mutate the map. */
+		pollStatus: (project) => {
+			const poll = polls.get(project);
+			return poll ? { ...poll } : null;
+		},
 		/** The bell's notice lines for skipped PR reviews, oldest first. */
 		skipNotices: () => skipNotices.map((n) => n.text),
+		prRun,
 	};
 }

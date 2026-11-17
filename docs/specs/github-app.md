@@ -82,8 +82,11 @@ the release and the `post_error` handling it has today. The GitHub call changes:
   `{ event: <"COMMENT", or "APPROVE" per pr-reviews.md "Post">, body: <body>,
   commit_id: <reviewedHead> }` (no footer),
   `Authorization: Bearer <installation token>`. The board token and `gh` stay unused.
-- A refused `APPROVE` review (HTTP 422) retries once with event `COMMENT` and the
-  same body; the response then carries `approveSkipped` (pr-reviews.md "Post").
+- A refused `APPROVE` or `REQUEST_CHANGES` review (HTTP 422; GitHub refuses both on a
+  pull request whose author is the posting identity) retries once with event `COMMENT`
+  and the same body; the response then carries `approveSkipped` or `changesSkipped`
+  (pr-reviews.md "Post"). The dismissal PUT rides the same installation token and needs
+  no new permission (`Pull requests: Read and write` covers dismissals).
 - With no app configured, or an installation 404: today's `gh` call with the board token.
 - Another app-path failure (bad key, GitHub 5xx, network): 502 like a gh failure —
   the claim is released, `post_error` stores the redacted error, no fallback post.
@@ -133,5 +136,5 @@ the release and the `post_error` handling it has today. The GitHub call changes:
 ## Non-goals
 
 - Moving merge pushes, releases or CI reads to the app.
-- GitHub webhooks; a post without a click; `APPROVE` or `REQUEST_CHANGES` events.
+- GitHub webhooks; a post without a click.
 - Storing the token cache anywhere but memory.

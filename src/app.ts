@@ -267,7 +267,7 @@ import {
 	workCheckSendBack,
 	workCheckSendBackDirection,
 } from "./prompts.ts";
-import { createPrWatcher, PR_GATES, prUrl } from "./prs.ts";
+import { createPrWatcher, PR_GATES, postedReviewId, prUrl } from "./prs.ts";
 import { requirementsListPath } from "./python.ts";
 import { fetchQuota, forProvider, providerBlocked } from "./quota.ts";
 import {
@@ -360,6 +360,7 @@ import {
 	type TrendingState,
 } from "./trending.ts";
 import {
+	appendLog,
 	type CancelOutcome,
 	type FinishKeptOutcome,
 	FORK_HOLD_REASON,
@@ -454,6 +455,7 @@ import {
 	serverMergePush,
 	setHostedGitAuth,
 	setNetworkGitAuth,
+	shownVersion,
 	statusFiles,
 	validateCopyPath,
 } from "./worktree.ts";
@@ -634,6 +636,10 @@ interface AppDeps {
 	/** Node env style clock for the idle-review logic only; tests inject a fixed clock.
 	 * Defaults to Date.now. */
 	now?: () => number;
+	/** OTTR-1071: the server wiring's next regular hourly PR poll (its grid), for the
+	 * Settings watches row. Absent in narrow test mounts, so the state payload then
+	 * reports null. */
+	prPollNextAt?: () => number | null;
 	serverVersion: string;
 	port: number;
 	publicHosts: string[];
@@ -1712,6 +1718,7 @@ const BOOLEAN_SETTING_FIELDS = [
 	"prReviews",
 	"prReviewNotify",
 	"prReviewApprove",
+	"prReviewRequestChanges",
 	"prMode",
 	"issueWatch",
 	"dependabotWarn",
@@ -3016,6 +3023,13 @@ export async function createApp(deps: AppDeps) {
 		log: (msg: string) => console.log(`[pr] ${msg}`),
 		gh,
 		spawn: deps.prReviewSpawn,
+		// OTTR-1071: the quiet-time timer's tick runs under the same background control
+		// as the hourly poll: no new scan once the app closes, close() drains the run,
+		// and a rejection reaches the error log.
+		runQuiet: (project) =>
+			backgroundTick("PR review quiet gate", () =>
+				prWatcher.tick({ manual: project }),
+			),
 		// A re-review rewrites a draft the user may have read: the mark must go,
 		// or the updated card never wears the unread badge again. OTTR-827: the
 		// completion key goes with the plain id, or a done card's rail mark would
@@ -3025,6 +3039,16 @@ export async function createApp(deps: AppDeps) {
 				ids.filter((id) => id !== taskId && !id.startsWith(`${taskId}@`)),
 			);
 		},
+		// Draft-run lines land on the card log, so the drawer's log view live-updates
+		// while a run is in flight; a run with no card yet writes nothing here.
+		cardLog: async ({ project, taskId, line }) => {
+			const store = deps.projects.get(project)?.store;
+			if (store === undefined) return;
+			await appendLog(store, taskId, line);
+		},
+		// A run's start and end are in-memory state: without this edge a quiet board
+		// never rebuilds the frame, and the composer's status would hang on stale data.
+		runEdge: () => publishSoon(),
 	});
 
 	// Issue watcher: same live project Map; files new open GitHub issues as backlog cards.
@@ -5108,6 +5132,7 @@ export async function createApp(deps: AppDeps) {
 			? statSync(file, { throwIfNoEntry: false })?.mtimeMs
 			: undefined;
 		const settings = await e.store.getSettings();
+		const poll = prWatcher.pollStatus(e.name);
 		// OTTR-965: the Done lane's first "Show more" needs the settled count before any
 		// fetch. One list read counting rows, no card build.
 		const doneTotal = (await e.store.listTasks()).filter(
@@ -5137,6 +5162,13 @@ export async function createApp(deps: AppDeps) {
 			latestImage: e.latestImage,
 			archReview: e.archReview,
 			openPrs: e.openPrs ?? null,
+			// OTTR-1071: the PR watch's poll facts for the Settings watches row; null
+			// until this process polled the project (a restart starts empty).
+			prWatch: {
+				lastPollAt: poll?.at ?? null,
+				lastError: poll?.error ?? null,
+				nextPollAt: deps.prPollNextAt?.() ?? null,
+			},
 			settings,
 			taskPrefix: settings.taskIdPrefix ?? derivedTaskPrefix(e.name),
 			doneTotal,
@@ -5394,6 +5426,17 @@ export async function createApp(deps: AppDeps) {
 			ctx.settings.prReviewNotify === true &&
 			ctx.facts.pr.has(t.id)
 				? { prOccurrence: ctx.facts.pr.get(t.id) }
+				: {}),
+			// OTTR-1073: the draft-run record rides the row, so a run's start and end
+			// change the row an open drawer compares: the drawer refetches its detail
+			// and the composer's run status moves without a store write.
+			...(t.kind === "pr_review"
+				? {
+						prRun: await (async () => {
+							const pr = await e.store.getPrReviewByTask(t.id);
+							return pr === null ? null : prWatcher.prRun(e.name, pr.number);
+						})(),
+					}
 				: {}),
 		};
 	}
@@ -5845,6 +5888,7 @@ export async function createApp(deps: AppDeps) {
 							postedUrl: pr.postedUrl,
 							postedLogin: pr.postedLogin,
 							postError: pr.postError,
+							run: prWatcher.prRun(e.name, pr.number),
 						},
 					}
 				: {}),
@@ -6587,16 +6631,10 @@ export async function createApp(deps: AppDeps) {
 				taskIdPrefix: prefix === "" ? null : prefix,
 			});
 		});
-		// A gitless project has no HEAD to create a worktree from; the turn machinery would
-		// crash, so the rules interview waits for POST /init.
-		if (e.gitless)
-			return json({
-				project: await projectView(e),
-				interview: "gitless",
-				id: null,
-			});
-		const interview = await startInterview(e);
-		return json({ project: await projectView(e), ...interview });
+		// The rules interview waits for the wizard's last step: the settings saves land
+		// first, so PR mode and the target branch hold for the interview's first commit
+		// (docs/specs/add-project-wizard.md). POST /interview starts it.
+		return json({ project: await projectView(e) });
 	}
 
 	async function addProject(body: Record<string, unknown>): Promise<Response> {
@@ -9244,8 +9282,10 @@ export async function createApp(deps: AppDeps) {
 		if (err !== null) return json({ error: err }, 400);
 		e.gitless = false;
 		await refreshRemote(e);
-		const interview = await startInterview(e);
-		return json({ project: await projectView(e), ...interview });
+		// The interview stays with POST /interview: the wizard's last step and the
+		// checklist call it after the settings steps saved
+		// (docs/specs/add-project-wizard.md).
+		return json({ project: await projectView(e) });
 	}
 
 	async function handlePOSTProjects(req: Request): Promise<Response> {
@@ -9965,9 +10005,16 @@ export async function createApp(deps: AppDeps) {
 		owner: string,
 		draft: ParsedReview,
 		comments: Record<string, unknown>,
-		event: "COMMENT" | "APPROVE",
+		event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES",
 	): Promise<
-		{ via: "app"; stdout: string; approveSkipped?: string } | Response | null
+		| {
+				via: "app";
+				stdout: string;
+				approveSkipped?: string;
+				changesSkipped?: string;
+		  }
+		| Response
+		| null
 	> {
 		if (githubApp === null || appTokens === null) return null;
 		const appSecrets = [...gitSecrets()];
@@ -9988,7 +10035,7 @@ export async function createApp(deps: AppDeps) {
 			"content-type": "application/json",
 			"user-agent": "Ottr",
 		};
-		const postOnce = (ev: "COMMENT" | "APPROVE") =>
+		const postOnce = (ev: "COMMENT" | "APPROVE" | "REQUEST_CHANGES") =>
 			githubAppFetch(url, {
 				method: "POST",
 				headers,
@@ -10004,20 +10051,31 @@ export async function createApp(deps: AppDeps) {
 		try {
 			let res = await postOnce(event);
 			let text = await res.text();
-			if (!res.ok && event === "APPROVE" && res.status === 422) {
-				// GitHub refuses an APPROVE review when the posting identity opened
-				// the PR (HTTP 422), so the same draft goes out as a comment and the
-				// response notes the skip. Any other failure stays a 502: a 5xx or a
-				// rate limit must never trade the approval of this head away.
+			if (
+				!res.ok &&
+				(event === "APPROVE" || event === "REQUEST_CHANGES") &&
+				res.status === 422
+			) {
+				// GitHub refuses an APPROVE or REQUEST_CHANGES review when the
+				// posting identity opened the PR (HTTP 422), so the same draft goes
+				// out as a comment and the response notes the skip. Any other failure
+				// stays a 502: a 5xx or a rate limit must never trade the verdict of
+				// this head away.
 				const refused = res.status;
 				res = await postOnce("COMMENT");
 				text = await res.text();
 				if (res.ok)
-					return {
-						via: "app",
-						stdout: text,
-						approveSkipped: `GitHub refused the approve review (HTTP ${refused}); posted it as a comment instead`,
-					};
+					return event === "REQUEST_CHANGES"
+						? {
+								via: "app",
+								stdout: text,
+								changesSkipped: `GitHub refused the request-changes review (HTTP ${refused}); posted it as a comment instead`,
+							}
+						: {
+								via: "app",
+								stdout: text,
+								approveSkipped: `GitHub refused the approve review (HTTP ${refused}); posted it as a comment instead`,
+							};
 			}
 			if (!res.ok) {
 				const error =
@@ -10046,8 +10104,15 @@ export async function createApp(deps: AppDeps) {
 		repo: string | null,
 		draft: ParsedReview,
 		comments: Record<string, unknown>,
-		event: "COMMENT" | "APPROVE",
-	): Promise<{ stdout: string; approveSkipped?: string } | Response> {
+		event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES",
+	): Promise<
+		| {
+				stdout: string;
+				approveSkipped?: string;
+				changesSkipped?: string;
+		  }
+		| Response
+	> {
 		const payload = {
 			event,
 			body: `${draft.body}${REVIEW_FOOTER}`,
@@ -10059,8 +10124,11 @@ export async function createApp(deps: AppDeps) {
 		try {
 			dir = await mkdtemp(join(tmpdir(), "ottr-review-"));
 			// A fresh payload per attempt: the retry must send COMMENT, not the
-			// refused APPROVE.
-			const callGh = async (ev: "COMMENT" | "APPROVE", at: string) => {
+			// refused APPROVE or REQUEST_CHANGES.
+			const callGh = async (
+				ev: "COMMENT" | "APPROVE" | "REQUEST_CHANGES",
+				at: string,
+			) => {
 				const file = join(at, "review.json");
 				await writeFile(file, JSON.stringify({ ...payload, event: ev }), {
 					mode: 0o600,
@@ -10077,20 +10145,28 @@ export async function createApp(deps: AppDeps) {
 			res = await callGh(event, dir);
 			if (
 				res.code !== 0 &&
-				event === "APPROVE" &&
-				/\b422\b|Can not approve your own pull request/i.test(res.stderr)
+				(event === "APPROVE" || event === "REQUEST_CHANGES") &&
+				/\b422\b|Can not approve your own pull request|Can not request changes on your own pull request/i.test(
+					res.stderr,
+				)
 			) {
-				// GitHub refuses an APPROVE review when the posting identity opened
-				// the PR; gh prints the refusal body to stderr. Only that signature
-				// downsizes to a comment — any other exit stays a 502, so a 5xx or a
-				// rate limit never trades the approval of this head away.
+				// GitHub refuses an APPROVE or REQUEST_CHANGES review when the
+				// posting identity opened the PR; gh prints the refusal body to
+				// stderr. Only that signature downsizes to a comment — any other exit
+				// stays a 502, so a 5xx or a rate limit never trades the verdict of
+				// this head away.
 				const refused = res.code;
 				res = await callGh("COMMENT", dir);
 				if (res.code === 0)
-					return {
-						stdout: res.stdout,
-						approveSkipped: `GitHub refused the approve review (gh exit ${refused}); posted it as a comment instead`,
-					};
+					return event === "REQUEST_CHANGES"
+						? {
+								stdout: res.stdout,
+								changesSkipped: `GitHub refused the request-changes review (gh exit ${refused}); posted it as a comment instead`,
+							}
+						: {
+								stdout: res.stdout,
+								approveSkipped: `GitHub refused the approve review (gh exit ${refused}); posted it as a comment instead`,
+							};
 			}
 		} catch (err) {
 			// A spawn or temp file failure (e.g. gh missing) sent nothing: free the claim, or the head reads as posted.
@@ -10104,6 +10180,89 @@ export async function createApp(deps: AppDeps) {
 			return json({ error }, 502);
 		}
 		return { stdout: res.stdout };
+	}
+	/** Dismisses the board's earlier REQUEST_CHANGES review: null on success, else the error text. */
+	async function dismissPrChangesReview(
+		_e: Entry,
+		repo: string,
+		owner: string,
+		repoName: string,
+		number: number,
+		reviewId: string,
+	): Promise<string | null> {
+		const appSecrets = [...gitSecrets()];
+		if (githubApp !== null && appTokens !== null) {
+			try {
+				const tok = await appTokens.tokenFor(owner, repoName);
+				if (tok !== null) {
+					// Direct fetch, no gh: the dismissal rides the app's installation
+					// token like the review post, under Pull requests: Read and write.
+					const res = await githubAppFetch(
+						`${githubHost().apiBase}/repos/${repo}/pulls/${number}/reviews/${reviewId}/dismissals`,
+						{
+							method: "PUT",
+							headers: {
+								authorization: `Bearer ${tok}`,
+								accept: "application/vnd.github+json",
+								"content-type": "application/json",
+								"user-agent": "Ottr",
+							},
+							body: JSON.stringify({
+								message: "A newer Ottr review found no blocking findings",
+							}),
+						},
+					);
+					if (res.ok) return null;
+					const text = await res.text();
+					return (
+						redact(text.trim().slice(0, 300), appSecrets) ||
+						requestFailed(
+							`The dismissal of review ${reviewId} on ${repo}#${number}`,
+							res.status,
+							"check the app's or token's permissions, then post the review again",
+						)
+					);
+				}
+			} catch (err) {
+				// A mint or network failure dismissed nothing: the post already stands.
+				return (
+					redact(errmsg(err), appSecrets).trim().slice(0, 300) ||
+					"the dismissal failed"
+				);
+			}
+		}
+		const payload = {
+			message: "A newer Ottr review found no blocking findings",
+		};
+		let res: { code: number; stdout: string; stderr: string };
+		let dir: string | null = null;
+		try {
+			dir = await mkdtemp(join(tmpdir(), "ottr-dismiss-"));
+			const file = join(dir, "dismissal.json");
+			await writeFile(file, JSON.stringify(payload), { mode: 0o600 });
+			res = await gh([
+				"api",
+				`repos/${repo}/pulls/${number}/reviews/${reviewId}/dismissals`,
+				"-X",
+				"PUT",
+				"--input",
+				file,
+			]);
+		} catch (err) {
+			// A spawn or temp file failure sent nothing: the post already stands.
+			res = {
+				code: -1,
+				stdout: "",
+				stderr:
+					redact(errmsg(err), appSecrets).trim().slice(0, 300) ||
+					"the dismissal failed",
+			};
+		} finally {
+			if (dir !== null) await rm(dir, { recursive: true, force: true });
+		}
+		if (res.code !== 0)
+			return res.stderr.trim().slice(0, 300) || `gh exited ${res.code}`;
+		return null;
 	}
 	/** True when u is an https URL on the configured GitHub host. */
 	function isHostedHttpsUrl(u: string): boolean {
@@ -10188,7 +10347,8 @@ export async function createApp(deps: AppDeps) {
 				row: PrReviewRow;
 				head: string;
 				prev: string | null;
-				event: "APPROVE" | "COMMENT";
+				event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
+				blocking: boolean;
 		  }
 	> {
 		return withTask(e, task, async () => {
@@ -10209,12 +10369,18 @@ export async function createApp(deps: AppDeps) {
 			const prev = await e.store.claimPrPost(row.number, rawHead);
 			if (prev === undefined)
 				return json({ error: "already posted for this head" }, 409);
+			// REQUEST_CHANGES when the project opted in and this draft's own run
+			// found blocking findings; APPROVE when opted in and clean; an unknown
+			// verdict or no opt-in posts a plain comment.
+			const settings = await e.store.getSettings();
+			const blocking = await e.store.lastPrRunBlocking(row.number);
 			const event =
-				(await e.store.getSettings()).prReviewApprove === true &&
-				!(await e.store.lastPrRunBlocking(row.number))
-					? ("APPROVE" as const)
-					: ("COMMENT" as const);
-			return { row, head: rawHead, prev, event };
+				settings.prReviewRequestChanges === true && blocking
+					? ("REQUEST_CHANGES" as const)
+					: settings.prReviewApprove === true && !blocking
+						? ("APPROVE" as const)
+						: ("COMMENT" as const);
+			return { row, head: rawHead, prev, event, blocking };
 		});
 	}
 	async function preparePrPost(
@@ -10227,7 +10393,8 @@ export async function createApp(deps: AppDeps) {
 				row: PrReviewRow;
 				head: string;
 				prev: string | null;
-				event: "APPROVE" | "COMMENT";
+				event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
+				blocking: boolean;
 				draft: ParsedReview;
 				github: string;
 		  }
@@ -10249,6 +10416,7 @@ export async function createApp(deps: AppDeps) {
 			head: claimed.head,
 			prev: claimed.prev,
 			event: claimed.event,
+			blocking: claimed.blocking,
 			draft: picked.draft,
 			github: storedGithub,
 		};
@@ -10267,8 +10435,9 @@ export async function createApp(deps: AppDeps) {
 			draft.comments.length > 0
 				? { comments: reviewPayloadComments(draft.comments) }
 				: {};
-		// APPROVE only when the project opted in and this draft's own run found no blocking
-		// findings; an unknown verdict posts a plain comment.
+		// REQUEST_CHANGES when the project opted in and this draft's own run found
+		// blocking findings, APPROVE when opted in and clean; an unknown verdict or
+		// no opt-in posts a plain comment.
 		const event = prep.event;
 		const app = await postReviewViaApp(
 			e,
@@ -10286,10 +10455,12 @@ export async function createApp(deps: AppDeps) {
 		let via: "app" | "token" = "token";
 		let stdout: string;
 		let approveSkipped: string | undefined;
+		let changesSkipped: string | undefined;
 		if (app !== null) {
 			stdout = app.stdout;
 			via = "app";
 			approveSkipped = app.approveSkipped;
+			changesSkipped = app.changesSkipped;
 		} else {
 			const posted = await postReviewViaGh(
 				e,
@@ -10304,6 +10475,7 @@ export async function createApp(deps: AppDeps) {
 			if (posted instanceof Response) return posted;
 			stdout = posted.stdout;
 			approveSkipped = posted.approveSkipped;
+			changesSkipped = posted.changesSkipped;
 		}
 		// GitHub's response body is untrusted: only an https URL on the configured
 		// host becomes the drawer link, and only a plausible login names the
@@ -10320,8 +10492,42 @@ export async function createApp(deps: AppDeps) {
 				current.postedHead !== head
 			)
 				return json({ error: "the draft changed" }, 409);
+			// A clean comment replaces the board's earlier REQUEST_CHANGES review:
+			// dismiss it, so the PR does not keep an outdated changes request. A
+			// still-blocking comment keeps it: the changes request still stands.
+			let dismissError: string | null = null;
+			if (
+				event === "COMMENT" &&
+				!prep.blocking &&
+				row.postedEvent === "REQUEST_CHANGES"
+			) {
+				const reviewId = postedReviewId(row.postedUrl);
+				if (reviewId !== null)
+					dismissError = await dismissPrChangesReview(
+						e,
+						repo,
+						owner,
+						repoName,
+						row.number,
+						reviewId,
+					);
+			}
 			// A watcher can close or merge this PR during the post. Preserve that state.
-			await e.store.setPrPostedUrl(row.number, url, login);
+			// The review GitHub accepted decides the stored event: a downsized post is
+			// a comment on GitHub, whatever the decided event was.
+			await e.store.setPrPostedUrl(
+				row.number,
+				url,
+				login,
+				approveSkipped !== undefined || changesSkipped !== undefined
+					? "COMMENT"
+					: event,
+			);
+			// A skipped review or a failed dismissal must show on the card: the note
+			// lands in post_error, the post itself stays.
+			const postError = dismissError ?? changesSkipped ?? null;
+			if (postError !== null)
+				await e.store.setPrPostError(row.number, postError);
 			// The posted review's own comments must never alert: the baseline is the post time.
 			await e.store.setPrComments(row.number, Date.now(), false);
 			// The head is posted: the card leaves needs_you for done/idle.
@@ -10335,6 +10541,7 @@ export async function createApp(deps: AppDeps) {
 			via,
 			inline: draft.comments.length,
 			...(approveSkipped !== undefined ? { approveSkipped } : {}),
+			...(changesSkipped !== undefined ? { changesSkipped } : {}),
 		});
 	}
 
@@ -13239,7 +13446,9 @@ export async function createApp(deps: AppDeps) {
 				await api(req, async () =>
 					json({
 						onboarding: deps.hosted === undefined && admin === null,
-						version: deps.serverVersion,
+						// shownVersion: serverVersion keeps the boot-time stamp for the reload
+						// handshake, but the sidebar must never show a bare timestamp.
+						version: shownVersion(deps.serverVersion),
 						live: !prod,
 						...(deps.hosted !== undefined && { hosted: true }),
 					}),

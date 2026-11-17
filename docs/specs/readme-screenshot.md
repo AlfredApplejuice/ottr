@@ -11,6 +11,9 @@ fixed afterwards (a5019bd) by hand. Two gaps:
 2. No rule where agents read it: AGENTS.md (local-only) and the work prompt never name
    the screenshot, so live sessions never see a requirement.
 
+An inherited `OTTR_VM_RUNNER_URL` without `OTTR_WORKER_TOKEN` also prevents demo startup.
+A readiness retry cannot repair this environment error.
+
 ## Scope
 
 - A one-command capture: `bun run readme-screenshot` → `scripts/readme-screenshot.ts`.
@@ -21,10 +24,16 @@ fixed afterwards (a5019bd) by hand. Two gaps:
 
 ## Capture behaviour
 
-- Starts the demo board (`bun src/dev.ts`) on a free port in the repo checkout; demo
-  data only, never a real board. The board seeds a unique scratch root under `.dev/`
-  per spawn (`OTTR_DEV_ROOT` pins it), so concurrent boards in one checkout never
-  share a seeded database.
+- Starts the demo board (`bun src/dev.ts`) on a free port in the repo checkout.
+  Each attempt uses a fresh temporary demo root and state directory, regardless of inherited
+  `OTTR_DEV_ROOT` and `OTTR_STATE_DIR` values. It never uses a real board.
+- Demo child environments omit `OTTR_VM_RUNNER_URL`, even when the host sets it.
+  Real boards keep the existing VM runner authentication checks.
+- If the board misses the 30 s readiness deadline, stops that child through `stopChildren`.
+  Starts one new attempt on a free port with a fresh demo root and state directory.
+  Waits up to 30 s again. A second timeout exits 1 with the same readiness error.
+  An early board exit or capture error does not cause a retry.
+- Both `bun run readme-screenshot` and `bash scripts/readme-screenshot.ts` run the capture.
 - Drives Chrome headless over CDP with Bun's WebSocket client. No npm dependency:
   adding one is an AGENTS.md hard stop.
 - Chrome discovery: `OTTR_SCREENSHOT_CHROME` env wins, else the newest Chrome across the
@@ -62,6 +71,11 @@ fixed afterwards (a5019bd) by hand. Two gaps:
 
 - One command regenerates the screenshot from demo data with the settings above; the
   smoke run shows the produced image and a valid PNG header.
+- The first ready board requires no retry. A first timeout followed by readiness succeeds.
+  Two timeouts stop both board attempts and report
+  `the demo board did not become ready within 30 s` with exit 1.
+  Readiness checks count request time toward each 30 s deadline.
+- An inherited VM runner URL without a worker token cannot block either demo attempt.
 - AGENTS.md and the work prompt name the screenshot step for board-visible UI changes.
 - Gates stay green: `bun run check` (with the reminder step) and `bun test`.
 

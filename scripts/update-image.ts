@@ -451,6 +451,9 @@ async function deploySidecar(
 	const sha = (
 		await sg("rev-parse", "--short=12", "origin/main")
 	).stdout.trim();
+	// The build deploys this checkout's commit, not the main repo's, so the stamp
+	// comes from this repo's history.
+	if (sha !== "") process.env.OTTR_VERSION = await imageVersion(sg, sha);
 	const made =
 		sha === "" ? null : await buildFromWorktree(d, compose, sg, service, sha);
 	if (made === null) {
@@ -724,8 +727,34 @@ async function drainRunningBoard(
 	return null;
 }
 
+/** Version stamp for the image build: the newest release tag reachable from `sha`
+ * (`vX.Y.Z`, or `vX.Y.Z-N-g<sha>` past it), else `sha` short when no release tag
+ * reaches it. The run sets it in its own env as OTTR_VERSION for every compose
+ * build, so compose interpolates it into the image's build arg (docker-compose.yml)
+ * and the board shows the version the image was built from. */
+async function imageVersion(
+	g: (...args: string[]) => Promise<GitResult>,
+	sha: string,
+): Promise<string> {
+	try {
+		const r = await g("describe", "--tags", "--match", "v[0-9]*", sha);
+		if (r.code === 0 && r.stdout.trim() !== "") return r.stdout.trim();
+		const short = await g("rev-parse", "--short", sha);
+		if (short.code === 0 && short.stdout.trim() !== "")
+			return short.stdout.trim();
+	} catch {
+		// git unusable: the sha itself still names the commit the image builds.
+	}
+	return sha;
+}
+
 /** What the run deploys, read once before the build and reused by the later phases. */
-type RunMeta = { head: string; omp: string; commits: string[] };
+type RunMeta = {
+	head: string;
+	omp: string;
+	version: string;
+	commits: string[];
+};
 
 /** Deploys exactly origin/main and reads the deploy metadata; a number stops the run. */
 async function preflightAndRead(
@@ -744,6 +773,12 @@ async function preflightAndRead(
 	// Read before the build: the hold between build and restart can last an hour, and main
 	// can move in the checkout meanwhile. The success line names what the image built.
 	const head = (await g("log", "-1", "--format=%h")).stdout.trim();
+	// The stamp names the commit this run deploys: describe the post-ff HEAD once
+	// here, and the builds below all interpolate that same value.
+	const version = await imageVersion(
+		g,
+		(await g("rev-parse", "HEAD")).stdout.trim(),
+	);
 	const dockerfile = await Bun.file(resolve(repo, "Dockerfile.worker")).text();
 	const omp = /^ARG OMP_VERSION=(\S+)/m.exec(dockerfile)?.[1] ?? "unknown";
 	// Computed once: the hold renews every 30 s and each renewal reuses this list.
@@ -755,7 +790,7 @@ async function preflightAndRead(
 					.map((s) => s.trim().slice(0, 200))
 					.filter(Boolean)
 					.slice(0, 50);
-	return { head, omp, commits };
+	return { head, omp, version, commits };
 }
 
 /** Builds the server image and deploys the sidecar checkouts; a number stops the run. */
@@ -763,9 +798,12 @@ async function buildAndSidecars(
 	d: Deps,
 	compose: string[],
 	repo: string,
+	version: string,
 	running: string[],
 	stop: (why: string) => number,
 ): Promise<number | null> {
+	// compose reads ${OTTR_VERSION} for the build arg from this process env.
+	process.env.OTTR_VERSION = version;
 	const build = await d.docker("compose", ...compose, "build", "server");
 	if (build.code !== 0) {
 		d.log(build.out.trim().split("\n").slice(-10).join("\n"));
@@ -787,10 +825,13 @@ async function buildAndSidecars(
 async function buildVmRunner(
 	d: Deps,
 	compose: string[],
+	version: string,
 	services: string[],
 	stop: (why: string) => number,
 ): Promise<number | null> {
 	if (!services.includes("vm-runner")) return null;
+	// A sidecar build has stamped its own repo's version; this one deploys main's.
+	process.env.OTTR_VERSION = version;
 	const build = await d.docker("compose", ...compose, "build", "vm-runner");
 	if (build.code === 0) return null;
 	d.log(build.out.trim().split("\n").slice(-10).join("\n"));
@@ -2211,11 +2252,18 @@ async function deployMain(
 	const services = await runningServices(d, compose, stop);
 	if (typeof services === "number") return services;
 
-	const built = await buildAndSidecars(d, compose, repo, services, stop);
+	const built = await buildAndSidecars(
+		d,
+		compose,
+		repo,
+		meta.version,
+		services,
+		stop,
+	);
 	if (built !== null) return built;
 
 	const serverWasRunning = services.includes("server");
-	const vmBuilt = await buildVmRunner(d, compose, services, stop);
+	const vmBuilt = await buildVmRunner(d, compose, meta.version, services, stop);
 	if (vmBuilt !== null) return vmBuilt;
 
 	const seed = await seedBoard(d, compose, repo, env, serverWasRunning);

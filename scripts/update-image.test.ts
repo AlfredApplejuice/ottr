@@ -1,4 +1,12 @@
-import { afterAll, describe, expect, mock, test } from "bun:test";
+import {
+	afterAll,
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	mock,
+	test,
+} from "bun:test";
 import {
 	existsSync,
 	mkdtempSync,
@@ -31,6 +39,18 @@ afterAll(
 	() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }),
 	60_000,
 );
+
+// The runs under test stamp OTTR_VERSION in this process's env for their compose
+// builds; restore it after every test, because bun test shares one process across
+// files and a leftover stamp would change describeVersion's answers downstream.
+const savedStamp = { value: process.env.OTTR_VERSION };
+beforeEach(() => {
+	savedStamp.value = process.env.OTTR_VERSION;
+});
+afterEach(() => {
+	if (savedStamp.value === undefined) delete process.env.OTTR_VERSION;
+	else process.env.OTTR_VERSION = savedStamp.value;
+});
 
 /** git for fixtures with a throwaway identity — never the git() under test. */
 function must(cwd: string, ...args: string[]): string {
@@ -233,6 +253,8 @@ interface FakeRecord {
 	seedFailRecords: string[];
 	/** The stored seed-failed record: the `cat` answers it, the write sets it, the rm clears it. */
 	seedFailState: { value: string };
+	/** The OTTR_VERSION each compose build ran with, in order. */
+	buildStamps: (string | undefined)[];
 	built: FakeRun["built"];
 }
 
@@ -326,6 +348,8 @@ function buildExec(
 	rec: FakeRecord,
 ): ExecResult | null {
 	if (!args.includes("build")) return null;
+	// What the build ran with: the stamp the run left in this process env.
+	rec.buildStamps.push(process.env.OTTR_VERSION);
 	// What the sidecar's build context holds while the build runs.
 	if (extra !== undefined) {
 		const m = /context: (".*")/.exec(readFileSync(extra, "utf8"));
@@ -576,6 +600,7 @@ function fakes(o: FakeOptions = {}): FakeRun {
 	const restartWaits: string[] = [];
 	const seedFailRecords: string[] = [];
 	const seedFailState = { value: o.seedFailRecord ?? "" };
+	const buildStamps: (string | undefined)[] = [];
 	const logs: string[] = [];
 	const waits: number[] = [];
 	const built: FakeRun["built"] = [];
@@ -602,6 +627,7 @@ function fakes(o: FakeOptions = {}): FakeRun {
 		restartWaits,
 		seedFailRecords,
 		seedFailState,
+		buildStamps,
 		built,
 	};
 	const n: PollCounters = {
@@ -650,6 +676,7 @@ function fakes(o: FakeOptions = {}): FakeRun {
 		logs,
 		waits,
 		built,
+		buildStamps,
 		seedRuns,
 		seedImages,
 		seedWrites,
@@ -814,6 +841,8 @@ interface FakeRun {
 	waits: number[];
 	/** The sidecar build contexts: the tree, its files (no .git), its Dockerfile.worker. */
 	built: { tree: string; files: string[]; dockerfile: string }[];
+	/** The OTTR_VERSION each compose build ran with, in order. */
+	buildStamps: (string | undefined)[];
 	/** The board-seed run call lines, in order. */
 	seedRuns: string[];
 	/** The ALATE_IMAGE each board-seed run saw, in order. */
@@ -1307,6 +1336,46 @@ describe("updateImage", () => {
 		// The worktree is gone again, from the disk and from the checkout's list.
 		expect(f.built.map((b) => existsSync(b.tree))).toEqual([false]);
 		expect(must(side.main, "worktree", "list").split("\n")).toHaveLength(1);
+	}, 60_000);
+
+	test("every compose build carries the deployed commit's version stamp", async () => {
+		delete process.env.OTTR_VERSION;
+		const { main } = checkout();
+		// The tag sits on main's HEAD, which is origin/main: the commit it deploys.
+		must(main, "tag", "-a", "v2.3.4", "-m", "v2.3.4");
+		const side = checkout();
+		bump(side.ci, "2.0.0");
+		const f = fakes({
+			turns: "0",
+			sidecar: { name: "sidecar", dir: side.main },
+			sidecarNewImage: true,
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		// The server build carries the main repo's describe output; the sidecar
+		// build carries its own repo's short sha (that repo has no release tag).
+		expect(f.buildStamps).toEqual([
+			"v2.3.4",
+			must(
+				side.main,
+				"rev-parse",
+				"--short",
+				must(side.origin, "rev-parse", "main"),
+			),
+		]);
+		expect(f.calls).toEqual([
+			PS,
+			BUILD,
+			CFGJSON,
+			SIDE_BUILD,
+			...SIDE_COMPARE,
+			SIDE_UP,
+			GET,
+			...COMPARE,
+			COUNT,
+			UP,
+			DEPLOYED(main),
+			PRUNE,
+		]);
 	}, 60_000);
 
 	test("a running service the plain config omits (its profile is not active) warns", async () => {
@@ -3243,14 +3312,44 @@ describe("rolling restart", () => {
 	test("a vm-runner image that does not build stops the run before any hold or recreate", async () => {
 		const { main, ci } = checkout();
 		bump(ci, "1.1.0");
+		const side = checkout();
+		bump(side.ci, "2.0.0");
+		delete process.env.OTTR_VERSION;
+		// The tag must sit on the commit the run deploys: bump moved origin/main,
+		// so tag the fetched ref, not main's own (still behind) HEAD.
+		must(main, "fetch", "-q", "origin", "main");
+		must(main, "tag", "v2.3.4", "origin/main");
 		const f = fakes({
 			newImage: true,
 			running: "server\nvm-runner",
+			sidecar: { name: "sidecar", dir: side.main },
+			sidecarNewImage: true,
 			vmBuild: 1,
 			gets: [vmBoard(0)],
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
-		expect(f.calls).toEqual([PS, BUILD, CFGJSON, VM_BUILD]);
+		expect(f.calls).toEqual([
+			PS,
+			BUILD,
+			CFGJSON,
+			SIDE_BUILD,
+			...SIDE_COMPARE,
+			SIDE_UP,
+			VM_BUILD,
+		]);
+		// The sidecar build stamped its own repo's commit between the two main
+		// builds, so the vm-runner stamp proves the re-stamp: without the reset
+		// in buildVmRunner the third value would stay the sidecar's short sha.
+		expect(f.buildStamps).toEqual([
+			"v2.3.4",
+			must(
+				side.main,
+				"rev-parse",
+				"--short",
+				must(side.origin, "rev-parse", "main"),
+			),
+			"v2.3.4",
+		]);
 		expect(f.logs).toContain("kvm build failed");
 		expect(f.logs).toContain(
 			"stopped: the vm-runner image does not build; the stack keeps the old one",

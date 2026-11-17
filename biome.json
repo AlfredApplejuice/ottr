@@ -5,6 +5,7 @@
 			"src/**",
 			"scripts/**",
 			"extension/**",
+			".agents/skills/check-ottr-board/scripts/**",
 			"!!**/.worktrees",
 			"!!**/.dev",
 			"!!src/fixtures"

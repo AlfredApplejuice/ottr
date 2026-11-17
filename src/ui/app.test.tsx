@@ -12,6 +12,8 @@ import type {
 	ProjectView,
 	ProposalSummary,
 	PrReviewView,
+	PrRunState,
+	ReleasePlan,
 	StateResponse,
 	Task,
 	TaskCard,
@@ -63,18 +65,22 @@ const {
 	pollTransportDiag,
 	setupHints,
 	reportHtml,
+	shortNoticeText,
 	Drawer,
 	LogView,
 	ProjectBoard,
 	RailRows,
 	SEARCH_APPLY_MS,
 	ComposeDialog,
+	ConsolidationReview,
 	FollowUpDialog,
 	DeepenReview,
+	ReleaseDialog,
 	AddProjectModal,
 	OrphanNotice,
 	SeedFailedLine,
 	ProvisionErrorLine,
+	SetupChecklist,
 	ranOnLabel,
 	AuthPage,
 	PrReviewSection,
@@ -1724,6 +1730,301 @@ describe("WarningLines", () => {
 		expect(html).toContain(
 			"Settings - Bogus is not a card, and the word Settings alone stays text too.",
 		);
+	});
+});
+
+describe("card links in bell text", () => {
+	// Mirrors the panel's resolver: only ottr's ids resolve, foreign projects
+	// and unknown ids stay text.
+	const cardsCtx = {
+		resolve: (id: string, project: string | null) => {
+			if (project !== null && project !== "ottr") return null;
+			return id === "OTTR-1071" || id === "OTTR-1070"
+				? { project: "ottr", id }
+				: null;
+		},
+		open: () => {},
+	};
+	const advisory =
+		"agent-data main checkout changed while several cards were running (ottr#OTTR-1071, alate#ALAT-180): new commits abc1234 sync: add parallel-work check. No card was parked.";
+
+	test("a project#id reference in a warning links; a foreign project's stays text", () => {
+		const html = renderToStaticMarkup(
+			<WarningLines warnings={[advisory]} cards={cardsCtx} />,
+		);
+		expect(html).toContain(
+			'<a class="notif-link" data-card-link="1" href="/projects/ottr/tasks/OTTR-1071" title="Open card OTTR-1071">ottr#OTTR-1071</a>',
+		);
+		// alate is not a project the resolver knows: the reference stays text.
+		expect(html).toContain("alate#ALAT-180");
+		expect(html).not.toContain("alate#ALAT-180</a>");
+	});
+
+	test("project-prefixed, hash-only, and bare id forms all link", () => {
+		const html = renderToStaticMarkup(
+			<WarningLines
+				warnings={[
+					"Refs: ottr#OTTR-1071, #OTTR-1072 and OTTR-1073 were running",
+				]}
+				cards={{
+					resolve: (id: string) => ({ project: "ottr", id }),
+					open: () => {},
+				}}
+			/>,
+		);
+		expect(html).toContain('href="/projects/ottr/tasks/OTTR-1071"');
+		expect(html).toContain('href="/projects/ottr/tasks/OTTR-1072"');
+		expect(html).toContain('href="/projects/ottr/tasks/OTTR-1073"');
+		// The anchor text keeps each form as written.
+		expect(html).toContain(">ottr#OTTR-1071</a>");
+		expect(html).toContain(">#OTTR-1072</a>");
+		expect(html).toContain(">OTTR-1073</a>");
+	});
+
+	test("a commit sha after project# stays text", () => {
+		const html = renderToStaticMarkup(
+			<WarningLines
+				warnings={["The image holds ottr#7f78beca while the board runs."]}
+				cards={cardsCtx}
+			/>,
+		);
+		expect(html).not.toContain("<a ");
+		expect(html).toContain("ottr#7f78beca");
+	});
+
+	test("an unknown card id stays text", () => {
+		const html = renderToStaticMarkup(
+			<WarningLines
+				warnings={["The run waits for ottr#OTTR-9999 to finish."]}
+				cards={cardsCtx}
+			/>,
+		);
+		expect(html).not.toContain("<a ");
+		expect(html).toContain("ottr#OTTR-9999");
+	});
+
+	test("a bare known id in the restart line links; without cards the same text stays plain", () => {
+		const wait = {
+			running: "a".repeat(40),
+			commit: "b".repeat(40),
+			commits: 2,
+			since: 1730990000000,
+			turns: ["OTTR-1070"],
+			command:
+				"docker compose -f /srv/ottr/compose.yaml up -d --no-deps --wait server",
+		};
+		const linked = renderToStaticMarkup(
+			<RestartWaitLine
+				wait={wait}
+				inboxKey="restart-wait:1730990000000"
+				fresh={false}
+				cards={cardsCtx}
+			/>,
+		);
+		expect(linked).toContain(
+			'<a class="notif-link" data-card-link="1" href="/projects/ottr/tasks/OTTR-1070" title="Open card OTTR-1070">OTTR-1070</a>',
+		);
+		const plain = renderToStaticMarkup(
+			<RestartWaitLine
+				wait={wait}
+				inboxKey="restart-wait:1730990000000"
+				fresh={false}
+			/>,
+		);
+		expect(plain).not.toContain("data-card-link");
+		expect(plain).toContain("The restart waits for: OTTR-1070.");
+	});
+
+	test("the restart host command lives behind the Details disclosure", () => {
+		const html = renderToStaticMarkup(
+			<RestartWaitLine
+				wait={{
+					running: "a".repeat(40),
+					commit: "b".repeat(40),
+					commits: 2,
+					since: 1730990000000,
+					turns: [],
+					command:
+						"docker compose -f /srv/ottr/compose.yaml up -d --no-deps --wait server",
+				}}
+				inboxKey="restart-wait:1730990000000"
+				fresh={false}
+			/>,
+		);
+		const { window } = new Window({ url: "http://localhost/" });
+		const doc = window.document;
+		doc.body.innerHTML = html;
+		const details = doc.querySelector(".notif-details");
+		expect(details?.querySelector("summary")?.textContent).toBe("Details");
+		expect(details?.textContent).toContain(
+			"docker compose -f /srv/ottr/compose.yaml up -d --no-deps --wait server",
+		);
+		// The collapsed line carries no piece of the host command.
+		doc.querySelectorAll(".notif-details").forEach((d) => {
+			d.remove();
+		});
+		expect(doc.body.textContent).not.toContain("docker compose");
+	});
+
+	test("the seed failure's multi-line tail hides behind Details", () => {
+		const fail = {
+			since: 1730990000000,
+			commit: "c".repeat(40),
+			text: "Seed pull failed for the agent layer image.\ncontainer ottr-worker-1 exited with code 1\nrepair steps live in /tmp/ottr-seed-9912/repair.sh",
+		};
+		const html = renderToStaticMarkup(
+			<SeedFailedLine
+				fail={fail}
+				inboxKey="seed-failed:1730990000000"
+				fresh={false}
+			/>,
+		);
+		const { window } = new Window({ url: "http://localhost/" });
+		const doc = window.document;
+		doc.body.innerHTML = html;
+		// The collapsed line keeps only the first line of the recorded text.
+		expect(doc.body.textContent).toContain(
+			"Seed pull failed for the agent layer image.",
+		);
+		const details = doc.querySelector(".notif-details");
+		expect(details?.querySelector("summary")?.textContent).toBe("Details");
+		expect(details?.textContent).toContain("ottr-worker-1");
+		expect(details?.textContent).toContain("/tmp/ottr-seed-9912/repair.sh");
+		doc.querySelectorAll(".notif-details").forEach((d) => {
+			d.remove();
+		});
+		expect(doc.body.textContent).not.toContain("ottr-worker-1");
+		expect(doc.body.textContent).not.toContain("/tmp/ottr-seed-9912");
+	});
+
+	test("five card references clamp to three anchors and a +2 more control", () => {
+		const ids = ["OTTR-1", "OTTR-2", "OTTR-3", "OTTR-4", "OTTR-5"];
+		const html = renderToStaticMarkup(
+			<WarningLines
+				warnings={[
+					"Cards running across the checkout change (ottr#OTTR-1, ottr#OTTR-2, ottr#OTTR-3, ottr#OTTR-4, ottr#OTTR-5) kept their worktrees.",
+				]}
+				cards={{
+					resolve: (id: string) =>
+						ids.includes(id) ? { project: "ottr", id } : null,
+					open: () => {},
+				}}
+			/>,
+		);
+		expect(html.match(/data-card-link="1"/g)?.length).toBe(3);
+		expect(html).toContain("+2 more");
+		expect(html).toContain('aria-label="Show 2 more cards"');
+		expect(html).toContain('aria-expanded="false"');
+		// The clamp keeps the separator after the third reference and moves the
+		// line's closing punctuation behind the button, so it reads
+		// "...OTTR-3, +2 more." instead of "OTTR-3+2 more".
+		expect(html).toContain("</a>, <button");
+		expect(html).toContain("+2 more</button>.");
+		// The 4th and 5th references only come back after expansion.
+		expect(html).not.toContain("OTTR-4");
+		expect(html).not.toContain("OTTR-5");
+	});
+
+	test("shortNoticeText keeps the first line and first sentence", () => {
+		expect(shortNoticeText("First sentence. Second one follows.")).toBe(
+			"First sentence.",
+		);
+		expect(shortNoticeText("Head: tail stays out of the collapsed line.")).toBe(
+			"Head:",
+		);
+		expect(shortNoticeText("No sentence end here\nsecond line\nthird")).toBe(
+			"No sentence end here",
+		);
+		expect(shortNoticeText("Trailing end is the whole line.")).toBe(
+			"Trailing end is the whole line.",
+		);
+	});
+
+	test("shortNoticeText drops host paths, flags, and container names from the collapsed copy", () => {
+		// Stripping runs before the cut, so the ";" after "(exit 1)" becomes the
+		// first clean sentence end and the tail moves behind Details.
+		expect(
+			shortNoticeText(
+				"SkillSpector rejected /tmp/alate-data-9f34/user/omp/agent/skills/egm-review-loop (exit 1); nothing was installed",
+			),
+		).toBe("SkillSpector rejected (exit 1);");
+		expect(
+			shortNoticeText("bun install failed (exit 1) in /opt/agent-data"),
+		).toBe("bun install failed (exit 1)");
+		expect(
+			shortNoticeText(
+				"container ottr-worker-1 exited before the seed finished",
+			),
+		).toBe("container exited before the seed finished");
+		expect(
+			shortNoticeText(
+				"Install it at https://github.com/apps/ottr-ai/installations/new.",
+			),
+		).toBe("Install it at https://github.com/apps/ottr-ai/installations/new.");
+		expect(shortNoticeText("seed flags -d --no-deps --wait ignored")).toBe(
+			"seed flags ignored",
+		);
+		// Card refs match no detail-token shape, tagged or bare.
+		expect(
+			shortNoticeText("cards ottr#OTTR-1071, alate#ALAT-180 were running"),
+		).toBe("cards ottr#OTTR-1071, alate#ALAT-180 were running");
+	});
+
+	test("shortNoticeText keeps a removed path's period and drops its connector", () => {
+		expect(
+			shortNoticeText(
+				"bun install failed (exit 1) in /opt/agent-data. Run node sync.mjs to repair.",
+			),
+		).toBe("bun install failed (exit 1).");
+	});
+
+	test("shortNoticeText strips container names that carry punctuation", () => {
+		// The shape test runs on the token's bare core, so a sentence period or
+		// a bracket pair riding on the name cannot keep the name in the pane.
+		expect(
+			shortNoticeText(
+				"bun install failed (exit 1) in container ottr-worker-1. Run node sync.mjs to repair.",
+			),
+		).toBe("bun install failed (exit 1) in container.");
+		expect(
+			shortNoticeText("container (ottr-worker-1) and (alate-seed-2) exited"),
+		).toBe("container and exited");
+	});
+
+	test("shortNoticeText caps a flattened single-line record to one short clean line", () => {
+		const record =
+			"bun install failed (exit 1) in /opt/agent-data container ottr-worker-1 exited before the seed finished temp tree /tmp/ottr-seed-3182 left in place alate snapshot import stopped at step 3 of 5 repair: run node sync.mjs from the alate checkout repair: clear /tmp/ottr-seed-3182 and re-run the update";
+		const short = shortNoticeText(record, 160);
+		expect(short.startsWith("bun install failed")).toBe(true);
+		expect(short).not.toContain("/");
+		expect(short).not.toContain("sync.mjs");
+		expect(short.length).toBeLessThanOrEqual(161);
+		expect(short.length).toBeLessThan(record.length);
+		// The cap cannot engage on this record: the stripped line's first clause
+		// end ("repair:") is a clean cut below 160 chars, so the line ends there
+		// and Details carries the repair steps. No partially cut word: whatever
+		// ends the line is a whole fixture word.
+		const body = short.endsWith("…") ? short.slice(0, -1) : short;
+		const lastWord = body.split(" ").at(-1) ?? "";
+		expect(lastWord !== "" && record.split(/\s+/).includes(lastWord)).toBe(
+			true,
+		);
+	});
+
+	test("shortNoticeText caps a long clean sentence at a word boundary", () => {
+		const sentence = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+		const short = shortNoticeText(sentence, 40);
+		expect(short.length).toBeLessThanOrEqual(41);
+		expect(short.endsWith("…")).toBe(true);
+		const lastWord = short.slice(0, -1).split(" ").at(-1) ?? "";
+		expect(lastWord !== "" && sentence.split(" ").includes(lastWord)).toBe(
+			true,
+		);
+	});
+
+	test("shortNoticeText without a cap returns a long clean sentence whole", () => {
+		const sentence = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+		expect(shortNoticeText(sentence)).toBe(sentence);
 	});
 });
 
@@ -4274,6 +4575,7 @@ describe("Drawer approve button", () => {
 				postedLogin: null,
 				postedUrl: null,
 				postError: null,
+				run: null,
 			},
 		} as Partial<TaskCard>);
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
@@ -5513,6 +5815,7 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		postedUrl: null,
 		postedLogin: null,
 		postError: null,
+		run: null,
 	});
 
 	test("an open pr_review drawer shows the ask-for-draft composer", () => {
@@ -5646,6 +5949,609 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		expect(two).toContain('aria-describedby="pr-review-inline"');
 		const none = section(waitingReview(), "## Summary\nfine");
 		expect(none).toMatch(/id="pr-review-inline"[^>]*>No inline comments/);
+	});
+
+	// The ask composer mirrors the card's last draft run (docs/specs/pr-reviews.md,
+	// "Draft runs"): in flight shows the spinner line, a failed run shows its error,
+	// and a clean end names the draft ready — the record is the status, so it also
+	// survives the section remount a moved head causes.
+	test("a draft run in flight shows Writing a new draft beside the composer", () => {
+		const html = section(waitingReview(), "## Summary\nreview", {
+			...prView("open"),
+			run: { startedAt: 1_000, endedAt: null, error: null, model: "@plan" },
+		});
+		expect(html).toContain("Writing a new draft...");
+		expect(html).toMatch(
+			/class="dim"><span class="spinner" aria-hidden="true"><\/span> Writing/,
+		);
+		expect(html).not.toContain("New draft ready.");
+	});
+
+	test("a failed draft run shows its error with role alert", () => {
+		const html = section(waitingReview(), "## Summary\nreview", {
+			...prView("open"),
+			run: {
+				startedAt: 1_000,
+				endedAt: 1_500,
+				error: "gateway down",
+				model: "@plan",
+			},
+		});
+		expect(html).toContain('role="alert"');
+		expect(html).toContain("gateway down");
+		expect(html).not.toContain("Writing a new draft...");
+		expect(html).not.toContain("New draft ready.");
+	});
+
+	test("a clean ended run shows New draft ready without an ask", () => {
+		const html = section(waitingReview(), "## Summary\nreview", {
+			...prView("open"),
+			run: {
+				startedAt: 1_000,
+				endedAt: 1_500,
+				error: null,
+				model: "@plan",
+			},
+		});
+		expect(html).toContain("New draft ready.");
+		expect(html).not.toContain("Writing a new draft...");
+	});
+
+	// The head moved between the ask and the run's end: requestReview refreshed the
+	// head, savePrDraft wrote the new reviewed_head, and the drawer's reviewedHead
+	// key remounts the section. The fresh mount still sees the ended run and shows
+	// its result (OTTR-1073 send-back).
+	test("a fresh mount after a head move shows the landed run's result", () => {
+		const moved = section(
+			{
+				...waitingReview(),
+				prReview: { ...prView("open"), reviewedHead: "d".repeat(40) },
+			} as TaskCard,
+			"## Summary\nreview of the new head",
+			{
+				...prView("open"),
+				reviewedHead: "d".repeat(40),
+				run: {
+					startedAt: 2_000,
+					endedAt: 2_500,
+					error: null,
+					model: "@plan",
+				},
+			},
+		);
+		expect(moved).toContain("New draft ready.");
+		expect(moved).toContain("review of the new head");
+	});
+});
+
+// The run status after a real ask needs the noteFor state, so these tests mount
+// PrReviewSection on happy-dom (the same swap as the drawer mount tests above).
+describe("PR review draft-run status on a mounted ask composer", () => {
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	const project = {
+		name: "proj",
+		hasRules: true,
+		github: null,
+		sessionsDir: "/tmp/sessions",
+		settings: { maxParallel: 1 },
+	} as unknown as ProjectView;
+	const drawerBase = {
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		projects: [],
+		read: true,
+		onMarkUnread: () => {},
+		onMarkSeen: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+	const prView = (run: PrRunState | null): PrReviewView => ({
+		number: 7,
+		url: "https://github.com/acme/widget/pull/7",
+		state: "open",
+		reviewedHead: "c".repeat(40),
+		postedHead: null,
+		postedUrl: null,
+		postedLogin: null,
+		postError: null,
+		run,
+	});
+	const draft = "## Summary\nreview";
+	const card = (): TaskCard =>
+		cardFixture({
+			...({
+				kind: "pr_review",
+				report: null,
+				details: draft,
+				branch: null,
+				model: null,
+				worktree: null,
+				sessionId: null,
+				images: [],
+				pendingImages: [],
+				shots: [],
+				keptFiles: [],
+				workCheckLog: [],
+			} as unknown as Partial<TaskCard>),
+			id: "P-5",
+			stage: "in_progress",
+			state: "needs_you",
+			prReview: prView(null),
+		});
+	const view = (cardRow: TaskCard): TaskView => ({
+		...cardRow,
+		turns: [],
+		details: draft,
+		report: null,
+		diffFiles: null,
+		prompt: "review the draft",
+		summary: null,
+		gate: null,
+		workCheckLog: [],
+		workCheckReport: null,
+	});
+	/** The React prop handler on a node; happy-dom events never reach React's plugins. */
+	const propOf = (
+		node: Element,
+		name: "onClick" | "onChange",
+	): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const fn = (
+			(node as unknown as Record<string, unknown>)[key] as Record<
+				string,
+				((e: unknown) => void) | undefined
+			>
+		)[name];
+		if (fn === undefined) throw new Error(`node has no ${name}`);
+		return fn;
+	};
+	// Minimal Act: run the work, hand a failure to the composer's inline error.
+	const actProp = async (
+		fn: () => Promise<void>,
+		onError?: (message: string) => void,
+	): Promise<boolean> => {
+		try {
+			await fn();
+		} catch (e) {
+			onError?.(e instanceof Error ? e.message : String(e));
+			return false;
+		}
+		return true;
+	};
+
+	test("an ask shows Writing a new draft, then the failed run's error", async () => {
+		const realFetch = globalThis.fetch;
+		const posts: { url: string; body: string }[] = [];
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			if (url.endsWith("/tasks/P-5/reply") && init?.method === "POST") {
+				posts.push({ url, body: String(init.body) });
+				return new Response(JSON.stringify({ ok: true }));
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView(null)}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			const note = container.querySelector(
+				"#pr-review-note",
+			) as unknown as HTMLTextAreaElement;
+			expect(note).not.toBeNull();
+			await act(async () => {
+				propOf(note, "onChange")({ target: { value: "Cover the retry path" } });
+			});
+			const ask = [...container.querySelectorAll("button")].find(
+				(b) => b.textContent === "Ask for draft",
+			);
+			expect(ask).toBeDefined();
+			await act(async () => {
+				propOf(ask as unknown as Element, "onClick")({});
+			});
+			// The POST answered and no run record reached the view yet: the spinner
+			// line shows, the field is cleared, and the note went out as the reply.
+			expect(container.textContent).toContain("Writing a new draft...");
+			expect(note.value).toBe("");
+			expect(posts).toHaveLength(1);
+			expect(JSON.parse(posts[0]!.body)).toEqual({
+				text: "Cover the retry path",
+			});
+			// The run record arrives ended with an error: the spinner line gives way
+			// to the error, still keyed to the untouched field.
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 1_000,
+							endedAt: 1_500,
+							error: "gateway down",
+							model: "@plan",
+						})}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			expect(container.textContent).toContain("gateway down");
+			expect(container.textContent).not.toContain("Writing a new draft...");
+			const alert = container.querySelector('[role="alert"]');
+			expect(alert?.textContent).toBe("gateway down");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("a landed draft flips the status to New draft ready, typing hides it", async () => {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ ok: true }))) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView(null)}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			const note = container.querySelector(
+				"#pr-review-note",
+			) as unknown as HTMLTextAreaElement;
+			await act(async () => {
+				propOf(note, "onChange")({ target: { value: "Look at the loop" } });
+			});
+			const ask = [...container.querySelectorAll("button")].find(
+				(b) => b.textContent === "Ask for draft",
+			);
+			await act(async () => {
+				propOf(ask as unknown as Element, "onClick")({});
+			});
+			// The run ended clean and its draft landed on the card: the new draft is
+			// the one the drawer now holds, so the status names it ready.
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 2_000,
+							endedAt: 2_400,
+							error: null,
+							model: "@plan",
+						})}
+						draft={"## Summary\nrewritten review"}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			expect(container.textContent).toContain("New draft ready.");
+			expect(container.textContent).not.toContain("Writing a new draft...");
+			// The unedited review box follows the landed draft.
+			const box = container.querySelector(
+				"#pr-review-text",
+			) as unknown as HTMLTextAreaElement;
+			expect(box.value).toBe("## Summary\nrewritten review");
+			// The status is the run record, not the typed text: typing the next ask
+			// leaves it up until that ask's own run arrives.
+			await act(async () => {
+				propOf(note, "onChange")({ target: { value: "One more pass" } });
+			});
+			expect(container.textContent).toContain("New draft ready.");
+			// The next run arriving in flight replaces the result with the spinner.
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 3_000,
+							endedAt: null,
+							error: null,
+							model: "@plan",
+						})}
+						draft={"## Summary\nrewritten review"}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			expect(container.textContent).toContain("Writing a new draft...");
+			expect(container.textContent).not.toContain("New draft ready.");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("an edited review box keeps the user's text when a draft lands", async () => {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ ok: true }))) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView(null)}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			const box = container.querySelector(
+				"#pr-review-text",
+			) as unknown as HTMLTextAreaElement;
+			await act(async () => {
+				propOf(box, "onChange")({ target: { value: "my own edit" } });
+			});
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 2_000,
+							endedAt: 2_400,
+							error: null,
+							model: "@plan",
+						})}
+						draft="## Summary\nrewritten review"
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			// The user's edit wins over the landed draft. The status still names the
+			// clean run: it rides the run record, not the composer's own ask.
+			expect(
+				(
+					container.querySelector(
+						"#pr-review-text",
+					) as unknown as HTMLTextAreaElement
+				).value,
+			).toBe("my own edit");
+			expect(container.textContent).toContain("New draft ready.");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("a second ask waits past the stale ended record and shows the new run", async () => {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ ok: true }))) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			// The card already holds a clean ended run from an earlier ask.
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 1_000,
+							endedAt: 1_400,
+							error: null,
+							model: "@plan",
+						})}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			const note = container.querySelector(
+				"#pr-review-note",
+			) as unknown as HTMLTextAreaElement;
+			await act(async () => {
+				propOf(note, "onChange")({ target: { value: "Second pass" } });
+			});
+			const ask = [...container.querySelectorAll("button")].find(
+				(b) => b.textContent === "Ask for draft",
+			);
+			await act(async () => {
+				propOf(ask as unknown as Element, "onClick")({});
+			});
+			// The stale ended record must not end the wait before the new run lands.
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 1_000,
+							endedAt: 1_400,
+							error: null,
+							model: "@plan",
+						})}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			expect(container.textContent).toContain("Writing a new draft...");
+			// The wait is exclusive: the stale record's result must not show beside
+			// the spinner while this ask waits for its own run.
+			expect(container.textContent).not.toContain("New draft ready.");
+			// The ask's own run arrives, still in flight: the spinner stays.
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 2_000,
+							endedAt: null,
+							error: null,
+							model: "@plan",
+						})}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			expect(container.textContent).toContain("Writing a new draft...");
+			// It ends failed: the error replaces the spinner.
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 2_000,
+							endedAt: 2_400,
+							error: "gateway down",
+							model: "@plan",
+						})}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			expect(container.textContent).toContain("gateway down");
+			expect(container.textContent).not.toContain("Writing a new draft...");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	// A pr_review card has no turns: its Work steps section shows the card log
+	// through LogView, so the draft-run lines live-update like a turn's output.
+	test("a pr_review drawer's Work steps show the card log, not No turns yet", async () => {
+		const realFetch = globalThis.fetch;
+		const logText =
+			"== pr review draft 2026-11-16T10:00:00.000Z (model @plan)\n" +
+			"- draft saved 2026-11-16T10:00:30.000Z (took 30s)\n";
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.endsWith("/tasks/P-5")) {
+				return new Response(JSON.stringify(view(card())), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			if (url.endsWith("/tasks/P-5/context")) {
+				return new Response(JSON.stringify({ context: null }));
+			}
+			if (url.includes("/tasks/P-5/log?")) {
+				return new Response(logText, {
+					headers: {
+						"X-Log-Size": String(new TextEncoder().encode(logText).length),
+					},
+				});
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(<Drawer {...drawerBase} task={card()} />);
+			});
+			await act(async () => {
+				await Bun.sleep(10);
+			});
+			const log = container.querySelector("#drawer-steps pre.log");
+			expect(log).not.toBeNull();
+			expect(log?.textContent).toContain("== pr review draft");
+			expect(log?.textContent).toContain("draft saved");
+			expect(container.textContent).not.toContain("No turns yet.");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
 	});
 });
 
@@ -7374,6 +8280,380 @@ describe("DeepenReview", () => {
 	});
 });
 
+describe("ConsolidationReview", () => {
+	const review = (original: string, consolidated: string) =>
+		renderToStaticMarkup(
+			<ConsolidationReview
+				original={original}
+				consolidated={consolidated}
+				onUse={() => {}}
+				onDiscard={() => {}}
+			/>,
+		);
+	test("a changed proposal renders add and del rows with +/- glyphs and both actions", () => {
+		const html = review("keep\nold line", "keep\nnew line");
+		expect(html).toContain('aria-label="Consolidation review"');
+		expect(html).toContain("dl-add");
+		expect(html).toContain("dl-del");
+		expect(html).toContain("+");
+		expect(html).toContain("\u2212");
+		expect(html).toContain(">old line</span>");
+		expect(html).toContain(">new line</span>");
+		expect(html).toContain("Use consolidated notes");
+		expect(html).toContain("Discard");
+	});
+	test("an identical proposal says so instead of an empty diff box", () => {
+		const html = review("same\nnotes", "same\nnotes");
+		expect(html).not.toContain("dl-add");
+		expect(html).toContain("nothing to change");
+	});
+});
+
+describe("ReleaseDialog consolidation", () => {
+	// React interaction needs browser globals; the setup mirrors the deepen
+	// describes above: happy-dom registers them for this describe, and afterAll
+	// puts the originals back, so later test files in the same process see no DOM.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+	// happy-dom's dispatched clicks never reach React's event plugin: call the
+	// production onClick React rendered onto the node instead.
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+	// Buttons are found by their exact label.
+	const button = (box: ParentNode, name: string): HTMLButtonElement => {
+		const node = [...box.querySelectorAll("button")].find(
+			(b) => b.textContent?.trim() === name,
+		);
+		if (node === undefined) throw new Error(`no ${name} button`);
+		return node as HTMLButtonElement;
+	};
+	// The production onChange React rendered onto the node; the textarea is typed by
+	// calling it with a minimal event object, since happy-dom's dispatched input
+	// event never reaches React's ChangeEventPlugin.
+	const onChangeOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onChange?: (e: unknown) => void;
+		};
+		if (props.onChange === undefined) throw new Error("node has no onChange");
+		return props.onChange;
+	};
+	const notesValue = (box: ParentNode): string =>
+		(box.querySelector("#release-notes-proposal") as HTMLTextAreaElement).value;
+	const notes = "- add the thing\n- fix the bug";
+	const consolidated =
+		"- the thing landed\n\n## Bug fixes\n\n- the bug is gone";
+	const plan: ReleasePlan = {
+		sha: "a".repeat(40),
+		from: "v1.0.0",
+		version: "v1.1.0",
+		notes,
+		commits: 12,
+		tasks: [{ id: "t1", title: "Add the thing" }],
+		blocked: null,
+	};
+	const project = {
+		name: "proj",
+		github: null,
+		settings: { releaseCommand: null },
+	} as unknown as ProjectView;
+	const runAct = async (fn: () => Promise<unknown>): Promise<boolean> => {
+		await fn();
+		return true;
+	};
+	type Call = { url: string; method?: string; body?: unknown };
+	type Harness = {
+		calls: Call[];
+		container: HTMLDivElement;
+		/** Re-renders the same root with a new `open` value, for close/reopen tests. */
+		render: (open: boolean) => Promise<void>;
+		done: () => Promise<void>;
+	};
+	const json = (body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		});
+	/** Mounts the open dialog over a fetch mock and lets the plan fetch land.
+	 *  GET /release answers the plan, POST /release answers {} (Start); the
+	 *  release-summary POST goes to `summary`, and every other URL 404s (the
+	 *  model catalog reads its failure and stays null). */
+	const mount = async (
+		summary?: () => Response | Promise<Response>,
+	): Promise<Harness> => {
+		const calls: Call[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const call: Call = {
+				url: String(input),
+				method: init?.method,
+				body:
+					typeof init?.body === "string"
+						? (JSON.parse(init.body) as unknown)
+						: undefined,
+			};
+			calls.push(call);
+			if (call.url.endsWith("/release-summary") && call.method === "POST")
+				return summary !== undefined
+					? summary()
+					: new Response("{}", { status: 404 });
+			if (call.url.endsWith("/release") && call.method === "POST")
+				return json({});
+			if (call.url.endsWith("/release")) return json(plan);
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const render = (open: boolean): Promise<void> =>
+			act(async () => {
+				root.render(
+					<ReleaseDialog
+						project={project}
+						open={open}
+						onClose={() => {}}
+						act={runAct}
+					/>,
+				);
+			});
+		try {
+			await render(true);
+			// One more act lets the plan fetch land.
+			await act(async () => {});
+		} catch (e) {
+			globalThis.fetch = realFetch;
+			throw e;
+		}
+		return {
+			calls,
+			container,
+			render,
+			done: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+			},
+		};
+	};
+	/** Clicks a button by label and lets the resulting state settle. */
+	const click = async (h: Harness, name: string): Promise<void> => {
+		await act(async () => {
+			onClickOf(button(h.container, name))({});
+		});
+		await act(async () => {});
+	};
+
+	test("opening runs no consolidation request and keeps the commit-history notes", async () => {
+		const h = await mount();
+		try {
+			expect(h.calls.some((c) => c.url.endsWith("/release-summary"))).toBe(
+				false,
+			);
+			expect(notesValue(h.container)).toBe(notes);
+			expect(button(h.container, "Consolidate notes").disabled).toBe(false);
+			expect(h.container.textContent).not.toContain("Consolidation review");
+		} finally {
+			await h.done();
+		}
+	});
+
+	test("Consolidate notes posts once and shows the diff of both texts", async () => {
+		const h = await mount(() => json({ summary: consolidated, reason: null }));
+		try {
+			await click(h, "Consolidate notes");
+			const post = h.calls.find((c) => c.url.endsWith("/release-summary"));
+			expect(post?.method).toBe("POST");
+			expect(post?.body).toEqual({ sha: plan.sha });
+			expect(h.container.textContent).toContain("Proposed notes");
+			// One proposal at a time: the button re-arms after Use or Discard.
+			expect(button(h.container, "Consolidate notes").disabled).toBe(true);
+			expect(h.container.querySelector(".deepen-diff")).not.toBeNull();
+			expect(h.container.textContent).toContain("the thing landed");
+			expect(h.container.textContent).toContain("fix the bug");
+			// The proposal is a review, not a replacement: the draft still holds
+			// the deterministic notes until the user accepts.
+			expect(notesValue(h.container)).toBe(notes);
+		} finally {
+			await h.done();
+		}
+	});
+
+	test("the diff bases on the live draft, so Use cannot silently drop the user's edits", async () => {
+		const h = await mount(() => json({ summary: consolidated, reason: null }));
+		try {
+			// The user edits the deterministic notes before asking for a proposal.
+			const box = h.container.querySelector(
+				"#release-notes-proposal",
+			) as HTMLTextAreaElement;
+			await act(async () => {
+				onChangeOf(box)({ target: { value: `${notes}\n- my own edit line` } });
+			});
+			await click(h, "Consolidate notes");
+			// The review diffs the edited draft against the proposal, so the edit
+			// the Use action would remove shows as a removed line.
+			const diff = h.container.querySelector(".deepen-diff");
+			expect(diff).not.toBeNull();
+			expect(diff?.textContent).toContain("my own edit line");
+			expect(diff?.textContent).toContain("the thing landed");
+			expect(notesValue(h.container)).toContain("my own edit line");
+			// Use replaces the whole draft with the proposal, as the diff showed.
+			await click(h, "Use consolidated notes");
+			expect(notesValue(h.container)).toBe(consolidated);
+		} finally {
+			await h.done();
+		}
+	});
+
+	test("a consolidation reply that lands after a close and reopen never fills the new dialog", async () => {
+		const { promise: pending, resolve } = Promise.withResolvers<Response>();
+		let asked = 0;
+		const h = await mount(() => {
+			asked += 1;
+			return asked === 1
+				? pending
+				: json({ summary: consolidated, reason: null });
+		});
+		try {
+			await click(h, "Consolidate notes");
+			// Close and reopen (the plan refetches) while the first request is
+			// still unanswered; the reopen must invalidate the in-flight reply.
+			await h.render(false);
+			await h.render(true);
+			expect(
+				h.calls.filter((c) => c.url.endsWith("/release-summary")),
+			).toHaveLength(1);
+			resolve(json({ summary: consolidated, reason: null }));
+			await act(async () => {});
+			await act(async () => {});
+			// The stale reply belongs to the closed session: no review, no busy
+			// state, and the notes editor keeps the deterministic notes.
+			expect(h.container.textContent).not.toContain("Proposed notes");
+			expect(notesValue(h.container)).toBe(notes);
+			expect(button(h.container, "Consolidate notes").disabled).toBe(false);
+		} finally {
+			await h.done();
+		}
+	});
+
+	test("Use consolidated notes writes the draft and Start sends it", async () => {
+		const h = await mount(() => json({ summary: consolidated, reason: null }));
+		try {
+			await click(h, "Consolidate notes");
+			await click(h, "Use consolidated notes");
+			expect(notesValue(h.container)).toBe(consolidated);
+			expect(h.container.textContent).not.toContain("Consolidation review");
+			await click(h, "Start release");
+			const rel = h.calls.find(
+				(c) => c.url.endsWith("/release") && c.method === "POST",
+			);
+			expect(rel?.body).toEqual({ sha: plan.sha, notes: consolidated });
+		} finally {
+			await h.done();
+		}
+	});
+
+	test("Discard keeps the original notes and Start sends no notes override", async () => {
+		const h = await mount(() => json({ summary: consolidated, reason: null }));
+		try {
+			await click(h, "Consolidate notes");
+			await click(h, "Discard");
+			expect(notesValue(h.container)).toBe(notes);
+			expect(h.container.textContent).not.toContain("Use consolidated notes");
+			// Discard re-arms the button, so a fresh proposal can be requested.
+			expect(button(h.container, "Consolidate notes").disabled).toBe(false);
+			await click(h, "Start release");
+			const rel = h.calls.find(
+				(c) => c.url.endsWith("/release") && c.method === "POST",
+			);
+			expect(rel?.body).toEqual({ sha: plan.sha });
+		} finally {
+			await h.done();
+		}
+	});
+
+	test("a failed consolidation shows the advisory, keeps the notes, and a retry succeeds", async () => {
+		let n = 0;
+		const h = await mount(() => {
+			n += 1;
+			return n === 1
+				? json({ summary: null, reason: "the gateway is down" })
+				: json({ summary: consolidated, reason: null });
+		});
+		try {
+			await click(h, "Consolidate notes");
+			expect(h.container.textContent).toContain(
+				"Consolidated notes unavailable: the gateway is down",
+			);
+			expect(notesValue(h.container)).toBe(notes);
+			expect(h.container.textContent).not.toContain("Consolidation review");
+			// The button re-arms: a retry clears the advisory and opens the review.
+			await click(h, "Consolidate notes");
+			expect(n).toBe(2);
+			expect(h.container.textContent).not.toContain("the gateway is down");
+			expect(h.container.querySelector(".deepen-diff")).not.toBeNull();
+		} finally {
+			await h.done();
+		}
+	});
+
+	test("an identical proposal reports no line changes instead of an empty diff box", async () => {
+		const h = await mount(() => json({ summary: notes, reason: null }));
+		try {
+			await click(h, "Consolidate notes");
+			expect(h.container.textContent).toContain("nothing to change");
+			expect(h.container.querySelector(".deepen-diff")).toBeNull();
+			expect(button(h.container, "Use consolidated notes").disabled).toBe(
+				false,
+			);
+		} finally {
+			await h.done();
+		}
+	});
+});
+
 // Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
 const drawerFields = {
 	kind: "work",
@@ -8986,6 +10266,27 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		settings: { maxParallel: 1, copyExtra: [] },
 	} as unknown as ProjectView;
 
+	// The wizard's fresh project: retro off keeps the board step first, and the GitHub
+	// remote enables the PR mode row (docs/specs/add-project-wizard.md).
+	const wizardProject = {
+		name: "wiz",
+		hasRules: false,
+		gitless: false,
+		github: "https://github.com/o/wiz",
+		sessionsDir: "/tmp/sessions",
+		settings: {
+			retroSince: null,
+			retroFilter: false,
+			forkResearch: false,
+			holdUpdateMerges: false,
+			forkMergeHold: false,
+			prMode: false,
+			targetBranch: null,
+			maxParallel: null,
+			copyExtra: [],
+		},
+	} as unknown as ProjectView;
+
 	const hostsView = (githubTokenSet: boolean): Record<string, unknown> => ({
 		tokens: githubTokenSet
 			? [{ host: "github.com", username: "x-access-token", tokenSet: true }]
@@ -9033,7 +10334,7 @@ describe("AddProjectModal board GitHub token reuse", () => {
 					{ status: 400 },
 				);
 			}
-			return new Response(JSON.stringify({ project, interview: "i1" }), {
+			return new Response(JSON.stringify({ project }), {
 				status: 200,
 			});
 		}
@@ -9044,21 +10345,44 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			});
 			return new Response(JSON.stringify(hostsView(true)), { status: 200 });
 		}
+		// The wizard's calls once it replaced the form: settings saves return the view,
+		// the interview call files a card, the fork facts answer empty.
+		if (url.endsWith("/settings") && method === "POST") {
+			posts.push({
+				url,
+				body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+			});
+			return new Response(JSON.stringify(project), { status: 200 });
+		}
+		if (url.endsWith("/interview") && method === "POST") {
+			posts.push({
+				url,
+				body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+			});
+			return new Response(
+				JSON.stringify({ interview: "queued", id: "WIZ-1" }),
+				{ status: 200 },
+			);
+		}
+		if (url.endsWith("/github")) {
+			return new Response(JSON.stringify({ forks: 0, active: 0, recent: [] }), {
+				status: 200,
+			});
+		}
 		return new Response("{}", { status: 404 });
 	}
 
 	async function mountAdd(
 		githubTokenSet: boolean,
 		projects: ProjectView[] = [],
+		wizardProject?: ProjectView,
 	): Promise<{
 		container: HTMLDivElement;
 		root: ReturnType<typeof createRoot>;
 		posts: { url: string; body: Record<string, unknown> }[];
-		added: string[];
 		restore: () => void;
 	}> {
 		const posts: { url: string; body: Record<string, unknown> }[] = [];
-		const added: string[] = [];
 		const calls = { project: 0 };
 		const realFetch = globalThis.fetch;
 		globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
@@ -9066,7 +10390,7 @@ describe("AddProjectModal board GitHub token reuse", () => {
 				hostsView,
 				posts,
 				calls,
-				project,
+				wizardProject ?? project,
 				githubTokenSet,
 				input,
 				init,
@@ -9097,7 +10421,6 @@ describe("AddProjectModal board GitHub token reuse", () => {
 						act={actProp}
 						projects={projects}
 						onClose={() => {}}
-						onAdded={(interview: string) => added.push(interview)}
 						openTask={() => {}}
 					/>,
 				);
@@ -9110,7 +10433,6 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			container,
 			root,
 			posts,
-			added,
 			restore: () => {
 				globalThis.fetch = realFetch;
 			},
@@ -9118,7 +10440,7 @@ describe("AddProjectModal board GitHub token reuse", () => {
 	}
 
 	test("the board token button retries Add with the prefilled x-access-token", async () => {
-		const { container, root, posts, added, restore } = await mountAdd(true);
+		const { container, root, posts, restore } = await mountAdd(true);
 		try {
 			const urlInput = container.querySelector(
 				"input[data-autofocus]",
@@ -9156,7 +10478,9 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			expect(posts.filter((p) => p.url.endsWith("/api/projects")).length).toBe(
 				2,
 			);
-			expect(added).toEqual(["i1"]);
+			// The add response carries no interview verdict: the wizard replaced the form
+			// and the interview waits for its last step (OTTR-1065).
+			expect(container.textContent).toContain("Set up proj");
 		} finally {
 			await act(async () => {
 				root.unmount();
@@ -9339,6 +10663,179 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			container.remove();
 			restore();
 		}
+	});
+
+	// OTTR-1065: one guided flow — add, board step, Project step, then the interview.
+	/** Types the wizard fixture's URL and submits; the 400's token step retries through
+	 *  the board token button, leaving the wizard in the dialog. */
+	const addThroughDialog = async (container: HTMLDivElement): Promise<void> => {
+		const urlInput = container.querySelector(
+			"input[data-autofocus]",
+		) as unknown as HTMLInputElement;
+		await act(async () => {
+			typeInto(urlInput, "https://github.com/o/wiz.git");
+			onChangeOf(urlInput)({
+				target: urlInput,
+				currentTarget: urlInput,
+			});
+		});
+		const form = container.querySelector("form") as unknown as HTMLFormElement;
+		await act(async () => {
+			form.dispatchEvent(submitEvent());
+		});
+		const boardButton = [...container.querySelectorAll("button")].find(
+			(b) => b.textContent === "Use the board GitHub token",
+		);
+		await act(async () => {
+			onClickOf(boardButton as unknown as Element)({});
+		});
+	};
+
+	const buttonOf = (container: HTMLDivElement, label: string): Element => {
+		const b = [...container.querySelectorAll("button")].find(
+			(x) => x.textContent === label,
+		);
+		if (b === undefined) throw new Error(`no ${label} button`);
+		return b;
+	};
+
+	test("PR mode saves before the interview starts", async () => {
+		const { container, root, posts, restore } = await mountAdd(
+			true,
+			[],
+			wizardProject,
+		);
+		try {
+			await addThroughDialog(container);
+			// The fresh project opens at the board step: retro is off.
+			expect(container.textContent).toContain("Retro");
+			// Skip the board and runner steps: their defaults stay.
+			await act(async () => {
+				onClickOf(buttonOf(container, "Skip, use defaults"))({});
+			});
+			await act(async () => {
+				onClickOf(buttonOf(container, "Skip, use defaults"))({});
+			});
+			// The Project step: PR mode is the step's only checkbox.
+			const pr = container.querySelector(
+				'input[type="checkbox"]',
+			) as unknown as HTMLInputElement;
+			expect(pr).not.toBeNull();
+			await act(async () => {
+				onChangeOf(pr)({ target: { checked: true }, currentTarget: pr });
+			});
+			// Next keeps the target branch at its default; Done starts the interview.
+			await act(async () => {
+				onClickOf(buttonOf(container, "Next"))({});
+			});
+			await act(async () => {
+				onClickOf(buttonOf(container, "Done"))({});
+			});
+			const prSave = posts.findIndex(
+				(p) => p.url.endsWith("/settings") && p.body.prMode === true,
+			);
+			const interview = posts.findIndex((p) => p.url.endsWith("/interview"));
+			expect(prSave).toBeGreaterThanOrEqual(0);
+			// The interview call exists and only follows the PR mode save.
+			expect(interview).toBeGreaterThan(prSave);
+			expect(posts[interview]?.body).toEqual({});
+			// The wizard finished: the checklist flag cleared.
+			expect(
+				posts.some(
+					(p) => p.url.endsWith("/settings") && p.body.setupChecklist === false,
+				),
+			).toBe(true);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+	});
+
+	test("closing the dialog after the add queues no interview", async () => {
+		const { container, root, posts, restore } = await mountAdd(
+			true,
+			[],
+			wizardProject,
+		);
+		try {
+			await addThroughDialog(container);
+			// The wizard replaced the form and no card is filed yet.
+			expect(container.textContent).toContain("Skip, use defaults");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+		expect(posts.some((p) => p.url.endsWith("/api/projects"))).toBe(true);
+		expect(posts.some((p) => p.url.endsWith("/interview"))).toBe(false);
+	});
+});
+
+describe("SetupChecklist rules item", () => {
+	// Retro and fork research are settled, so the checklist's only possible item is the
+	// rules one the add wizard's last step normally settles (docs/specs/add-project-wizard.md).
+	const base = {
+		name: "proj",
+		hasRules: false,
+		gitless: false,
+		github: null,
+		settings: {
+			retroSince: 1,
+			retroFilter: false,
+			forkResearch: true,
+			setupChecklist: true,
+		},
+	} as unknown as ProjectView;
+
+	const renderChecklist = (
+		project: ProjectView,
+		rulesTask: string | null,
+	): string =>
+		renderToStaticMarkup(
+			<SetupChecklist
+				project={project}
+				save={async () => true}
+				rulesTask={rulesTask === null ? null : ({ id: rulesTask } as TaskCard)}
+				openTask={() => {}}
+				interview={async () => true}
+				initGit={async () => true}
+				onOpenSetup={() => {}}
+			/>,
+		);
+
+	test("a project without rules shows the way to start the interview", () => {
+		const html = renderChecklist(base, null);
+		expect(html).toContain("No AGENTS.md yet");
+		expect(html).toContain("Start rules interview");
+	});
+
+	test("a live rules card turns the item into an open action", () => {
+		const html = renderChecklist(base, "PROJ-7");
+		expect(html).toContain("Open rules task");
+		expect(html).not.toContain("Start rules interview");
+	});
+
+	test("a gitless project offers Create git repo first", () => {
+		const html = renderChecklist(
+			{ ...base, gitless: true } as unknown as ProjectView,
+			null,
+		);
+		expect(html).toContain("Create git repo");
+		expect(html).not.toContain("Start rules interview");
+	});
+
+	test("a project with rules shows no rules item", () => {
+		const html = renderChecklist(
+			{ ...base, hasRules: true } as unknown as ProjectView,
+			null,
+		);
+		expect(html).not.toContain("No AGENTS.md yet");
+		expect(html).not.toContain("Start rules interview");
 	});
 });
 
@@ -10649,7 +12146,7 @@ describe("AddProjectModal Git URL field error", () => {
 			const method = init?.method ?? "GET";
 			if (url.endsWith("/api/projects") && method === "POST") {
 				posts.push({ url });
-				return new Response(JSON.stringify({ project, interview: "i1" }), {
+				return new Response(JSON.stringify({ project }), {
 					status: 200,
 				});
 			}
@@ -10669,7 +12166,6 @@ describe("AddProjectModal Git URL field error", () => {
 							return true;
 						}}
 						onClose={() => {}}
-						onAdded={() => {}}
 						openTask={() => {}}
 						projects={[]}
 					/>,

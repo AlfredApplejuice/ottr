@@ -204,7 +204,13 @@ omp. Two parts do the work:
    [README, Docker Compose, latest release](../README.md#docker-compose-latest-release))
    updates by moving its image tag. Neither host script runs there.
    The one-shot updater fast-forwards `main` and builds the image, then it
-   rolls the stack one runner at a time. A runner is a worker (its hostname, the
+   rolls the stack one runner at a time. Each build stamps the deployed
+   commit's version into the image as `OTTR_VERSION`: the
+   `git describe --tags --match "v[0-9]*"` output for that commit (`vX.Y.Z`,
+   or `vX.Y.Z-N-g<sha>` past the tag), or the short commit sha when no
+   release tag reaches it. The board shows this stamp in the sidebar. When
+   the image carries no stamp and git is unavailable, the board shows
+   `unknown version`, never a boot time. A runner is a worker (its hostname, the
    compose service name) or the server itself (`local`). It stops when the
    checkout has uncommitted changes or commits that origin lacks, when
    `docker compose ps` fails, or when it cannot compare the server's image with
@@ -1010,8 +1016,13 @@ three, so the turn writes only to its scratch disk. Files under `OTTR_VM_STATE_D
 
 - `base/base-<key>.ext4`: the base, built by `vm-runner` from its own container root
   (the `vm-runner` image with the worker toolchain). The build starts in the background
-  when `vm-runner` starts, and a turn waits for it. The key hashes the Ottr version,
-  `omp --version` and `package.json`, so a new image builds a new base.
+  when `vm-runner` starts, and a turn waits for it. The key hashes the content of
+  everything the base copies (the container root minus the tar's excludes and the
+  per-container `/etc/hosts`, `/etc/resolv.conf` and `/etc/hostname`), plus the Ottr
+  version and `omp --version`, so any change to a copied guest file builds a new base.
+  That includes files the image build writes that no package owns, such as
+  `/etc/gitconfig` from the image's `git config --system` step, and the root-level
+  scripts.
 - `layers/<project>-<key>.ext4`: the project layer with the project's system packages,
   tools and Python packages. The runner bakes it in a VM (bake mode, layer writable). The
   board sends the project's trusted lists on the vm dispatch: it reads the raw texts from

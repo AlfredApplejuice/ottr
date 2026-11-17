@@ -784,7 +784,8 @@ export async function headVersion(dir: string): Promise<string> {
 /** Version the board shows: the release stamp baked into the image first (OTTR_VERSION; the
  * image ships no .git to describe), then the newest release tag reachable from HEAD
  * (`vX.Y.Z`, or `vX.Y.Z-N-g<short>` when HEAD sits past it), the short HEAD sha on a dev
- * checkout with no release, and headVersion's boot-time fallback when git is unusable. */
+ * checkout with no release, and headVersion's boot-time fallback when git is unusable
+ * (shownVersion maps that fallback to "unknown version" for every surface). */
 export async function describeVersion(dir: string): Promise<string> {
 	const stamp = process.env.OTTR_VERSION?.trim();
 	if (stamp !== undefined && stamp !== "") return stamp;
@@ -800,6 +801,14 @@ export async function describeVersion(dir: string): Promise<string> {
 		// git missing or unusable
 	}
 	return headVersion(dir);
+}
+
+/** The version a surface shows. describeVersion's boot-time fallback (no OTTR_VERSION, no
+ * git: epoch milliseconds, 13 digits today) still changes on every restart, which the
+ * stale-tab reload handshake needs, but it is not a version, so no surface shows it as
+ * one. */
+export function shownVersion(v: string): string {
+	return /^\d{13,}$/.test(v) ? "unknown version" : v;
 }
 
 /** What `archReviewDelta` reports: the commit delta, whether a watermark anchors it (false = never
@@ -2942,6 +2951,34 @@ export async function cleanMergeTree(
  * card with the reason. `identity === null` keeps the built-in Ottr identity
  * (gitIdentity.ts).
  */
+/** The base tree's rows with `file` at `blob`: the existing row keeps its mode, a new
+ * file's row sorts in by name. `existingSha` is the sha the file already carries at
+ * the base tree, null when the file is new. */
+function rowsWithFile(
+	lsOut: string,
+	file: string,
+	blob: string,
+): { existingSha: string | null; rows: string[] } {
+	// `ls-tree -z` rows: "mode SP type SP sha TAB name\0".
+	const entries = lsOut.split("\0").filter((row) => row !== "");
+	const nameOf = (row: string) => row.slice(row.indexOf("\t") + 1);
+	const existing = entries.find((row) => nameOf(row) === file);
+	const existingSha =
+		existing === undefined
+			? null
+			: (existing.slice(0, existing.indexOf("\t")).split(" ")[2] ?? null);
+	const mode = existing?.split(" ")[0] ?? "100644";
+	const rows =
+		existing !== undefined
+			? entries.map((row) =>
+					row === existing ? `${mode} blob ${blob}\t${file}` : row,
+				)
+			: [...entries, `100644 blob ${blob}\t${file}`].sort((a, b) =>
+					nameOf(a) < nameOf(b) ? -1 : 1,
+				);
+	return { existingSha, rows };
+}
+
 export async function commitFileOnBranch(
 	mainPath: string,
 	file: string,
@@ -2975,24 +3012,8 @@ export async function commitFileOnBranch(
 		);
 	const ls = await git(["ls-tree", "-z", baseTree.stdout.trim()], mainPath);
 	if (ls.code !== 0) throw new Error(`git ls-tree failed: ${ls.stderr.trim()}`);
-	// `ls-tree -z` rows: "mode SP type SP sha TAB name\0".
-	const entries = ls.stdout.split("\0").filter((row) => row !== "");
-	const nameOf = (row: string) => row.slice(row.indexOf("\t") + 1);
-	const existing = entries.find((row) => nameOf(row) === file);
-	const existingSha =
-		existing === undefined
-			? null
-			: (existing.slice(0, existing.indexOf("\t")).split(" ")[2] ?? null);
+	const { existingSha, rows } = rowsWithFile(ls.stdout, file, blob);
 	if (existingSha === blob) return { kind: "same" };
-	const mode = existing?.split(" ")[0] ?? "100644";
-	const rows =
-		existing !== undefined
-			? entries.map((row) =>
-					row === existing ? `${mode} blob ${blob}\t${file}` : row,
-				)
-			: [...entries, `100644 blob ${blob}\t${file}`].sort((a, b) =>
-					nameOf(a) < nameOf(b) ? -1 : 1,
-				);
 	const tree = await git(
 		["mktree", "-z"],
 		mainPath,

@@ -1,8 +1,12 @@
 /**
  * vm-runner disk images (docs/adr/0009-microvm-workers.md):
  * - base rootfs: an ext4 copy of this container's own root (the vm-runner image ships the
- *   same bun, omp and /app as a worker), read-only vda of every VM. Keyed by OTTR_VERSION,
- *   `omp --version` and /app/package.json, so an image update rebuilds it once.
+ *   same bun, omp and /app as a worker), read-only vda of every VM. Keyed by the content
+ *   of everything it copies (the source root minus the tar's excludes — the pinned
+ *   roots plus this process's state dir — and the per-container /etc files, see
+ *   copiedPathSkipped) plus OTTR_VERSION and `omp --version`, so any change to a
+ *   copied guest file rebuilds it once. The digest walk reads the whole copied tree,
+ *   once per vm-runner process start.
  * - project layer: an ext4 holding the overlay `upper/` and `work/` dirs a bake VM fills with
  *   the project's apt/tools/pip installs (the worker's per-turn installs, done once). Keyed
  *   by the base key plus the dispatch's provisioning list texts (docs/specs/vm-list-isolation.md),
@@ -16,14 +20,17 @@ import {
 	closeSync,
 	existsSync,
 	ftruncateSync,
+	lstatSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
-	readFileSync,
+	readlinkSync,
+	readSync,
 	renameSync,
 	rmSync,
+	type Stats,
 } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import type { Exec } from "./vmNet.ts";
 import type { ProvisionLists } from "./workers.ts";
 
@@ -42,6 +49,37 @@ const BASE_EXCLUDES = [
 /** Mount points the guest init needs in the copy, which the excludes dropped. */
 const MOUNT_POINTS = ["proc", "sys", "dev", "run", "tmp", "data", "root"];
 
+/**
+ * /etc files the container runtime rewrites on every start. The tar skips their bind
+ * mounts (--one-file-system), and the base key skips their content, so a container
+ * restart never churns the key.
+ */
+const ETC_RUNTIME_FILES: Record<string, true> = {
+	hosts: true,
+	"resolv.conf": true,
+	hostname: true,
+};
+
+/**
+ * True for a path the base rootfs never copies: `skips` (the tar's anchored excludes at
+ * their exact paths relative to the copy root, plus this process's state dir in the same
+ * form — OTTR_VM_STATE_DIR may place it outside the pinned /var/lib/ottr-vm, and a cache
+ * file there must never key the base) and the per-container /etc files above. Everything else under the source root is
+ * hashed, so the key also moves when the image build writes a file no package owns (for
+ * example /etc/gitconfig from Dockerfile.worker's `git config --system`, or the
+ * root-level /ottr-entry.sh and /no-proxy.sh).
+ */
+function copiedPathSkipped(rel: string, skips: readonly string[]): boolean {
+	if (skips.includes(rel)) return true;
+	const rest = rel.slice(1);
+	const slash = rest.indexOf("/");
+	return (
+		slash !== -1 &&
+		rest.slice(0, slash) === "etc" &&
+		ETC_RUNTIME_FILES[rest.slice(slash + 1)] === true
+	);
+}
+
 export interface BakeResult {
 	exitCode: number | null;
 	stderrTail: string;
@@ -54,12 +92,64 @@ export type LayerResult =
 function baseKey(i: {
 	ottrVersion: string;
 	ompVersion: string;
-	packageJson: string;
+	/** Content digest of the whole copied root, null when absent. */
+	guest: string | null;
 }): string {
 	// JSON keeps the parts unambiguous: "a"+"bc" and "ab"+"c" must not collide.
 	return createHash("sha256")
-		.update(JSON.stringify([i.ottrVersion, i.ompVersion, i.packageJson]))
+		.update(JSON.stringify([i.ottrVersion, i.ompVersion, i.guest]))
 		.digest("hex");
+}
+
+/** sha256 of a file's content, read in chunks so a big binary never sits in the heap. */
+function fileDigest(path: string): string {
+	const hash = createHash("sha256");
+	const fd = openSync(path, "r");
+	try {
+		const buf = Buffer.allocUnsafe(HASH_CHUNK);
+		for (;;) {
+			const n = readSync(fd, buf, 0, HASH_CHUNK, null);
+			if (n === 0) break;
+			hash.update(buf.subarray(0, n));
+		}
+	} finally {
+		closeSync(fd);
+	}
+	return hash.digest("hex");
+}
+
+/**
+ * Content digest of one copied guest path under the image root `root`: a file hashes by
+ * content, a symlink by its target, a directory by its sorted children's digests; null
+ * when absent. The sorted names keep the digest stable across readdir order, a symlink
+ * never gets followed as a directory, so there is no cycle, and paths that
+ * copiedPathSkipped names contribute nothing.
+ */
+function guestDigest(
+	root: string,
+	rel: string,
+	skips: readonly string[],
+): string | null {
+	const at = join(root, rel);
+	let st: Stats;
+	try {
+		st = lstatSync(at);
+	} catch {
+		return null;
+	}
+	if (st.isSymbolicLink()) return `l:${readlinkSync(at)}`;
+	if (st.isFile()) return `f:${fileDigest(at)}`;
+	const parts: string[] = [];
+	// The root call comes in as rel "/": its children must read "/name", not "//name".
+	const base = rel === "/" ? "" : rel;
+	const children = readdirSync(at, { withFileTypes: true })
+		.filter((e) => !copiedPathSkipped(`${base}/${e.name}`, skips))
+		.sort((a, b) => (a.name < b.name ? -1 : 1));
+	for (const entry of children)
+		parts.push(
+			`${entry.name}\u0000${guestDigest(root, `${base}/${entry.name}`, skips) ?? "?"}`,
+		);
+	return `d:${createHash("sha256").update(parts.join("\n")).digest("hex")}`;
 }
 
 /**
@@ -92,14 +182,6 @@ export function listFiles(
 		});
 	return out;
 }
-
-const readOrNull = (path: string): string | null => {
-	try {
-		return readFileSync(path, "utf8");
-	} catch {
-		return null;
-	}
-};
 
 export function layerKey(base: string, lists: ProvisionLists): string {
 	// A missing list (null) and an empty one ("") install the same, but keeping them apart
@@ -148,6 +230,9 @@ function keepOnly(dir: string, keep: string): void {
 
 const MIB = 1024 * 1024;
 
+/** Hash chunk for the guest file digests (fileDigest). */
+const HASH_CHUNK = 8 * MIB;
+
 export class VmRootfs {
 	private basePromise: Promise<{ key: string; path: string }> | null = null;
 	/** Per project: the tail of its bake chain, so two turns never bake one layer twice. */
@@ -159,7 +244,6 @@ export class VmRootfs {
 			homeRoot: string;
 			exec: Exec;
 			ottrVersion: string;
-			packageJsonPath: string;
 			/** Apparent size of a fresh layer image (sparse). */
 			layerBytes: number;
 			/** The root the base copies; "/" outside tests. */
@@ -180,10 +264,19 @@ export class VmRootfs {
 
 	private async buildBase(): Promise<{ key: string; path: string }> {
 		const { exec, stateDir } = this.o;
+		// The digest skips exactly what the tar excludes: BASE_EXCLUDES plus this
+		// process's state dir, which OTTR_VM_STATE_DIR may move outside them. The tar's
+		// exclude is anchored at the copy root, so the state dir rides in its
+		// root-relative form ("/srv/ottr-vm" when root is a test's temp dir).
+		const copyRoot = this.o.sourceRoot ?? "/";
+		const skips: readonly string[] = [
+			...BASE_EXCLUDES,
+			`/${relative(copyRoot, stateDir)}`,
+		];
 		const key = baseKey({
 			ottrVersion: this.o.ottrVersion,
 			ompVersion: (await run(exec, ["omp", "--version"])).trim(),
-			packageJson: readOrNull(this.o.packageJsonPath) ?? "",
+			guest: guestDigest(copyRoot, "/", skips),
 		});
 		const dir = join(stateDir, "base");
 		const path = join(dir, `${key}.ext4`);

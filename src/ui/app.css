@@ -2107,6 +2107,53 @@ button.notif-link {
 .update-cycle-notice > .notif-commits {
 	padding-left: 24px;
 }
+/* Bell entry Details disclosure: the long tail (the host command, the seed failure
+   transcript) hides until opened, so the collapsed line stays short. The dim, small
+   type marks the tail as reference material, not the message. */
+.notif-details {
+	margin-top: 4px;
+	font-size: 12.5px;
+	color: var(--dim);
+}
+/* The summary reads like the bell's other links (a.notif-link), minus the native marker. */
+.notif-details summary {
+	padding: 0;
+	font: inherit;
+	color: var(--accent);
+	text-decoration: underline;
+	cursor: pointer;
+	list-style: none;
+	overflow-wrap: anywhere;
+}
+.notif-details summary::-webkit-details-marker {
+	display: none;
+}
+/* The host command is unbreakable words: wrap anywhere so a 320px pane never
+   scrolls on two axes (WCAG reflow). */
+.notif-details code {
+	overflow-wrap: anywhere;
+}
+/* The "+N more" control that reveals the clamped card links in place. */
+.notif-more {
+	padding: 0;
+	border: 0;
+	background: none;
+	font: inherit;
+	color: var(--accent);
+	text-decoration: underline;
+	cursor: pointer;
+	overflow-wrap: anywhere;
+	/* The gap keeps "+N more" from gluing onto the id before it. */
+	margin-left: 0.35em;
+}
+
+/* A card ref reads as one token, and browsers break it at the id's hyphen
+   ("OTTR-" / "1065"), so keep the anchors unbroken. Realistic refs (project
+   slug + PREFIX-N) fit the pane at every breakpoint; the notif-link class's
+   overflow-wrap stays for every other link (URLs, settings phrases). */
+a[data-card-link] {
+	white-space: nowrap;
+}
 
 /* ---- Shell: area list + main pane ---- */
 
@@ -2922,8 +2969,20 @@ as the read-only notes box and the advisory's link-style action. */
 	font-size: 12.5px;
 	line-height: 1.6;
 }
+/* The Consolidate notes button and the commit-list toggle sit in one row, so the
+   editor's two actions keep one even gap. */
+.release-notes-actions {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+/* The consolidation diff gets its own breathing room; the composer's deepen diff
+   keeps the shared .deepen-diff look. */
+.release-dialog .deepen-diff {
+	padding: 6px 8px;
+}
 .release-notes-toggle {
-	margin-top: 2px;
+	margin-top: 0;
 	padding: 0;
 	color: var(--accent);
 	background: transparent;
@@ -4948,6 +5007,27 @@ dialog.diff-view {
 .dialog.release-dialog {
 	max-height: min(94dvh, 960px);
 }
+/* The consolidation review adds about 200px more, so the body scrolls (the jira-dialog
+   pattern) and the pinned foot keeps Cancel and Start release reachable. Flex children
+   hold their own height: the body scrolls as a whole instead of squashing the notes
+   editor or the diff. */
+.dialog.release-dialog[open] {
+	display: flex;
+	flex-direction: column;
+}
+.dialog.release-dialog > .dialog-body {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow-y: auto;
+}
+.dialog.release-dialog > .dialog-body > * {
+	flex-shrink: 0;
+}
+.release-dialog-foot {
+	padding: 12px 18px 16px;
+	/* The scroll edge above reads as a boundary, not as a cut-off line of text. */
+	border-top: 1px solid var(--line);
+}
 /* Import from Jira: head and JQL at the top, stage and actions pinned at the bottom; only the
    result list scrolls. Each row stacks key, summary and facts in one column, so a 320px phone
    needs no sideways scroll. With no room left for the list (a short phone, 200% zoom), the
@@ -6403,6 +6483,17 @@ dialog.confirm-dialog {
 	list-style: none;
 	margin: 0;
 	padding: 0;
+}
+/* Five steps overflow a 375 px dialog: scroll the strip there, never wrap it
+ * (the stage-tabs rule). Scoping the scroll keeps the wide underline merge. */
+@media (max-width: 440px) {
+	.setup-steps {
+		overflow-x: auto;
+		scrollbar-width: thin;
+	}
+	.setup-steps li {
+		margin-bottom: 0;
+	}
 }
 .setup-steps li {
 	display: inline-flex;

@@ -23,6 +23,7 @@ import {
 	fmtPct,
 	GitHostsSection,
 	HindsightSection,
+	HostedContext,
 	hostedHidden,
 	ModelRolesSection,
 	NotificationsSection,
@@ -39,6 +40,7 @@ import {
 	SETTINGS_TOC,
 	SessionSection,
 	SettingsPage,
+	SetupRulesSection,
 	shortProvisionLines,
 	userLayerEmpty,
 	userLayerLine,
@@ -1833,6 +1835,231 @@ describe("Project switch cards", () => {
 	test("a public repo or an unknown visibility marks nothing", async () => {
 		expect(await taggedRows(json(200, { private: false }))).toEqual([]);
 		expect(await taggedRows(json(502, { error: "gh failed" }))).toEqual([]);
+	});
+});
+
+describe("PR reviews watch facts and Check PRs now", () => {
+	const settings = (prReviews: boolean): ProjectView["settings"] =>
+		({
+			holdUpdateMerges: false,
+			retroSince: null,
+			retroFilter: false,
+			forkResearch: false,
+			trendingScout: false,
+			prReviews,
+			prMode: false,
+			issueWatch: false,
+			ompWatch: false,
+			dependabotWarn: true,
+			microVm: false,
+			pushSyncCommits: false,
+			maxParallel: 2,
+			copyExtra: [],
+			displayName: null,
+			releaseCommand: null,
+			archReviewCap: 30,
+			maxImages: 4,
+			keptWorktreeDays: 7,
+			autoTend: false,
+			autoTendLimit: 5,
+			tendChurnGlobs: [],
+			setupChecklist: false,
+			targetBranch: null,
+			originUrl: null,
+		}) as unknown as ProjectView["settings"];
+
+	const project = (prReviews: boolean, prWatch: unknown): ProjectView =>
+		({
+			name: "proj",
+			icon: null,
+			remote: null,
+			github: "octo/repo",
+			vmRunner: { configured: false, ok: false, reason: "not set" },
+			hasRules: true,
+			gitless: false,
+			archReview: null,
+			prWatch,
+			settings: settings(prReviews),
+		}) as unknown as ProjectView;
+
+	const json = (status: number, body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status,
+			headers: { "Content-Type": "application/json" },
+		});
+
+	const watchRow = (container: Element): Element => {
+		const row = [
+			...container.querySelectorAll("#project-watches-section .check-row"),
+		].find((r) => r.querySelector("label")?.textContent === "PR reviews");
+		return row as Element;
+	};
+
+	const checkButton = (container: Element): HTMLButtonElement =>
+		Array.from(container.querySelectorAll("button")).find(
+			(b) => b.textContent?.trim() === "Check PRs now",
+		) as HTMLButtonElement;
+
+	/** Renders the form with the check route answering `checks` in order; returns the
+	 *  container and the recorded check calls. The fetch stub answers the two mount
+	 *  calls, same as above. */
+	async function prForm(
+		p: ProjectView,
+		checks: Response[],
+	): Promise<{
+		container: HTMLDivElement;
+		checkCalls: { url: string; method: string }[];
+		unmount: () => Promise<void>;
+	}> {
+		const checkCalls: { url: string; method: string }[] = [];
+		const answers = [...checks];
+		const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = String(input);
+			if (url.endsWith("/api/projects/proj/prs/check")) {
+				checkCalls.push({ url, method: init?.method ?? "GET" });
+				const answer = answers.shift();
+				if (answer === undefined) throw new Error(`unexpected fetch ${url}`);
+				return answer;
+			}
+			if (url.endsWith("/api/projects/proj/github/visibility"))
+				return json(200, { private: false });
+			if (url.endsWith("/api/projects/proj/ssh-key"))
+				return json(200, { own: null, expiresAt: null });
+			throw new Error(`unexpected fetch ${url}`);
+		}) as typeof fetch;
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(
+				<ProjectSettingsForm
+					project={p}
+					tasks={[]}
+					trendingScan={true}
+					act={async (fn) => {
+						await fn();
+						return true;
+					}}
+					openTask={() => {}}
+				/>,
+			);
+		});
+		return {
+			container,
+			checkCalls,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+			},
+		};
+	}
+
+	const LAST = 1_730_634_000_000;
+	const NEXT = LAST + 3_600_000;
+
+	test("the on row shows the last and next check and an enabled button", async () => {
+		const { container, unmount } = await prForm(
+			project(true, { lastPollAt: LAST, lastError: null, nextPollAt: NEXT }),
+			[],
+		);
+		try {
+			const row = watchRow(container);
+			expect(row.textContent).toContain(`Last check: ${stamp(LAST)}`);
+			expect(row.textContent).toContain(`Next regular check: ${stamp(NEXT)}`);
+			expect(checkButton(container)?.disabled).toBe(false);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("Check PRs now posts once and reports Check started", async () => {
+		const { container, checkCalls, unmount } = await prForm(
+			project(true, { lastPollAt: LAST, lastError: null, nextPollAt: NEXT }),
+			[json(200, { ok: true })],
+		);
+		try {
+			await act(async () => checkButton(container).click());
+			expect(checkCalls).toEqual([
+				{ url: "/api/projects/proj/prs/check", method: "POST" },
+			]);
+			const status = watchRow(container).querySelector(
+				'[id$="-desc"] [role="status"]',
+			);
+			expect(status?.textContent).toBe("Check started.");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a failed check shows the server's error below the rows", async () => {
+		const { container, checkCalls, unmount } = await prForm(
+			project(true, { lastPollAt: LAST, lastError: null, nextPollAt: NEXT }),
+			[json(500, { error: "gh boom" })],
+		);
+		try {
+			await act(async () => checkButton(container).click());
+			expect(checkCalls.length).toBe(1);
+			const alert = container.querySelector(
+				'#project-watches-section [role="alert"]',
+			);
+			expect(alert?.textContent).toContain("gh boom");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a failed last check replaces the time with its reason", async () => {
+		const { container, unmount } = await prForm(
+			project(true, {
+				lastPollAt: LAST,
+				lastError: "GitHub answered 502",
+				nextPollAt: null,
+			}),
+			[],
+		);
+		try {
+			expect(watchRow(container).textContent).toContain(
+				"Last check: Failed: GitHub answered 502",
+			);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the off row says checks do not run and the button is disabled", async () => {
+		const { container, unmount } = await prForm(
+			project(false, { lastPollAt: LAST, lastError: null, nextPollAt: NEXT }),
+			[],
+		);
+		try {
+			expect(watchRow(container).textContent).toContain(
+				"PR reviews are off: no checks run.",
+			);
+			expect(checkButton(container)?.disabled).toBe(true);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a never-checked watch shows Never and an unknown next check", async () => {
+		const { container, unmount } = await prForm(
+			project(true, { lastPollAt: null, lastError: null, nextPollAt: null }),
+			[],
+		);
+		try {
+			const row = watchRow(container);
+			expect(row.textContent).toContain("Last check: Never");
+			expect(row.textContent).toContain("Next regular check: unknown");
+		} finally {
+			await unmount();
+		}
 	});
 });
 
@@ -5367,48 +5594,313 @@ describe("AlateSection stored API key", () => {
 	});
 });
 
-describe("ProjectSetupSteps rules action", () => {
-	// A minimal ProjectView at step 2: the Rules section reads hasRules, gitless and the
-	// settings the step's drafts seed from.
-	const project = {
-		name: "proj",
-		hasRules: false,
-		gitless: false,
-		github: null,
-		settings: {
-			maxParallel: null,
-			copyExtra: [],
-			forkResearch: false,
-		},
-	} as unknown as ProjectView;
-
-	const renderSteps = (props: {
+describe("SetupRulesSection rules action", () => {
+	// The rules section is a pure component: it reads hasRules, gitless and the caller's
+	// rules card, so the action choice renders without a wizard around it.
+	const renderSection = (props: {
 		rulesTask?: string | null;
 		openTask?: (id: string) => void;
+		gitless?: boolean;
 	}): string =>
 		renderToStaticMarkup(
-			<ProjectSetupSteps
-				project={project}
-				rulesTask={props.rulesTask}
+			<SetupRulesSection
+				gitless={props.gitless ?? false}
+				hasRules={false}
+				rulesTask={props.rulesTask ?? null}
+				rulesQueued={false}
 				openTask={props.openTask}
-				act={async (fn) => {
-					await fn();
-					return true;
-				}}
 				onClose={() => {}}
+				initRepo={async () => true}
+				alignRules={async () => true}
+				discussRules={async () => true}
 			/>,
 		);
 
 	test("a live rules card offers Open rules task instead of Discuss rules", () => {
-		const html = renderSteps({ rulesTask: "PROJ-7", openTask: () => {} });
+		const html = renderSection({ rulesTask: "PROJ-7", openTask: () => {} });
 		expect(html).toContain("Open rules task");
 		expect(html).not.toContain("Discuss rules");
 	});
 
 	test("without a rules card or opener the Discuss rules button stays", () => {
-		const html = renderSteps({});
+		const html = renderSection({});
 		expect(html).toContain("Discuss rules");
 		expect(html).not.toContain("Open rules task");
+	});
+
+	test("a gitless folder offers Create git repo before any interview", () => {
+		const html = renderSection({ gitless: true, openTask: () => {} });
+		expect(html).toContain("Create git repo");
+		expect(html).not.toContain("Discuss rules");
+	});
+});
+
+describe("ProjectSetupSteps step order", () => {
+	// The wizard's fixtures: a fresh project whose board settings are missing, and one
+	// whose retro and fork research are already on. The settings the wizard reads.
+	const base = {
+		name: "proj",
+		hasRules: false,
+		gitless: false,
+	};
+	const fresh = {
+		...base,
+		github: null,
+		settings: {
+			retroSince: null,
+			retroFilter: false,
+			forkResearch: false,
+			holdUpdateMerges: false,
+			forkMergeHold: false,
+			prMode: false,
+			targetBranch: null,
+			maxParallel: null,
+			copyExtra: [],
+		},
+	} as unknown as ProjectView;
+	const settled = {
+		...base,
+		github: "https://github.com/o/r",
+		settings: {
+			...fresh.settings,
+			retroSince: 1,
+			forkResearch: true,
+		},
+	} as unknown as ProjectView;
+
+	const renderSteps = (project: ProjectView, hosted = false): string =>
+		renderToStaticMarkup(
+			<HostedContext.Provider value={hosted}>
+				<ProjectSetupSteps
+					project={project}
+					act={async (fn) => {
+						await fn();
+						return true;
+					}}
+					onClose={() => {}}
+				/>
+			</HostedContext.Provider>,
+		);
+
+	test("a fresh project opens at the board step: Automation first, no Project fields", () => {
+		const html = renderSteps(fresh);
+		expect(html).toContain("2 of 5");
+		expect(html).toContain("Retro");
+		expect(html).toContain("Skip, use defaults");
+		expect(html).not.toContain("PR mode");
+		expect(html).not.toContain("Target branch");
+		// Only Source is settled; the user has seen nothing else.
+		expect(html.match(/class="done"/g)).toHaveLength(1);
+	});
+
+	test("a project with retro and fork research done opens at the Project step", () => {
+		const html = renderSteps(settled);
+		expect(html).toContain("4 of 5");
+		expect(html).toContain("PR mode");
+		expect(html).toContain("Target branch");
+		expect(html).toContain("Skip, use defaults");
+		expect(html).not.toContain("Retro");
+		// The skipped board steps are settled by their defaults.
+		expect(html.match(/class="done"/g)).toHaveLength(3);
+	});
+
+	test("hosted mode hides the PR mode row and keeps the target branch", () => {
+		const html = renderSteps(settled, true);
+		expect(html).toContain("Target branch");
+		expect(html).not.toContain("PR mode");
+	});
+
+	test("a gitless project opens at the rules step's init panel", () => {
+		const html = renderSteps({
+			...fresh,
+			gitless: true,
+		} as unknown as ProjectView);
+		expect(html).toContain("5 of 5");
+		expect(html).toContain("Create git repo");
+		// The settings steps are NOT settled: the user never saw them
+		// (OTTR-1065 send-back).
+		expect(html.match(/class="done"/g)).toHaveLength(1);
+	});
+});
+
+describe("ProjectSetupSteps gitless init jump", () => {
+	// A gitless project opens at the rules step's init panel; creating the repo must
+	// move to the first unsettled settings step, not stay beside the interview start
+	// (OTTR-1065 send-back).
+	const gitless = {
+		name: "bare",
+		hasRules: false,
+		gitless: true,
+		github: null,
+		settings: {
+			retroSince: null,
+			retroFilter: false,
+			forkResearch: false,
+			holdUpdateMerges: false,
+			forkMergeHold: false,
+			prMode: false,
+			targetBranch: null,
+			maxParallel: null,
+			copyExtra: [],
+		},
+	} as unknown as ProjectView;
+
+	test("creating the repo lands on the Automation step, not beside the interview", async () => {
+		const realFetch = globalThis.fetch;
+		let inits = 0;
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			if (url.endsWith("/init") && (init?.method ?? "GET") === "POST") {
+				inits += 1;
+				return okJson({ project: { ...gitless, gitless: false } });
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectSetupSteps
+						project={gitless}
+						act={async (fn) => {
+							await fn();
+							return true;
+						}}
+						onClose={() => {}}
+					/>,
+				);
+			});
+			expect(container.textContent).toContain("Create git repo");
+			const button = [...container.querySelectorAll("button")].find(
+				(b) => b.textContent === "Create git repo",
+			);
+			expect(button).toBeDefined();
+			await act(async () => {
+				(button as HTMLButtonElement).click();
+			});
+			// The wizard moved to the Automation step: the settings walk precedes
+			// the interview.
+			expect(container.textContent).toContain("Retro");
+			expect(container.textContent).not.toContain("Create git repo");
+			// The strip marks only Source settled.
+			const done = container.querySelectorAll(".setup-steps li.done");
+			expect(done).toHaveLength(1);
+			expect(done[0]?.textContent).toBe("Source");
+			expect(inits).toBe(1);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("Done appears only after the init and the settings walk", async () => {
+		const realFetch = globalThis.fetch;
+		const posts: string[] = [];
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			const method = init?.method ?? "GET";
+			if (method === "POST") posts.push(url);
+			// The init answers with a non-gitless view; the interview queues; the
+			// finish patch saves the checklist flag.
+			if (url.endsWith("/init") && method === "POST")
+				return okJson({ project: { ...gitless, gitless: false } });
+			if (url.endsWith("/interview") && method === "POST")
+				return okJson({ interview: "queued", id: "BARE-1" });
+			if (url.endsWith("/settings") && method === "POST")
+				// The settings route answers with the project view itself.
+				return okJson({ ...gitless, gitless: false });
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const buttonOf = (label: string): HTMLButtonElement => {
+			const b = [...container.querySelectorAll("button")].find(
+				(x) => x.textContent === label,
+			);
+			if (b === undefined) throw new Error(`no ${label} button`);
+			return b;
+		};
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectSetupSteps
+						project={gitless}
+						act={async (fn) => {
+							await fn();
+							return true;
+						}}
+						onClose={() => {}}
+					/>,
+				);
+			});
+			// At the gitless open the primary interview action and Back are not
+			// offered: the init button is the only way forward.
+			expect(
+				[...container.querySelectorAll("button")].some(
+					(b) => b.textContent === "Done",
+				),
+			).toBe(false);
+			expect(
+				[...container.querySelectorAll("button")].some(
+					(b) => b.textContent === "Back",
+				),
+			).toBe(false);
+			// Init lands on Automation. Done is a last-step action, so it is still
+			// absent here and returns once the walk reaches the rules step.
+			await act(async () => {
+				buttonOf("Create git repo").click();
+			});
+			expect(container.textContent).toContain("Retro");
+			expect(
+				[...container.querySelectorAll("button")].some(
+					(b) => b.textContent === "Done",
+				),
+			).toBe(false);
+			// The settings walk: Automation → Runners → Project → Rules.
+			await act(async () => {
+				buttonOf("Next").click();
+			});
+			expect(container.textContent).toContain("Runner cap");
+			await act(async () => {
+				buttonOf("Next").click();
+			});
+			expect(container.textContent).toContain("Target branch");
+			await act(async () => {
+				buttonOf("Next").click();
+			});
+			expect(container.textContent).toContain("Discuss rules");
+			// Done fires the interview; the finish patch follows it. The whole walk
+			// posts exactly: init, interview, checklist clear.
+			await act(async () => {
+				buttonOf("Done").click();
+			});
+			expect(posts).toHaveLength(3);
+			expect(posts[0]?.endsWith("/init")).toBe(true);
+			expect(posts[1]?.endsWith("/interview")).toBe(true);
+			expect(posts[2]?.endsWith("/settings")).toBe(true);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
 	});
 });
 

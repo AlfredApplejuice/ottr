@@ -1053,6 +1053,7 @@ describe("settings", () => {
 			prReviews: false,
 			prReviewNotify: true,
 			prReviewApprove: false,
+			prReviewRequestChanges: false,
 			prMode: false,
 			microVm: false,
 			trendingScout: false,
@@ -1090,6 +1091,7 @@ describe("settings", () => {
 			prReviews: false,
 			prReviewNotify: true,
 			prReviewApprove: false,
+			prReviewRequestChanges: false,
 			prMode: false,
 			microVm: false,
 			trendingScout: false,
@@ -4953,6 +4955,7 @@ describe("pr review store methods", () => {
 		postedHead: null,
 		postedUrl: null,
 		postedLogin: null,
+		postedEvent: null,
 		state: "open" as const,
 		draft: false,
 		title: "Fix the thing",
@@ -4993,6 +4996,19 @@ describe("pr review store methods", () => {
 		).toBe(true);
 	});
 
+	test("prReviewRequestChanges defaults to false and persists across reopen", async () => {
+		expect(DEFAULT_SETTINGS.prReviewRequestChanges).toBe(false);
+		const store = await open(join(root, "pr-request-changes"));
+		expect((await store.getSettings()).prReviewRequestChanges).toBe(false);
+		await store.setSettings({ prReviewRequestChanges: true });
+		expect((await store.getSettings()).prReviewRequestChanges).toBe(true);
+		await store.close();
+		expect(
+			(await (await open(join(root, "pr-request-changes"))).getSettings())
+				.prReviewRequestChanges,
+		).toBe(true);
+	});
+
 	test("savePrReview upserts by number and round-trips booleans and nulls", async () => {
 		const store = await open(join(root, "pr-row"));
 		expect(await store.getPrReview(12)).toBeNull();
@@ -5028,40 +5044,6 @@ describe("pr review store methods", () => {
 		expect(await store.prReviewRunsSince(2000)).toBe(1);
 		expect(await store.prReviewRunsSince(2001)).toBe(0);
 		expect(await store.prReviewRunsSince(1000)).toBe(2);
-	});
-
-	test("lastPrRunAt gives the latest done run's start per head and ignores undone runs", async () => {
-		const store = await open(join(root, "pr-last-run"));
-		await store.savePrReview({
-			number: 12,
-			taskId: null,
-			head: "abc",
-			firstSeenAt: 1,
-			reviewedHead: null,
-			postedHead: null,
-			postedUrl: null,
-			postedLogin: null,
-			state: "open",
-			draft: false,
-			title: "t",
-			postError: null,
-			commentsAt: null,
-			commentsUnseen: false,
-		});
-		const run1 = await store.startPrRun(12, "abc", 1000);
-		await store.startPrRun(12, "abc", 500);
-		// A failed attempt counts for the cap but is not a review yet.
-		expect(await store.lastPrRunAt(12, "abc")).toBeNull();
-		await store.savePrDraft({
-			run: run1,
-			number: 12,
-			head: "abc",
-			draft: "d",
-			prompt: "p",
-			blocking: true,
-		});
-		expect(await store.lastPrRunAt(12, "abc")).toBe(1000);
-		expect(await store.lastPrRunAt(12, "xyz")).toBeNull();
 	});
 
 	test("savePrDraft files one waiting card, then updates the same card; only saved heads count as reviewed", async () => {
@@ -5298,6 +5280,7 @@ describe("pr review store methods", () => {
 		expect(await store.getPrReview(7)).toMatchObject({
 			postedUrl: "https://github.com/acme/widget/pull/7#pullrequestreview-2",
 			postedLogin: null,
+			postedEvent: null,
 		});
 		await store.setPrPostedUrl(7, null, "octocat");
 		expect((await store.getPrReview(7))?.postedLogin).toBe("octocat");
@@ -5305,6 +5288,49 @@ describe("pr review store methods", () => {
 		expect(await store.getPrReview(7)).toMatchObject({
 			postedUrl: null,
 			postedLogin: null,
+		});
+		const changesUrl =
+			"https://github.com/acme/widget/pull/7#pullrequestreview-9";
+		await store.setPrPostedUrl(7, changesUrl, "ottr[bot]", "REQUEST_CHANGES");
+		expect(await store.getPrReview(7)).toMatchObject({
+			postedUrl: changesUrl,
+			postedLogin: "ottr[bot]",
+			postedEvent: "REQUEST_CHANGES",
+		});
+		// The two-column clear keeps the decided event: only a post with an event rewrites it.
+		await store.setPrPostedUrl(7, null, null);
+		expect(await store.getPrReview(7)).toMatchObject({
+			postedUrl: null,
+			postedLogin: null,
+			postedEvent: "REQUEST_CHANGES",
+		});
+		// The watcher's two-column update (no event argument) leaves the stored event untouched.
+		await store.setPrPostedUrl(7, changesUrl, "ottr[bot]");
+		expect(await store.getPrReview(7)).toMatchObject({
+			postedUrl: changesUrl,
+			postedLogin: "ottr[bot]",
+			postedEvent: "REQUEST_CHANGES",
+		});
+		await store.close();
+	});
+
+	test("setPrPostError writes and clears post_error and keeps the posted fields", async () => {
+		const store = await open(join(root, "pr-post-error"));
+		await store.savePrReview({ ...row, number: 7 });
+		const url = "https://github.com/acme/widget/pull/7#pullrequestreview-4";
+		await store.setPrPostedUrl(7, url, "ottr[bot]", "REQUEST_CHANGES");
+		await store.setPrPostError(7, "dismissal failed: 403");
+		expect(await store.getPrReview(7)).toMatchObject({
+			postError: "dismissal failed: 403",
+			postedUrl: url,
+			postedLogin: "ottr[bot]",
+			postedEvent: "REQUEST_CHANGES",
+		});
+		await store.setPrPostError(7, null);
+		expect(await store.getPrReview(7)).toMatchObject({
+			postError: null,
+			postedUrl: url,
+			postedEvent: "REQUEST_CHANGES",
 		});
 		await store.close();
 	});
@@ -7369,6 +7395,7 @@ describe("async store serial operations", () => {
 			postedHead: null,
 			postedUrl: null,
 			postedLogin: null,
+			postedEvent: null,
 			state: "open",
 			draft: false,
 			title: "PR",
