@@ -56,6 +56,7 @@ import {
 	runGh,
 	runReleaseCommand,
 } from "./release.ts";
+import { cachedRepoHomepage } from "./repoHomepage.ts";
 import { publicHosts } from "./requestGuards.ts";
 import { startRun, vmRunnerFromEnv, workerFromEnv } from "./runner.ts";
 import { archReviewView, lastFullReview, reviewBlocked } from "./scheduler.ts";
@@ -477,8 +478,38 @@ async function refreshArchReview(e: Entry): Promise<void> {
 const PR_TTL = 10 * 60_000;
 const prChips = new Map<string, { at: number; value: OpenPrsView | null }>();
 
+/** Homepage links piggyback on the project metadata poll, with repo-scoped cached probes. */
+function refreshHomepage(e: Entry, publish?: () => void): void {
+	const repo = e.github === null ? null : ownerRepo(e.github);
+	if (repo === null) {
+		const previous = e.homepage;
+		e.homepage = null;
+		e.homepageRepo = null;
+		if (previous != null) publish?.();
+		return;
+	}
+	if (e.homepageRepo !== repo) {
+		const previous = e.homepage;
+		e.homepageRepo = repo;
+		e.homepage = null;
+		if (previous != null) publish?.();
+	}
+	void cachedRepoHomepage(repo).then((value) => {
+		if (
+			e.homepageRepo !== repo ||
+			e.github === null ||
+			ownerRepo(e.github) !== repo
+		)
+			return;
+		const previous = e.homepage;
+		e.homepage = value;
+		if (JSON.stringify(previous) !== JSON.stringify(value)) publish?.();
+	});
+}
+
 /** Open-PR chips piggybacking on the release refresh: writes e.openPrs, one gh probe per TTL per repo. */
 function refreshOpenPrs(e: Entry, publish?: () => void): void {
+	refreshHomepage(e, publish);
 	const repo = e.github === null ? null : ownerRepo(e.github);
 	if (repo === null) {
 		e.openPrs = null;

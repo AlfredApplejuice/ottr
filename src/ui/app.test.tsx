@@ -10003,6 +10003,7 @@ describe("ProjectBoard repo link", () => {
 			doneTotal: 0,
 			settings: { setupChecklist: false },
 			sessionsDir: "/tmp/s",
+			homepage: null,
 			...over,
 		}) as unknown as ProjectView;
 
@@ -10031,6 +10032,30 @@ describe("ProjectBoard repo link", () => {
 		expect(html).toContain('href="https://github.com/octo/repo.git"');
 		expect(html).toContain("octo/repo</a>");
 		expect(html).not.toContain('aria-label="GitHub"');
+	});
+
+	test("the header links a configured project homepage", () => {
+		const html = renderBoard(
+			projectWith({
+				github: "https://github.com/octo/repo",
+				homepage: { url: "https://example.org/project", domain: "example.org" },
+			}),
+		);
+		expect(html).toContain('href="https://example.org/project"');
+		expect(html).toContain("example.org</a>");
+		const homepageLink = html.match(
+			/<a[^>]*href="https:\/\/example\.org\/project"[^>]*>(.*?)<\/a>/s,
+		);
+		expect(homepageLink?.[1]).toContain("<svg");
+		expect(html).toContain('target="_blank"');
+		expect(html).toContain('rel="noopener noreferrer"');
+		expect(html).toContain('title="Project homepage"');
+	});
+
+	test("the header hides a missing project homepage", () => {
+		const html = renderBoard(projectWith({ homepage: null }));
+		expect(html).not.toContain('title="Project homepage"');
+		expect(html).not.toContain("example.org");
 	});
 
 	test("a remote without an owner/repo tail keeps the icon-only link", () => {

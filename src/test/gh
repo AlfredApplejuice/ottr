@@ -1,0 +1,10 @@
+#!/bin/bash
+set -euo pipefail
+
+if (( $# != 4 )); then
+	exit 2
+fi
+if [[ "$1" != "api" || "$2" != "--method" || "$3" != "GET" || "$4" != "repos/owner/project" ]]; then
+	exit 2
+fi
+printf '%s\n' '{"homepage":"https://example.com/project"}'

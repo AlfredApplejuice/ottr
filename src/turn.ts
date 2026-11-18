@@ -187,6 +187,7 @@ import type {
 	Next,
 	OpenPrsView,
 	Outcome,
+	ProjectHomepage,
 	ProjectSettings,
 	PromptGateState,
 	QuotaState,
@@ -840,6 +841,10 @@ export interface TurnProject {
 	 * scheduler tick (server.ts's refreshOpenPrs), read-only elsewhere. null with no
 	 * GitHub remote, before the first probe, or when gh fails. */
 	openPrs?: OpenPrsView | null;
+	/** Homepage from the current GitHub repository; unset before the first poll. */
+	homepage?: ProjectHomepage | null;
+	/** Repository key associated with homepage; prevents a late probe from restoring stale data. */
+	homepageRepo?: string | null;
 	/** Commits since the last arch review on the target; refreshed by the scheduler tick, read-only elsewhere. */
 	archReview: ArchReview | null;
 }

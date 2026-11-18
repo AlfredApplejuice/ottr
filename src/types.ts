@@ -997,6 +997,12 @@ export interface OpenPrsView {
 	prs: OpenPrSummary[];
 }
 
+/** A validated homepage URL and the host shown in the project header. */
+export interface ProjectHomepage {
+	url: string;
+	domain: string;
+}
+
 export interface ProjectView {
 	name: string;
 	/** mtime in ms of the project's custom icon file, or null when none is set. */
@@ -1051,6 +1057,8 @@ export interface ProjectView {
 	/** Open pull requests on the GitHub repo, newest first; null with no GitHub remote,
 	 * before the first probe, or when gh fails. */
 	openPrs: OpenPrsView | null;
+	/** Validated homepage of the GitHub repo, or null when none is available. */
+	homepage: ProjectHomepage | null;
 	/** OTTR-1071: the PR watch's poll facts (last check, its error, next regular check),
 	 * shown by the Settings Watches card's PR reviews row. */
 	prWatch: PrWatchStatus;

@@ -2801,6 +2801,8 @@ a[data-card-link] {
 /* Release and image links read as links: accent like every other anchor, no rest
    underline (the icon already marks them), underline on hover. */
 .project-meta a {
+	min-width: 24px;
+	min-height: 24px;
 	color: var(--accent);
 	text-decoration: none;
 }
@@ -9087,7 +9089,8 @@ button.log-mode[aria-pressed="true"] {
 	.meters,
 	.lane-add,
 	.help-badge,
-	.notif-line button.icon {
+	.notif-line button.icon,
+	.project-meta a {
 		min-height: 44px;
 		min-width: 44px;
 	}

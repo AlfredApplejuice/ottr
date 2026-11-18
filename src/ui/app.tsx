@@ -4108,6 +4108,17 @@ function ProjectMeta(p: { project: ProjectView }) {
 					{repoSlug(project.github)}
 				</a>
 			)}
+			{project.homepage != null && (
+				<a
+					href={project.homepage.url}
+					target="_blank"
+					rel="noopener noreferrer"
+					title="Project homepage"
+				>
+					<Icon name="external-link" size={13} />
+					{project.homepage.domain}
+				</a>
+			)}
 		</p>
 	);
 }

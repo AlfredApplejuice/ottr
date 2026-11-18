@@ -5132,6 +5132,7 @@ export async function createApp(deps: AppDeps) {
 			? statSync(file, { throwIfNoEntry: false })?.mtimeMs
 			: undefined;
 		const settings = await e.store.getSettings();
+		const homepageRepo = e.github === null ? null : ownerRepo(e.github);
 		const poll = prWatcher.pollStatus(e.name);
 		// OTTR-965: the Done lane's first "Show more" needs the settled count before any
 		// fetch. One list read counting rows, no card build.
@@ -5162,6 +5163,10 @@ export async function createApp(deps: AppDeps) {
 			latestImage: e.latestImage,
 			archReview: e.archReview,
 			openPrs: e.openPrs ?? null,
+			homepage:
+				homepageRepo !== null && e.homepageRepo === homepageRepo
+					? (e.homepage ?? null)
+					: null,
 			// OTTR-1071: the PR watch's poll facts for the Settings watches row; null
 			// until this process polled the project (a restart starts empty).
 			prWatch: {

@@ -11392,6 +11392,48 @@ describe("pushSyncCommits setting and ProjectView fields", () => {
 		expect(b.mainUnpushed).toBe(false);
 	});
 
+	test("the state project view includes its homepage or null", async () => {
+		const p1 = projects.get("p1")!;
+		const previous = p1.homepage;
+		const previousGithub = p1.github;
+		const previousHomepageRepo = p1.homepageRepo;
+		const readHomepage = async () => {
+			app.publishSoon();
+			const response = await fetch(new URL("/api/state", server.url), {
+				headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
+			});
+			expect(response.status).toBe(200);
+			const body = (await response.json()) as {
+				projects: Array<{ name: string; homepage: unknown }>;
+			};
+			return body.projects.find((project) => project.name === "p1")?.homepage;
+		};
+		try {
+			p1.github = "https://github.com/docs/guide";
+			p1.homepageRepo = "docs/guide";
+			p1.homepage = {
+				url: "https://docs.example.test/guide",
+				domain: "docs.example.test",
+			};
+			expect(await readHomepage()).toEqual({
+				url: "https://docs.example.test/guide",
+				domain: "docs.example.test",
+			});
+			p1.homepageRepo = "other/repo";
+			expect(await readHomepage()).toBeNull();
+			p1.homepageRepo = "docs/guide";
+			delete p1.homepage;
+			expect(await readHomepage()).toBeNull();
+		} finally {
+			if (previous === undefined) delete p1.homepage;
+			else p1.homepage = previous;
+			p1.github = previousGithub;
+			if (previousHomepageRepo === undefined) delete p1.homepageRepo;
+			else p1.homepageRepo = previousHomepageRepo;
+			app.publishSoon();
+		}
+	});
+
 	test("a non-boolean pushSyncCommits is 400", async () => {
 		const res = await post("/api/projects/p1/settings", {
 			pushSyncCommits: "yes",
