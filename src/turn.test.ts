@@ -13718,9 +13718,12 @@ const checkedRun = (
 	};
 };
 
-const pass = (notes: string[] = []) =>
+const pass = (
+	notes: string[] = [],
+	fixed: { id: number; reason: string }[] = [],
+) =>
 	runResult({
-		finalText: JSON.stringify({ blockers: [], fixed: [], notes }),
+		finalText: JSON.stringify({ blockers: [], fixed, notes }),
 	});
 const block = (finding: string, quote: string, bugClass?: string) =>
 	runResult({
@@ -13754,6 +13757,199 @@ describe("work card check", () => {
 			...overrides,
 		});
 	}
+
+	test("an omitted earlier blocker retries and never enters the merge queue", async () => {
+		const head = { sha: "sha1" };
+		const { store, record, loop } = await workCheckCase(
+			head,
+			[block("tests were weakened", "const x = 1;"), pass(), pass()],
+			{ diffText: async () => "const x = 1;\n" },
+		);
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const blocked = (await store.getTask(task.id))!;
+		expect(blocked.workCheckLog[0]!.outcome).toBe("blockers");
+		expect(blocked.workCheckSendbacks).toBe(1);
+
+		head.sha = "sha2";
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(record.runs).toHaveLength(5);
+		expect(after.workCheckHead).toBe(blocked.workCheckHead);
+		expect(after.workCheckReport).toBe(blocked.workCheckReport);
+		expect(after.workCheckSendbacks).toBe(blocked.workCheckSendbacks);
+		expect(after.workCheckLog).toHaveLength(2);
+		expect(after.workCheckLog[0]).toEqual(blocked.workCheckLog[0]);
+		expect(after.workCheckLog[0]!.blockers[0]!.status).toBeUndefined();
+		expect(after.workCheckLog[1]!.outcome).toBe("error");
+		expect(after.workCheckLog[1]!.error).toBeTruthy();
+		expect(after.workCheckLog[1]!.blockers).toEqual([]);
+		expect(after.needsReason).toContain("failed twice");
+		const text = await logText(store, task.id);
+		expect(text).toContain("work check attempt 1 failed:");
+		expect(text).toContain("work check attempt 2 failed:");
+	});
+
+	test("repeated incomplete re-checks retain open blockers at the history cap", async () => {
+		const head = { sha: "sha1" };
+		const rechecks = 21;
+		const { store, record, loop } = await workCheckCase(
+			head,
+			[
+				block("tests were weakened", "const x = 1;"),
+				...Array.from({ length: rechecks * 2 }, () => pass()),
+			],
+			{ diffText: async () => "const x = 1;\n" },
+		);
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const blocked = (await store.getTask(task.id))!;
+
+		for (let attempt = 0; attempt < rechecks; attempt++) {
+			if (attempt > 0) {
+				await store.updateTask(task.id, {
+					state: "queued",
+					needsReason: null,
+					pendingPrompt: "Please retry the work check.",
+				});
+			}
+			head.sha = `sha${attempt + 2}`;
+			await loop.runTurn(store.name, task.id);
+
+			const after = (await store.getTask(task.id))!;
+			expect(after.stage).toBe("in_progress");
+			expect(after.state).toBe("needs_you");
+			expect(after.workCheckHead).toBe(blocked.workCheckHead);
+			expect(after.workCheckReport).toBe(blocked.workCheckReport);
+			expect(after.workCheckSendbacks).toBe(blocked.workCheckSendbacks);
+			expect(
+				after.workCheckLog.find((run) => run.outcome === "blockers")?.blockers,
+			).toEqual(blocked.workCheckLog[0]!.blockers);
+			expect(record.runs.at(-1)!.prompt).toContain(
+				"\n1. tests were weakened\n   quote: const x = 1;",
+			);
+		}
+		expect(record.runs).toHaveLength(2 + rechecks * 3);
+		expect(
+			(await store.getTask(task.id))!.workCheckLog.length,
+		).toBeLessThanOrEqual(20);
+	});
+
+	test("a partial omission rejects fixes and new blockers without a partial update", async () => {
+		const head = { sha: "sha1" };
+		const initial = runResult({
+			finalText: JSON.stringify({
+				blockers: [
+					{ finding: "weak tests", quote: "const x = 1;" },
+					{ finding: "missing validation", quote: "const y = 2;" },
+				],
+				fixed: [],
+				notes: [],
+			}),
+		});
+		const incomplete = runResult({
+			finalText: JSON.stringify({
+				blockers: [{ finding: "new issue", quote: "const z = 3;" }],
+				fixed: [{ id: 1, reason: "the tests now cover the branch" }],
+				notes: ["a new note"],
+			}),
+		});
+		const { store, record, loop } = await workCheckCase(
+			head,
+			[initial, incomplete, incomplete],
+			{ diffText: async () => "const x = 1;\nconst y = 2;\nconst z = 3;\n" },
+		);
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const blocked = (await store.getTask(task.id))!;
+		expect(blocked.workCheckLog[0]!.blockers).toHaveLength(2);
+
+		head.sha = "sha2";
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(record.runs).toHaveLength(5);
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.workCheckHead).toBe(blocked.workCheckHead);
+		expect(after.workCheckReport).toBe(blocked.workCheckReport);
+		expect(after.workCheckSendbacks).toBe(blocked.workCheckSendbacks);
+		expect(after.workCheckLog).toHaveLength(2);
+		expect(after.workCheckLog[0]).toEqual(blocked.workCheckLog[0]);
+		expect(after.workCheckLog[0]!.blockers.map((b) => b.status)).toEqual([
+			undefined,
+			undefined,
+		]);
+		expect(after.workCheckLog[1]!.outcome).toBe("error");
+		expect(after.workCheckLog[1]!.blockers).toEqual([]);
+		expect(after.workCheckLog[1]!.notes).toEqual([]);
+		expect(after.workCheckLog[1]!.error).toBeTruthy();
+	});
+
+	test("a complete retry after a partial omission applies only the valid verdict", async () => {
+		const head = { sha: "sha1" };
+		const { store, record, loop } = await workCheckCase(
+			head,
+			[
+				runResult({
+					finalText: JSON.stringify({
+						blockers: [
+							{ finding: "weak tests", quote: "const x = 1;" },
+							{ finding: "missing validation", quote: "const y = 2;" },
+						],
+						fixed: [],
+						notes: [],
+					}),
+				}),
+				pass(["discard this note"], [{ id: 1, reason: "incomplete answer" }]),
+				pass(
+					["both fixes verified"],
+					[
+						{ id: 1, reason: "the tests cover the branch" },
+						{ id: 2, reason: "the code validates the input" },
+					],
+				),
+			],
+			{ diffText: async () => "const x = 1;\nconst y = 2;\n" },
+		);
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const blocked = (await store.getTask(task.id))!;
+
+		head.sha = "sha2";
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(record.runs).toHaveLength(5);
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.workCheckHead).toBe("sha2");
+		expect(after.workCheckReport).toBe(blocked.workCheckReport);
+		expect(after.workCheckSendbacks).toBe(blocked.workCheckSendbacks);
+		expect(after.workCheckLog).toHaveLength(2);
+		expect(after.workCheckLog[0]!.blockers).toEqual([
+			{
+				finding: "weak tests",
+				quote: "const x = 1;",
+				status: "fixed",
+				statusReason: "the tests cover the branch",
+			},
+			{
+				finding: "missing validation",
+				quote: "const y = 2;",
+				status: "fixed",
+				statusReason: "the code validates the input",
+			},
+		]);
+		expect(after.workCheckLog[1]!.outcome).toBe("pass");
+		expect(after.workCheckLog[1]!.notes).toEqual(["both fixes verified"]);
+		const text = await logText(store, task.id);
+		expect(text).toContain("work check attempt 1 failed:");
+		expect(text).not.toContain("work check attempt 2 failed:");
+	});
 
 	test("a ready card with commits ahead runs the check once, and a pass keeps it merging/queued", async () => {
 		const head = { sha: "sha1" };
@@ -13906,7 +14102,10 @@ describe("work card check", () => {
 		const diffs: string[] = [];
 		const { store, record, loop } = await workCheckCase(
 			head,
-			[block("tests were weakened", "const x = 1;"), pass()],
+			[
+				block("tests were weakened", "const x = 1;"),
+				pass([], [{ id: 1, reason: "the new commits restore the tests" }]),
+			],
 			{
 				diffText: async (_wt: unknown, from: string) => {
 					diffs.push(from);
@@ -14005,7 +14204,19 @@ describe("work card check", () => {
 						notes: [],
 					}),
 				}),
-				block("scope creep", "also touched README", "round-2"),
+				runResult({
+					finalText: JSON.stringify({
+						blockers: [
+							{
+								finding: "scope creep",
+								quote: "also touched README",
+								bugClass: "round-2",
+							},
+						],
+						fixed: [{ id: 1, reason: "the tests now cover this branch" }],
+						notes: [],
+					}),
+				}),
 				runResult({
 					finalText: JSON.stringify({
 						blockers: [
@@ -14024,7 +14235,19 @@ describe("work card check", () => {
 						notes: [],
 					}),
 				}),
-				block("scope creep", "also touched README", "round-4"),
+				runResult({
+					finalText: JSON.stringify({
+						blockers: [
+							{
+								finding: "scope creep",
+								quote: "also touched README",
+								bugClass: "round-4",
+							},
+						],
+						fixed: [{ id: 1, reason: "the tests cover the new case" }],
+						notes: [],
+					}),
+				}),
 				runResult({
 					finalText: JSON.stringify({
 						blockers: [
@@ -14255,7 +14478,10 @@ describe("work card check", () => {
 		const head = { sha: "sha1" };
 		const { store, record, loop } = await workCheckCase(
 			head,
-			[block("the claim is wrong", "const x = 1;"), pass()],
+			[
+				block("the claim is wrong", "const x = 1;"),
+				pass([], [{ id: 1, reason: "the new report corrects the claim" }]),
+			],
 			{ diffText: async () => "const x = 1;\n" },
 			[
 				runResult({
@@ -14313,7 +14539,10 @@ describe("work card check", () => {
 		const head = { sha: "sha1" };
 		const { store, record, loop } = await workCheckCase(
 			head,
-			[block("tests were weakened", "const x = 1;"), pass()],
+			[
+				block("tests were weakened", "const x = 1;"),
+				pass([], [{ id: 1, reason: "the new approach restores the tests" }]),
+			],
 			{ diffText: async () => "const x = 1;\n" },
 		);
 		const task = await store.createTask("work please");
@@ -14351,7 +14580,10 @@ describe("work card check", () => {
 		const head = { sha: "sha1" };
 		const { store, record, loop } = await workCheckCase(
 			head,
-			[block("tests were weakened", "const x = 1;"), pass()],
+			[
+				block("tests were weakened", "const x = 1;"),
+				pass([], [{ id: 1, reason: "the code restores the tests" }]),
+			],
 			{ diffText: async () => "const x = 1;\n" },
 		);
 		const task = await store.createTask("work please");
@@ -14428,7 +14660,10 @@ describe("work card check", () => {
 					"touches auth and secrets; a human must review this first",
 					"const x = 1;",
 				),
-				pass(["the user approved the blocker"]),
+				pass(
+					["the user approved the blocker"],
+					[{ id: 1, reason: "the user completed the required review" }],
+				),
 			],
 			{ diffText: async () => "const x = 1;\n" },
 		);
@@ -14459,7 +14694,7 @@ describe("work card check", () => {
 		expect(after.workCheckHead).toBe("sha1");
 		expect(after.workCheckLog).toHaveLength(2);
 		expect(after.workCheckLog[1]!.outcome).toBe("pass");
-		// The approved blocker resolved when the re-check dropped it.
+		// The re-check explicitly resolves the blocker after the required human review.
 		expect(after.workCheckLog[0]!.blockers[0]!.status).toBe("fixed");
 	});
 
@@ -20115,8 +20350,8 @@ describe("turn survivor round 5 — work card to merging", () => {
 		expect((await store.getTask(task.id))!.workCheckHead).toBe("sha1");
 	});
 
-	test("after an errored check, a new check sees the full diff and resolves only the open blockers", async () => {
-		const { store, record, loop } = await checkCase([verdict({})]);
+	test("after an errored check, an empty verdict leaves open blockers unresolved and parks the card", async () => {
+		const { store, record, loop } = await checkCase([verdict({}), verdict({})]);
 		const task = await store.createTask("work please");
 		const settled = {
 			finding: "old naming",
@@ -20147,21 +20382,23 @@ describe("turn survivor round 5 — work card to merging", () => {
 		expect(prompt).toContain("Diff of the branch");
 		expect(prompt).toContain("\n1. weak tests\n   quote: const x = 1;");
 		const after = (await store.getTask(task.id))!;
-		expect(after.stage).toBe("merging");
+		expect(checkPrompts(record)).toHaveLength(2);
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.workCheckSendbacks).toBe(1);
 		expect(after.workCheckLog).toHaveLength(3);
-		expect(after.workCheckLog[0]!.blockers).toEqual([
-			settled,
-			{
-				...open,
-				status: "fixed",
-				statusReason: "not re-cited by the re-check",
-			},
-		]);
+		expect(after.workCheckLog[0]!.blockers).toEqual([settled, open]);
 		expect(after.workCheckLog[1]!.blockers).toEqual([]);
+		expect(after.workCheckLog[2]!.outcome).toBe("error");
+		expect(after.workCheckLog[2]!.error).toBeTruthy();
 	});
 
 	test("a human message from the last check's start instant is not reply data, and the re-check runs anyway", async () => {
-		const { store, record, loop } = await checkCase([verdict({})]);
+		const { store, record, loop } = await checkCase([
+			verdict({
+				fixed: [{ id: 1, reason: "the tests now cover the missing case" }],
+			}),
+		]);
 		const task = await store.createTask("work please");
 		const said = await humanTurn(store, task.id, "looks fine to me");
 		await store.updateTask(task.id, {
@@ -20199,7 +20436,11 @@ describe("turn survivor round 5 — work card to merging", () => {
 	});
 
 	test("a reply-driven re-check at an unchanged head sees the reply and the since-head diff", async () => {
-		const { store, record, loop } = await checkCase([verdict({})]);
+		const { store, record, loop } = await checkCase([
+			verdict({
+				fixed: [{ id: 1, reason: "the reply completes the required review" }],
+			}),
+		]);
 		const task = await store.createTask("work please");
 		const said = await humanTurn(store, task.id, "I approve the auth change");
 		await store.updateTask(task.id, {
@@ -20224,15 +20465,22 @@ describe("turn survivor round 5 — work card to merging", () => {
 	});
 
 	test("a re-check at a new head reads the new-commits diff up to HEAD", async () => {
-		const { store, record, loop } = await checkCase([verdict({})], {
-			targetSha: async () => "sha2",
-			diffText: async (_wt: string, from: string, to: string) =>
-				to !== "HEAD"
-					? null
-					: from === "sha1"
-						? "const y = 2;\n"
-						: "const x = 1;\nconst y = 2;\n",
-		});
+		const { store, record, loop } = await checkCase(
+			[
+				verdict({
+					fixed: [{ id: 1, reason: "the new commits add the missing test" }],
+				}),
+			],
+			{
+				targetSha: async () => "sha2",
+				diffText: async (_wt: string, from: string, to: string) =>
+					to !== "HEAD"
+						? null
+						: from === "sha1"
+							? "const y = 2;\n"
+							: "const x = 1;\nconst y = 2;\n",
+			},
+		);
 		const task = await store.createTask("work please");
 		await store.updateTask(task.id, {
 			workCheckLog: [

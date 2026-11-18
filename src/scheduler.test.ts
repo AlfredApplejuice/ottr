@@ -54,12 +54,14 @@ import {
 	selectFindings,
 	silentSince,
 	waitingOn,
+	workCheckAccountingError,
 	workCheckBlockerCounts,
 	workCheckCountsDiverged,
 	workCheckDivergeAsk,
 	workCheckDiverged,
 	workCheckDivergeReason,
 } from "./scheduler.ts";
+import fc from "./test/properties.ts";
 import type { Task, WorkCheckRun } from "./types.ts";
 
 describe("silentSince", () => {
@@ -144,11 +146,26 @@ describe("mergeAnywayPatch", () => {
 				at: 1,
 				model: null,
 				outcome: "blockers",
-				blockers: [{ finding: "f", quote: "q" }],
+				blockers: [
+					{ finding: "f", quote: "q" },
+					{
+						finding: "fixed",
+						quote: "q2",
+						status: "fixed",
+						statusReason: "the code now rejects it",
+					},
+					{
+						finding: "overridden",
+						quote: "q3",
+						status: "overridden",
+						statusReason: "the user accepted this risk",
+					},
+				],
 				notes: [],
 				durationMs: 0,
 			},
 		];
+		const completed = structuredClone(log[0]!.blockers.slice(1));
 		const before = Date.now();
 		const patch = mergeAnywayPatch({ workCheckLog: log }, "why");
 		const after = Date.now();
@@ -166,6 +183,8 @@ describe("mergeAnywayPatch", () => {
 			asked: null,
 		});
 		expect(patch.workCheckLog[0]?.blockers[0]?.statusReason).toBe("why");
+		expect(patch.workCheckLog[0]?.blockers.slice(1)).toEqual(completed);
+		expect(log[0]?.blockers[0]?.status).toBeUndefined();
 	});
 });
 
@@ -2055,6 +2074,191 @@ describe("work check helpers", () => {
 			{ finding: "fabricated", quote: "NOT IN THE SOURCES" },
 		]);
 		expect(notes).toHaveLength(3); // two demotions plus the plain note
+	});
+
+	describe("workCheckAccountingError", () => {
+		const open = [
+			{ finding: "first", quote: "first quote" },
+			{ finding: "second", quote: "second quote" },
+		];
+		const fixed = [
+			{ id: 1, reason: "the code now rejects it" },
+			{ id: 2, reason: "the regression test covers it" },
+		];
+
+		test("accepts complete fixes, with no account needed when no blockers precede the check", () => {
+			expect(
+				workCheckAccountingError({ blockers: [], notes: [], fixed }, open, []),
+			).toBeNull();
+			expect(
+				workCheckAccountingError(
+					{ blockers: [], notes: [], fixed: [] },
+					[],
+					[],
+				),
+			).toBeNull();
+			expect(
+				workCheckAccountingError(
+					{ blockers: [], notes: [], fixed: [{ id: 1, reason: " \tfix\n" }] },
+					open.slice(0, 1),
+					[],
+				),
+			).toBeNull();
+		});
+
+		test.each([
+			["empty account", []],
+			["partial account", fixed.slice(0, 1)],
+			...[-1, 0, 3, 1.5, Number.NaN, Number.POSITIVE_INFINITY].map(
+				(id) =>
+					[`invalid ID ${id}`, [...fixed, { id, reason: "fix" }]] as const,
+			),
+			...["", " \t\n"].map(
+				(reason) => ["empty reason", [...fixed, { id: 1, reason }]] as const,
+			),
+		] as const)("rejects %s", (_name, account) => {
+			expect(
+				workCheckAccountingError(
+					{ blockers: [], notes: [], fixed: [...account] },
+					open,
+					[],
+				),
+			).not.toBeNull();
+		});
+
+		test.each([
+			null,
+			7,
+			{ id: "2", reason: "fix" },
+			{ id: 2.5, reason: "fix" },
+			{ id: 2, reason: 7 },
+			{ reason: "fix" },
+		])(
+			"a malformed parsed fix cannot account for the second blocker: %j",
+			(bad) => {
+				const parsed = parseWorkCheck(
+					JSON.stringify({ blockers: [], fixed: [fixed[0], bad], notes: [] }),
+				);
+				expect(parsed).not.toBeNull();
+				expect(workCheckAccountingError(parsed!, open, [])).not.toBeNull();
+			},
+		);
+
+		test("accepts an exact grounded recurrence with a fix for the other blocker", () => {
+			const parsed = parseWorkCheck(
+				JSON.stringify({
+					blockers: [{ finding: "a new description", quote: open[1]!.quote }],
+					fixed: [fixed[0]],
+				}),
+			)!;
+			for (const sources of [
+				["second quote", "", ""],
+				["", "second quote", ""],
+				["", "", "second quote"],
+			] as const) {
+				const { blockers } = demoteUnquoted(
+					parsed,
+					sources[0],
+					sources[1],
+					sources[2],
+				);
+				expect(workCheckAccountingError(parsed, open, blockers)).toBeNull();
+			}
+		});
+
+		test.each([
+			["second quote", undefined, ""],
+			["second quote", "nit", "second quote"],
+			["second quote", "pre-existing", "second quote"],
+			["second", undefined, "second quote"],
+			["", undefined, "second quote"],
+		] as const)(
+			"rejects an ungrounded, demoted, or changed recurrence: %s %s",
+			(quote, severity, source) => {
+				const parsed = parseWorkCheck(
+					JSON.stringify({
+						blockers: [{ finding: "still open", quote, severity }],
+						fixed: [fixed[0]],
+					}),
+				)!;
+				const { blockers } = demoteUnquoted(parsed, source, "", "");
+				expect(workCheckAccountingError(parsed, open, blockers)).not.toBeNull();
+			},
+		);
+
+		test("property: a no-blocker verdict passes only with a reason for every earlier blocker", () => {
+			fc.assert(
+				fc.property(
+					fc.array(
+						fc.record({
+							include: fc.boolean(),
+							reason: fc.oneof(
+								fc.string(),
+								fc.constant("fixed"),
+								fc.constant(" \t"),
+							),
+						}),
+						{ maxLength: 8 },
+					),
+					(accounts) => {
+						const earlier = accounts.map((_, i) => ({
+							finding: `finding ${i}`,
+							quote: `quote ${i}`,
+						}));
+						const parsed = parseWorkCheck(
+							JSON.stringify({
+								blockers: [],
+								fixed: accounts.flatMap((account, i) =>
+									account.include
+										? [{ id: i + 1, reason: account.reason }]
+										: [],
+								),
+							}),
+						)!;
+						expect(workCheckAccountingError(parsed, earlier, []) === null).toBe(
+							accounts.every(
+								(account) => account.include && account.reason.trim() !== "",
+							),
+						);
+					},
+				),
+			);
+		});
+
+		test("property: an omitted or malformed fix cannot close an earlier blocker", () => {
+			fc.assert(
+				fc.property(
+					fc.array(fc.string(), { minLength: 1, maxLength: 8 }),
+					fc.nat(),
+					fc.constantFrom("omitted", "type", "fraction", "range", "reason"),
+					(reasons, index, kind) => {
+						const missing = index % reasons.length;
+						const earlier = reasons.map((_, i) => ({
+							finding: `finding ${i}`,
+							quote: `quote ${i}`,
+						}));
+						const bad = {
+							omitted: null,
+							type: { id: String(missing + 1), reason: "fix" },
+							fraction: { id: missing + 1.5, reason: "fix" },
+							range: { id: reasons.length + 1, reason: "fix" },
+							reason: { id: missing + 1, reason: " \t\n" },
+						}[kind];
+						const parsed = parseWorkCheck(
+							JSON.stringify({
+								blockers: [],
+								fixed: reasons.map((reason, i) =>
+									i === missing ? bad : { id: i + 1, reason: `Fix: ${reason}` },
+								),
+							}),
+						)!;
+						expect(
+							workCheckAccountingError(parsed, earlier, []),
+						).not.toBeNull();
+					},
+				),
+			);
+		});
 	});
 
 	test("openWorkBlockers returns the last blockers run's unresolved entries only", () => {

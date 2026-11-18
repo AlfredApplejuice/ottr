@@ -1015,6 +1015,11 @@ export interface WorkCheckVerdict {
 	fixed: { id: number; reason: string }[];
 }
 
+export interface WorkCheckSplit {
+	blockers: WorkCheckBlocker[];
+	notes: string[];
+}
+
 /** The verdict's blockers; null when `r.blockers` exists but is malformed (the run retries). */
 function parseWorkBlockers(
 	r: Record<string, unknown>,
@@ -1099,9 +1104,8 @@ export function parseWorkCheck(text: string): WorkCheckVerdict | null {
 	return { blockers, notes, fixed };
 }
 
-/** The blockers a card still owes a fix: those of the last blockers run without a status. Every
- * older run's blockers carry a status by then (turn.ts marks uncited ones fixed when the next
- * check completes), so this never double-counts one problem. Pure. */
+/** Open blockers from the latest blockers run. Earlier runs remain as history,
+ * so recurring quotes count once. Pure. */
 export function openWorkBlockers(
 	log: readonly WorkCheckRun[],
 ): WorkCheckBlocker[] {
@@ -1111,6 +1115,31 @@ export function openWorkBlockers(
 		return run.blockers.filter((b) => b.status === undefined);
 	}
 	return [];
+}
+
+/** Rejects a verdict unless each earlier blocker has an explicit fix or a grounded recurrence. Pure. */
+export function workCheckAccountingError(
+	verdict: WorkCheckVerdict,
+	open: readonly WorkCheckBlocker[],
+	blockers: readonly WorkCheckBlocker[],
+): string | null {
+	const fixed = new Set<number>();
+	for (const f of verdict.fixed) {
+		if (
+			!Number.isInteger(f.id) ||
+			f.id < 1 ||
+			f.id > open.length ||
+			f.reason.trim() === ""
+		)
+			return "the work check used an invalid fixed blocker ID or an empty fix reason";
+		fixed.add(f.id);
+	}
+	const requoted = new Set(blockers.map((b) => b.quote));
+	for (const [i, b] of open.entries()) {
+		if (!fixed.has(i + 1) && !requoted.has(b.quote))
+			return `the work check did not account for earlier blocker ${i + 1}`;
+	}
+	return null;
 }
 
 /** Opening of the needs_you reason the work-check block at the send-back cap sets; the reply
@@ -1344,7 +1373,7 @@ export function demoteUnquoted(
 	diffText: string,
 	reportText: string,
 	transcriptText: string,
-): { blockers: WorkCheckBlocker[]; notes: string[] } {
+): WorkCheckSplit {
 	const blockers: WorkCheckBlocker[] = [];
 	const demoted: string[] = [];
 	for (const b of verdict.blockers) {

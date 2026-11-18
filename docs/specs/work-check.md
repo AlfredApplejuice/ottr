@@ -50,6 +50,20 @@ keeps only quotes that the diff, the ready report, or the transcript contains (t
 still grounds a `fabricated-actions` quote); anything else demotes to a note. Severities,
 classes, and the strict-JSON verdict format are unchanged.
 
+## Earlier blocker accounts
+
+- A re-check must account for every earlier open blocker before the board accepts its verdict.
+- An explicit `fixed` entry must name a valid one-based blocker ID and give a non-empty reason.
+- A blocker stays unresolved when the new grounded blockers repeat its exact quote.
+- An omitted blocker is not fixed. Notes, malformed fixes, and demoted quotes do not resolve it.
+- An incomplete account uses the existing retry path. If both attempts fail, the card parks at
+  `needs_you`, outside the merge queue.
+- An incomplete verdict changes no earlier blocker status, completed head, original report, or
+  send-back count. Earlier completed statuses stay unchanged.
+- Repeated check errors must not evict the latest open blockers from the 20-run history.
+- The existing **Merge anyway** action still overrides open blockers with the user's reason.
+- Cancellation and takeover guards still control all check state changes.
+
 ## Send-backs and the cap
 
 - A blocked check sends the card back to the work agent with the blockers; the count
@@ -96,3 +110,11 @@ classes, and the strict-JSON verdict format are unchanged.
 - The first check input holds no earlier blockers and no original report.
 - The cap still asks the user after `WORK_CHECK_MAX_SENDBACKS` send-backs.
 - A retracted claim in an earlier report is not part of the re-check input as a current claim.
+- A sequence creates a blocker through a work-check event, then returns empty `fixed` and
+  `blockers` arrays. The card stays outside the merge queue, and the blocker stays unresolved.
+- A partial omission among several earlier blockers rejects the whole verdict.
+- A valid explicit fix records its reason. A grounded repeated blocker stays unresolved.
+- Malformed and incomplete verdict properties use the fixed-seed test setup. An accepted pass
+  accounts for every earlier blocker.
+- The human override still records its reason and queues the merge.
+- Repeated incomplete re-checks keep the open blockers after the history reaches its 20-run cap.

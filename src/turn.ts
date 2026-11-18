@@ -119,7 +119,11 @@ import {
 	usageLimitResetMs,
 	WORKER_BUSY,
 } from "./runner.ts";
-import type { DepProject, WorkCheckVerdict } from "./scheduler.ts";
+import type {
+	DepProject,
+	WorkCheckSplit,
+	WorkCheckVerdict,
+} from "./scheduler.ts";
 import {
 	applyCheckVerdicts,
 	badDep,
@@ -149,6 +153,7 @@ import {
 	selectFindings,
 	UNCHECKED_FINDINGS_HOLD,
 	WORK_CHECK_ASK_BLOCK,
+	workCheckAccountingError,
 	workCheckAsk,
 	workCheckBlockerCounts,
 	workCheckCountsDiverged,
@@ -2300,18 +2305,15 @@ export function createTurnLoop(
 					stage: "in_progress",
 					state: "needs_you",
 					needsReason: `The work check was lost: ${error}. Reply to re-run it, or cancel the card.`,
-					workCheckLog: [
-						...cur.workCheckLog,
-						{
-							at: Date.now(),
-							model: null,
-							outcome: "error",
-							blockers: [],
-							notes: [],
-							durationMs: 0,
-							error,
-						},
-					],
+					workCheckLog: appendWorkCheckRun(cur.workCheckLog, {
+						at: Date.now(),
+						model: null,
+						outcome: "error",
+						blockers: [],
+						notes: [],
+						durationMs: 0,
+						error,
+					}),
 				});
 			else
 				await store.updateTask(t.id, {
@@ -10827,22 +10829,35 @@ export function createTurnLoop(
 			checkMs += ran.checkMs;
 			const out = workAttemptOutcome(ran.result);
 			if (out.verdict !== null) {
-				await applyWorkCheckVerdict(
-					st,
-					cur,
-					head,
-					roles.checkModel,
-					fromRole,
-					open,
-					priorLog,
-					roles.warn,
-					checkStart,
-					checkMs,
+				const split = demoteUnquoted(
 					out.verdict,
 					built.diff,
+					readyReportText(st.result.outcome, st.result.finalText),
 					built.transcriptText,
 				);
-				return false;
+				const accountingError = workCheckAccountingError(
+					out.verdict,
+					open,
+					split.blockers,
+				);
+				if (accountingError === null) {
+					await applyWorkCheckVerdict(
+						st,
+						cur,
+						head,
+						roles.checkModel,
+						fromRole,
+						open,
+						priorLog,
+						roles.warn,
+						checkStart,
+						checkMs,
+						out.verdict,
+						split,
+					);
+					return false;
+				}
+				out.failed = accountingError;
 			}
 			checkFailed = out.failed;
 			limitHit = out.limitHit;
@@ -10988,11 +11003,9 @@ export function createTurnLoop(
 		);
 	}
 
-	/** Applies a valid work-check verdict: earlier blockers resolve three ways — the verdict's
-	 * fixed list (by the prompt's 1-based id) wins; a blocker whose exact quote the new
-	 * blockers re-cite stays open; anything else counts as fixed because the re-check dropped
-	 * it. Copies, never in place. A pass stamps the card (the deferred write below stores
-	 * merging/queued with the check record); blockers go back to the work agent. */
+	/** Applies a valid work-check verdict. Explicit fixes take precedence over repeated quotes.
+	 * Other earlier blockers stay open. Copies, never in place. A pass stamps the card
+	 * (the deferred write below stores merging/queued). Blockers return to the work agent. */
 	async function applyWorkCheckVerdict(
 		st: TurnSettle,
 		cur: Task,
@@ -11005,8 +11018,7 @@ export function createTurnLoop(
 		checkStart: number,
 		checkMs: number,
 		verdict: WorkCheckVerdict,
-		diff: string,
-		transcriptText: string,
+		split: WorkCheckSplit,
 	): Promise<void> {
 		const originalLog = st.log;
 		const lines: string[] = [];
@@ -11032,18 +11044,7 @@ export function createTurnLoop(
 					st.result.outcome,
 					st.result.finalText,
 				);
-				const split = demoteUnquoted(
-					verdict,
-					diff,
-					readyReport,
-					transcriptText,
-				);
-				// Earlier blockers resolve three ways: the verdict's fixed list
-				// (by the prompt's 1-based id) wins; a blocker whose exact quote
-				// the new blockers re-cite stays open; anything else counts as
-				// fixed because the re-check dropped it. Copies, never in place.
 				const fixedById = new Map(verdict.fixed.map((f) => [f.id, f.reason]));
-				const requoted = new Set(split.blockers.map((b) => b.quote));
 				const runs = [...priorLog];
 				const lastIdx = runs.findLastIndex((r) => r.outcome === "blockers");
 				const prev = lastIdx === -1 ? undefined : runs[lastIdx];
@@ -11060,12 +11061,7 @@ export function createTurnLoop(
 									status: "fixed" as const,
 									statusReason: reason,
 								};
-							if (requoted.has(b.quote)) return b;
-							return {
-								...b,
-								status: "fixed" as const,
-								statusReason: "not re-cited by the re-check",
-							};
+							return b;
 						}),
 					};
 				const run: WorkCheckRun = {
@@ -11080,7 +11076,7 @@ export function createTurnLoop(
 					durationMs: checkMs,
 					...warn,
 				};
-				const allRuns = [...runs, run].slice(-20);
+				const allRuns = appendWorkCheckRun(runs, run);
 				await st.log(
 					`- work check: ${split.blockers.length} blocker(s), ${split.notes.length} note(s), ${(checkMs / 1000).toFixed(0)}s`,
 				);
@@ -11104,6 +11100,24 @@ export function createTurnLoop(
 		} finally {
 			for (const line of lines) await originalLog(line);
 		}
+	}
+
+	/** Keeps the latest unresolved blockers run within the 20-run history cap. */
+	function appendWorkCheckRun(
+		log: readonly WorkCheckRun[],
+		run: WorkCheckRun,
+	): WorkCheckRun[] {
+		const runs = [...log, run];
+		if (runs.length <= 20) return runs;
+		const kept = runs.slice(-20);
+		const latest = runs.findLast((r) => r.outcome === "blockers");
+		if (
+			latest !== undefined &&
+			latest.blockers.some((b) => b.status === undefined) &&
+			!kept.includes(latest)
+		)
+			kept[0] = latest;
+		return kept;
 	}
 
 	/** A work check that failed twice (or hit a usage limit): park needs_you for a re-run, or
@@ -11155,20 +11169,17 @@ export function createTurnLoop(
 								holdAttempts: 0,
 							}
 						: patch),
-					workCheckLog: [
-						...priorLog,
-						{
-							at: checkStart,
-							model: checkModel,
-							role: checkRole,
-							outcome: "error",
-							blockers: [],
-							notes: [],
-							durationMs: checkMs,
-							...warn,
-							error: checkFailed,
-						},
-					],
+					workCheckLog: appendWorkCheckRun(priorLog, {
+						at: checkStart,
+						model: checkModel,
+						role: checkRole,
+						outcome: "error",
+						blockers: [],
+						notes: [],
+						durationMs: checkMs,
+						...warn,
+						error: checkFailed,
+					}),
 				});
 			});
 		} finally {
