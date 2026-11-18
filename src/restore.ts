@@ -13,6 +13,7 @@ import {
 	SNAPSHOT_MANIFEST,
 } from "./backup.ts";
 import { StoreLockedError } from "./dblock.ts";
+import { parseDatabaseConfig, safeDatabaseError } from "./postgresConfig.ts";
 import { ADOPTED_MARKER } from "./store.ts";
 
 type RestoreRun = { code: number; out: string[]; err: string[] };
@@ -85,6 +86,18 @@ export async function runRestore(
 	args: string[],
 	env: Record<string, string | undefined>,
 ): Promise<RestoreRun> {
+	try {
+		if (parseDatabaseConfig(env.OTTR_DATABASE_URL).backend === "postgres")
+			return {
+				code: 1,
+				out: [],
+				err: [
+					"SQLite restore is not available for PostgreSQL. No files changed.",
+				],
+			};
+	} catch (error) {
+		return { code: 1, out: [], err: [safeDatabaseError(error).message] };
+	}
 	const arg = args[0];
 	if (args.length > 1 || arg?.startsWith("-"))
 		return { code: 1, out: [], err: [USAGE] };

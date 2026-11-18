@@ -2977,6 +2977,9 @@ describe("preparing migration", () => {
 				'["λ.png"]',
 			],
 		);
+		// D-era rebuilds run only after the old-rowid ordinal backfill.
+		legacy.exec("ALTER TABLE tasks ADD COLUMN insertion_ordinal INTEGER");
+		legacy.exec("UPDATE tasks SET insertion_ordinal = 1");
 		const before = {
 			ddl: legacy
 				.query<Record<string, unknown>, []>(
@@ -7735,5 +7738,182 @@ describe("sqlite auto-rollback", () => {
 			second.id,
 			first.id,
 		]);
+	});
+});
+
+describe("persistent task insertion order", () => {
+	test("old rowids survive both CHECK rebuilds and a later reopen", async () => {
+		const dir = join(root, "ordinal-old-checks");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const file = join(dir, ".tasks", "tasks.db");
+		const raw = new Database(file, { create: true });
+		raw.exec(`CREATE TABLE tasks (
+			id TEXT PRIMARY KEY, title TEXT, prompt TEXT,
+			stage TEXT NOT NULL CHECK (stage IN ('todo','in_progress','merging','done')),
+			state TEXT NOT NULL CHECK (state IN ('queued','running','needs_you','idle')),
+			needs_reason TEXT, pending_prompt TEXT, branch TEXT, base TEXT, worktree TEXT,
+			session_id TEXT, summary TEXT, details TEXT, queued_at INTEGER, cancelled_at INTEGER,
+			images TEXT NOT NULL DEFAULT '[]', pending_images TEXT NOT NULL DEFAULT '[]',
+			release_version TEXT, release_notes TEXT, session_title TEXT, asked TEXT, model TEXT,
+			kept_files TEXT NOT NULL DEFAULT '[]', follow_up_of TEXT, commits INTEGER, done_at INTEGER,
+			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+		)`);
+		for (const [rowid, id] of [
+			[90, "a-last"],
+			[4, "z-first"],
+			[20, "m-middle"],
+		] as const)
+			raw.run(
+				"INSERT INTO tasks (rowid, id, stage, state, created_at, updated_at) VALUES (?, ?, 'todo', 'queued', 100, 100)",
+				[rowid, id],
+			);
+		raw.close();
+		const store = await open(dir);
+		expect((await store.listTasks()).map((task) => task.id)).toEqual([
+			"a-last",
+			"m-middle",
+			"z-first",
+		]);
+		await store.close();
+		const reader = new Database(file);
+		expect(
+			reader
+				.query(
+					"SELECT id, insertion_ordinal FROM tasks ORDER BY insertion_ordinal",
+				)
+				.all(),
+		).toEqual([
+			{ id: "z-first", insertion_ordinal: 1 },
+			{ id: "m-middle", insertion_ordinal: 2 },
+			{ id: "a-last", insertion_ordinal: 3 },
+		]);
+		reader.run("DELETE FROM tasks WHERE id = 'a-last'");
+		reader.run(
+			"INSERT INTO tasks (id, stage, state, created_at, updated_at) VALUES ('raw-next', 'todo', 'queued', 100, 100)",
+		);
+		expect(
+			reader
+				.query("SELECT insertion_ordinal FROM tasks WHERE id = 'raw-next'")
+				.get(),
+		).toEqual({ insertion_ordinal: 4 });
+		reader.run("DELETE FROM tasks WHERE id = 'raw-next'");
+		reader.close();
+		const reopened = await open(dir);
+		const created = await reopened.createTask("later", null, "work", "b-new");
+		await reopened.close();
+		const final = new Database(file, { readonly: true });
+		expect(
+			final
+				.query("SELECT insertion_ordinal FROM tasks WHERE id = ?")
+				.get(created.id),
+		).toEqual({ insertion_ordinal: 5 });
+		final.close();
+	});
+
+	test("raw explicit ordinals advance the counter and collisions fail", async () => {
+		const store = await open(join(root, "ordinal-import"));
+		const file = join(store.serverDir, "tasks.db");
+		await store.close();
+		const raw = new Database(file);
+		raw.run(
+			"INSERT INTO tasks (id, stage, state, created_at, updated_at, insertion_ordinal) VALUES ('imported', 'todo', 'queued', 1, 1, 900)",
+		);
+		expect(() =>
+			raw.run(
+				"INSERT INTO tasks (id, stage, state, created_at, updated_at, insertion_ordinal) VALUES ('collision', 'todo', 'queued', 1, 1, 900)",
+			),
+		).toThrow();
+		for (const ordinal of [0, -1, 1.5])
+			expect(() =>
+				raw.run(
+					"INSERT INTO tasks (id, stage, state, created_at, updated_at, insertion_ordinal) VALUES (?, 'todo', 'queued', 1, 1, ?)",
+					[`invalid-${ordinal}`, ordinal],
+				),
+			).toThrow();
+		raw.run("DELETE FROM tasks WHERE id = 'imported'");
+		raw.close();
+		const reopened = await open(store.path);
+		const task = await reopened.createTask("after import");
+		await reopened.close();
+		const reader = new Database(file, { readonly: true });
+		expect(
+			reader
+				.query("SELECT insertion_ordinal FROM tasks WHERE id = ?")
+				.get(task.id),
+		).toEqual({ insertion_ordinal: 901 });
+		reader.close();
+	});
+
+	test("signed-int64 exhaustion refuses creation without a partial task or events", async () => {
+		const store = await open(join(root, "ordinal-int64-limit"));
+		const file = join(store.serverDir, "tasks.db");
+		await store.close();
+		const raw = new Database(file);
+		raw.exec(
+			"INSERT INTO tasks (id, stage, state, created_at, updated_at, insertion_ordinal) VALUES ('maximum', 'todo', 'queued', 1, 1, 9223372036854775807)",
+		);
+		raw.exec("DELETE FROM tasks WHERE id = 'maximum'");
+		raw.close();
+		const reopened = await open(store.path);
+		await expect(reopened.createTask("too late")).rejects.toThrow(
+			"Task insertion ordinal exhausted",
+		);
+		expect(await reopened.listTasks()).toEqual([]);
+		expect(await reopened.events()).toEqual([]);
+	});
+});
+
+describe("report read admission", () => {
+	for (const rollback of [false, true]) {
+		test(`outside report reads wait for ${rollback ? "rollback" : "commit"}`, async () => {
+			const store = await open(join(root, `report-admission-${rollback}`));
+			const task = await store.createTask("report");
+			await store.updateTask(task.id, { report: "committed" });
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const failure = new Error("report transaction rollback");
+			const write = store.transaction(async () => {
+				await store.updateTask(task.id, { report: "uncommitted" });
+				entered.resolve();
+				await release.promise;
+				if (rollback) throw failure;
+			});
+			// Observe the rejection before the paused transaction can resume.
+			const outcome = write.catch((error: unknown) => error);
+			await entered.promise;
+			let settled = false;
+			const read = store.getTaskReport(task.id).then((value) => {
+				settled = true;
+				return value;
+			});
+			// Real driver I/O does not use fake timers. Let an admitted read finish.
+			await Bun.sleep(10);
+			expect(settled).toBe(false);
+			release.resolve();
+			expect(await outcome).toBe(rollback ? failure : undefined);
+			expect(await read).toBe(rollback ? "committed" : "uncommitted");
+			await store.close();
+			await expect(store.getTaskReport(task.id)).rejects.toThrow();
+		});
+	}
+});
+
+describe("PostgreSQL project discovery", () => {
+	test("registry identities select real project folders without SQLite files", () => {
+		const dir = join(root, "registry-discovery");
+		mkdirSync(join(dir, "registered"), { recursive: true });
+		mkdirSync(join(dir, "unregistered", ".tasks"), { recursive: true });
+		writeFileSync(join(dir, "unregistered", ".tasks", "tasks.db"), "");
+		writeFileSync(join(dir, "not-a-directory"), "");
+		expect(
+			discoverProjects([dir], [], [], ["registered", "not-a-directory"]),
+		).toEqual([join(dir, "registered")]);
+		expect(discoverProjects([dir], [], [], [])).toEqual([]);
+		expect(
+			discoverProjects([dir], [], [join(dir, "registered")], ["registered"]),
+		).toEqual([]);
+		expect(
+			discoverProjects([dir], [join(dir, "registered")], [], ["registered"]),
+		).toEqual([join(dir, "registered")]);
 	});
 });

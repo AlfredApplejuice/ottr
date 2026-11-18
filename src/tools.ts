@@ -22,6 +22,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { PROJECT, workerProjects } from "./apt.ts";
+import { childDatabaseEnv } from "./childEnv.ts";
 import { resolveAgentLayer } from "./layers.ts";
 import { boardOmpHome, turnListHome } from "./login.ts";
 import { pluginSkillDirs } from "./pluginSkills.ts";
@@ -591,6 +592,7 @@ function guardPaths(name: string, dir: string): void {
 /** stdout; throws with the stderr tail on a non-zero exit. */
 async function exec(argv: string[]): Promise<string> {
 	const p = Bun.spawn(argv, {
+		env: childDatabaseEnv(),
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",

@@ -28,6 +28,8 @@ import type { SQLiteDatabase } from "./sqliteDriver.ts";
 
 /** A snapshot is due when the newest one is this old or older. */
 export const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+export const POSTGRES_BACKUP_NOTICE =
+	"backup: PostgreSQL backups belong to the operator. SQLite snapshots are off.";
 
 const DEFAULT_KEEP = 7;
 const PARTIAL = ".partial";

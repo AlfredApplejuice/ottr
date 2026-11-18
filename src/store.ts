@@ -18,6 +18,16 @@ import {
 } from "./dblock.ts";
 import type { PerfFacts } from "./perf.ts";
 import { platform } from "./platform/index.ts";
+import { databaseConfig } from "./postgresConfig.ts";
+import {
+	getPostgresDatabase,
+	PostgresDatabase,
+	type StoreDatabase,
+} from "./postgresDriver.ts";
+import {
+	initializeProjectSchema,
+	projectSchemaName,
+} from "./postgresSchema.ts";
 import { derivedTaskPrefix } from "./prefix.ts";
 import {
 	ARCH_REVIEW_MARKER,
@@ -147,7 +157,8 @@ const TASKS_DDL = `CREATE TABLE IF NOT EXISTS tasks (
   push_sha TEXT,
   update_ids TEXT NOT NULL DEFAULT '[]',
   update_merge_approved INTEGER NOT NULL DEFAULT 0,
-  revision INTEGER NOT NULL DEFAULT 1
+  revision INTEGER NOT NULL DEFAULT 1,
+  insertion_ordinal INTEGER
 )`;
 /** The pr_review_runs table DDL, kept separate so the shape migration below reuses the exact shape. */
 const PR_REVIEW_RUNS_DDL = `CREATE TABLE IF NOT EXISTS pr_review_runs (
@@ -1156,6 +1167,7 @@ export function discoverProjects(
 	roots: string[],
 	extra: string[] = [],
 	removed: string[] = [],
+	registeredProjects?: readonly string[],
 ): string[] {
 	// One path per basename: the board keys projects (and their OTTR_DATA_DIR data dirs) by
 	// folder name, so two roots may not contribute the same name twice. Removed paths drop out
@@ -1163,11 +1175,21 @@ export function discoverProjects(
 	// Explicit extra paths go first — an explicit path wins over a root scan — then first root
 	// hit wins.
 	const byName = new Map<string, string>();
+	const registered =
+		registeredProjects === undefined ? null : new Set(registeredProjects);
 	const add = (dir: string): void => {
 		const abs = resolve(dir);
 		if (removed.some((r) => platform.samePath(r, abs))) return;
-		if (!existsSync(join(serverDirFor(abs), "tasks.db"))) return;
 		const name = basename(abs);
+		if (registered === null) {
+			if (!existsSync(join(serverDirFor(abs), "tasks.db"))) return;
+		} else if (
+			!registered.has(name) ||
+			!existsSync(abs) ||
+			!lstatSync(abs).isDirectory()
+		) {
+			return;
+		}
 		if (!byName.has(name)) byName.set(name, abs);
 	};
 	for (const p of extra) add(resolve(p));
@@ -1360,7 +1382,7 @@ export class ProjectStore {
 	readonly sessionsDir: string;
 	readonly worktreesDir: string;
 
-	private readonly db: SQLiteDatabase;
+	private readonly db: StoreDatabase;
 	private readonly queue: StoreQueue;
 	/** Settles when open's fire-and-forget transcript backfills (cost columns, done
 	 * context) have landed; rejection-free. Reads that must see the filled columns await
@@ -1368,7 +1390,7 @@ export class ProjectStore {
 	 * migrated database. */
 	backfill: Promise<void> = Promise.resolve();
 
-	private constructor(projectPath: string, db: SQLiteDatabase) {
+	private constructor(projectPath: string, db: StoreDatabase) {
 		this.path = projectPath;
 		this.name = basename(projectPath);
 		this.tasksDir = tasksDirFor(projectPath);
@@ -1378,19 +1400,19 @@ export class ProjectStore {
 		this.worktreesDir = join(projectPath, ".worktrees");
 		this.db = db;
 
-		this.queue = new StoreQueue({
-			begin: async () => {
-				await db.exec("BEGIN");
-			},
-			commit: async () => {
-				await db.exec("COMMIT");
-			},
-			rollback: () => db.rollback(),
-		});
+		this.queue =
+			db instanceof PostgresDatabase
+				? db.createQueue()
+				: new StoreQueue({
+						begin: () => db.exec("BEGIN"),
+						commit: () => db.exec("COMMIT"),
+						rollback: () => db.rollback(),
+					});
 	}
 
 	async transaction<T>(work: () => T | Promise<T>): Promise<T> {
-		return this.queue.transaction(work);
+		// Public callbacks can have external effects. Never repeat them after connection loss.
+		return this.queue.transaction(work, { replay: false });
 	}
 
 	static async init(projectPath: string): Promise<ProjectStore> {
@@ -1404,11 +1426,104 @@ export class ProjectStore {
 		return await ProjectStore.open(root);
 	}
 
-	/** Additive column convergence: adds one column when the (possibly stale) column list
-	 * lacks it, and records the name in the list — the ALTER never updates the PRAGMA
-	 * snapshot, so later readers in the same open (further addColumns, migration gates)
-	 * would otherwise miss a column this open just added and skip work until the next
-	 * restart (OTTR-963's backfill did exactly that). */
+	private static async convergeInsertionOrdinals(
+		db: SQLiteDatabase,
+		cols: string[],
+	): Promise<void> {
+		await db.exec("BEGIN");
+		try {
+			await ProjectStore.addColumn(
+				db,
+				cols,
+				"insertion_ordinal",
+				"ALTER TABLE tasks ADD COLUMN insertion_ordinal INTEGER",
+			);
+			const counter = await db
+				.query<{ value: string }, []>(
+					"SELECT value FROM settings WHERE key = 'task-insertion-ordinal'",
+				)
+				.get();
+			if (counter !== null && !/^[0-9]+$/.test(counter.value))
+				throw new Error("Invalid task insertion ordinal counter");
+			let ordinal = counter === null ? 0n : BigInt(counter.value);
+			if (ordinal > 9223372036854775807n)
+				throw new RangeError("Task insertion ordinal exhausted");
+			const invalid = await db
+				.query<{ id: string }, []>(
+					"SELECT id FROM tasks WHERE insertion_ordinal IS NOT NULL AND (typeof(insertion_ordinal) <> 'integer' OR insertion_ordinal <= 0) LIMIT 1",
+				)
+				.get();
+			if (invalid !== null) throw new Error("Invalid task insertion ordinal");
+			const maximum = await db
+				.query<{ ordinal: number | bigint | null }, []>(
+					"SELECT MAX(insertion_ordinal) AS ordinal FROM tasks",
+				)
+				.get();
+			if (maximum?.ordinal != null && BigInt(maximum.ordinal) > ordinal)
+				ordinal = BigInt(maximum.ordinal);
+			const pending = await db
+				.query<{ id: string }, []>(
+					"SELECT id FROM tasks WHERE insertion_ordinal IS NULL ORDER BY rowid ASC",
+				)
+				.all();
+			for (const row of pending) {
+				ordinal += 1n;
+				if (ordinal > 9223372036854775807n)
+					throw new RangeError("Task insertion ordinal exhausted");
+				await db.run("UPDATE tasks SET insertion_ordinal = ? WHERE id = ?", [
+					ordinal,
+					row.id,
+				]);
+			}
+			await db.run(
+				"INSERT INTO settings (key, value) VALUES ('task-insertion-ordinal', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+				[ordinal.toString()],
+			);
+			await ProjectStore.installInsertionOrdinalTriggers(db);
+			await db.exec("COMMIT");
+		} catch (error) {
+			await db.rollback();
+			throw error;
+		}
+	}
+
+	/** Raw SQLite demo/import inserts share the persistent allocation counter. */
+	private static async installInsertionOrdinalTriggers(
+		db: SQLiteDatabase,
+	): Promise<void> {
+		await db.exec(`
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_insertion_ordinal ON tasks (insertion_ordinal);
+			CREATE TRIGGER IF NOT EXISTS tasks_insertion_ordinal_insert
+			AFTER INSERT ON tasks BEGIN
+				SELECT CASE WHEN NEW.insertion_ordinal IS NULL AND
+					CAST((SELECT value FROM settings WHERE key = 'task-insertion-ordinal') AS INTEGER) = 9223372036854775807
+					THEN RAISE(ABORT, 'Task insertion ordinal exhausted') END;
+				UPDATE settings SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+					WHERE key = 'task-insertion-ordinal' AND NEW.insertion_ordinal IS NULL;
+				UPDATE tasks SET insertion_ordinal = CAST(
+					(SELECT value FROM settings WHERE key = 'task-insertion-ordinal') AS INTEGER)
+					WHERE id = NEW.id AND NEW.insertion_ordinal IS NULL;
+				SELECT CASE WHEN (SELECT insertion_ordinal FROM tasks WHERE id = NEW.id) IS NULL
+					OR (SELECT insertion_ordinal FROM tasks WHERE id = NEW.id) <= 0
+					OR typeof((SELECT insertion_ordinal FROM tasks WHERE id = NEW.id)) <> 'integer'
+					THEN RAISE(ABORT, 'Invalid task insertion ordinal') END;
+				UPDATE settings SET value = CAST(NEW.insertion_ordinal AS TEXT)
+					WHERE key = 'task-insertion-ordinal'
+					AND CAST(value AS INTEGER) < NEW.insertion_ordinal;
+			END;
+			CREATE TRIGGER IF NOT EXISTS tasks_insertion_ordinal_update
+			AFTER UPDATE OF insertion_ordinal ON tasks BEGIN
+				SELECT CASE WHEN NEW.insertion_ordinal IS NULL OR NEW.insertion_ordinal <= 0
+					OR typeof(NEW.insertion_ordinal) <> 'integer'
+					THEN RAISE(ABORT, 'Invalid task insertion ordinal') END;
+				UPDATE settings SET value = CAST(NEW.insertion_ordinal AS TEXT)
+					WHERE key = 'task-insertion-ordinal'
+					AND CAST(value AS INTEGER) < NEW.insertion_ordinal;
+			END;
+		`);
+	}
+
+	/** Add one absent column and refresh the convergence snapshot. */
 	private static async addColumn(
 		db: SQLiteDatabase,
 		cols: string[],
@@ -1433,6 +1548,8 @@ export class ProjectStore {
 		label: string,
 	): Promise<string[] | null> {
 		if (!tasksSql.includes(detect)) return null;
+		if (!names.split(",").some((name) => name.trim() === "insertion_ordinal"))
+			names += ", insertion_ordinal";
 		const count = async (table: string): Promise<number> =>
 			(
 				await db
@@ -1459,6 +1576,7 @@ export class ProjectStore {
 				);
 			await db.exec("DROP TABLE tasks");
 			await db.exec("ALTER TABLE tasks_migrating RENAME TO tasks");
+			await ProjectStore.installInsertionOrdinalTriggers(db);
 			const columns = (
 				await db.query<{ name: string }, []>("PRAGMA table_info(tasks)").all()
 			).map((column) => column.name);
@@ -1698,14 +1816,22 @@ export class ProjectStore {
 		const dbPath = join(serverDir, "tasks.db");
 		// Shared PRAGMA + instance-lock sequence (R2-9): one live opener per db file
 		// (incident 2026-10-06); a refused opener throws with the holder named, handle closed.
-		const db = await openLocked(dbPath);
+		const db =
+			databaseConfig().backend === "postgres"
+				? await getPostgresDatabase(projectSchemaName(basename(root)))
+				: await openLocked(dbPath);
 		const store = new ProjectStore(root, db);
 		try {
+			if (db instanceof PostgresDatabase) {
+				await initializeProjectSchema(db, basename(root));
+				return await store.finishOpen();
+			}
 			await store.queue.run(async () => {
 				await db.exec(SCHEMA);
 				let cols = (
 					await db.query<{ name: string }, []>("PRAGMA table_info(tasks)").all()
 				).map((c) => c.name);
+				await ProjectStore.convergeInsertionOrdinals(db, cols);
 				await ProjectStore.addColumn(
 					db,
 					cols,
@@ -2524,18 +2650,20 @@ export class ProjectStore {
 					"ALTER TABLE pr_review_runs ADD COLUMN blocking INTEGER NOT NULL DEFAULT 1",
 				);
 			});
-			// OTTR-866: the one-time cost and context backfills from the session
-			// transcripts start here, after the migrations, and ride the store's backfill
-			// promise so reads that need the columns can await them (OTTR-884 merge).
-			store.backfill = store.backfillTranscriptData().catch(() => {
-				/* backfill is best-effort; the next open retries */
-			});
-			await store.backfill;
-			return store;
+			return await store.finishOpen();
 		} catch (error) {
 			await store.close();
 			throw error;
 		}
+	}
+
+	private async finishOpen(): Promise<ProjectStore> {
+		// Transcript backfills start only after either backend finishes its migrations.
+		this.backfill = this.backfillTranscriptData().catch(() => {
+			/* backfill is best-effort; the next open retries */
+		});
+		await this.backfill;
+		return this;
 	}
 
 	async logPath(taskId: string): Promise<string> {
@@ -2657,7 +2785,7 @@ export class ProjectStore {
 		const fromSession = firstSessionTitle(this.sessionsDir, task.sessionId);
 		if (fromSession === null) return null;
 		const title = cleanTitle(fromSession);
-		return this.transaction(async () => {
+		return this.queue.transaction(async () => {
 			const current = await this.getTask(task.id);
 			if (current === null) return null;
 			const saved = await this.storedTitle(task.id);
@@ -3206,7 +3334,7 @@ export class ProjectStore {
 			{ ok: true; task: Task } | { ok: false; error: string }
 		>(async () => {
 			const now = o.now ?? Date.now();
-			const res = await this.transaction(
+			const res = await this.queue.transaction(
 				async (): Promise<
 					{ ok: true; id: string } | { ok: false; error: string }
 				> => {
@@ -3816,6 +3944,24 @@ export class ProjectStore {
 		});
 	}
 
+	private async nextInsertionOrdinal(): Promise<bigint> {
+		const row = await this.db
+			.query<{ value: string }, []>(
+				"SELECT value FROM settings WHERE key = 'task-insertion-ordinal'",
+			)
+			.get();
+		if (row === null || !/^[0-9]+$/.test(row.value))
+			throw new Error("Invalid task insertion ordinal counter");
+		const next = BigInt(row.value) + 1n;
+		if (next > 9223372036854775807n)
+			throw new RangeError("Task insertion ordinal exhausted");
+		await this.db.run(
+			"UPDATE settings SET value = ? WHERE key = 'task-insertion-ordinal'",
+			[next.toString()],
+		);
+		return next;
+	}
+
 	async createTask(
 		prompt: string,
 		model: string | null = null,
@@ -3841,9 +3987,10 @@ export class ProjectStore {
 				for (let n = 2; (await this.getTask(usedId)) !== null; n++)
 					usedId = `${id}-${n}`;
 			}
+			const ordinal = await this.nextInsertionOrdinal();
 			await this.db.run(
-				"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at, queued_at, model, kind) VALUES (?, ?, ?, 'todo', 'queued', ?, ?, ?, ?, ?)",
-				[usedId, title, prompt, now, now, now, model, kind],
+				"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at, queued_at, model, kind, insertion_ordinal) VALUES (?, ?, ?, 'todo', 'queued', ?, ?, ?, ?, ?, ?)",
+				[usedId, title, prompt, now, now, now, model, kind, ordinal],
 			);
 			await this.recordEvent("create", usedId, null, "todo", null);
 			await this.recordEvent("state", usedId, null, "queued", null);
@@ -3894,12 +4041,14 @@ export class ProjectStore {
 	 * longer carry it): legacy 'unknown'-steps rows resolve their steps against it
 	 * (OTTR-488) one narrow query at a time. */
 	async getTaskReport(id: string): Promise<string | null> {
-		const row = await this.db
-			.query<{ report: string | null }, [string]>(
-				"SELECT report FROM tasks WHERE id = ?",
-			)
-			.get(id);
-		return row?.report ?? null;
+		return this.queue.run(async () => {
+			const row = await this.db
+				.query<{ report: string | null }, [string]>(
+					"SELECT report FROM tasks WHERE id = ?",
+				)
+				.get(id);
+			return row?.report ?? null;
+		});
 	}
 
 	async listTasks(): Promise<ListedTask[]> {
@@ -3910,7 +4059,7 @@ export class ProjectStore {
 						Omit<TaskRow, "diff_text" | "details" | "report" | "diff_files">,
 						[]
 					>(
-						`SELECT ${TASK_LIST_COLUMNS} FROM tasks ORDER BY created_at DESC, rowid DESC`,
+						`SELECT ${TASK_LIST_COLUMNS} FROM tasks ORDER BY created_at DESC, insertion_ordinal DESC`,
 					)
 					.all()
 			).map((row) => toListedTask(this.name, row));
@@ -4155,7 +4304,7 @@ export class ProjectStore {
 	}
 
 	async finishTurnState(turnId: number, patch: TurnPatch): Promise<Turn> {
-		return this.transaction(async () => {
+		return this.queue.transaction(async () => {
 			const sets: string[] = [];
 			const values: (string | number | null)[] = [];
 			for (const key of Object.keys(TURN_COLUMNS) as (keyof TurnPatch)[]) {
@@ -4247,7 +4396,7 @@ export class ProjectStore {
 		}
 
 		if (sum === null) return;
-		await this.transaction(async () => {
+		await this.queue.transaction(async () => {
 			await this.db.run(
 				`UPDATE turns SET tokens_in = ?, tokens_out = ?, cache_read = ?, cache_write = ?, cost = ?
 				 WHERE id = ? AND task_id = ? AND started_at = ? AND ended_at = ? AND cost IS NULL
@@ -4303,10 +4452,10 @@ export class ProjectStore {
 			expectedContextTokens === undefined
 				? task.context_tokens
 				: expectedContextTokens;
-		await this.transaction(async () => {
+		await this.queue.transaction(async () => {
 			await this.db.run(
-				`UPDATE tasks SET context_tokens = ? WHERE id = ? AND session_id IS ?
-				 AND context_tokens IS ?${doneOnly ? " AND stage = 'done' AND context_tokens IS NULL" : ""}`,
+				`UPDATE tasks SET context_tokens = ? WHERE id = ? AND session_id IS NOT DISTINCT FROM ?
+				 AND context_tokens IS NOT DISTINCT FROM ?${doneOnly ? " AND stage = 'done' AND context_tokens IS NULL" : ""}`,
 				[ctx.promptTokens, taskId, task.session_id, previousContext],
 			);
 		});
@@ -4532,7 +4681,7 @@ export class ProjectStore {
 						},
 						[string]
 					>(
-						"SELECT id, error, outcome, exit_code AS exitCode FROM turns WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+						'SELECT id, error, outcome, exit_code AS "exitCode" FROM turns WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1',
 					)
 					.get(taskId)) ?? null
 			);
@@ -4740,14 +4889,20 @@ export class ProjectStore {
 
 	/** Snapshot copy of tasks.db for the backup (docs/specs/db-backup.md); `dest` must not exist. */
 	async backupTo(dest: string): Promise<void> {
+		const db = this.db;
+		if (db instanceof PostgresDatabase)
+			throw new Error(
+				"PostgreSQL backup is operator-owned; SQLite snapshots are unavailable",
+			);
 		return this.queue.run(async () => {
-			await vacuumInto(this.db, dest, ["tasks", "turns"]);
+			await vacuumInto(db, dest, ["tasks", "turns"]);
 		});
 	}
 
 	async close(): Promise<void> {
 		await this.queue.close(async () => {
-			await closeLocked(this.db);
+			if (this.db instanceof PostgresDatabase) await this.db.close();
+			else await closeLocked(this.db);
 		});
 	}
 }

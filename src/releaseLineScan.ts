@@ -8,6 +8,7 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { childDatabaseEnv } from "./childEnv.ts";
 import {
 	lineCapReached,
 	type RegistryRelease,
@@ -312,6 +313,7 @@ export async function releaseLineBlocked(
 	// No base ref: fail closed — nothing to compare against.
 	const rev = Bun.spawnSync(["git", "rev-parse", "--verify", "origin/main"], {
 		cwd: wt,
+		env: childDatabaseEnv(),
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -324,6 +326,7 @@ export async function releaseLineBlocked(
 		["git", "ls-tree", "--name-only", "origin/main", "--", "bun.lock"],
 		{
 			cwd: wt,
+			env: childDatabaseEnv(),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -336,6 +339,7 @@ export async function releaseLineBlocked(
 			["git", "cat-file", "blob", "origin/main:bun.lock"],
 			{
 				cwd: wt,
+				env: childDatabaseEnv(),
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "pipe",

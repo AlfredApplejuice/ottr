@@ -1,6 +1,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { childDatabaseEnv } from "./childEnv.ts";
 import { gitAuthEnv, parseGitToken, parseGitUrl } from "./gitHosts.ts";
 import { ghEnvFor, githubHost, hostMatcher } from "./githubHost.ts";
 import { platform } from "./platform/index.ts";
@@ -1087,21 +1088,21 @@ function releaseArgv(command: string): string[] {
 	return argv;
 }
 
-/** The command's env: the process env minus the hosted secret, plus the release facts. */
+/** The command's env excludes server secrets and includes the release facts. */
 function releaseEnv(o: {
 	sha: string;
 	version: string;
 	notesFile: string;
 	archReview?: { delta: number } | null;
 }): Record<string, string | undefined> {
-	return {
+	return childDatabaseEnv({
 		// The hosted signing key never reaches the tenant's command (hosted-mode spec).
 		...withoutHostedSecret(process.env),
 		OTTR_RELEASE_VERSION: o.version,
 		OTTR_RELEASE_COMMIT: o.sha,
 		OTTR_RELEASE_NOTES_FILE: o.notesFile,
 		...(o.archReview ? { OTTR_ARCH_REVIEW: String(o.archReview.delta) } : {}),
-	};
+	});
 }
 
 /** Spawns the command's process tree; a missing binary names the command in the error. */

@@ -1,4 +1,5 @@
 // Provider usage limits (5 h, 7 d, monthly, ...) as reported by `omp usage --json`.
+import { childDatabaseEnv } from "./childEnv.ts";
 import type { QuotaLimit, QuotaState } from "./types.ts";
 
 type Obj = Record<string, unknown>;
@@ -185,7 +186,7 @@ export async function fetchQuota(
 		const p = Bun.spawn(["omp", "usage", "--json"], {
 			stdout: "pipe",
 			stderr: "pipe",
-			env,
+			env: childDatabaseEnv(env),
 			windowsHide: true,
 			timeout: 30_000,
 		});

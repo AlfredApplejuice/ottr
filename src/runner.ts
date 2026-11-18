@@ -1589,7 +1589,10 @@ function vmEnvDenied(
 	// pointer would name a missing file there; git would then skip the global scope
 	// entirely and never see an identity the VM image ships in its own home.
 	if (k === "GIT_CONFIG_GLOBAL") return true;
-	if (k.startsWith("OTTR_") && !/^OTTR_(RETRO|REVIEW|TRENDING)$/.test(k))
+	if (
+		k.startsWith("OTTR_") &&
+		!/^OTTR_(RETRO|REVIEW|TRENDING|TEST_PG_URL|REQUIRE_PG_TESTS)$/.test(k)
+	)
 		return true;
 	return false;
 }
@@ -1623,6 +1626,7 @@ export function vmEnv(o: {
 		env.OTTR_TASK_ID = o.board.taskId;
 	}
 	if (o.layerEnv !== null) Object.assign(env, o.layerEnv);
+	delete env.OTTR_DATABASE_URL;
 	return env;
 }
 
@@ -1849,6 +1853,7 @@ async function resolveIdentityEnv(
 	layerEnv: { HOME: string; PI_CODING_AGENT_DIR: string } | null,
 ): Promise<Record<string, string>> {
 	const identBaseEnv = withoutGitAuth({ ...process.env, ...o.env });
+	delete identBaseEnv.OTTR_DATABASE_URL;
 	if (o.vm) {
 		return o.commitIdentity != null
 			? commitIdentityEnv(o.commitIdentity, { name: false, email: false })
@@ -2055,6 +2060,11 @@ function startVmRun(
 		throw new Error(
 			`config overlays not copied into the VM: ${missingOverlays.join(", ")}`,
 		);
+	const testEnv: Record<string, string> = {};
+	for (const key of ["OTTR_TEST_PG_URL", "OTTR_REQUIRE_PG_TESTS"] as const) {
+		const value = process.env[key];
+		if (value !== undefined) testEnv[key] = value;
+	}
 	const vmHandle = runWorker(
 		{
 			id: crypto.randomUUID(),
@@ -2062,7 +2072,7 @@ function startVmRun(
 			cwd: o.cwd,
 			stdin: o.prompt,
 			env: vmEnv({
-				env: { ...o.env, ...identityEnv },
+				env: { ...testEnv, ...o.env, ...identityEnv },
 				secrets: o.secrets,
 				sessionName: o.sessionName,
 				board: o.board ?? null,

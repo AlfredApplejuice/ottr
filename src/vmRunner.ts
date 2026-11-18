@@ -31,6 +31,7 @@ import {
 } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, isAbsolute, join, posix, relative } from "node:path";
+import { childDatabaseEnv } from "./childEnv.ts";
 import { type Dir, openDir, withDir } from "./confine.ts";
 import {
 	type BoardAddr,
@@ -63,6 +64,7 @@ import {
 	type ProvisionLists,
 	type VmOutcome,
 	type VmSpec,
+	validWorkerEnv,
 	WORKER_DONE,
 	type WorkerRequest,
 } from "./workers.ts";
@@ -739,6 +741,7 @@ export function firecrackerLauncher(binary: string): VmLauncher {
 		const config = join(spec.runDir, `firecracker-${spec.mode}.json`);
 		writeFileSync(config, JSON.stringify(firecrackerConfig(spec)));
 		const p = Bun.spawn([binary, "--no-api", "--config-file", config], {
+			env: childDatabaseEnv(),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -2150,11 +2153,16 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 	/** The 400 reason the /run body gives, null when the request is well-formed. */
 	function checkRunBody(body: WorkerRequest): string | null {
 		if (
+			typeof body !== "object" ||
+			body === null ||
 			typeof body.id !== "string" ||
 			!Array.isArray(body.argv) ||
 			!body.argv.every((a) => typeof a === "string") ||
 			typeof body.cwd !== "string" ||
 			!isAbsolute(body.cwd) ||
+			!validWorkerEnv(body.env) ||
+			(body.githubReadEnv !== undefined &&
+				!validWorkerEnv(body.githubReadEnv)) ||
 			typeof body.stdin !== "string"
 		)
 			return "bad request";

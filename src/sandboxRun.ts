@@ -15,6 +15,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import { childDatabaseEnv } from "./childEnv.ts";
 import { projectTrustedLists } from "./trustedLists.ts";
 import {
 	cwdUnderTarget,
@@ -36,6 +37,7 @@ export type GitSpawn = (
 
 const defaultSpawn: GitSpawn = async (argv) => {
 	const proc = Bun.spawn(argv, {
+		env: childDatabaseEnv(),
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",

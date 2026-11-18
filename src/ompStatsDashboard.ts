@@ -6,6 +6,7 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { stripANSI } from "bun";
+import { childDatabaseEnv } from "./childEnv.ts";
 import { errmsg } from "./errmsg.ts";
 import {
 	type MirrorResult,
@@ -196,10 +197,10 @@ export function createOmpStatsDashboard(
 	}
 
 	function launch(gen: number): void {
-		const env: Record<string, string | undefined> = {
+		const env = childDatabaseEnv({
 			...deps.env(),
 			PI_CODING_AGENT_DIR: agentDir,
-		};
+		});
 		delete env.TERN_PANE;
 		delete env.TERN_PANE_SOCKET;
 		let c: DashboardChild;

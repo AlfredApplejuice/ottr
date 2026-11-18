@@ -321,6 +321,74 @@ Subprocess tests cover exclusive refusal, PRAGMAs, close, and natural exit. Fixe
 The README remains correct because SQLite stays the only shipped backend. This card adds no PostgreSQL selection or support claim.
 
 
+### Card D assumptions and refreshed inventory
+
+Card D starts from revision `d4a617f` after a refresh from `origin/main`.
+The existing async store API and caller guards remain unchanged.
+The store paths remain `src/store.ts`, `src/globalStore.ts`, `src/sqliteDriver.ts`, and `src/storeQueue.ts`.
+Startup and backup safety reach `src/server.ts`, `src/backup.ts`, and `src/restore.ts`.
+
+Environment filters reach the runner, workers, VM runner, login children, and LLM gateway.
+The server will pin its selection before child processes start.
+It will then remove the URL from its child environment and startup environment block.
+The existing environment scrubber will protect `/proc` on Linux.
+
+Explicit child environment records will retain their own production-URL filters.
+Bun's implicit child environment retains its boot copy after the scrub.
+Every child launch therefore needs an explicit environment filter, including Git, package tools, service helpers, and VM helpers.
+
+A fresh, fully opened SQLite project has 15 application tables and 194 columns before the insertion ordinal.
+The oracle includes `ask_drafts` and retired `learnings`.
+PostgreSQL step 1 must preserve that oracle except for `learnings`, with the shared ordinal added.
+
+One reserved PostgreSQL session will hold ownership and execute store statements.
+A tenant-wide queue will serialize complete store operations across schemas.
+Each store will retain its queue.
+PostgreSQL queues will share the current transaction scope, including nested calls and error state.
+This stricter connection boundary prevents writes through a session without the ownership lock.
+
+Only complete database transactions can repeat before COMMIT.
+No external effect can enter a transaction that can repeat.
+Read retry also requires one statement with known pure SQL constructs and functions.
+Quoted or unknown functions are not proof of a read-only operation.
+An uncertain reply after such a call follows the unknown-write rule.
+
+Public transaction callbacks can call external services or change nonlocal state.
+Their API remains unchanged, but these callbacks cannot repeat.
+Only store-internal database-only callbacks can use automatic transaction retry.
+Connection loss in a callback without retry permission requires a safe nonzero exit.
+Definite application or constraint rollback retains its normal error behavior.
+
+PostgreSQL project discovery uses exact registry names, not the presence of SQLite files.
+The existing SQLite discovery arguments retain their behavior.
+An optional registry list supplies the PostgreSQL discovery boundary.
+
+C's real connection, query, subprocess, and safe-error tests passed against isolated PostgreSQL 18.4.
+A separate live proof passed reserved-session identity, lock refusal, qualified SQL, commit, rollback, exact bigint values, and Unicode.
+Ripwire found 28 direct ProjectStore importers and 94 affected SQLite-driver test files.
+Its ambiguous and unresolved edges require source review and the full test suite as additional evidence.
+
+The isolated fixture uses PostgreSQL 18.4 binaries from the official PostgreSQL package repository.
+It runs from a temporary data directory, with UTF-8, a free loopback port, and a generated password.
+This uses the gate assumption that a disposable local fixture can replace an unavailable container runtime.
+It does not claim a Docker Compose runtime check.
+
+The credential-guard fault drill removed the production-URL filter from `childDatabaseEnv`.
+The targeted fixed-seed property failed with seed 42.
+The filter was then restored.
+
+```sh
+timeout 30s bun test src/postgresConfig.test.ts --test-name-pattern 'record helpers omit production selection'
+```
+
+The child-launch census includes explicit environment overrides and serialized worker/VM requests.
+It covers runner and worker launches, login and model helpers, Git and release commands, package tools, VM tools, Firecracker, and Unix and Windows process helpers.
+The VM validation job retains its existing environment allowlist.
+Test-variable propagation remains separate from the production-URL filter.
+
+AGEN-108 owns the managed AGENTS schema rule change in the agent-data project.
+Card D must wait for that dependency before delivery.
+
 ### SQL dialect inventory and target behavior
 
 | Surface and current evidence | Required target behavior |

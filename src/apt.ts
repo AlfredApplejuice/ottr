@@ -8,6 +8,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { childDatabaseEnv } from "./childEnv.ts";
 import { resolveAgentLayer } from "./layers.ts";
 
 // Debian package names (policy 5.6.1): a list entry can never turn into an apt-get option.
@@ -150,7 +151,7 @@ export async function install(
 /** stdout; throws with the stderr tail on a non-zero exit when `check` is set. */
 async function exec(argv: string[], check = true): Promise<string> {
 	const p = Bun.spawn(argv, {
-		env: { ...process.env, DEBIAN_FRONTEND: "noninteractive" },
+		env: { ...childDatabaseEnv(), DEBIAN_FRONTEND: "noninteractive" },
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",

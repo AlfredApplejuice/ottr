@@ -15,6 +15,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { childDatabaseEnv } from "./childEnv.ts";
 import {
 	appendLineBelow,
 	copyBelow,
@@ -87,7 +88,7 @@ export async function spawnPiped(
 		cwd,
 		// Explicit: the caller picks the env; Bun's default would be this process's boot env
 		// (git scopes GH_TOKEN to network subcommands via gitEnv; gh keeps it for its API).
-		env,
+		env: childDatabaseEnv(env),
 		stdin: input === undefined ? "ignore" : "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -252,7 +253,7 @@ export function gitEnv(
 	} else {
 		stripGitAuthEnv(env);
 	}
-	return env;
+	return childDatabaseEnv(env);
 }
 
 /**
@@ -2354,7 +2355,7 @@ export async function runMergeGates(
 	mainPath: string,
 ): Promise<{ ok: boolean; output: string }> {
 	// The gates run repo code: never hand it the hosted identity-signing key.
-	const env = { ...process.env };
+	const env = childDatabaseEnv();
 	delete env[HOSTED_SECRET_ENV];
 	const check = Bun.spawn([process.execPath, "run", "check"], {
 		cwd: mainPath,

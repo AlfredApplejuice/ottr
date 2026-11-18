@@ -2,6 +2,7 @@
 // Startup and wiring only: routes live in createApp() (src/app.ts), the turn
 // engine lives in createTurnLoop() (src/turn.ts). This file binds them.
 
+import { lstatSync, readdirSync } from "node:fs";
 import { constants, homedir } from "node:os";
 import { basename, delimiter, join, resolve } from "node:path";
 import type { Server } from "bun";
@@ -13,7 +14,12 @@ import {
 } from "./app.ts";
 import { ensureProjectPackages } from "./apt.ts";
 import { newSecret } from "./auth.ts";
-import { backupSources, backupTick, resolveBackup } from "./backup.ts";
+import {
+	backupSources,
+	backupTick,
+	POSTGRES_BACKUP_NOTICE,
+	resolveBackup,
+} from "./backup.ts";
 import { logError, trapCrashes } from "./crash.ts";
 import { pidAlive, StoreLockedError } from "./dblock.ts";
 import { errmsg } from "./errmsg.ts";
@@ -31,6 +37,8 @@ import {
 } from "./ompStatsDashboard.ts";
 import { orphanPids } from "./orphans.ts";
 import { platform } from "./platform/index.ts";
+import { initializeDatabaseConfig } from "./postgresConfig.ts";
+import { closePostgresBackend, getPostgresDatabase } from "./postgresDriver.ts";
 import { replayGateParks } from "./promptGate.ts";
 import {
 	commentOnPullRequest,
@@ -135,6 +143,8 @@ import {
 	worktreeLinked,
 } from "./worktree.ts";
 
+const DATABASE = initializeDatabaseConfig();
+
 const PORT = Number(process.env.PORT ?? 4747);
 /** Bind address; set OMP_TRACKER_HOST (e.g. 0.0.0.0) to serve beyond loopback. */
 const HOST = process.env.OMP_TRACKER_HOST ?? "127.0.0.1";
@@ -163,7 +173,89 @@ const ROOTS = process.env.OMP_TRACKER_ROOTS
 // Scratch tests and dev boards set OTTR_STATE_DIR so the global kv store never
 // opens (and locks) the checkout's own tracker.db.
 const STATE_DIR = process.env.OTTR_STATE_DIR ?? resolve(import.meta.dir, "..");
-const gstore = await GlobalStore.open(STATE_DIR);
+if (DATABASE.backend === "postgres") {
+	console.log(
+		`database: postgres host=${JSON.stringify(DATABASE.host)} database=${JSON.stringify(DATABASE.database)}`,
+	);
+} else {
+	console.log("database: sqlite");
+}
+
+/** Inspect paths only. Never open or converge the SQLite files during PostgreSQL startup. */
+function hasLiveSqliteState(): boolean {
+	const present = (path: string): boolean =>
+		lstatSync(path, { throwIfNoEntry: false }) !== undefined;
+	const children = (path: string): string[] => {
+		try {
+			return readdirSync(path, { withFileTypes: true })
+				.filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+				.map((entry) => join(path, entry.name));
+		} catch (error) {
+			if (
+				(error as NodeJS.ErrnoException).code === "ENOENT" ||
+				(error as NodeJS.ErrnoException).code === "ENOTDIR"
+			)
+				return [];
+			throw error;
+		}
+	};
+	try {
+		if (present(join(resolve(STATE_DIR), ".tasks", "tracker.db"))) return true;
+		for (const root of ROOTS) {
+			for (const project of [resolve(root), ...children(root)]) {
+				if (present(join(project, ".tasks", "tasks.db"))) return true;
+			}
+		}
+		for (const root of [
+			process.env.OTTR_DATA_DIR,
+			process.env.OTTR_SERVER_DATA_DIR,
+		]) {
+			if (!root) continue;
+			for (const project of children(resolve(root))) {
+				if (present(join(project, "tasks.db"))) return true;
+			}
+		}
+		return false;
+	} catch {
+		throw new Error(
+			"Cannot inspect existing SQLite state before PostgreSQL startup.",
+		);
+	}
+}
+
+async function openGlobalStore(): Promise<GlobalStore> {
+	if (DATABASE.backend === "sqlite") return GlobalStore.open(STATE_DIR);
+	try {
+		// Keep this reference through initialization so ownership has no gap after inspection.
+		const guard = await getPostgresDatabase("ottr_global");
+		try {
+			const global = await guard.serialize(() =>
+				guard
+					.query<{ present: number }, [string]>(
+						"SELECT 1 AS present FROM pg_catalog.pg_namespace WHERE nspname = ?",
+					)
+					.get("ottr_global"),
+			);
+			if (
+				global === null &&
+				process.env.OTTR_PG_ALLOW_EMPTY !== "1" &&
+				hasLiveSqliteState()
+			) {
+				throw new Error(
+					"PostgreSQL has no ottr_global schema, but live SQLite state exists. Run bun src/import-sqlite-to-postgres.ts first, or set OTTR_PG_ALLOW_EMPTY=1 to accept an empty backend.",
+				);
+			}
+			return await GlobalStore.open(STATE_DIR);
+		} finally {
+			await guard.close();
+		}
+	} catch (error) {
+		await closePostgresBackend();
+		throw error;
+	}
+}
+
+const gstore = await openGlobalStore();
 /** Jira token sealing (docs/specs/jira-import.md section 1): the key file sits next to tracker.db.
  * A malformed key never stops the boot: the Jira routes answer 503 until it is fixed. */
 let secretBox: SecretBox | undefined;
@@ -242,7 +334,7 @@ function every(work: () => void | Promise<unknown>, ms: number): void {
 let loopRef: TurnLoop | undefined;
 let appRef: App | undefined;
 /** Stop new work, settle active callbacks, and release all locks before exit. */
-async function shutdown(exitCode: number): Promise<void> {
+export async function shutdown(exitCode: number): Promise<void> {
 	if (shuttingDown) return;
 	shuttingDown = true;
 	for (const timer of timers) clearInterval(timer);
@@ -286,6 +378,12 @@ async function shutdown(exitCode: number): Promise<void> {
 	} catch (err) {
 		failed = true;
 		logError("shutdown: could not close the global store", err);
+	}
+	try {
+		await closePostgresBackend();
+	} catch (err) {
+		failed = true;
+		logError("shutdown: could not close the PostgreSQL backend", err);
 	}
 	process.exit(exitCode === 0 && failed ? 1 : exitCode);
 }
@@ -428,7 +526,11 @@ const SELF_ROOT = resolve(import.meta.dir, "..");
  * The image's OTTR_VERSION stamp, else the release tag HEAD carries, else short sha on dev, else boot time. */
 const serverVersion = await describeVersion(SELF_ROOT);
 
-if (process.env.OTTR_DATA_DIR && process.env.OTTR_SERVER_DATA_DIR) {
+if (
+	DATABASE.backend === "sqlite" &&
+	process.env.OTTR_DATA_DIR &&
+	process.env.OTTR_SERVER_DATA_DIR
+) {
 	let adopted: AdoptResult[] = [];
 	try {
 		adopted = await adoptSharedProjectData(
@@ -451,7 +553,7 @@ if (process.env.OTTR_DATA_DIR && process.env.OTTR_SERVER_DATA_DIR) {
 				`could not move project database ${r.name} to the server data dir (${r.error}); move it by hand, see docs/WORKERS.md`,
 			);
 	}
-} else if (process.env.OTTR_DATA_DIR) {
+} else if (DATABASE.backend === "sqlite" && process.env.OTTR_DATA_DIR) {
 	console.warn(
 		"OTTR_SERVER_DATA_DIR is not set: project databases stay on the worker-shared data dir (OTTR_DATA_DIR)",
 	);
@@ -469,6 +571,29 @@ const workerRoots = process.env.OTTR_DATA_DIR
 	: [];
 if (process.env.OTTR_DATA_DIR) setWorkerRoots(workerRoots);
 
+let registeredProjects: string[] | undefined;
+if (DATABASE.backend === "postgres") {
+	try {
+		const registry = await getPostgresDatabase("ottr_global");
+		try {
+			registeredProjects = await registry.serialize(async () =>
+				(
+					await registry
+						.query<{ project_name: string }, []>(
+							'SELECT project_name FROM "ottr_global"."project_registry"',
+						)
+						.all()
+				).map((row) => row.project_name),
+			);
+		} finally {
+			await registry.close();
+		}
+	} catch (err) {
+		logError("refusing to read the PostgreSQL project registry", err);
+		await shutdown(1);
+	}
+}
+
 /** Projects whose tasks.db did not open at boot: the backup records each as a failed database,
  * so retention keeps the last good copy (docs/specs/db-backup.md). */
 const unopenedProjects: { name: string; error: string }[] = [];
@@ -476,12 +601,13 @@ for (const p of discoverProjects(
 	ROOTS,
 	shared.projectPaths,
 	shared.removedPaths,
+	registeredProjects,
 )) {
 	let store: ProjectStore;
 	try {
 		store = await ProjectStore.open(p);
 	} catch (err) {
-		if (err instanceof StoreLockedError) {
+		if (err instanceof StoreLockedError || DATABASE.backend === "postgres") {
 			// A second server must refuse startup and release all stores it opened.
 			logError("refusing to start", err);
 			await shutdown(1);
@@ -1057,34 +1183,38 @@ every(async () => {
 
 // Backups (docs/specs/db-backup.md): daily snapshot of tracker.db and each tasks.db, hourly
 // check; the boot call lets a board that was down catch up.
-const backup = resolveBackup(process.env, STATE_DIR, workerRoots);
-for (const text of backup.errors) console.error(`backup: ${text}`);
-if (backup.keep !== 0) {
-	const backupNow = async (): Promise<void> => {
-		if (shuttingDown) return;
-		if (backupWork !== undefined) return backupWork;
-		backupWork = backupTick({
-			dir: backup.dir,
-			keep: backup.keep,
-			now: new Date(),
-			refuseBelow: backup.refuseBelow,
-			// A project that opened later (added again from the board) is a live source, not a failure.
-			sources: () =>
-				backupSources(
-					gstore,
-					[...projects.values()].map((e) => e.store),
-					unopenedProjects.filter((u) => !projects.has(u.name)),
-				),
-			log: (line) => console.log(line),
-		});
-		try {
-			await backupWork;
-		} finally {
-			backupWork = undefined;
-		}
-	};
-	await backupNow();
-	every(backupNow, 3_600_000);
+if (DATABASE.backend === "postgres") {
+	console.log(POSTGRES_BACKUP_NOTICE);
+} else {
+	const backup = resolveBackup(process.env, STATE_DIR, workerRoots);
+	for (const text of backup.errors) console.error(`backup: ${text}`);
+	if (backup.keep !== 0) {
+		const backupNow = async (): Promise<void> => {
+			if (shuttingDown) return;
+			if (backupWork !== undefined) return backupWork;
+			backupWork = backupTick({
+				dir: backup.dir,
+				keep: backup.keep,
+				now: new Date(),
+				refuseBelow: backup.refuseBelow,
+				// A project that opened later is a live source, not a failure.
+				sources: () =>
+					backupSources(
+						gstore,
+						[...projects.values()].map((e) => e.store),
+						unopenedProjects.filter((u) => !projects.has(u.name)),
+					),
+				log: (line) => console.log(line),
+			});
+			try {
+				await backupWork;
+			} finally {
+				backupWork = undefined;
+			}
+		};
+		await backupNow();
+		every(backupNow, 3_600_000);
+	}
 }
 
 // Service due checks never wait for statistics or model quota work.

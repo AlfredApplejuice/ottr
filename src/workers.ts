@@ -563,10 +563,22 @@ function validLists(lists: WorkerRequest["lists"]): boolean {
 	);
 }
 
+/** Serialized strings and arrays are not environment records. */
+export function validWorkerEnv(env: unknown): env is Record<string, string> {
+	return (
+		typeof env === "object" &&
+		env !== null &&
+		!Array.isArray(env) &&
+		Object.values(env).every((value) => typeof value === "string")
+	);
+}
+
 /** A /run request is well-formed when argv is all strings, cwd is an existing absolute
  * directory, and the lists are texts. */
 function validRunBody(body: WorkerRequest): boolean {
 	return (
+		typeof body === "object" &&
+		body !== null &&
 		Array.isArray(body.argv) &&
 		body.argv.every((a) => typeof a === "string") &&
 		typeof body.cwd === "string" &&
@@ -574,6 +586,8 @@ function validRunBody(body: WorkerRequest): boolean {
 		isAbsolute(body.cwd) &&
 		existsSync(body.cwd) &&
 		statSync(body.cwd).isDirectory() &&
+		validWorkerEnv(body.env) &&
+		(body.githubReadEnv === undefined || validWorkerEnv(body.githubReadEnv)) &&
 		validLists(body.lists)
 	);
 }
@@ -962,13 +976,23 @@ async function dispatchRun(
 	target: WorkerTarget,
 	controller: AbortController,
 ): Promise<Response> {
+	if (
+		!validWorkerEnv(req.env) ||
+		(req.githubReadEnv !== undefined && !validWorkerEnv(req.githubReadEnv))
+	)
+		throw new WorkerConnectError("bad request environment");
+	const env = { ...req.env };
+	delete env.OTTR_DATABASE_URL;
+	const githubReadEnv =
+		req.githubReadEnv === undefined ? undefined : { ...req.githubReadEnv };
+	if (githubReadEnv !== undefined) delete githubReadEnv.OTTR_DATABASE_URL;
 	const res = await fetch(`${url}/run`, {
 		method: "POST",
 		headers: {
 			"content-type": "application/json",
 			...(target.token ? { "x-otwr-token": target.token } : {}),
 		},
-		body: JSON.stringify(req),
+		body: JSON.stringify({ ...req, env, githubReadEnv }),
 		signal: controller.signal,
 		// redirect: "manual": the worker token must never follow a redirect
 		// off-host; a 3xx answer fails the dispatch like any non-200.

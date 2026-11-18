@@ -11,6 +11,7 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { type Subprocess, stripANSI } from "bun";
+import { childDatabaseEnv } from "./childEnv.ts";
 import { errmsg } from "./errmsg.ts";
 import { pinnedAgentLayer } from "./layers.ts";
 
@@ -707,6 +708,7 @@ export async function signOutWorkerStore(
 	const child = Bun.spawn(
 		[process.execPath, import.meta.path, provider, dbPath, cause],
 		{
+			env: childDatabaseEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 			timeout: ms,

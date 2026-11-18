@@ -1,5 +1,6 @@
 // Pure fork-analysis prompt/parse layer. Untrusted fork content: never instructions, always data.
 
+import { childDatabaseEnv } from "./childEnv.ts";
 import { githubHost } from "./githubHost.ts";
 import { boardOmpEnv } from "./login.ts";
 import type {
@@ -269,7 +270,7 @@ export const defaultSpawn: SpawnFn = async (argv, o) => {
 		stdout: "pipe",
 		stderr: "pipe",
 		cwd: o.cwd,
-		env: o.env,
+		env: childDatabaseEnv(o.env),
 		timeout: o.timeoutMs,
 		windowsHide: true,
 	});

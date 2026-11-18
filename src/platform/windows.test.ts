@@ -108,20 +108,35 @@ describe("windows platform", () => {
 		]);
 	});
 
-	test("listProcesses passes 64 MiB maxBuffer, utf8 encoding and windowsHide to powershell", () => {
-		const calls: Call[] = [];
-		const ok = asSpawnSync((command, args, options) => {
-			calls.push({ command, args, options });
-			return { status: 0, stdout: "[]" };
-		});
-		expect(windows.listProcesses(ok)).toEqual([]);
-		expect(calls.length).toBe(1);
-		expect(last(calls).command).toBe("powershell");
-		expect(last(calls).options).toEqual({
-			windowsHide: true,
-			encoding: "utf8",
-			maxBuffer: 64 * 1024 * 1024,
-		});
+	test("Windows child processes exclude the server database URL and preserve isolated test settings", () => {
+		const values = {
+			OTTR_DATABASE_URL: crypto.randomUUID(),
+			OTTR_TEST_PG_URL: crypto.randomUUID(),
+			OTTR_REQUIRE_PG_TESTS: "1",
+		};
+		const saved = Object.keys(values).map(
+			(key) => [key, process.env[key]] as const,
+		);
+		Object.assign(process.env, values);
+		try {
+			const run = asSpawnSync((_command, _args, options) => {
+				const env = (options as { env?: NodeJS.ProcessEnv } | undefined)?.env;
+				expect(env !== undefined).toBe(true);
+				expect(Object.hasOwn(env ?? {}, "OTTR_DATABASE_URL")).toBe(false);
+				expect(env?.OTTR_TEST_PG_URL === values.OTTR_TEST_PG_URL).toBe(true);
+				expect(
+					env?.OTTR_REQUIRE_PG_TESTS === values.OTTR_REQUIRE_PG_TESTS,
+				).toBe(true);
+				return { status: 0, stdout: "[]" };
+			});
+			expect(windows.listProcesses(run)).toEqual([]);
+			windows.killTree(4242, run);
+		} finally {
+			for (const [key, value] of saved) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
 	});
 
 	test("processesWithCwdUnder is []: Windows has no read-only foreign cwd", () => {
