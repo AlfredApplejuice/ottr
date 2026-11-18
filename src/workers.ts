@@ -4,11 +4,13 @@ import {
 	readdirSync,
 	readFileSync,
 	readlinkSync,
+	realpathSync,
 	statSync,
 } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { ensurePackages as ensureAptPackages, parseAptTxt } from "./apt.ts";
+import { acquireLayerUse } from "./layers.ts";
 import { type SignIn, signIns } from "./login.ts";
 import { platform } from "./platform/index.ts";
 import { redirectProxyHint } from "./proxyHint.ts";
@@ -434,6 +436,17 @@ export function serveWorker(opts: {
 		// so a kernel kill that lands during this run is distinguishable from one
 		// the container already carried (docs/specs/worker-oom-continue.md).
 		const oomBefore = oomSnapshot(opts.cgroupRoot);
+		// The worker's own lease on the child's pinned layer (OTTR-1132): it lives until the
+		// child closes, so no stream loss, detach, or board settlement can drop it. The
+		// release stays in this closure, off the entry that /detached serializes.
+		let release: () => void;
+		try {
+			release = workerLayerLease(workerHome, env.HOME);
+		} catch (err) {
+			return new Response(`layer lease failed: ${String(err)}`, {
+				status: 500,
+			});
+		}
 		let child: ChildProcess;
 		try {
 			child = spawn(opts.ompPath ?? "omp", body.argv, {
@@ -443,8 +456,15 @@ export function serveWorker(opts: {
 				windowsHide: true,
 			});
 		} catch (err) {
+			release();
 			return new Response(`spawn failed: ${String(err)}`, { status: 500 });
 		}
+		// A live child can emit "error" after spawn. Only a no-child spawn error releases
+		// before "close"; a live child's lease must remain held.
+		child.on("error", () => {
+			if (child.pid === undefined) release();
+		});
+		child.on("close", release);
 		const forgetChild = (): void => {
 			if (child.pid !== undefined) runChildren.delete(child.pid);
 		};
@@ -666,6 +686,35 @@ async function provisionRun(
 		.map((l) => `${l}\n`)
 		.join("");
 	return { notes, pathDir };
+}
+
+/**
+ * The worker's lease on the layer the child's HOME pins (OTTR-1132), as acquireLayerUse's
+ * idempotent release (it never throws: a failed release warns and keeps the protection). Only a
+ * real directory straight below the worker home's `.alate/layers` takes a lease, in the
+ * worker home's own registry: the request never picks the root. Any other HOME (the flat
+ * home, a symlinked or nested path, a foreign home) gets a no-op release. A failed
+ * acquisition throws, so no child reads an unprotected layer.
+ */
+function workerLayerLease(
+	workerHome: string,
+	home: string | undefined,
+): () => void {
+	const none = (): void => {};
+	if (home === undefined || !isAbsolute(home)) return none;
+	let real: string;
+	let layersRoot: string;
+	try {
+		real = realpathSync(home);
+		layersRoot = join(realpathSync(workerHome), ".alate", "layers");
+	} catch {
+		return none;
+	}
+	// Any symlink on the way (a planted layers/<id> link, a linked .alate) changes the
+	// realpath: equality proves HOME is the real layer dir itself.
+	if (real !== home || dirname(real) !== layersRoot) return none;
+	if (!statSync(real).isDirectory()) return none;
+	return acquireLayerUse(workerHome, basename(real));
 }
 
 /** The child's env: request env over the container env, minus every push credential and the

@@ -59,6 +59,7 @@ import { defaultSshDir, GIT_URL_ERROR, type Keyscan } from "./gitHosts.ts";
 import { DEFAULT_COMMIT_EMAIL, DEFAULT_COMMIT_NAME } from "./gitIdentity.ts";
 import { GlobalStore } from "./globalStore.ts";
 import { MAX_IMAGE_BYTES } from "./images.ts";
+import { acquireLayerUse } from "./layers.ts";
 import { boardOmpEnv, boardOmpHome, type SignIn, signIns } from "./login.ts";
 import { MERMAID_VERSION, mermaidSrc } from "./mermaidVersion.ts";
 import { modelRoles } from "./models.ts";
@@ -6283,6 +6284,43 @@ describe("agent layer boot reconcile", () => {
 		}
 		expect([...registry(shared)].sort()).toEqual(["bbb"]);
 		expect(registry(board)).toEqual(["bbb"]);
+	});
+
+	test("boot keeps a live holder that is absent from open turns", async () => {
+		const suffix = Math.random().toString(36).slice(2, 8);
+		const shared = join(root, `rec-live-${suffix}`);
+		mkdirSync(join(shared, ".alate", "layers", "live"), { recursive: true });
+		const release = acquireLayerUse(shared, "live");
+		const board = join(root, `rec-live-board-${suffix}`);
+		const savedHome = process.env.HOME;
+		const savedBoard = process.env.OTTR_BOARD_OMP_HOME;
+		try {
+			process.env.HOME = shared;
+			process.env.OTTR_BOARD_OMP_HOME = board;
+			await mount(); // createApp reconciles once, with no open turns
+			expect(registry(shared)).toEqual(["live"]);
+		} finally {
+			release();
+			if (savedHome === undefined) delete process.env.HOME;
+			else process.env.HOME = savedHome;
+			if (savedBoard === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+			else process.env.OTTR_BOARD_OMP_HOME = savedBoard;
+		}
+	});
+
+	test("reconcileLayerUse preserves a live holder without an open turn", () => {
+		const home = join(
+			root,
+			`rec-live-direct-${Math.random().toString(36).slice(2, 8)}`,
+		);
+		mkdirSync(join(home, ".alate", "layers", "live"), { recursive: true });
+		const release = acquireLayerUse(home, "live");
+		try {
+			reconcileLayerUse([], [home]);
+			expect(registry(home)).toEqual(["live"]);
+		} finally {
+			release();
+		}
 	});
 
 	test("reconcileLayerUse drops stale and unsafe ids, skips homes without layers", () => {

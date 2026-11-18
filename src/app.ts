@@ -1311,11 +1311,11 @@ export function workerTmpWarnings(
 }
 /**
  * Boot reconcile of the layer in-use registries (docs/specs/agent-layer-switch.md, "Record"):
- * rebuilds each home's `<home>/.alate/in-use.json` from `openLayers`, the layer ids the stores'
- * open turns still pin. A home keeps only the ids whose layer folder exists there: alate's
- * clean-up never deletes a layer a crashed-but-live turn reads, and an id whose folder is
- * already gone stops blocking it. Never throws: `rebuildLayerUse` is best-effort, and a home
- * without a `.alate` dir (no layer was ever installed) is left alone.
+ * reconciles each home's registry with `openLayers`, the recovery pins from the stores'
+ * open turns. `rebuildLayerUse` preserves independently live or uncertain holders, prunes
+ * only holders proven ended, and replaces recovery pins from open turns. This function
+ * keeps only safe open-turn ids whose layer folder exists there. A home without `.alate`
+ * is left alone. Never throws: `rebuildLayerUse` warns rather than throwing on errors.
  */
 export function reconcileLayerUse(
 	openLayers: string[],

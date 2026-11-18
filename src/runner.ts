@@ -18,9 +18,8 @@ import {
 } from "./gitIdentity.ts";
 import type { TokenUsage } from "./hosted.ts";
 import {
-	addLayerUse,
+	acquireLayerUse,
 	pinnedAgentLayer,
-	removeLayerUse,
 	resolveAgentLayer,
 } from "./layers.ts";
 import {
@@ -1806,30 +1805,35 @@ function resolveMemoryConfig(o: StartOptions): string | null {
 	return ensureMemoryOverlay();
 }
 
+type RunLayerPin = Pick<
+	RunStart,
+	"layerEnv" | "layerDir" | "layerId" | "unregisterLayer"
+>;
+
 /** Pin the agent layer once per call, before any spawn: the env carries the resolved layer
  * directory, so a later atomic switch of `.alate/current` never touches a live run. Worker
  * runs resolve the shared home (alate provisions it), the board's own runs the board home. */
-function resolveLayerPin(
-	layerHome: string,
-	sink: RunSink,
-): {
-	layerEnv: { HOME: string; PI_CODING_AGENT_DIR: string } | null;
-	layerDir: string | null;
-	layerId: string | null;
-	unregisterLayer: () => void;
-} {
+function resolveLayerPin(layerHome: string, sink: RunSink): RunLayerPin {
 	const pin = pinnedAgentLayer(layerHome);
 	if (!pin.ok && pin.reason !== "none")
 		sink.logMark(
 			`! agent layer pin failed (${pin.reason}); running the flat home\n`,
 		);
-	let unregistered = false;
+	// OTTR-1132: the lease belongs to this run alone; its release drops only this holder.
+	// An acquisition failure throws here, before any spawn reads an unprotected layer.
+	const release = pin.ok ? acquireLayerUse(layerHome, pin.layer.id) : null;
 	const unregisterLayer = (): void => {
-		if (!pin.ok || unregistered) return;
-		unregistered = true;
-		removeLayerUse(layerHome, pin.layer.id);
+		if (release === null) return;
+		// Settlement paths must not throw: a failed release keeps the lease (protection
+		// stays on) and is reported in the run log.
+		try {
+			release();
+		} catch (err) {
+			sink.logMark(
+				`! agent layer lease release failed (${err instanceof Error ? err.message : err})\n`,
+			);
+		}
 	};
-	if (pin.ok) addLayerUse(layerHome, pin.layer.id);
 	return {
 		layerEnv: pin.ok
 			? { HOME: pin.layer.dir, PI_CODING_AGENT_DIR: pin.agentDir }
@@ -2272,23 +2276,52 @@ export async function startRun(o: StartOptions): Promise<RunHandle> {
 	const vmToken = o.vm
 		? o.vm.tokens.issue({ ...o.vm.grant, base: o.vm.base })
 		: null;
-	const sink = createRunSink({
-		logPath: o.logPath,
-		dataRoot: o.dataRoot,
-		onLog: o.onLog,
-		onSession: o.onSession,
-		onProgress: o.onProgress,
-		secrets: vmToken === null ? o.secrets : [...(o.secrets ?? []), vmToken],
-		meter: o.meter,
-		onUsage: o.onUsage,
-		onRecorded: o.onRecorded,
-	});
-	const startedAt = Date.now();
-	// Pin the agent layer once per call, before any spawn: the env carries the resolved layer
-	// directory, so a later atomic switch of `.alate/current` never touches a live run. Worker
-	// runs resolve the shared home (alate provisions it), the board's own runs the board home.
-	const layerHome = o.worker || o.vm ? homedir() : boardOmpHome();
-	const layerPin = resolveLayerPin(layerHome, sink);
+	// Until a handle exists, no settlement releases the lease or revokes the token: every
+	// pre-handle error (sink, lease acquisition, setup, dispatch prep) cleans up here.
+	let layerPin: RunLayerPin | null = null;
+	try {
+		const sink = createRunSink({
+			logPath: o.logPath,
+			dataRoot: o.dataRoot,
+			onLog: o.onLog,
+			onSession: o.onSession,
+			onProgress: o.onProgress,
+			secrets: vmToken === null ? o.secrets : [...(o.secrets ?? []), vmToken],
+			meter: o.meter,
+			onUsage: o.onUsage,
+			onRecorded: o.onRecorded,
+		});
+		const startedAt = Date.now();
+		// Pin the agent layer once per call, before any spawn: the env carries the resolved
+		// layer directory, so a later atomic switch of `.alate/current` never touches a live
+		// run. Worker runs resolve the shared home (alate provisions it), the board's own runs
+		// the board home.
+		const layerHome = o.worker || o.vm ? homedir() : boardOmpHome();
+		layerPin = resolveLayerPin(layerHome, sink);
+		return await startPinnedRun(
+			o,
+			sink,
+			startedAt,
+			layerHome,
+			layerPin,
+			vmToken,
+		);
+	} catch (err) {
+		layerPin?.unregisterLayer();
+		if (o.vm && vmToken !== null) o.vm.tokens.revoke(vmToken);
+		throw err;
+	}
+}
+
+/** Everything between the layer pin and the run handle: a throw here releases the pin. */
+async function startPinnedRun(
+	o: StartOptions,
+	sink: RunSink,
+	startedAt: number,
+	layerHome: string,
+	layerPin: RunLayerPin,
+	vmToken: string | null,
+): Promise<RunHandle> {
 	const memoryConfig = resolveMemoryConfig(o);
 	// The plugin-skills overlay reads the run's pinned home, so a layer run gets its own
 	// layer's plugins (docs/specs/turn-home-plugin-skills.md).

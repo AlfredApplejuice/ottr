@@ -1449,21 +1449,24 @@ not layer content (OTTR-453 moves the pick to the deployment): the pin never rew
 the layer's `config.yml`. The entry script keeps its boot-time flip of the flat homes
 for the no-layer era and for spawns that stay flat.
 
-The board records each pinned layer id in `H/.alate/in-use.json` for the run's life and
-removes it when the run settles. Alate deletes a layer folder only when it is not
-`current`, not the layer `current` named before the last switch, and absent from
-`in-use.json`. A corrupt `in-use.json` never fails a run, and clean-up then still keeps
-the last two layers. The bound a pinned run can hit: a turn that outlives two switches
-(a 9 h mutation run can) loses its layer, the turn fails, and classification requeues it
-once, then parks it for a human.
+The board records live layer holders in `H/.alate/in-use.json`. The public file keeps the
+`{"layers":[{"id": string, "since": epoch-ms}]}` shape. Private owner data stays separate.
+Each run releases only its own holder. The worker child has a separate holder until it
+exits, even if the run detaches. An acquisition failure stops the spawn.
 
-Error cases: no layer yet (no `current` link, or an alate that still writes flat) runs
-the flat home, exactly as before; a broken `current` link falls back to the flat home and
-logs a warning into the run log, and the next provision repairs the switch; a shared-state
-link that cannot be written falls back the same way, so a run never fails because of
-pinning. The provision tick installs a layer whenever the alate server reports layer
-support (`layers: true` in `GET /health`), with no idle wait; while it does not, the tick
-keeps the old idle gate, because that server writes the flat home under a running turn.
+A failed release retains protection and reports a warning. At boot, open turns supply
+recovery pins. Reconcile preserves live or uncertain holders and replaces recovery pins
+from open turns. It removes a holder only when its lock proves that the holder ended.
+Alate deletes a layer folder only when it is not `current`, not the layer named before the
+last switch, and absent from `in-use.json`. The current and previous layers remain
+retention rules, not lease limits.
+
+If no `current` link exists, the run uses the flat home.
+A broken `current` link or failed shared-state link preparation also uses the flat home and records a warning.
+The next provision repairs a broken switch.
+
+The provision tick installs a layer without an idle wait when Alate reports `layers: true` in `GET /health`.
+Otherwise, the tick keeps the idle gate because that Alate server writes the flat home under a live turn.
 
 #### Seed the board config
 

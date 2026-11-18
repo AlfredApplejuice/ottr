@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { readLayerUse, rebuildLayerUse } from "./layers.ts";
 import { signIns } from "./login.ts";
 import { createRunSink, type RunSink } from "./runner.ts";
 import {
@@ -2508,4 +2509,262 @@ describe("detach protocol", () => {
 			"redirect not followed; a proxy may intercept this call: check NO_PROXY",
 		);
 	}, 30_000);
+});
+
+describe("worker layer lease (OTTR-1132)", () => {
+	// Gate omp: emits one tick, then exits 0 on its own once its release file exists.
+	// Every test ends its children by writing those files in a finally, never by a
+	// kill, and waits there for each close. The 60 s fallback is a natural exit too.
+	const gatePath = join(dir, "gate-omp.js");
+	writeFileSync(
+		gatePath,
+		`process.stdout.write('{"type":"tick"}\\n');
+const fs = require("node:fs");
+setInterval(() => { if (fs.existsSync(process.argv[2])) process.exit(0); }, 20);
+setTimeout(() => process.exit(0), 60000);`,
+	);
+
+	type Reader = ReadableStreamDefaultReader<Uint8Array>;
+
+	let leaseN = 0;
+	/** A fresh worker home with one real layer dir straight below its .alate/layers. */
+	function layerHome(): { home: string; id: string; layer: string } {
+		const home = freshWorkerHome();
+		const id = `lease-layer-${leaseN++}`;
+		const layer = join(home, ".alate", "layers", id);
+		mkdirSync(layer, { recursive: true });
+		return { home, id, layer };
+	}
+	const releaseFile = (): string => join(dir, `lease-release-${leaseN++}`);
+	const leasedIds = (home: string): string[] =>
+		readLayerUse(home).map((e) => e.id);
+
+	async function until(
+		cond: () => Promise<boolean> | boolean,
+		what: string,
+	): Promise<void> {
+		const deadline = Date.now() + 20_000;
+		for (;;) {
+			if (await cond()) return;
+			if (Date.now() > deadline) throw new Error(`${what}: never happened`);
+			await Bun.sleep(50);
+		}
+	}
+
+	async function postRun(
+		url: string,
+		id: string,
+		home: string,
+		release: string,
+	): Promise<Response> {
+		return await fetch(`${url}/run`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				id,
+				argv: [gatePath, release],
+				cwd: dir,
+				stdin: "",
+				env: { HOME: home },
+			}),
+		});
+	}
+
+	/** POST /run of the gate child with the request HOME the board's pin sends. */
+	async function gateRun(
+		url: string,
+		id: string,
+		home: string,
+		release: string,
+		readers: Reader[],
+	): Promise<Reader> {
+		const res = await postRun(url, id, home, release);
+		expect(res.status).toBe(200);
+		const reader = res.body!.getReader();
+		readers.push(reader);
+		// The tick proves the spawn, and the lease is taken before the spawn.
+		expect((await reader.read()).done).toBe(false);
+		return reader;
+	}
+
+	async function drain(reader: Reader): Promise<string> {
+		const dec = new TextDecoder();
+		let text = "";
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) return text;
+			text += dec.decode(value, { stream: true });
+		}
+	}
+
+	async function detachedList(url: string): Promise<Record<string, unknown>[]> {
+		const res = await fetch(`${url}/detached`);
+		expect(res.status).toBe(200);
+		return (await res.json()) as Record<string, unknown>[];
+	}
+
+	async function detachAll(url: string, n: number): Promise<void> {
+		const res = await fetch(`${url}/detach`, { method: "POST" });
+		expect(await res.json()).toEqual({ detached: n });
+	}
+
+	/** The finally of every test: release each gate child and wait for its natural close
+	 * (attached: its stream ends; detached: its /detached entry stops running). */
+	async function settle(
+		releases: string[],
+		readers: Reader[],
+		urls: string[],
+	): Promise<void> {
+		for (const r of releases) writeFileSync(r, "");
+		for (const r of readers) await drain(r);
+		for (const u of urls)
+			await until(
+				async () => (await detachedList(u)).every((e) => e.running === false),
+				"detached children close",
+			);
+	}
+
+	test("a detached child keeps its lease past the stream and a rebuild; its close clears it", async () => {
+		const { home, id, layer } = layerHome();
+		const release = releaseFile();
+		const readers: Reader[] = [];
+		const url = start({ ompPath: process.execPath, home });
+		try {
+			const reader = await gateRun(url, "lease-d1", layer, release, readers);
+			expect(leasedIds(home)).toEqual([id]);
+			// The board stream settles: the detach closes it with the child still live.
+			await detachAll(url, 1);
+			expect((await reader.read()).done).toBe(true);
+			expect(leasedIds(home)).toEqual([id]);
+			// Boot reconciliation with no open turn layers keeps the live worker holder.
+			rebuildLayerUse(home, []);
+			expect(leasedIds(home)).toEqual([id]);
+			// The public registry keeps its exact shape: no owner metadata.
+			const raw = JSON.parse(
+				readFileSync(join(home, ".alate", "in-use.json"), "utf8"),
+			) as { layers: Record<string, unknown>[] };
+			expect(Object.keys(raw)).toEqual(["layers"]);
+			expect(raw.layers.map((e) => Object.keys(e).sort())).toEqual([
+				["id", "since"],
+			]);
+			// The /detached wire shape stays unchanged: the lease never rides it.
+			const [entry] = await detachedList(url);
+			expect(Object.keys(entry ?? {}).sort()).toEqual([
+				"cwd",
+				"id",
+				"pid",
+				"running",
+				"startedAt",
+			]);
+			writeFileSync(release, "");
+			await until(
+				async () => (await detachedList(url))[0]?.running === false,
+				"detached child close",
+			);
+			await until(() => leasedIds(home).length === 0, "lease release");
+		} finally {
+			await settle([release], readers, [url]);
+		}
+	}, 30_000);
+
+	test("independent workers and runs on one layer release only their own lease", async () => {
+		const { home, id, layer } = layerHome();
+		const relA = releaseFile();
+		const relB = releaseFile();
+		const relC = releaseFile();
+		const readers: Reader[] = [];
+		const urlA = start({ ompPath: process.execPath, home });
+		const urlB = start({ ompPath: process.execPath, home });
+		try {
+			const readerA = await gateRun(urlA, "lease-a", layer, relA, readers);
+			const readerB = await gateRun(urlB, "lease-b", layer, relB, readers);
+			const readerC = await gateRun(urlB, "lease-c", layer, relC, readers);
+			expect(leasedIds(home)).toEqual([id]);
+			// Worker B loses both streams; worker A stays attached.
+			await detachAll(urlB, 2);
+			expect((await readerB.read()).done).toBe(true);
+			expect((await readerC.read()).done).toBe(true);
+			expect(leasedIds(home)).toEqual([id]);
+			// B's first child closes: A and C still hold the layer, through a rebuild too.
+			writeFileSync(relB, "");
+			await until(
+				async () =>
+					(await detachedList(urlB)).find((e) => e.id === "lease-b")
+						?.running === false,
+				"lease-b close",
+			);
+			expect(leasedIds(home)).toEqual([id]);
+			rebuildLayerUse(home, []);
+			expect(leasedIds(home)).toEqual([id]);
+			// A's attached child closes with its sentinel: C still holds the layer.
+			writeFileSync(relA, "");
+			expect(await drain(readerA)).toContain(WORKER_DONE);
+			expect(leasedIds(home)).toEqual([id]);
+			// The last holder's close clears the layer.
+			writeFileSync(relC, "");
+			await until(() => leasedIds(home).length === 0, "last lease release");
+		} finally {
+			await settle([relA, relB, relC], readers, [urlA, urlB]);
+		}
+	}, 60_000);
+
+	test("a spawn error releases its own lease once and spares a live holder", async () => {
+		const { home, id, layer } = layerHome();
+		const release = releaseFile();
+		const readers: Reader[] = [];
+		const live = start({ ompPath: process.execPath, home });
+		// A missing omp binary: Bun fires both "error" and "close", and no child exists.
+		const broken = start({ ompPath: join(dir, "no-such-omp"), home });
+		try {
+			const reader = await gateRun(live, "lease-live", layer, release, readers);
+			expect(leasedIds(home)).toEqual([id]);
+			for (const n of [1, 2]) {
+				const res = await postRun(broken, `lease-err-${n}`, layer, release);
+				await res.text();
+				expect(leasedIds(home)).toEqual([id]);
+			}
+			// The failed runs left no lease behind: the live close alone clears the layer.
+			writeFileSync(release, "");
+			expect(await drain(reader)).toContain(WORKER_DONE);
+			await until(() => leasedIds(home).length === 0, "live lease release");
+		} finally {
+			await settle([release], readers, [live]);
+		}
+	}, 30_000);
+
+	test("a HOME outside the worker home's real direct layers takes no lease", async () => {
+		const { home, layer } = layerHome();
+		const foreign = layerHome();
+		const nested = join(layer, "nested");
+		mkdirSync(nested);
+		const linked = join(home, ".alate", "layers", "linked");
+		symlinkSync(foreign.layer, linked);
+		const releases: string[] = [];
+		const readers: Reader[] = [];
+		const url = start({ ompPath: process.execPath, home });
+		try {
+			for (const [i, requestHome] of [
+				foreign.layer,
+				nested,
+				linked,
+				home,
+			].entries()) {
+				const release = releaseFile();
+				releases.push(release);
+				const reader = await gateRun(
+					url,
+					`lease-out-${i}`,
+					requestHome,
+					release,
+					readers,
+				);
+				expect(leasedIds(home)).toEqual([]);
+				expect(leasedIds(foreign.home)).toEqual([]);
+				writeFileSync(release, "");
+				expect(await drain(reader)).toContain(WORKER_DONE);
+			}
+		} finally {
+			await settle(releases, readers, [url]);
+		}
+	}, 60_000);
 });
