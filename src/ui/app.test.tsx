@@ -105,6 +105,8 @@ const {
 	ProjectLogo,
 	ProjectTag,
 	windowGone,
+	windowPace,
+	modelPace,
 } = await import("./kit.tsx");
 const {
 	alateChip,
@@ -271,6 +273,81 @@ describe("windowGone", () => {
 		expect(windowGone(lim({ window: "5h", resetsAt: now + 9 * H }), now)).toBe(
 			0,
 		);
+	});
+});
+
+describe("windowPace", () => {
+	const H = 3_600_000;
+	const now = 1_000 * H;
+	const lim = (usedPct: number, resetsAt: number | null) => ({
+		provider: "p",
+		label: "x",
+		window: "7d",
+		windowLabel: null,
+		plan: null,
+		usedPct,
+		resetsAt,
+	});
+	test("names the lead or lag of the quota against the window's clock", () => {
+		// 7d window, 84h left: half the time gone.
+		expect(windowPace(lim(75, now + 84 * H), now)).toEqual({
+			label: "1d 18h ahead",
+			pace: "ahead",
+		});
+		expect(windowPace(lim(25, now + 84 * H), now)).toEqual({
+			label: "1d 18h behind",
+			pace: "behind",
+		});
+		expect(windowPace(lim(50, null), now)).toBeNull();
+	});
+	test("holds 'on pace' inside the 30 minute deadzone, not past it", () => {
+		// 7d = 168h; 1 point = 1.68h. 0.25 points = 25.2m (inside), 0.5 points = 50.4m (outside).
+		expect(windowPace(lim(50.25, now + 84 * H), now)?.pace).toBe("on");
+		expect(windowPace(lim(49.75, now + 84 * H), now)?.pace).toBe("on");
+		expect(windowPace(lim(50.5, now + 84 * H), now)?.pace).toBe("ahead");
+		expect(windowPace(lim(49.5, now + 84 * H), now)?.pace).toBe("behind");
+	});
+});
+
+describe("modelPace", () => {
+	const H = 3_600_000;
+	const now = 1_000 * H;
+	const lim = (
+		provider: string,
+		window: string,
+		usedPct: number,
+		resetsAt: number,
+	) => ({
+		provider,
+		label: window,
+		window,
+		windowLabel: null,
+		plan: null,
+		usedPct,
+		resetsAt,
+	});
+	test("a used-up window wins and names when the provider is back", () => {
+		const limits = [
+			lim("openai-codex", "5h", 12, now + 4 * H),
+			lim("openai-codex", "7d", 100, now + 2 * H),
+		];
+		expect(modelPace(limits, "openai-codex/gpt-6-sol", now)).toEqual({
+			label: "limit · back in 2h 0m",
+			pace: "full",
+		});
+	});
+	test("otherwise the window furthest ahead of its clock, only for the model's provider", () => {
+		const limits = [
+			// 5h, 1h left: 80 % of the time gone, 42 % used → 38 points behind.
+			lim("anthropic", "5h", 42, now + H),
+			// 7d, 84h left: 50 % gone, 81 % used → 31 points ahead.
+			lim("anthropic", "7d", 81, now + 84 * H),
+			lim("openai-codex", "7d", 100, now + 2 * H),
+		];
+		expect(modelPace(limits, "anthropic/claude-sonnet-5-5", now)?.pace).toBe(
+			"ahead",
+		);
+		expect(modelPace(limits, "ollama/llama", now)).toBeNull();
 	});
 });
 
@@ -9632,7 +9709,7 @@ describe("Drawer proposal decision panel", () => {
 		expect(html).toMatch(/<div class="decide-reason"><svg class="icon-svg"/);
 	});
 
-	test("a proposal card in needs_you renders exactly one Accept button", () => {
+	test("a proposal card in needs_you renders one Accept, the model picker, and no Reply composer", () => {
 		const task = cardFixture({
 			...drawerFields,
 			stage: "todo",
@@ -9645,8 +9722,16 @@ describe("Drawer proposal decision panel", () => {
 		const accepts = html.match(/title="Start the proposed task"/g) ?? [];
 		expect(accepts).toHaveLength(1);
 		expect(html.match(/>Accept<\/button>/g) ?? []).toHaveLength(1);
-		// The composer itself stays: Reply keeps rendering under it.
-		expect(html).toContain('id="drawer-reply"');
+		// Nothing to reply to before Accept: the composer stays hidden until the task starts.
+		expect(html).not.toContain('id="drawer-reply"');
+		// The first turn's model is picked in the Decide panel, beside Accept.
+		const decide = html.slice(
+			html.indexOf('id="drawer-decide"'),
+			html.indexOf("</section>", html.indexOf('id="drawer-decide"')),
+		);
+		expect(decide).toMatch(
+			/<div class="decide-model"><div class="model-fields">/,
+		);
 	});
 
 	test("the reply band starts folded: a reply field and a Reply head, the form not open", () => {

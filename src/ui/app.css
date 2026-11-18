@@ -1101,6 +1101,11 @@ textarea {
 	max-height: calc(100dvh - var(--bar-h) - 18px);
 	overflow: auto;
 }
+/* The System popover's quota table carries five columns (label, bars, used, pace, resets):
+   the wider box keeps window labels readable. */
+#system-detail {
+	width: 480px;
+}
 @supports (position-anchor: --a) {
 	.meters {
 		anchor-name: --meters;
@@ -1294,10 +1299,26 @@ textarea {
    (.quota h3). The list gap holds 2px to the group's first row; the margin lifts the
    heading off the row above, so a group reads as one labelled chunk. */
 .model-heading {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: 8px;
 	margin: 7px 0 0;
 	font-size: 12px;
 	font-weight: 600;
 	color: var(--text);
+}
+/* The quota pace beside a role row or provider heading: the System popover's pace colors. */
+.model-option-end {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	flex: none;
+}
+.model-pace {
+	font-size: 11.5px;
+	font-weight: 400;
+	white-space: nowrap;
 }
 /* Trigger: "model level" (Gemini's "Argon Mittel"): the model in the bright tone, the level
    after a space in the dim tone, so the model name reads first. */
@@ -1434,6 +1455,10 @@ textarea {
 	font-weight: 600;
 	color: var(--text-strong);
 }
+/* In the quota table the headline sits in the head row's label cell. */
+.qt-head > h2 {
+	margin: 0;
+}
 .caption {
 	margin: 6px 0 0;
 	font-size: 12px;
@@ -1537,7 +1562,7 @@ textarea {
    differ in shape and weight (a thin bright line with an end dot, a boxed grey bar), not only tone. */
 .qt {
 	display: grid;
-	grid-template-columns: minmax(0, 1fr) 96px 3.2em 4.6em;
+	grid-template-columns: minmax(0, 1fr) 96px 3.2em 7.6em 4.6em;
 	align-items: center;
 	gap: 5px 10px;
 	font-size: 12.5px;
@@ -1553,6 +1578,7 @@ textarea {
 }
 .qt-num,
 .qt-val,
+.qt-pace,
 .qt-reset {
 	text-align: right;
 }
@@ -1571,6 +1597,22 @@ textarea {
 	font-size: 12px;
 	font-weight: 600;
 	color: var(--text);
+}
+/* Provider head: the name, then its banked resets, and the usage page link at the right. */
+.qt-provider {
+	display: flex;
+	align-items: baseline;
+	gap: 10px;
+}
+.qt-credits {
+	font-weight: 400;
+	color: var(--accent);
+}
+.qt-provider > a {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	color: inherit;
 }
 .qt-label {
 	min-width: 0;
@@ -1612,8 +1654,21 @@ textarea {
 .qt-row[data-level="crit"] .qt-val {
 	color: var(--crit-text);
 }
-.qt-reset {
+.qt-reset,
+.qt-pace {
 	color: var(--dim);
+}
+/* Pace reads at a glance: amber when the quota runs ahead of the clock (slow down), steel
+   accent when it lags behind (room to spend). DESIGN.md keeps green for diff text only. */
+.qt-pace[data-pace="ahead"] {
+	color: var(--alarm);
+}
+.qt-pace[data-pace="behind"] {
+	color: var(--accent);
+}
+/* A used-up window (the model picker's "limit · back in …") reads critical. */
+.qt-pace[data-pace="full"] {
+	color: var(--crit-text);
 }
 .qt-key .qt-time,
 .qt-key .qt-used {
@@ -2815,24 +2870,6 @@ a[data-card-link] {
 	width: fit-content;
 	max-width: 100%;
 	overflow-wrap: anywhere;
-}
-.fu-list a {
-	display: flex;
-	align-items: baseline;
-	justify-content: space-between;
-	gap: 12px;
-	width: 100%;
-	min-height: 32px;
-	padding: 5px 10px;
-	border: 1px solid transparent;
-	border-radius: 4px;
-	background: none;
-	font: inherit;
-	font-size: 13px;
-	color: var(--text);
-	text-align: left;
-	text-decoration: none;
-	cursor: pointer;
 }
 /* The source card id inside a proposal reason: a real link, underlined so it reads
    as one; the accent carries the hover and focus states. */
@@ -4048,10 +4085,6 @@ a.pr-link:hover {
    the hue never carries the warning alone. */
 .sys tr[data-warn] > * {
 	background: var(--alarm-bg);
-}
-.fu-list a:hover {
-	background: var(--card);
-	color: var(--text-strong);
 }
 .needs-reason a:hover,
 .needs-reason a:focus-visible,
@@ -7222,6 +7255,10 @@ dialog.drawer[open]::backdrop {
 	border-radius: 50%;
 	background: var(--well);
 }
+/* Waiting for: the blocking cards as bare nodes, no thread; a dependency is no lineage. */
+.lineage-deps li::before {
+	display: none;
+}
 /* This card is always the rail's last item: its node and thread end at its own row (15px, half a
    30px row), not at the middle of the item, which also holds the follow-up branch. */
 .lineage-rail .lineage-self::after {
@@ -7370,42 +7407,6 @@ a.lineage-row:hover .lineage-title {
 }
 .st-running {
 	color: var(--text-strong);
-}
-/* Related-task rows (dependencies, follow-ups): one quiet list, a full-row click target per task;
-   the status word reuses the meta line's coding (dim, amber only for needs-you, steel for an asked
-   round). Kept below the .st rules so specificity never descends. */
-.fu-list {
-	list-style: none;
-	margin: 0;
-	padding: 0;
-	display: grid;
-	gap: 2px;
-	/* The track shrinks to the drawer, so a long title ellipsizes instead of pushing the status
-	   off a phone screen (the auto track grew to the title's full width). */
-	grid-template-columns: minmax(0, 1fr);
-}
-.fu-title {
-	min-width: 0;
-	overflow: hidden;
-	white-space: nowrap;
-	text-overflow: ellipsis;
-	/* Links are steel, same as the parent chip above. */
-	color: var(--accent);
-}
-/* Related-row key: the card's speaking id (e.g. OTTR-6), same quiet mono metadata as the card head. */
-.fu-list .fu-key {
-	flex: none;
-	font-family: var(--mono);
-	font-size: 11.5px;
-	color: var(--dim); /* at least 4.5:1 on --card */
-	font-variant-numeric: tabular-nums;
-}
-.fu-list a:hover .fu-title {
-	color: var(--accent-hover);
-}
-.fu-list .st {
-	flex: none;
-	font-size: 12px;
 }
 .fu-head button:hover {
 	color: var(--text-strong);
@@ -7666,6 +7667,10 @@ button.diff-path {
 	/* Git errors carry the GitHub-API hint on a following line ("GitHub: …"); keep it under. */
 	white-space: pre-line;
 }
+/* The usage-hold hint reads as the reason's next step: tucked under the box. */
+.hint.hold-next {
+	margin: -2px 0 8px;
+}
 .needs-reason::before {
 	content: "";
 	flex: none;
@@ -7675,22 +7680,39 @@ button.diff-path {
 	background: var(--alarm);
 	clip-path: polygon(50% 0, 100% 100%, 0 100%);
 }
-/* The proposal's decision is one recessed card: a dim byline (the reason, led by the
-   lineage arrow, never the amber triangle), the summary and the full prompt, then a
-   footer bar with Accept and Edit at the right, like a dialog's actions. */
+/* The proposal's decision takes the ask panel's box and the board card's proposal border
+   (dashed, --line-hover): no fill and no inner rules. The summary leads in bold behind the
+   grey waiting mark like a question, the dim byline (the reason, led by the lineage arrow,
+   never the amber triangle) and the full prompt follow, then the model and the buttons. */
 .decide-card {
-	margin: 8px 0 0;
-	background: var(--well);
-	border: 1px solid var(--line);
+	margin: 8px 0;
+	padding: 14px;
+	border: 1px dashed var(--line-hover);
 	border-radius: 6px;
 }
 .decide-body {
-	padding: 4px 14px 12px;
+	display: flex;
+	flex-direction: column;
+}
+.decide-ask {
+	display: flex;
+	align-items: flex-start;
+	gap: 7px;
+	margin: 0 0 6px;
+	color: var(--text-strong);
+}
+.decide-ask > .mark {
+	flex: none;
+	margin-top: 3px;
+}
+.decide-ask > :not(.mark) {
+	flex: 1;
+	min-width: 0;
 }
 .decide-reason {
 	display: flex;
 	gap: 8px;
-	margin: 8px 0 0;
+	margin: 2px 0 0;
 	font-size: 12.5px;
 	color: var(--dim);
 	overflow-wrap: anywhere;
@@ -7706,7 +7728,7 @@ button.diff-path {
 	display: grid;
 	grid-template-columns: max-content minmax(0, 1fr);
 	gap: 2px 14px;
-	margin: 10px 0 0;
+	margin: 0;
 }
 .decide-facts > div {
 	display: contents;
@@ -7715,8 +7737,7 @@ button.diff-path {
 	color: var(--dim);
 }
 .decide-fallback {
-	margin: 10px 0 0;
-	color: var(--text-strong);
+	font-weight: 600;
 	overflow-wrap: anywhere;
 }
 .meta div {
@@ -7730,8 +7751,11 @@ button.diff-path {
 	display: flex;
 	justify-content: flex-end;
 	gap: 8px;
-	padding: 10px 14px;
-	border-top: 1px solid var(--line);
+	padding: 14px 0 0;
+}
+/* The model the first turn runs with sits over the decision buttons. */
+.decide-model {
+	padding: 14px 0 0;
 }
 .decide-actions .primary {
 	min-width: 96px;
@@ -8366,10 +8390,9 @@ button.log-mode[aria-pressed="true"] {
 	margin-top: 8px;
 	font-size: 0;
 }
-/* New task / Follow up: the caption's name group joins the picker's own row — the visible
-   "(optional)" sits in the elastic gap column, flush against the model trigger. Left loose,
-   the head drops to an implicit full-width row below the box, where the mark reads as a
-   stray label of the actions row under the card. The quota chip keeps its implicit row. */
+/* New task / Follow up: the caption's name group (hidden at font-size 0, kept for the label's
+   accessible name) joins the picker's own row. Left loose, the head drops to an implicit
+   full-width row below the box. The quota chip keeps its implicit row. */
 .prompt-card > .model-fields .field-head {
 	display: contents;
 }

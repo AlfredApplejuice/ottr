@@ -318,7 +318,7 @@ test("the seeded retro files a proposal that waits for a decision", () => {
 			"SELECT value FROM settings WHERE key = 'next-task-num'",
 		)
 		.get()!.value;
-	expect(JSON.parse(counter)).toBe(14);
+	expect(JSON.parse(counter)).toBe(16);
 });
 
 // The dev board shows the mutation meter only when progress parses as a Stryker line, so

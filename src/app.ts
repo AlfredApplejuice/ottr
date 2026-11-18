@@ -8239,8 +8239,31 @@ export async function createApp(deps: AppDeps) {
 		// card has no live run: the pick pre-stages the model its reply turn spawns with.
 		const model = modelParam(r.body);
 		if (model instanceof Response) return model;
-		const res = await applyUserEdit(e, task, { model }, r.body);
+		// `resume: true` on a queued card held for a usage limit ends the hold with the switch,
+		// so the card starts on the new model; the start gate still checks that model's quota
+		// and holds again when it is used up too.
+		const resume =
+			r.body.resume === true &&
+			task.state === "queued" &&
+			task.holdUntil !== null &&
+			task.holdProvider !== null;
+		const res = await applyUserEdit(
+			e,
+			task,
+			resume
+				? {
+						model,
+						holdUntil: null,
+						holdProvider: null,
+						holdWindow: null,
+						holdSetAt: null,
+						needsReason: null,
+					}
+				: { model },
+			r.body,
+		);
 		if (res instanceof Response) return res;
+		if (resume) await deps.schedule();
 		return json(await taskView(e, res));
 	}
 

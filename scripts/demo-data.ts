@@ -64,6 +64,14 @@ export interface Spec {
 	retro?: boolean;
 	/** Index of the retro card this pending proposal continues; seeds the proposal reason and lineage link. */
 	proposalOf?: number;
+	/** A queued card held by the start gate at its model's exhausted quota (turn.ts
+	 *  gateUsageStart): the picked model, its provider and window, and minutes to the reset. */
+	usageHold?: {
+		model: string;
+		provider: string;
+		window: string;
+		inMin: number;
+	};
 }
 
 export interface ProjectSpec {
@@ -204,6 +212,28 @@ const POOL: ProjectSpec[] = [
 				state: "needs_you",
 				age: 1.4,
 				proposalOf: 12,
+			},
+			{
+				title: "Tune the presence sensor debounce for hallway lights",
+				stage: "todo",
+				state: "queued",
+				age: 0.2,
+				// Mirrors the demo usage report's used-up Codex 7 Day window (src/dev.ts OTTR_DEMO_USAGE).
+				usageHold: {
+					model: "openai-codex/gpt-6-sol",
+					provider: "openai-codex",
+					window: "7d",
+					inMin: 42,
+				},
+			},
+			{
+				// Lineage and a dependency on one card: the drawer shows both rails.
+				title: "Carry the legend contrast fix over to the energy charts",
+				stage: "todo",
+				state: "queued",
+				age: 0.3,
+				followUpOf: 10,
+				deps: [4],
 			},
 		],
 	},
@@ -508,7 +538,18 @@ export function insertTaskRow(
 	);
 	// A proposal links its retro; a follow-up links the card it continues.
 	const { followUpOf, proposalReason } = seedLinks(prefix, project, t);
-	const needs = proposalReason ?? t.needs ?? null;
+	const hold = t.usageHold;
+	const holdUntil = hold === undefined ? null : now + hold.inMin * MIN;
+	const holdAt =
+		holdUntil === null
+			? ""
+			: new Date(holdUntil).toISOString().slice(0, 16).replace("T", " ");
+	const needs =
+		proposalReason ??
+		t.needs ??
+		(hold === undefined
+			? null
+			: `The ${hold.provider} usage limit is reached. The board starts the task again after the limit resets at ${holdAt} UTC. Send a message to run it now, or cancel the card.`);
 	// queued_at marks cards that sit in a queue right now.
 	const queuedAt = t.state === "queued" ? createdAt : null;
 	const updatedAt =
@@ -517,8 +558,9 @@ export function insertTaskRow(
 		`INSERT INTO tasks (id, title, prompt, stage, state, needs_reason, pending_prompt,
 			 research, asked, release_version, release_notes, follow_up_of, depends_on,
 			 created_at, updated_at, queued_at, cancelled_at, done_at, commits,
-			 session_id, session_title, kind)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 session_id, session_title, kind, model, hold_until, hold_provider, hold_window,
+			 hold_set_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			id,
 			t.retro ? retroPrompt.slice(0, 80) : t.title.slice(0, 80),
@@ -542,6 +584,11 @@ export function insertTaskRow(
 			`demo-${id}`,
 			(t.retro ? retroPrompt : t.title).slice(0, 60),
 			taskKind(t),
+			hold?.model ?? null,
+			holdUntil,
+			hold?.provider ?? null,
+			hold?.window ?? null,
+			hold === undefined ? null : now - 10 * MIN,
 		],
 	);
 	return { id, prompt, createdAt, isDone, spec: t };

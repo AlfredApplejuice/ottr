@@ -8,6 +8,7 @@ import {
 	useState,
 } from "react";
 import { createRoot } from "react-dom/client";
+import { forModel, usageReset } from "../quota.ts";
 import type {
 	ProjectView,
 	QuotaLimit,
@@ -943,6 +944,58 @@ export function windowGone(l: QuotaLimit, now: number): number | null {
 	const ms = windowLengthMs(l);
 	if (ms === null || ms <= 0) return null;
 	return clamp(100 - ((l.resetsAt - now) / ms) * 100, 0, 100);
+}
+
+/** Lead or lag under this stays "on pace": a few minutes either way is noise, not a signal. */
+const PACE_DEADZONE_MS = 30 * 60_000;
+
+/** How far the quota use runs from the window's clock, as time: "2d 5h ahead" when more quota
+ *  is used than time has gone (the window burns faster than it runs: slow down), "2d 5h behind"
+ *  when less (room to spare), "on pace" within PACE_DEADZONE_MS. Null when the window length
+ *  or the reset is unknown. */
+export function windowPace(
+	l: QuotaLimit,
+	now: number,
+): { label: string; pace: "ahead" | "behind" | "on" } | null {
+	const gone = windowGone(l, now);
+	const ms = windowLengthMs(l);
+	if (gone === null || ms === null) return null;
+	const lead = ((clamp(l.usedPct, 0, 100) - gone) / 100) * ms;
+	if (Math.abs(lead) < PACE_DEADZONE_MS)
+		return { label: "on pace", pace: "on" };
+	const pace = lead > 0 ? "ahead" : "behind";
+	return { label: `${duration(Math.abs(lead))} ${pace}`, pace };
+}
+
+/** The quota note a model picker row shows for the model's provider: "limit · back in 2h 5m"
+ *  while a window is used up (usageReset's binding reset), else the pace of the window that
+ *  runs furthest ahead of its clock, the one that stops agents first. Null without windows. */
+export function modelPace(
+	limits: QuotaLimit[],
+	selector: string,
+	now: number,
+): { label: string; pace: "ahead" | "behind" | "on" | "full" } | null {
+	const mine = forModel(limits, selector);
+	if (mine.some((l) => l.usedPct >= 100)) {
+		const back = usageReset(limits, selector, now);
+		return {
+			label:
+				back === null
+					? "limit reached"
+					: `limit · back in ${until(back.resetsAt, now)}`,
+			pace: "full",
+		};
+	}
+	let worst: QuotaLimit | null = null;
+	let worstPts = Number.NEGATIVE_INFINITY;
+	for (const l of mine) {
+		const gone = windowGone(l, now);
+		if (gone !== null && l.usedPct - gone > worstPts) {
+			worst = l;
+			worstPts = l.usedPct - gone;
+		}
+	}
+	return worst === null ? null : windowPace(worst, now);
 }
 
 /** One usage window in Settings: label, percent, the app bar's time-over-quota twin bar, reset countdown. */

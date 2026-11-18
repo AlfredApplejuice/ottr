@@ -1453,8 +1453,19 @@ export interface QuotaLimit {
 	resetsAt: number | null;
 }
 
+/** One provider's banked rate-limit resets as omp reports them (OpenAI Codex, Anthropic). */
+export interface QuotaResetCredits {
+	provider: string;
+	/** Resets the account can redeem now. */
+	available: number;
+	/** Epoch ms when the soonest available reset expires; null when omp names none. */
+	nextExpiry: number | null;
+}
+
 export interface QuotaState {
 	limits: QuotaLimit[];
+	/** Banked resets per provider that reports them; absent from boards that predate them. */
+	resetCredits?: QuotaResetCredits[];
 	/** Why the last check failed; limits are empty then. */
 	error: string | null;
 	/** Epoch ms of the last check. */

@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import {
+	fetchQuota,
 	forModel,
+	parseResetCredits,
 	parseUsage,
 	providerBlocked,
 	tightest,
@@ -71,6 +73,45 @@ const REPORT = JSON.stringify({
 			],
 		},
 	],
+});
+
+test("fetchQuota reads the dev board's OTTR_DEMO_USAGE report instead of spawning omp", async () => {
+	// PATH empty: a spawn would fail and report an error, never these limits.
+	const q = await fetchQuota({ OTTR_DEMO_USAGE: REPORT, PATH: "" });
+	expect(q.error).toBeNull();
+	expect(q.limits).toEqual(parseUsage(REPORT));
+});
+
+test("parseResetCredits counts each provider's banked resets and its soonest available expiry", () => {
+	// Shape of real `omp usage --json` resetCredits (2026-11-18), personal fields dropped.
+	const text = JSON.stringify({
+		reports: [
+			{
+				provider: "anthropic",
+				resetCredits: { availableCount: 0, eligible: false, credits: [] },
+			},
+			{
+				provider: "openai-codex",
+				resetCredits: {
+					availableCount: 2,
+					credits: [
+						{ expiresAt: "2026-12-12T22:49:09.302959Z", status: "available" },
+						{ expiresAt: "2026-11-01T00:00:00Z", status: "redeemed" },
+						{ expiresAt: "2026-11-30T19:17:30.520363Z", status: "available" },
+					],
+				},
+			},
+			{ provider: "zai", limits: [] },
+		],
+	});
+	expect(parseResetCredits(text)).toEqual([
+		{ provider: "anthropic", available: 0, nextExpiry: null },
+		{
+			provider: "openai-codex",
+			available: 2,
+			nextExpiry: Date.parse("2026-11-30T19:17:30.520363Z"),
+		},
+	]);
 });
 
 test("maps every usable limit to provider, label, percent, reset and plan, dropping the rest of the account metadata", () => {

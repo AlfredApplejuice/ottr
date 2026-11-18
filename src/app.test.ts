@@ -7539,6 +7539,44 @@ describe("model switch route", () => {
 		expect((await store.getTask(t.id))!.model).toBe("zai/glm-5.3-flash");
 	});
 
+	test("resume on a usage-held queued card ends the hold with the switch; without it the hold stays", async () => {
+		const held = {
+			holdUntil: Date.now() + 3_600_000,
+			holdProvider: "openai-codex",
+			holdWindow: "7d",
+			holdSetAt: Date.now(),
+			needsReason: "The openai-codex usage limit is reached.",
+		};
+		const t = await store.createTask("held");
+		await store.updateTask(t.id, held);
+		await post(`/api/projects/p1/tasks/${t.id}/model`, {
+			model: "anthropic/claude-sonnet-5-5",
+		});
+		expect((await store.getTask(t.id))!.holdUntil).toBe(held.holdUntil);
+		const res = await post(`/api/projects/p1/tasks/${t.id}/model`, {
+			model: "anthropic/claude-sonnet-5-5",
+			resume: true,
+		});
+		expect(res.status).toBe(200);
+		const after = (await store.getTask(t.id))!;
+		expect(after.model).toBe("anthropic/claude-sonnet-5-5");
+		expect(after).toMatchObject({
+			holdUntil: null,
+			holdProvider: null,
+			holdWindow: null,
+			holdSetAt: null,
+			needsReason: null,
+		});
+		// A card held for something else (an open prompt edit: no provider) keeps its hold.
+		const edit = await store.createTask("edit hold");
+		await store.updateTask(edit.id, { holdUntil: Date.now() + 60_000 });
+		await post(`/api/projects/p1/tasks/${edit.id}/model`, {
+			model: "x/y",
+			resume: true,
+		});
+		expect((await store.getTask(edit.id))!.holdUntil).not.toBeNull();
+	});
+
 	test("absent or non-string model is 400", async () => {
 		const t = await store.createTask("validate me");
 		const absent = await post(`/api/projects/p1/tasks/${t.id}/model`, {});

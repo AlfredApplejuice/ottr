@@ -208,6 +208,7 @@ const card = (over: Partial<TaskCard>): TaskCard =>
 		releaseVersion: null,
 		followUpOf: null,
 		asked: null,
+		needsReason: null,
 		...over,
 	}) as TaskCard;
 
@@ -327,6 +328,25 @@ test("splitAlarms splits plain needs from asks and counts preparing as running",
 	expect(split.needs.map((x) => x.id)).toEqual(["n1"]);
 	expect(split.asks.map((x) => x.id)).toEqual(["n2"]);
 	expect(split.running.map((x) => x.id)).toEqual(["n3", "n4"]);
+});
+
+test("a proposal waits: no needs mark, outside every alarm group", () => {
+	const reason =
+		'Retro proposal from t3 ("Fix the widget"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.';
+	const proposal = card({ id: "p1", state: "needs_you", needsReason: reason });
+	const blocker = card({
+		id: "p2",
+		state: "needs_you",
+		needsReason: "hit a blocker",
+	});
+	expect(cardMark(proposal)).toBe("queued");
+	expect(cardMark(blocker)).toBe("needs");
+	// A cancelled proposal keeps the cancelled mark.
+	expect(cardMark({ ...proposal, cancelledAt: 5 })).toBe("cancelled");
+	const split = splitAlarms([proposal, blocker]);
+	expect(split.needs.map((x) => x.id)).toEqual(["p2"]);
+	expect(split.asks).toEqual([]);
+	expect(split.running).toEqual([]);
 });
 
 test("alarmLabel singular, plural, and empty", () => {

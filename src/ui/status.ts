@@ -1,3 +1,4 @@
+import { isProposalReason } from "../prompts.ts";
 import {
 	type DepIndex,
 	depHold,
@@ -228,7 +229,7 @@ export function statusLine(
 /** The card's state mark. A card idle short of done (a review parked while its findings land)
  * waits like a queued one: only a done card earns the check; a cancelled card earns the x. */
 export function cardMark(
-	t: Pick<Task, "cancelledAt" | "state" | "stage" | "asked">,
+	t: Pick<Task, "cancelledAt" | "state" | "stage" | "asked" | "needsReason">,
 ):
 	| "needs"
 	| "asked"
@@ -238,9 +239,22 @@ export function cardMark(
 	| "done"
 	| "cancelled" {
 	if (t.cancelledAt !== null) return "cancelled";
+	// A proposal is a suggestion, not a fault: it waits like a card not started yet.
+	if (isProposal(t)) return "queued";
 	if (t.state === "needs_you") return t.asked !== null ? "asked" : "needs";
 	if (t.state === "running" || t.state === "preparing") return t.state;
 	return t.state === "queued" || t.stage !== "done" ? "queued" : "done";
+}
+
+/** A retro or fork proposal waiting for the operator's decision: not started, never an alarm. */
+export function isProposal(
+	t: Pick<Task, "state" | "cancelledAt" | "needsReason">,
+): boolean {
+	return (
+		t.state === "needs_you" &&
+		t.cancelledAt === null &&
+		isProposalReason(t.needsReason)
+	);
 }
 
 /** The hold statusLine shows for `t`, over the whole project (`tasks` spans every lane): a
@@ -305,7 +319,8 @@ export function releaseHolding(
 }
 
 /** The alarm split the overview, the areas nav and the notifications share: plain needs_you
- * cards, needs_you cards with an outstanding ask, and live work (preparing counts as running). */
+ * cards, needs_you cards with an outstanding ask, and live work (preparing counts as running).
+ * A proposal is in none of them: it waits for a decision, it does not need action. */
 export function splitAlarms(tasks: readonly TaskCard[]): {
 	needs: TaskCard[];
 	asks: TaskCard[];
@@ -315,6 +330,7 @@ export function splitAlarms(tasks: readonly TaskCard[]): {
 	const asks: TaskCard[] = [];
 	const running: TaskCard[] = [];
 	for (const t of tasks) {
+		if (isProposal(t)) continue;
 		if (t.state === "needs_you") (t.asked !== null ? asks : needs).push(t);
 		else if (t.state === "running" || t.state === "preparing") running.push(t);
 	}

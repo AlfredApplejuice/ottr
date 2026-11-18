@@ -34,7 +34,7 @@ import {
 	IMPLEMENT_RECOMMENDATIONS,
 	isProposalReason,
 } from "../prompts.ts";
-import { forModel, tightest, tightestFor } from "../quota.ts";
+import { forModel, providerOf, tightest, tightestFor } from "../quota.ts";
 import { missingByUse, type SkillUse } from "../requiredSkills.ts";
 import {
 	type DepIndex,
@@ -64,6 +64,7 @@ import {
 	type ProjectView,
 	type ProvisioningResponse,
 	type PrReviewView,
+	type QuotaResetCredits,
 	type QuotaState,
 	REVIEW_BODY_MAX,
 	type ReleasePlan,
@@ -144,6 +145,7 @@ import {
 	useOptimisticValue,
 	useQuota,
 	windowGone,
+	windowPace,
 	ZoomableImage,
 } from "./kit.tsx";
 import { Markdown } from "./markdown.tsx";
@@ -250,6 +252,7 @@ import {
 	cardMark,
 	holdFor,
 	holdLeft,
+	isProposal,
 	reReleaseOf,
 	splitAlarms,
 	statusLine,
@@ -701,24 +704,11 @@ function cardDerived(task: TaskCard): {
 	return { sp, spLeft, silent, commits, held };
 }
 
-/** A retro proposal waiting for the operator's decision: not started, never an error. */
-function isProposalCard(
-	task: Pick<TaskCard, "state" | "cancelledAt" | "needsReason">,
-): boolean {
-	return (
-		task.state === "needs_you" &&
-		task.cancelledAt === null &&
-		isProposalReason(task.needsReason)
-	);
-}
-
-/** The card's top line: mark, id, unread/research/cancelled flags, main-loop model. A
- *  proposal takes the grey queued ring: it waits like a card not started yet. */
+/** The card's top line: mark, id, unread/research/cancelled flags, main-loop model. */
 function cardHead(
 	task: TaskCard,
 	unread: boolean,
 	catalog: ModelCatalog | null,
-	proposal: boolean,
 ): ReactNode {
 	return (
 		<span className="card-head">
@@ -727,7 +717,7 @@ function cardHead(
 				// icon button toggles it, the card carries only the state.
 				<Mark kind="star" />
 			) : (
-				<Mark kind={proposal ? "queued" : cardMark(task)} />
+				<Mark kind={cardMark(task)} />
 			)}
 			<span className="card-key" title={`Task ${task.id}`}>
 				{task.id}
@@ -1072,7 +1062,7 @@ const Card = memo(function Card({
 	const catalog = useModels();
 	const release = releaseOf(task);
 	const { sp, spLeft, silent, commits, held } = cardDerived(task);
-	const proposal = isProposalCard(task);
+	const proposal = isProposal(task);
 	return (
 		// A stretched link opens the card; the release link sits beside it, never nested in it.
 		// biome-ignore lint/a11y/noStaticElementInteractions: HTML5 drag-and-drop on the card shell; keyboard users act through the stretched link inside
@@ -1104,7 +1094,7 @@ const Card = memo(function Card({
 				}
 				onClick={(e) => navClick(e, () => onOpen(task.id))}
 			>
-				{cardHead(task, unread, catalog, proposal)}
+				{cardHead(task, unread, catalog)}
 				<span className="card-title">{task.sessionTitle ?? task.title}</span>
 				{/* A proposal is a suggestion, not a fault: its reason stays in the tooltip and the
 				    drawer's decision panel, never as the amber error line. */}
@@ -1266,6 +1256,7 @@ function quotaRow(l: QuotaState["limits"][number]): ReactNode {
 				</span>
 			</span>
 			<span className="qt-val">{Math.round(l.usedPct)} %</span>
+			{quotaPaceCell(l)}
 			<span
 				className="qt-reset"
 				title={l.resetsAt === null ? undefined : `Resets ${stamp(l.resetsAt)}`}
@@ -1276,13 +1267,73 @@ function quotaRow(l: QuotaState["limits"][number]): ReactNode {
 	);
 }
 
+/** The pace cell: amber "ahead" says slow down, steel "behind" says there is room to spend,
+ *  dim "on pace" says neither. */
+function quotaPaceCell(l: QuotaState["limits"][number]): ReactNode {
+	const p = windowPace(l, Date.now());
+	return (
+		<span className="qt-pace" data-pace={p?.pace}>
+			{p?.label ?? "–"}
+		</span>
+	);
+}
+
+/** Each provider's own usage page, where the account's windows and banked resets live. */
+const PROVIDER_USAGE_PAGES: Record<string, string> = {
+	anthropic: "https://claude.ai/settings/usage",
+	"openai-codex": "https://chatgpt.com/settings/usage?tab=overview",
+	zai: "https://z.ai/manage-apikey/coding-plan/personal/usage",
+};
+
+/** A provider's head row in the quota table: its name, linked to its usage page when the
+ *  provider has one, then the banked resets it can redeem now (only when there are any). */
+function quotaProviderHead(
+	provider: string,
+	credits: QuotaResetCredits | undefined,
+): ReactNode {
+	const page = PROVIDER_USAGE_PAGES[provider];
+	return (
+		<h3 className="qt-provider">
+			{page === undefined ? (
+				<span>{provider}</span>
+			) : (
+				<a
+					href={page}
+					target="_blank"
+					rel="noopener noreferrer"
+					title={`Open the ${provider} usage page`}
+				>
+					{provider}
+					<Icon name="external-link" size={12} />
+				</a>
+			)}
+			{credits !== undefined && credits.available > 0 && (
+				<span
+					className="qt-credits"
+					title={
+						credits.nextExpiry === null
+							? undefined
+							: `The next one expires ${stamp(credits.nextExpiry)}`
+					}
+				>
+					{credits.available === 1
+						? "1 reset available"
+						: `${fmtNum(credits.available)} resets available`}
+				</span>
+			)}
+		</h3>
+	);
+}
+
 /** The Provider quota section of the System popover; one row per window per provider.
  *  One row per window: a thin time line over the quota bar, so a quota bar longer than
  *  its time line means the window burns faster than it runs. */
 function systemQuotaSection(quota: QuotaState | null): ReactNode {
 	return (
 		<section>
-			<h2>Provider quota</h2>
+			{(quota === null ||
+				quota.error !== null ||
+				quota.limits.length === 0) && <h2>Provider quota</h2>}
 			{quota === null ? (
 				<p className="caption">Checking omp usage…</p>
 			) : quota.error !== null ? (
@@ -1294,9 +1345,11 @@ function systemQuotaSection(quota: QuotaState | null): ReactNode {
 			) : (
 				<>
 					<div className="qt">
-						<div className="qt-head" aria-hidden="true">
-							<span />
-							<span className="qt-key">
+						{/* The headline takes the head row's empty label cell; the column keys
+						    beside it are visual only. */}
+						<div className="qt-head">
+							<h2>Provider quota</h2>
+							<span className="qt-key" aria-hidden="true">
 								<span>
 									<span className="qt-time">
 										<i />
@@ -1310,13 +1363,23 @@ function systemQuotaSection(quota: QuotaState | null): ReactNode {
 									quota
 								</span>
 							</span>
-							<span className="qt-num">used</span>
-							<span className="qt-num">resets</span>
+							<span className="qt-num" aria-hidden="true">
+								used
+							</span>
+							<span className="qt-num" aria-hidden="true">
+								pace
+							</span>
+							<span className="qt-num" aria-hidden="true">
+								resets
+							</span>
 						</div>
 						{[...Map.groupBy(quota.limits, (l) => l.provider)].map(
 							([provider, limits]) => (
 								<Fragment key={provider}>
-									<h3>{provider}</h3>
+									{quotaProviderHead(
+										provider,
+										quota.resetCredits?.find((c) => c.provider === provider),
+									)}
 									{limits.map((l) => quotaRow(l))}
 								</Fragment>
 							),
@@ -2466,12 +2529,9 @@ function ModelField({
 				{/* biome-ignore lint/a11y/noLabelWithoutControl: the label wraps the picker's trigger button, which sits inside ModelMenuTrigger */}
 				<label className="field">
 					<span className="field-head">
-						{/* Name and mark share one flex child: the head is space-between, so a loose
-						    third child would float mid-row between label and quota chip. */}
-						<span className="field-head-name">
-							Model
-							<span className="opt-mark">(optional)</span>
-						</span>
+						{/* The name stays one flex child: the head is space-between, so the quota
+						    chip sits at the right edge. */}
+						<span className="field-head-name">Model</span>
 						{/* Every window as the top bar's twin bar (time gone over quota used) plus its used
 						    percent; only a window past the band turns amber, a critical one red. */}
 						{modelQuotaChip(limits, worst)}
@@ -2506,6 +2566,7 @@ function ModelField({
 				shown={models.length}
 				total={allModels.length}
 				loading={catalog === null}
+				defaultModel={catalog?.defaultModel ?? undefined}
 				onPick={pickModel}
 				after={modelLevelAfter(
 					menu,
@@ -8851,17 +8912,20 @@ export async function implementSteps(o: {
 /** moved to ../types.ts (the server resolves stored steps too, OTTR-488) */
 export { recommendsSteps };
 
-/** Related cards in the drawer (dependencies, follow-ups): one quiet row per card with the same
- * status words and alarm coding as the meta line; a click opens the card. The href uses each
- * linked card's own project, so a cross-project row opens that project's URL. */
+/** The drawer's "Waiting for" cards in the lineage rail's node grammar: one unthreaded node
+ * per blocking card (a blocker is no parent; this card's own row stays in Lineage), its live
+ * status where the lineage puts its tag, with the meta line's alarm coding. LineageCardLink
+ * keeps every card link's href and click rules. */
 function RelatedTasks({
 	items,
+	selfProject,
 	project,
 	tasks,
 	onOpenTask,
 	draining,
 }: {
 	items: TaskCard[];
+	selfProject: string;
 	project: ProjectView;
 	tasks: TaskCard[];
 	onOpenTask: (id: string) => void;
@@ -8869,31 +8933,31 @@ function RelatedTasks({
 	draining: boolean;
 }) {
 	return (
-		<ul className="fu-list">
+		<ol className="lineage-rail lineage-deps">
 			{items.map((k) => (
 				<li key={k.id}>
-					<a
-						href={taskPath(k.project, k.id)}
-						title={k.sessionTitle ?? k.title}
-						onClick={(e) => navClick(e, () => onOpenTask(k.id))}
-					>
-						<span className="fu-key">{k.id}</span>
-						<span className="fu-title">{k.sessionTitle ?? k.title}</span>
-						<span
-							className={
-								k.state === "needs_you"
-									? `st st-needs_you${k.asked !== null ? " st-asked" : ""}`
-									: "st"
-							}
-						>
-							{/* Same alarm marks as the meta line: markup, not ::before. */}
-							{k.state === "needs_you" && <Mark kind={cardMark(k)} />}
-							{statusLine(k, project.hasRules, holdFor(k, tasks), draining)}
-						</span>
-					</a>
+					<LineageCardLink
+						card={k}
+						selfProject={selfProject}
+						tag=""
+						onOpenTask={onOpenTask}
+						state={
+							<span
+								className={
+									k.state === "needs_you"
+										? `st st-needs_you${k.asked !== null ? " st-asked" : ""}`
+										: "st"
+								}
+							>
+								{/* Same alarm marks as the meta line: markup, not ::before. */}
+								{k.state === "needs_you" && <Mark kind={cardMark(k)} />}
+								{statusLine(k, project.hasRules, holdFor(k, tasks), draining)}
+							</span>
+						}
+					/>
 				</li>
 			))}
-		</ul>
+		</ol>
 	);
 }
 
@@ -9540,10 +9604,10 @@ function PromptEditForm({
 }
 
 /** The decision panel of a proposal card: the reason line, the stored five-line summary
- * (or the prompt's first paragraph for older and fork proposals), the two decision
- * buttons and the collapsed full prompt. The decline lives in the drawer-actions row's
- * Cancel task. The panel replaces the needs-reason box and the
- * Prompt section, which stay hidden on proposal cards. */
+ * (or the prompt's first paragraph for older and fork proposals), the model the first turn
+ * runs with, the decision buttons and the collapsed full prompt. The panel replaces the
+ * needs-reason box, the Prompt section and the Reply composer, which stay hidden on
+ * proposal cards until Accept starts the task. */
 function ProposalPanel({
 	task,
 	loading,
@@ -9562,6 +9626,7 @@ function ProposalPanel({
 	onSaveEdit,
 	editConflict,
 	onCancel,
+	modelField,
 }: {
 	task: TaskView;
 	/** True while the detail fetch runs: the prompt slots hold a loading line. */
@@ -9582,6 +9647,8 @@ function ProposalPanel({
 	editConflict: TaskView | null;
 	/** Declines the proposal (the drawer's Cancel task, with its confirm). */
 	onCancel: () => Promise<boolean>;
+	/** The drawer's model picker; a pick lands before Accept starts the first turn. */
+	modelField: ReactNode;
 }) {
 	// Older proposals and partial fixtures carry no summary: undefined reads as the fallback.
 	const s = task.proposalSummary ?? null;
@@ -9691,15 +9758,20 @@ function ProposalPanel({
 				</div>
 			</details>
 		);
-	// One recessed card holds the whole decision: reason, summary and full prompt, then
-	// a footer bar with Accept and Edit at the right, like a dialog's actions.
+	// One framed card in the ask panel's grammar holds the whole decision: the summary as
+	// the question behind the waiting mark, the reason byline and full prompt, then the model
+	// and the decision buttons.
 	return (
 		<div className="decide-card">
 			<div className="decide-body">
+				<div className="decide-ask">
+					<Mark kind="queued" />
+					{facts}
+				</div>
 				{reason}
-				{facts}
 				{prompt}
 			</div>
+			<div className="decide-model">{modelField}</div>
 			{actions}
 		</div>
 	);
@@ -9876,7 +9948,7 @@ function DrawerHead(p: {
 				)}
 				{/* The stage label already says done; the status word only earns its place when it adds state.
 				    A proposal is a suggestion, not a fault: it reads "not started" in grey, like its card. */}
-				{isProposalCard(task) ? (
+				{isProposal(task) ? (
 					<span className="st">not started</span>
 				) : (
 					task.state !== "idle" && (
@@ -10171,6 +10243,7 @@ function DrawerWaiting(p: {
 				<DrawerSec id="drawer-waiting" label="Waiting for">
 					<RelatedTasks
 						items={waiting}
+						selfProject={row.project}
 						project={project}
 						tasks={tasks}
 						onOpenTask={onOpenTask}
@@ -10193,6 +10266,15 @@ function DrawerWaiting(p: {
 							onOpenTask={onOpenTask}
 						/>
 					</div>
+				)}
+			{/* A usage-limit hold's way out lives in the steer composer: name it here. */}
+			{task.state === "queued" &&
+				task.holdUntil !== null &&
+				task.holdProvider !== null && (
+					<p className="hint hold-next">
+						To start now, pick a model from another provider in the composer
+						below, then press Resume.
+					</p>
 				)}
 			{/* A parked merge hold approves by reply; the hold-actions bar at the end of the
 					    body pins the message's actions while the report scrolls. The server still
@@ -10529,16 +10611,29 @@ function DrawerPrompts(p: {
 				</DrawerSec>
 			)}
 			{!proposal && editable && edit === null && (
-				<DrawerSec id="drawer-prompt" label="Prompt">
+				<DrawerSec
+					id="drawer-prompt"
+					label="Prompt"
+					head={
+						// Release notes' grammar: the section's one quiet action sits in its head.
+						!p.loading && (
+							<button
+								type="button"
+								className="ghost"
+								title="Edit the task text"
+								onClick={openEdit}
+							>
+								<Icon name="edit" />
+								Edit task
+							</button>
+						)
+					}
+				>
 					{p.loading ? (
 						<DrawerLoading label="Loading the prompt" />
 					) : (
 						<div className="task-prompt">
 							<Markdown text={task.prompt} />
-							<button type="button" onClick={openEdit}>
-								<Icon name="edit" />
-								Edit task
-							</button>
 						</div>
 					)}
 				</DrawerSec>
@@ -12149,7 +12244,7 @@ function SteerComposer(p: {
 				onModelMenuOpen={onModelMenuOpen}
 				modelConflict={modelConflict}
 				secondary={
-					task.state === "running" && (
+					task.state === "running" ? (
 						<BusyButton
 							title="Interrupt this turn like Esc: the worktree, branch and session stay; the card waits for your reply"
 							run={async () =>
@@ -12173,6 +12268,18 @@ function SteerComposer(p: {
 							<Icon name="stop" />
 							Stop turn
 						</BusyButton>
+					) : (
+						// A usage-limit hold names its provider; an open prompt edit holds without one.
+						task.state === "queued" &&
+						task.holdUntil !== null &&
+						task.holdProvider !== null && (
+							<HoldResumeButton
+								task={task}
+								catalog={catalog}
+								model={model.value}
+								act={act}
+							/>
+						)
 					)
 				}
 				primary={
@@ -12201,6 +12308,45 @@ function SteerComposer(p: {
 				browse. A model pick lands with the next turn.
 			</p>
 		</form>
+	);
+}
+
+/** The steer composer's way out of a usage-limit hold: start the card now on the model its
+ *  picker holds. On a model of the held provider the button stays off: that model waits for
+ *  the same reset. The server ends the hold with the switch (`resume: true`). */
+function HoldResumeButton({
+	task,
+	catalog,
+	model,
+	act,
+}: {
+	task: Pick<TaskView, "project" | "id" | "holdProvider">;
+	catalog: ModelCatalog | null;
+	model: string;
+	act: Act;
+}) {
+	const runs = model === "" ? (catalog?.defaultModel ?? "") : model;
+	const held = providerOf(runs) === task.holdProvider;
+	return (
+		<BusyButton
+			disabled={held}
+			title={
+				held
+					? `This model waits for the same ${task.holdProvider} reset: pick one from another provider`
+					: "End the usage-limit hold and start the task now with this model"
+			}
+			run={() =>
+				act(async () => {
+					await post(
+						`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/model`,
+						{ model, resume: true },
+					);
+				})
+			}
+		>
+			<Icon name="play" />
+			Resume
+		</BusyButton>
 	);
 }
 
@@ -12286,7 +12432,9 @@ function DrawerComposer(p: {
 				/>
 			) : (
 				task.state === "needs_you" &&
-				!prReviewOpen && (
+				!prReviewOpen &&
+				// An open proposal decides in the Decide panel: nothing to reply to before Accept.
+				!(proposal && !cancelled) && (
 					<ReplyComposer
 						task={task}
 						proposal={proposal}
@@ -13911,6 +14059,17 @@ export function Drawer({
 								onSaveEdit={editSubmit}
 								editConflict={editConflict}
 								onCancel={runCancel}
+								modelField={
+									<ModelField
+										catalog={catalog}
+										model={model.value}
+										setModel={switchModel}
+										modelQuery={modelQuery}
+										setModelQuery={setModelQuery}
+										onOpen={captureModelMenu}
+										conflict={modelConflict}
+									/>
+								}
 							/>
 						</section>
 					)}
@@ -14403,7 +14562,10 @@ function railRow(
 	const running = split.running.length;
 	const needs = split.needs.length;
 	const asks = split.asks.length;
-	const waiting = own.filter((t) => t.state === "queued").length;
+	// A proposal waits for a decision like a queued card; it never takes the needs mark.
+	const waiting = own.filter(
+		(t) => t.state === "queued" || isProposal(t),
+	).length;
 	const unread = own.filter((t) => isUnread(t, seen, since)).length;
 	// The one mark a row shows, by rank: needs action > asked > running > unread. Waiting has no mark.
 	const top = railTop({ needs, asks, running, unread });
