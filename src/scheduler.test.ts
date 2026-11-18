@@ -54,6 +54,7 @@ import {
 	SILENT_LOG_MS,
 	selectFindings,
 	silentSince,
+	validatableReview,
 	waitingOn,
 	workCheckAccountingError,
 	workCheckBlockerCounts,
@@ -1359,16 +1360,16 @@ describe("findingsHold", () => {
 });
 
 describe("the doneAt cutoff is inclusive at the same millisecond (CI 43875479904)", () => {
-	test("a follow-up filed in the review's done millisecond holds a queued merge", () => {
+	test("a validation run filed in the review's done millisecond never holds; a work follow-up does", () => {
 		// OTTR-1047's one CI failure, deterministic: the board files a validation
 		// run as a followUpOf child of the done review. When the filing lands in
 		// the SAME millisecond as the review's done stamp (a fast runner),
-		// `createdAt <= doneAt` counts it as a finding. It is stage todo — an
-		// open finding whose leadAtDone is false, because it did not exist when
-		// the review landed done (the stamp records the stage AT doneAt,
-		// OTTR-963) — so a queued merge waits. Fail-closed by design; the flaky
-		// fixture that tripped this (turn.test.ts's doneReview) now sleeps
-		// across the millisecond boundary instead of assuming the clock advanced.
+		// `createdAt <= doneAt` counts it as a finding. OTTR-1128 changed the rule:
+		// a validation run (kind "validation") never holds a merge in any stage, so
+		// it cannot hold the queued merge any more. The inclusive cutoff still
+		// holds for an untagged work follow-up filed in the same millisecond: it is
+		// stage todo, an open finding whose leadAtDone is false (it did not exist
+		// when the review landed done, OTTR-963), so a queued merge waits.
 		const review = task({
 			kind: "review",
 			stage: "done",
@@ -1382,7 +1383,9 @@ describe("the doneAt cutoff is inclusive at the same millisecond (CI 43875479904
 			createdAt: 5_000,
 		});
 		const merge = task({ stage: "merging", state: "queued" });
-		expect(mergeHold([review, validation, merge], merge)).toBe(FINDINGS_HOLD);
+		expect(mergeHold([review, validation, merge], merge)).toBeNull();
+		const work = task({ followUpOf: review.id, createdAt: 5_000 });
+		expect(mergeHold([review, work, merge], merge)).toBe(FINDINGS_HOLD);
 	});
 
 	test("a lead filed in the same millisecond never holds: backlog is not open", () => {
@@ -1419,6 +1422,171 @@ describe("the doneAt cutoff is inclusive at the same millisecond (CI 43875479904
 		});
 		const merge = task({ stage: "merging", state: "queued" });
 		expect(mergeHold([review, validation, merge], merge)).toBeNull();
+	});
+});
+
+describe("OTTR-1128: a lead never runs as a work turn and never holds its review", () => {
+	/** The board card form of `t`: no prompt, plus the `lead` mark for a lead. */
+	const boardCard = (t: Task, lead: boolean) => {
+		const { prompt: _prompt, ...rest } = t;
+		return lead ? { ...rest, lead: true as const } : rest;
+	};
+	const leadsOf = (review: Task) => [
+		task({
+			prompt: "Needs validation: a todo lead",
+			followUpOf: review.id,
+			createdAt: 150,
+		}),
+		task({
+			prompt: "Needs validation: an in_progress lead",
+			followUpOf: review.id,
+			createdAt: 160,
+			stage: "in_progress",
+			state: "needs_you",
+		}),
+	];
+
+	test("a release at merging whose only open findings are leads is free to finish", () => {
+		const release = task({
+			releaseVersion: "v9.9.9",
+			stage: "merging",
+			state: "idle",
+			createdAt: 100,
+		});
+		const leads = leadsOf(release);
+		const merge = task({ stage: "merging", state: "queued" });
+		const tasks = [release, ...leads, merge];
+		expect(findingsHold(tasks, release)).toBeNull();
+		// The unrelated merge still waits for the release to ship, never for the leads.
+		expect(mergeHold(tasks, merge)).toBe("waiting for release v9.9.9");
+		// The board card form: no prompt, the `lead` mark instead.
+		const board = [
+			boardCard(release, false),
+			...leads.map((l) => boardCard(l, true)),
+		];
+		expect(findingsHold(board, release)).toBeNull();
+		expect(mergeHold([...board, merge], merge)).toBe(
+			"waiting for release v9.9.9",
+		);
+	});
+
+	test("the Review button's review at merging is free once only leads are open", () => {
+		const review = task({
+			kind: "review",
+			stage: "merging",
+			state: "idle",
+			createdAt: 100,
+		});
+		const leads = leadsOf(review);
+		expect(findingsHold([review, ...leads], review)).toBeNull();
+		const board = [
+			boardCard(review, false),
+			...leads.map((l) => boardCard(l, true)),
+		];
+		expect(findingsHold(board, review)).toBeNull();
+	});
+
+	test("a done review's promoted leads and its validation run never hold a merge", () => {
+		// leadAtDone false: the leads were not parked backlog leads at doneAt, so only
+		// the OTTR-1128 lead rule frees the merge.
+		const review = task({
+			kind: "review",
+			stage: "done",
+			state: "idle",
+			createdAt: 100,
+			doneAt: 5_000,
+		});
+		const leads = leadsOf(review);
+		const validation = task({
+			kind: "validation",
+			followUpOf: review.id,
+			createdAt: 170,
+			stage: "in_progress",
+		});
+		const merge = task({ stage: "merging", state: "queued" });
+		expect(mergeHold([review, ...leads, validation, merge], merge)).toBeNull();
+		const board = [
+			boardCard(review, false),
+			...leads.map((l) => boardCard(l, true)),
+			boardCard(validation, false),
+		];
+		expect(mergeHold([...board, merge], merge)).toBeNull();
+	});
+
+	test("a non-lead finding in todo still holds (control)", () => {
+		const release = task({
+			releaseVersion: "v9.9.8",
+			stage: "merging",
+			state: "idle",
+			createdAt: 100,
+		});
+		const finding = task({
+			prompt: "Fix the rate limiter",
+			followUpOf: release.id,
+			createdAt: 150,
+		});
+		const tasks = [release, ...leadsOf(release), finding];
+		expect(findingsHold(tasks, release)).toBe(FINDINGS_HOLD);
+		// The board form of the same finding (no lead mark) holds too.
+		expect(
+			findingsHold(
+				tasks.map((t) => boardCard(t, t !== finding && t !== release)),
+				release,
+			),
+		).toBe(FINDINGS_HOLD);
+		// The review's question card is no lead: its hyphenated prefix holds.
+		const question = task({
+			prompt: `${LEAD_QUESTIONS_PROMPT_PREFIX} x`,
+			followUpOf: release.id,
+			createdAt: 150,
+		});
+		expect(findingsHold([release, question], release)).toBe(FINDINGS_HOLD);
+	});
+
+	test("pickRunnable never starts a lead that waits for a sandbox", () => {
+		const many = { ...opts, maxParallel: 10 };
+		const todoLead = task({ prompt: "Needs validation: rate limiter" });
+		const startedLead = task({
+			prompt: "Needs validation: retry\nBlocker: sandbox run: no network deny",
+			stage: "in_progress",
+		});
+		expect(pickRunnable([todoLead, startedLead], many)).toEqual([]);
+		const validated = task({
+			prompt: "Needs validation: proven",
+			validatedAt: 5,
+		});
+		const deployment = task({
+			prompt:
+				"Needs validation: proxy\nBlocker: deployment fact: Does a trusted proxy set X-Forwarded-For?",
+		});
+		const normal = task();
+		expect(
+			pickRunnable(
+				[todoLead, startedLead, validated, deployment, normal],
+				many,
+			),
+		).toEqual([validated, deployment, normal]);
+	});
+
+	test("validatableReview: a done review, or one idle at merging", () => {
+		const review = (p: Partial<Task>) =>
+			validatableReview(task({ kind: "review", ...p }));
+		expect(review({ stage: "done", state: "idle" })).toBe(true);
+		expect(review({ stage: "merging", state: "idle" })).toBe(true);
+		expect(
+			validatableReview(
+				task({ releaseVersion: "v1.0.0", stage: "merging", state: "idle" }),
+			),
+		).toBe(true);
+		expect(review({ stage: "merging", state: "queued" })).toBe(false);
+		expect(review({ stage: "merging", state: "running" })).toBe(false);
+		expect(review({ stage: "in_progress", state: "idle" })).toBe(false);
+		expect(review({ stage: "done", state: "idle", cancelledAt: 9 })).toBe(
+			false,
+		);
+		expect(validatableReview(task({ stage: "done", state: "idle" }))).toBe(
+			false,
+		);
 	});
 });
 

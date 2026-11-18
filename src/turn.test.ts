@@ -73,6 +73,7 @@ import {
 	isRetro,
 	isReview,
 	LEAD_APPLIES_OPTION,
+	LEAD_COMMITS_REASON,
 	LEAD_NOT_APPLY_OPTION,
 	LEAD_QUESTIONS_PROMPT_PREFIX,
 	liveCard,
@@ -29619,6 +29620,245 @@ describe("stored review findings", () => {
 		expect(fresh.prompt).toContain(`#${le.id}`);
 		expect(fresh.prompt).not.toContain(`#${ld.id}`);
 		expect(fresh.prompt).not.toContain(`#${lg.id}`);
+	});
+
+	// ---- OTTR-1128: a lead never runs as a work turn and never holds its review ----
+
+	test("a started lead of a held release goes to the release's batch validation, never a work turn (OTTR-1128)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await storedReviewSetup(
+			record,
+			[],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+				recorded: [],
+			}),
+			[],
+			{ publishRelease: publishingRelease(record), maxTotalRuns: () => null },
+		);
+		projects.get(store.name)!.target = "origin/main";
+		const review = await store.createTask(
+			`${ARCH_REVIEW_MARKER}release v1.0.0`,
+			null,
+			"review",
+		);
+		await store.updateTask(review.id, {
+			releaseVersion: "v1.0.0",
+			base: "shaR",
+			worktree: "wt-rel",
+			branch: "ott/rel",
+			releaseNotes: "notes body",
+			// Parked in the tick's held shape: the release waits at merging for
+			// its findings, and no live turn runs.
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+		});
+		const lead = await leadCard(
+			store,
+			review.id,
+			"Needs validation: release lead\nBlocker: sandbox run: cr",
+		);
+		// The user starts the lead (Accept or a drag): todo/queued.
+		await store.updateTask(lead.id, { stage: "todo", state: "queued" });
+		// A started lead holds no review: the release would otherwise wait on a
+		// work turn that has no sandbox_run (findingOpen ignores leads).
+		expect(
+			findingsHold(await store.listTasks(), (await store.getTask(review.id))!),
+		).toBeNull();
+
+		await loop.schedule();
+
+		// The same tick routes the lead back to the backlog and files the
+		// release's batch validation card with the lead in it.
+		const back = (await store.getTask(lead.id))!;
+		expect(back.stage).toBe("backlog");
+		expect(back.state).toBe("idle");
+		expect(back.queuedAt).toBeNull();
+		expect(back.validatedAt).toBeNull();
+		expect(back.details).toContain(
+			"a Needs validation lead runs in its review's batch validation run, never in a work turn.",
+		);
+		const cards = (await store.listTasks()).filter(
+			(t) => t.kind === "validation",
+		);
+		expect(cards).toHaveLength(1);
+		const card = cards[0]!;
+		expect(card.followUpOf).toBe(review.id);
+		expect(card.prompt).toContain(`#${lead.id}`);
+
+		// The release settle finishes while the lead and the open validation
+		// card exist: neither holds it.
+		await eventually(
+			async () => (await store.getTask(review.id))?.stage === "done",
+		);
+		expect(record.publishRelease).toHaveLength(1);
+		expect((await store.getTask(review.id))!.summary).toBe("Released v1.0.0");
+		expect(
+			findingsHold(await store.listTasks(), (await store.getTask(review.id))!),
+		).toBeNull();
+		// The only agent run is the validation card's: the lead never ran a work
+		// turn, and the done review's trigger filed no second card.
+		await settled(store, card.id);
+		expect(await store.listTurns(lead.id)).toHaveLength(0);
+		expect(await store.listTurns(card.id)).toHaveLength(1);
+		expect(record.runs).toHaveLength(1);
+		expect((await store.getTask(lead.id))!.stage).toBe("backlog");
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "validation"),
+		).toHaveLength(1);
+	});
+
+	test("a started lead whose branch holds commits parks needs_you and is never moved (OTTR-1128)", async () => {
+		const record = baseRecord();
+		const { store, loop } = await validationCase(record, {
+			// "ott/two" holds 2 commits beyond its base; any other branch is
+			// unreadable (null), which the routing treats like commits.
+			revListCount: async (_path: string, _base: string, branch: string) =>
+				branch === "ott/two" ? 2 : null,
+		});
+		const review = await doneReview(store, "with commits");
+		const two = await leadCard(
+			store,
+			review.id,
+			"Needs validation: two commits\nBlocker: sandbox run: c2",
+		);
+		await store.updateTask(two.id, {
+			stage: "todo",
+			state: "needs_you",
+			needsReason: "Reply to continue.",
+			branch: "ott/two",
+			base: "shaB",
+		});
+		const unreadable = await leadCard(
+			store,
+			review.id,
+			"Needs validation: unreadable branch\nBlocker: sandbox run: cu",
+		);
+		await store.updateTask(unreadable.id, {
+			stage: "in_progress",
+			state: "queued",
+			branch: "ott/gone",
+			base: "shaB",
+		});
+
+		await loop.schedule();
+		await flushPromises();
+
+		const afterTwo = (await store.getTask(two.id))!;
+		expect(afterTwo.stage).toBe("todo");
+		expect(afterTwo.state).toBe("needs_you");
+		expect(afterTwo.needsReason).toBe(LEAD_COMMITS_REASON);
+		const afterUnreadable = (await store.getTask(unreadable.id))!;
+		expect(afterUnreadable.stage).toBe("in_progress");
+		expect(afterUnreadable.state).toBe("needs_you");
+		expect(afterUnreadable.needsReason).toBe(LEAD_COMMITS_REASON);
+		// No card was deleted or batched, and neither lead ran.
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "validation"),
+		).toHaveLength(0);
+		expect(await store.listTurns(two.id)).toHaveLength(0);
+		expect(await store.listTurns(unreadable.id)).toHaveLength(0);
+		expect(record.runs).toHaveLength(0);
+	});
+
+	test("a started lead goes first in its review's batch, ahead of a better rank (OTTR-1128)", async () => {
+		const record = baseRecord();
+		const { store, loop } = await validationCase(record);
+		await store.setSettings({ validationBatchSize: 1 });
+		const review = await doneReview(store, "started first");
+		const best = mkFinding(
+			"Needs validation: best rank\nBlocker: sandbox run: cb",
+			1,
+		);
+		const worse = mkFinding(
+			"Needs validation: worse rank\nBlocker: sandbox run: cw",
+			2,
+		);
+		for (const f of [best, worse])
+			await store.appendReviewFinding(review.id, f);
+		const lBest = await leadCard(store, review.id, best.prompt);
+		const lWorse = await leadCard(store, review.id, worse.prompt);
+		// The user starts the worse-ranked lead only.
+		await store.updateTask(lWorse.id, { stage: "todo", state: "queued" });
+
+		await loop.schedule();
+
+		const cards = (await store.listTasks()).filter(
+			(t) => t.kind === "validation",
+		);
+		expect(cards).toHaveLength(1);
+		const card = (await store.getTask(cards[0]!.id))!;
+		expect(card.followUpOf).toBe(review.id);
+		// The cap of 1 takes the started lead, not the better rank.
+		expect(card.prompt).toBe(
+			validationRunPrompt({
+				reviewId: review.id,
+				leads: [{ id: lWorse.id, prompt: worse.prompt }],
+			}),
+		);
+		expect(card.prompt).not.toContain(`#${lBest.id}`);
+		expect((await store.getTask(lWorse.id))!.stage).toBe("backlog");
+		expect((await store.getTask(lBest.id))!.stage).toBe("backlog");
+	});
+
+	test("a validated lead stays normal work: it starts, a pending one is never picked (OTTR-1128)", async () => {
+		const record = baseRecord();
+		const { store, loop } = await validationCase(record, {
+			// A confirmed lead's work turn: a plain answered run.
+			startRun: async (o: StartOpts) => {
+				record.runs.push(o);
+				await o.onSession?.("sess");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({ outcome: { status: "answered", summary: "fixed" } }),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const review = await doneReview(store, "validated");
+		const confirmed = await leadCard(
+			store,
+			review.id,
+			"Needs validation: confirmed race\nBlocker: sandbox run: cc",
+		);
+		await store.updateTask(confirmed.id, {
+			validatedAt: Date.now(),
+			stage: "todo",
+			state: "queued",
+		});
+		const pending = await leadCard(
+			store,
+			review.id,
+			"Needs validation: pending race\nBlocker: sandbox run: cp",
+		);
+		await store.updateTask(pending.id, { stage: "todo", state: "queued" });
+
+		// The pure pick: the validated lead is runnable, the pending one never is.
+		const picked = pickRunnable(await store.listTasks(), {
+			maxParallel: 4,
+			hasRules: true,
+			mainUnpushed: false,
+		}).map((t) => t.id);
+		expect(picked).toContain(confirmed.id);
+		expect(picked).not.toContain(pending.id);
+
+		await loop.schedule();
+
+		// The tick starts the validated lead's work turn and never moves it back.
+		await eventually(
+			async () => (await store.listTurns(confirmed.id)).length > 0,
+		);
+		const afterConfirmed = (await store.getTask(confirmed.id))!;
+		expect(afterConfirmed.stage).not.toBe("backlog");
+		expect(afterConfirmed.details ?? "").not.toContain(
+			"Moved back to the backlog",
+		);
+		// The pending lead went to the batch instead of a work turn.
+		expect(await store.listTurns(pending.id)).toHaveLength(0);
+		expect((await store.getTask(pending.id))!.stage).toBe("backlog");
 	});
 });
 

@@ -310,6 +310,7 @@ import {
 	depProjectOf,
 	depProjectsOf,
 	findingsSettledAt,
+	isLead,
 	isRetro,
 	isReview,
 	LEAD_APPLIES_OPTION,
@@ -329,6 +330,7 @@ import {
 	reviewBlocked,
 	reviewFindings,
 	silentSince,
+	validatableReview,
 	WORK_CHECK_ASK_BLOCK,
 	WORK_CHECK_ASK_CANCEL,
 	WORK_CHECK_ASK_DIVERGE,
@@ -5670,6 +5672,7 @@ export async function createApp(deps: AppDeps) {
 			...(t.model === null ? { lastModel: tf?.lastModel ?? null } : {}),
 			...(progress ? { progress: progress.text } : {}),
 			...(silent !== null ? { silentSince: silent } : {}),
+			...(isLead(t) ? { lead: true as const } : {}),
 			...runStartedOf(t, tf, ctx.medians),
 			...(ctx.trendingRepos.has(t.id)
 				? { trendingRepo: ctx.trendingRepos.get(t.id) }
@@ -11343,11 +11346,12 @@ export async function createApp(deps: AppDeps) {
 		return await taskResponse(e, task.id);
 	}
 
-	/** OTTR-1047: the manual start of a done review's batch validation run. The card
-	 * itself is filed by the turn loop (deps.validateLeads, filePendingValidationRun);
-	 * the route only gates the input and schedules after the filing. OTTR-1129: an
-	 * optional body adds validate-again — `{ again: "blocked", before: <ISO> }` — and
-	 * the response wraps the card's view with the reset list. */
+	/** OTTR-1047: the manual start of a review's batch validation run: a done review, or
+	 * (OTTR-1128) one held at merging for its findings. The card itself is filed by the
+	 * turn loop (deps.validateLeads, filePendingValidationRun); the route only gates the
+	 * input and schedules after the filing. OTTR-1129: an optional body adds
+	 * validate-again — `{ again: "blocked", before: <ISO> }` — and the response wraps the
+	 * card's view with the reset list. */
 	async function handlePOSTProjectsTasksValidateByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/validate">,
 	): Promise<Response> {
@@ -11358,9 +11362,12 @@ export async function createApp(deps: AppDeps) {
 			return json({ error: "task is cancelled" }, 404);
 		if (!isReview(task))
 			return json({ error: "only a review card can be validated" }, 409);
-		if (task.stage !== "done")
+		if (!validatableReview(task))
 			return json(
-				{ error: "only a done review can start a validation run" },
+				{
+					error:
+						"only a done review or a review waiting at merging for its findings can start a validation run",
+				},
 				409,
 			);
 		// The optional body. Absent bytes, a JSON null, or {} keep the body-less

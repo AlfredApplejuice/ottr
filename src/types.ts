@@ -1253,6 +1253,10 @@ export type TaskCard = Omit<
 	/** Ids of the queued merges mergeHold parks behind this open release ("waiting for release
 	 * <version>"); present on release cards only, and only when the list is non-empty. */
 	heldMerges?: string[];
+	/** OTTR-1128: present (true) on a review lead, a card whose prompt carries the "Needs
+	 * validation" tag. The card ships no prompt, so the hold rules (scheduler.ts isLead)
+	 * read this mark instead. */
+	lead?: true;
 	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and
 	 * the unseen comment stamp that key the bell occurrences, plus the board-posted stamp
 	 * (docs/specs/pr-review-auto-post.md). The head keys the posted occurrence. */

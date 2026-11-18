@@ -90,6 +90,10 @@ export function liveCard(
 	return liveCardOf(tasks, kind) !== null;
 }
 
+/** How a card says it is a review lead: a store row by its prompt, a board card (no
+ * prompt) by its `lead` mark. */
+export type LeadMark = Pick<Task, "prompt"> | { lead?: true };
+
 /** The fields the review policies read. */
 export type ReviewTask = Pick<
 	Task,
@@ -103,7 +107,8 @@ export type ReviewTask = Pick<
 	| "leadAtDone"
 	| "dependsOn"
 	| "followUpOf"
->;
+> &
+	LeadMark;
 
 /** A review card: a release card, or the Review button's card. Both run the same review
  * (prompts.ts reviewBody); a release publishes after it. */
@@ -161,10 +166,20 @@ export function reviewFindings<T extends ReviewTask>(
 
 /** True while a finding is not done: a cancelled finding counts as done, and a
  * child in `backlog` stage (an unverified lead filed without a check verdict) is
- * optional work, not a commitment, so it never holds the review's Done.
+ * optional work, not a commitment, so it never holds the review's Done. A lead (the
+ * "Needs validation" tag) and a batch validation run never hold it in any stage
+ * (OTTR-1128): a promoted lead and its review would otherwise wait on each other.
  * Shared by findingsOpen and reviewHoldFor so the two open rules cannot drift. */
-function findingOpen(f: Pick<Task, "cancelledAt" | "stage">): boolean {
-	return f.cancelledAt === null && f.stage !== "done" && f.stage !== "backlog";
+function findingOpen(
+	f: Pick<Task, "cancelledAt" | "stage" | "kind"> & LeadMark,
+): boolean {
+	return (
+		f.cancelledAt === null &&
+		f.stage !== "done" &&
+		f.stage !== "backlog" &&
+		!isLead(f) &&
+		f.kind !== "validation"
+	);
 }
 
 function findingsOpen(
@@ -731,6 +746,8 @@ function workSlotReady(
 	// A trending scout only fills a slot nothing else wanted: pickLowPriority, after every project.
 	if (t.kind === "trending") return false;
 	// Work slots only: todo and in_progress (replies). Needs a rules file before a fresh todo starts.
+	// A lead that waits for a sandbox never runs as a work turn (OTTR-1128): it has no sandbox_run.
+	if (pendingSandboxLead(t)) return false;
 	if (t.stage === "todo" && !o.hasRules && t.kind !== "interview") return false;
 	// A queued card waits until every dependency is done (a cancelled dependency counts as
 	// done, waitingOn); merging cards wait in the merge slot above.
@@ -1254,6 +1271,12 @@ export const WORK_CHECK_ASK_CANCEL = "Cancel";
 export const LEAD_APPLIES_OPTION = "Yes, the risk applies";
 export const LEAD_NOT_APPLY_OPTION = "No, it does not apply";
 
+/** OTTR-1128: the needs_you reason of a started lead the board cannot move back to the
+ * backlog: its branch holds commits from an earlier work turn (or git could not count
+ * them). The card stays as it is, so no work is lost; the user decides. */
+export const LEAD_COMMITS_REASON =
+	"This Needs validation lead holds commits from an earlier work turn, so the board did not move it back to the backlog. A work turn has no sandbox_run: move the card to the backlog to validate it in its review's batch run, or cancel it.";
+
 /** The question card a review files for its deployment-fact leads; the reply route
  * recognizes it by this prompt prefix plus a non-null `asked`. */
 export const LEAD_QUESTIONS_PROMPT_PREFIX =
@@ -1278,6 +1301,40 @@ export function leadBlocker(prompt: string): LeadBlocker {
 	return m[1] === "deployment fact"
 		? { kind: "deployment", question: (m[2] ?? "").trim() }
 		: { kind: "sandbox", control: (m[2] ?? "").trim() };
+}
+
+/** A review lead: a card whose prompt carries the "Needs validation" tag. The review's
+ * question card ("Needs-validation lead questions ...") is not one. Pure. */
+export function isLead(t: LeadMark): boolean {
+	return "prompt" in t
+		? t.prompt.startsWith("Needs validation")
+		: t.lead === true;
+}
+
+/** OTTR-1128: a lead only a batch validation run can prove — never validated, with a
+ * sandbox blocker. A work turn has no sandbox_run, so the scheduler never starts one
+ * for it and the routing tick returns it to its review's batch. A deployment-fact
+ * lead the user answered and a validated lead stay normal work. Pure. */
+export function pendingSandboxLead(
+	t: Pick<Task, "prompt" | "validatedAt">,
+): boolean {
+	return (
+		isLead(t) &&
+		t.validatedAt === null &&
+		leadBlocker(t.prompt).kind === "sandbox"
+	);
+}
+
+/** True for a review whose leads a batch validation run may take: a done review, or one
+ * held at merging for its findings (OTTR-1128), so a release validates before it ships. */
+export function validatableReview(
+	t: Pick<Task, "kind" | "releaseVersion" | "cancelledAt" | "stage" | "state">,
+): boolean {
+	return (
+		isReview(t) &&
+		t.cancelledAt === null &&
+		(t.stage === "done" || (t.stage === "merging" && t.state === "idle"))
+	);
 }
 
 /** The needs_you reason for a diverging loop: the blocker counts per round, then the rule(s)

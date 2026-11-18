@@ -11698,7 +11698,10 @@ describe("manual validation start route (OTTR-1047)", () => {
 		}
 	});
 
-	test("a review that is not done is refused before the filing", async () => {
+	test("a review that is not done or idle at merging is refused before the filing", async () => {
+		// OTTR-1128 widened the rule from "done only": a review idle at merging (held
+		// for its findings) may start a run too. A running review and a review queued
+		// at merging stay refused.
 		const review = await store.createTask(
 			"running review for validation",
 			null,
@@ -11710,18 +11713,73 @@ describe("manual validation start route (OTTR-1047)", () => {
 			return { id: "nope", reset: [] };
 		};
 		try {
-			const res = await post(
-				`/api/projects/p1/tasks/${review.id}/validate`,
-				{},
-			);
-			expect(res.status).toBe(409);
-			expect(await errorOf(res)).toBe(
-				"only a done review can start a validation run",
-			);
+			for (const patch of [
+				{ stage: "in_progress", state: "running" },
+				{ stage: "merging", state: "queued" },
+			] as const) {
+				await store.updateTask(review.id, patch);
+				const res = await post(
+					`/api/projects/p1/tasks/${review.id}/validate`,
+					{},
+				);
+				expect(res.status).toBe(409);
+				expect(await errorOf(res)).toBe(
+					"only a done review or a review waiting at merging for its findings can start a validation run",
+				);
+			}
 			expect(filed).toBe(0);
 		} finally {
 			validateLeadsImpl = null;
 			await store.updateTask(review.id, { cancelledAt: Date.now() });
+		}
+	});
+
+	test("a review idle at merging with backlog leads files its validation run (OTTR-1128)", async () => {
+		const review = await store.createTask(
+			"merging review for validation",
+			null,
+			"review",
+		);
+		await store.updateTask(review.id, { stage: "merging", state: "idle" });
+		const lead = await store.createTask("Needs validation: a backlog lead");
+		await store.updateTask(lead.id, {
+			followUpOf: review.id,
+			stage: "backlog",
+			state: "idle",
+		});
+		const seen: string[] = [];
+		validateLeadsImpl = async (e, reviewId) => {
+			seen.push(reviewId);
+			const card = await e.store.createTask(
+				"Batch validation of 1 lead(s) of review.",
+				null,
+				"validation",
+			);
+			await e.store.updateTask(card.id, {
+				followUpOf: reviewId,
+				promptAuthor: "board",
+			});
+			return { id: card.id, reset: [] };
+		};
+		try {
+			const res = await post(
+				`/api/projects/p1/tasks/${review.id}/validate`,
+				{},
+			);
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as { id: string };
+			expect(seen).toEqual([review.id]);
+			const runs = (await store.listTasks()).filter(
+				(t) => t.kind === "validation" && t.followUpOf === review.id,
+			);
+			expect(runs.map((t) => t.id)).toEqual([b.id]);
+		} finally {
+			validateLeadsImpl = null;
+			for (const t of await store.listTasks())
+				if (t.kind === "validation" && t.followUpOf === review.id)
+					await store.updateTask(t.id, { cancelledAt: Date.now() });
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
 		}
 	});
 

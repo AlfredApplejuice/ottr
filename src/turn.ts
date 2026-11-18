@@ -140,6 +140,7 @@ import {
 	isRetro,
 	isReview,
 	LEAD_APPLIES_OPTION,
+	LEAD_COMMITS_REASON,
 	LEAD_NOT_APPLY_OPTION,
 	LEAD_QUESTIONS_PROMPT_PREFIX,
 	lastReviewBase,
@@ -148,12 +149,14 @@ import {
 	openWorkBlockers,
 	parseCheckVerdicts,
 	parseWorkCheck,
+	pendingSandboxLead,
 	pickLowPriority,
 	pickRunnable,
 	repeatedBugClasses,
 	reviewFindings,
 	selectFindings,
 	UNCHECKED_FINDINGS_HOLD,
+	validatableReview,
 	WORK_CHECK_ASK_BLOCK,
 	workCheckAccountingError,
 	workCheckAsk,
@@ -3149,6 +3152,12 @@ export function createTurnLoop(
 		depProjects: DepProject[],
 	): Promise<boolean> {
 		try {
+			// OTTR-1128: a started lead goes to its review's batch validation, never a work
+			// turn. The dev board's fabricated cards get no writes, like the lost-turn sweep.
+			if (!demoBoard())
+				await routeStartedLeads(e).catch((err) =>
+					logStoreError(e.store.name, err),
+				);
 			if (await dispatchRunnable(e, drained, cap, active, depProjects))
 				return true;
 			if (!drained) void settleReviews(e.store.name);
@@ -9465,12 +9474,14 @@ export function createTurnLoop(
 	}
 
 	/** OTTR-1047: files at most one batch validation card per call, in one store
-	 * transaction. The manual start route, the done-review triggers, and the chain of a
-	 * done validation run share this one implementation. Candidate reviews: `isReview`,
-	 * done, not cancelled, with at least one batchable lead (a direct backlog child, not
-	 * cancelled, never validated, a sandbox blocker — deployment-fact leads never enter
-	 * a batch). A review with an open validation card waits; one whose newest validation
-	 * card is cancelled stays declined unless `reviewId` overrides (the manual start).
+	 * transaction. The manual start route, the done-review triggers, the started-lead
+	 * routing (OTTR-1128), and the chain of a done validation run share this one
+	 * implementation. Candidate reviews: `validatableReview` (done, or held at merging
+	 * for its findings, OTTR-1128), not cancelled, with at least one batchable lead (a
+	 * direct backlog child, not cancelled, a pendingSandboxLead — deployment-fact and
+	 * validated leads never enter a batch). A review with an open validation card
+	 * waits; one whose newest validation card is cancelled stays declined unless
+	 * `reviewId` overrides (the manual start).
 	 * One validation run is open per project, so the call files one card only: an open
 	 * card anywhere answers 409. Priority: an explicit `reviewId` first (the chain of the
 	 * run that just finished), then candidate reviews by doneAt ascending. With
@@ -9482,12 +9493,14 @@ export function createTurnLoop(
 	 * validate-again) the call first clears the validatedAt of the review's sandbox
 	 * leads whose newest recorded outcome was blocked and whose validatedAt predates
 	 * `again.before`, inside this transaction, and the response carries the cleared
-	 * ids in `reset`. */
+	 * ids in `reset`. The leads in `first` (OTTR-1128: the ones the user just started)
+	 * sort ahead of the severity order. */
 	async function filePendingValidationRun(
 		e: TurnProject,
 		reviewId?: string,
 		strictReview?: boolean,
 		again?: { before: number },
+		first: ReadonlySet<string> = new Set(),
 	): Promise<
 		{ id: string; reset: string[] } | { error: string; status: number }
 	> {
@@ -9521,14 +9534,12 @@ export function createTurnLoop(
 				tasks.filter(
 					(t) =>
 						t.followUpOf === review.id &&
-						// A lead, not any backlog child: the review's question card is a
-						// backlog child too, and leadBlocker reads a missing line as a
-						// sandbox blocker, so the tag is what keeps it out of a batch.
-						t.prompt.startsWith("Needs validation") &&
+						// The tag check inside pendingSandboxLead keeps the review's question
+						// card (a backlog child too, and leadBlocker reads its missing line as
+						// a sandbox blocker) out of a batch.
+						pendingSandboxLead(t) &&
 						t.stage === "backlog" &&
-						t.cancelledAt === null &&
-						t.validatedAt === null &&
-						leadBlocker(t.prompt).kind === "sandbox",
+						t.cancelledAt === null,
 				);
 			// The user declined the review's validation by cancelling its newest card;
 			// the explicit reviewId (the manual start, the chain restart) overrides.
@@ -9551,9 +9562,7 @@ export function createTurnLoop(
 			const candidates = tasks
 				.filter(
 					(t) =>
-						isReview(t) &&
-						t.stage === "done" &&
-						t.cancelledAt === null &&
+						validatableReview(t) &&
 						(t.id === reviewId || !declined(t)) &&
 						batchableOf(t).length > 0,
 				)
@@ -9581,6 +9590,8 @@ export function createTurnLoop(
 				if (finding.rank !== null && !ranks.has(finding.prompt))
 					ranks.set(finding.prompt, finding.rank);
 			leads.sort((a, b) => {
+				const fa = first.has(a.id);
+				if (fa !== first.has(b.id)) return fa ? -1 : 1;
 				const ra = ranks.get(a.prompt);
 				const rb = ranks.get(b.prompt);
 				if (ra !== rb) {
@@ -9622,6 +9633,68 @@ export function createTurnLoop(
 			await filePendingValidationRun(e).catch((err) =>
 				logStoreError(e.store.name, err),
 			);
+	}
+
+	/** OTTR-1128: a lead only a sandbox can prove (pendingSandboxLead) never runs a work
+	 * turn: pickRunnable skips it, and this per-tick pass routes a started one back into its
+	 * review's batch validation. A lead in todo or in_progress that is not in flight (Accept,
+	 * a drag, a reply, or a lead that ran as a work turn before this rule) returns to the
+	 * backlog when its branch holds no commits beyond its base, and the review's next batch
+	 * takes it first. A lead with commits (or an unreadable branch) is never moved: it parks
+	 * needs_you with LEAD_COMMITS_REASON, so the board lists it for the user. No card is
+	 * deleted. Never throws past a project: the caller logs a store failure. */
+	async function routeStartedLeads(e: TurnProject): Promise<void> {
+		const started = (await e.store.listTasks()).filter(
+			(t) =>
+				t.cancelledAt === null &&
+				(t.stage === "todo" || t.stage === "in_progress") &&
+				(t.state === "queued" ||
+					t.state === "idle" ||
+					// A lead already parked for its commits costs no git read per tick.
+					(t.state === "needs_you" && t.needsReason !== LEAD_COMMITS_REASON)) &&
+				pendingSandboxLead(t),
+		);
+		const moved = new Map<string, Set<string>>();
+		for (const t of started) {
+			const reviewId = t.followUpOf;
+			if (reviewId === null) continue;
+			const commits =
+				t.branch === null || t.base === null
+					? 0
+					: await ops.revListCount(e.path, t.base, t.branch).catch(() => null);
+			await e.store.transaction(async () => {
+				const live = await e.store.getTask(t.id);
+				// A write that landed since the list (a cancel, a claim) owns the card.
+				if (
+					live === null ||
+					live.cancelledAt !== null ||
+					live.stage !== t.stage ||
+					live.state !== t.state
+				)
+					return;
+				if (commits !== 0) {
+					await e.store.updateTask(t.id, {
+						state: "needs_you",
+						needsReason: LEAD_COMMITS_REASON,
+					});
+					return;
+				}
+				await e.store.updateTask(t.id, {
+					stage: "backlog",
+					state: "idle",
+					queuedAt: null,
+					needsReason: null,
+					asked: null,
+					details: `${live.details ?? ""}\nMoved back to the backlog on ${new Date().toISOString().slice(0, 10)}: a Needs validation lead runs in its review's batch validation run, never in a work turn.`,
+				});
+				const ids = moved.get(reviewId) ?? new Set<string>();
+				moved.set(reviewId, ids.add(t.id));
+			});
+		}
+		// A refusal (a run already open, a review still running) leaves the lead in the
+		// backlog for the chain or the review's done trigger, like the other triggers.
+		for (const [id, leads] of moved)
+			await filePendingValidationRun(e, id, true, undefined, leads);
 	}
 
 	/** UI-shot guard: a work turn whose diff touches UI files (uiFiles) but attached no
