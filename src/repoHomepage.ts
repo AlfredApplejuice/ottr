@@ -57,11 +57,11 @@ export async function cachedRepoHomepage(
 	if (active !== undefined) return active;
 
 	const request = repositoryHomepage(repo, gh)
+		.catch(() => homepageCache.get(repo)?.value ?? null)
 		.then((value) => {
 			homepageCache.set(repo, { at: Date.now(), value });
 			return value;
 		})
-		.catch(() => homepageCache.get(repo)?.value ?? null)
 		.finally(() => {
 			homepageRequests.delete(repo);
 		});

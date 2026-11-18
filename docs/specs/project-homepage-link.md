@@ -8,7 +8,7 @@ The link shows the existing external-link icon and the homepage domain. It opens
 
 Ottr reads the `homepage` field from `GET repos/{owner}/{repo}` through `gh api`. The response uses GitHub's repository object shape, where `homepage` is a root field.
 
-The server refreshes this value with the existing project poll. `cachedRepoHomepage` shares requests and caches each result for ten minutes per repository. A page request does not call GitHub.
+The server refreshes this value with the existing project poll. `cachedRepoHomepage` shares requests and caches each result for ten minutes per repository. The interval starts when the request ends, whether it succeeds or fails. A page request does not call GitHub.
 
 ## Boundary and Errors
 
@@ -31,6 +31,8 @@ Hide the link when GitHub returns no homepage or an invalid value. A failed GitH
 - A project header with a homepage shows one external link with the right URL, domain, target, and `rel` value.
 - A project header without a homepage shows no homepage link.
 - A GitHub request failure does not block a board response and does not replace a last valid homepage.
+- A failed request, with or without a cached value, does not retry before ten minutes pass.
+- At the ten-minute boundary, the next poll can retry and replace the cached value after success.
 - The link works with keyboard focus and the existing project header style.
 
 ## Non-goals

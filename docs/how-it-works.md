@@ -260,6 +260,8 @@ The skill requires the Alate import and provision steps on each host and worker 
 
 The project header's release chip shows the repo's latest GitHub release — its name when the release's tag is not `vX.Y.Z` — and falls back to the highest `vX.Y.Z` tag merged into the target when the project has no GitHub remote or GitHub does not answer. When the latest GitHub release is not `vX.Y.Z`, Create release stays blocked with an explanation instead of offering a computed next version: Ottr's release flow only tags `vX.Y.Z`. When the project has a GitHub remote, the header also shows its open pull requests: up to three `#number` links (the title on hover, drafts marked), and more than three collapse into one count link to the repo's pulls page. The list re-probes GitHub about every ten minutes and hides itself when GitHub does not answer. The header also shows the homepage domain when the GitHub repo sets a valid HTTP or HTTPS URL.
 
+The homepage probe waits ten minutes after each request ends, including after a failure. A failed request keeps the last valid homepage, or hides the link when no value exists.
+
 While a review is open, only its finding cards merge — a release ships reviewed work and its fixes, nothing else. Also, the **Create release** and **Start review** buttons stay disabled until the open review or release and its findings are done.
 
 A release card that waits for you with every finding done shows the held merges on the card and offers **Release again**: it cancels the release and opens Create release, so a new review covers the fixes. A card that waits for such a release shows the hold and links to the release card. The board warnings name a release that holds merges for more than an hour after its last finding landed.

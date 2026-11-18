@@ -165,6 +165,52 @@ describe("repository homepage", () => {
 		]);
 	});
 
+	for (const [failure, response] of [
+		["a rejected command", new Error("gh unavailable")],
+		["a non-zero exit", { code: 1, stdout: "", stderr: "request failed" }],
+		["malformed JSON", { code: 0, stdout: "{", stderr: "" }],
+	] satisfies [string, Error | GhReply][]) {
+		test(`backs off ${failure} for ten minutes after a first failure`, async () => {
+			const now = spyOn(Date, "now").mockReturnValue(1_000_000);
+			const failedAt = 1_030_000;
+			const repo = `homepage-failure-${crypto.randomUUID()}`;
+			let calls = 0;
+			const gh: Gh = async () => {
+				calls += 1;
+				if (calls === 1) now.mockReturnValue(failedAt);
+				if (calls <= 2) {
+					if (response instanceof Error) throw response;
+					return response;
+				}
+				return reply({ homepage: validHomepage.url });
+			};
+			try {
+				expect(await cachedRepoHomepage(repo, gh)).toBeNull();
+				expect(calls).toBe(1);
+
+				for (const elapsed of [0, 5000, 60_000, 10 * 60_000 - 1]) {
+					now.mockReturnValue(failedAt + elapsed);
+					expect(await cachedRepoHomepage(repo, gh)).toBeNull();
+					expect(calls).toBe(1);
+				}
+
+				now.mockReturnValue(failedAt + 10 * 60_000);
+				expect(await cachedRepoHomepage(repo, gh)).toBeNull();
+				expect(calls).toBe(2);
+
+				now.mockReturnValue(failedAt + 10 * 60_000 + 5000);
+				expect(await cachedRepoHomepage(repo, gh)).toBeNull();
+				expect(calls).toBe(2);
+
+				now.mockReturnValue(failedAt + 20 * 60_000);
+				expect(await cachedRepoHomepage(repo, gh)).toEqual(validHomepage);
+				expect(calls).toBe(3);
+			} finally {
+				now.mockRestore();
+			}
+		});
+	}
+
 	test("reuses cached values, refreshes after ten minutes, and keeps the last good value on failure", async () => {
 		const now = spyOn(Date, "now").mockReturnValue(1_000_000);
 		const repo = `homepage-cache-${crypto.randomUUID()}`;
@@ -175,6 +221,7 @@ describe("repository homepage", () => {
 				return reply({ homepage: "https://example.com/project" });
 			if (calls === 2)
 				return reply({ homepage: "https://new.example/project" });
+			if (calls === 4) return reply({ homepage: validHomepage.url });
 			throw new Error("GitHub request failed");
 		};
 		try {
@@ -195,6 +242,19 @@ describe("repository homepage", () => {
 				domain: "new.example",
 			});
 			expect(calls).toBe(3);
+
+			for (const elapsed of [5000, 10 * 60_000 - 1]) {
+				now.mockReturnValue(1_000_000 + 20 * 60_000 + elapsed);
+				expect(await cachedRepoHomepage(repo, gh)).toEqual({
+					url: "https://new.example/project",
+					domain: "new.example",
+				});
+				expect(calls).toBe(3);
+			}
+
+			now.mockReturnValue(1_000_000 + 30 * 60_000);
+			expect(await cachedRepoHomepage(repo, gh)).toEqual(validHomepage);
+			expect(calls).toBe(4);
 		} finally {
 			now.mockRestore();
 		}
