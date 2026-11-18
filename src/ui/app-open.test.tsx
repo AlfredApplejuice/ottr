@@ -8,6 +8,7 @@ import type {
 	StateResponse,
 	SystemSnapshot,
 	TaskCard,
+	TaskView,
 } from "../types.ts";
 import { refreshState } from "./socket.ts";
 
@@ -302,6 +303,136 @@ const cardEl = (id: string): Element | null =>
 const drawer = (): Element | null => document.querySelector("dialog.drawer");
 const drawerOpen = (): boolean => drawer()?.hasAttribute("open") === true;
 
+const oldTask = card({
+	id: "OTTR-441",
+	title: "Old done task",
+	sessionTitle: "Old done task",
+	project: "alpha",
+	state: "idle",
+	stage: "done",
+	createdAt: 1,
+	doneAt: 100,
+});
+const oldTaskView = {
+	...oldTask,
+	prompt: "The older task prompt.",
+	summary: null,
+	details: null,
+	report: null,
+	diffFiles: null,
+	turns: [],
+	workCheckLog: [],
+	workCheckReport: null,
+	gate: null,
+	worktreeFiles: [],
+	shots: [],
+	images: [],
+	pendingImages: [],
+	keptFiles: [],
+	lateCommits: [],
+} as unknown as TaskView;
+const oldTaskPath = "/projects/alpha/tasks/OTTR-441";
+const oldTaskDetailUrl = "/api/projects/alpha/tasks/OTTR-441";
+const oldDonePageUrl = "/api/projects/alpha/done?page=2";
+
+const jsonResponse = (body: unknown, status = 200): Response =>
+	new Response(JSON.stringify(body), {
+		status,
+		headers: { "Content-Type": "application/json" },
+	});
+
+async function withOldTaskFixture(
+	respondToDetail: (attempt: number) => Promise<Response>,
+	run: (counts: {
+		detailRequests: () => number;
+		stateRequests: () => number;
+	}) => Promise<void>,
+): Promise<void> {
+	const alpha = projects[0]!;
+	const previousDoneTotal = alpha.doneTotal;
+	const previousFetch = host.fetch;
+	let detailRequests = 0;
+	let stateRequests = 0;
+	alpha.doneTotal =
+		tasks.filter((task) => task.project === alpha.name && task.stage === "done")
+			.length + 1;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		const url = String(input);
+		if (url === oldDonePageUrl)
+			return jsonResponse({ tasks: [oldTask], total: alpha.doneTotal });
+		if (url === oldTaskDetailUrl) return respondToDetail(++detailRequests);
+		if (url === "/api/state") stateRequests++;
+		return fetchMock(input);
+	}) as typeof fetch;
+	try {
+		await run({
+			detailRequests: () => detailRequests,
+			stateRequests: () => stateRequests,
+		});
+	} finally {
+		try {
+			await unmountApp();
+		} finally {
+			alpha.doneTotal = previousDoneTotal;
+			host.fetch = previousFetch;
+		}
+	}
+}
+
+const drawerHasTitle = (title: string): boolean =>
+	drawerOpen() && drawer()?.querySelector("h2")?.textContent === title;
+const oldTaskDrawerLoaded = (): boolean =>
+	drawerHasTitle(oldTask.sessionTitle ?? oldTask.title) &&
+	(drawer()?.textContent?.includes("The older task prompt.") ?? false);
+
+const openCard = async (id: string): Promise<void> => {
+	const open = cardEl(id)?.querySelector("a.card-open");
+	expect(open).not.toBeNull();
+	await click(open!);
+};
+
+const openOlderDoneCard = async (): Promise<void> => {
+	const more = document.querySelector<HTMLButtonElement>("button.lane-more");
+	expect(more).not.toBeNull();
+	await click(more!);
+	await waitFor(() => cardEl(oldTask.id) !== null);
+	await openCard(oldTask.id);
+};
+
+const appErrorRow = (): Element | null =>
+	document.querySelector('#inbox .notif-line[data-inbox-key^="crit:"]');
+
+async function expectOldTaskRetryAfter(
+	fail: () => Promise<Response>,
+): Promise<void> {
+	await withOldTaskFixture(
+		(attempt) =>
+			attempt === 1 ? fail() : Promise.resolve(jsonResponse(oldTaskView)),
+		async ({ detailRequests }) => {
+			await mountAt("/projects/alpha");
+			await openOlderDoneCard();
+			await waitFor(() => appErrorRow() !== null);
+			expect(appErrorRow()?.textContent?.trim().length ?? 0).toBeGreaterThan(0);
+			const drawerTitle = drawer()?.querySelector("h2")?.textContent;
+			expect(drawerTitle === undefined || drawerTitle === oldTask.title).toBe(
+				true,
+			);
+			expect(drawer()?.textContent ?? "").not.toContain(
+				"The older task prompt.",
+			);
+			expect(window.location.pathname).toBe(oldTaskPath);
+
+			await openCard("AL-1");
+			await waitFor(() => drawerHasTitle("Alpha work"));
+			await openCard(oldTask.id);
+			await waitFor(oldTaskDrawerLoaded);
+			expect(detailRequests()).toBeGreaterThanOrEqual(2);
+		},
+	);
+}
+
+// --- old Done task details --------------------------------------------------
+
 // --- tests ------------------------------------------------------------------
 
 test("the bell opens another project's card and the board follows it", async () => {
@@ -476,6 +607,387 @@ test("a pasted card URL loads that project's board with the drawer open", async 
 	} finally {
 		await unmountApp();
 	}
+});
+
+test("Show more opens an older done task at its canonical URL", async () => {
+	await withOldTaskFixture(
+		async () => jsonResponse(oldTaskView),
+		async () => {
+			await mountAt("/projects/alpha");
+			await openOlderDoneCard();
+			await waitFor(oldTaskDrawerLoaded);
+			expect(window.location.pathname).toBe(oldTaskPath);
+			expect(drawerOpen()).toBe(true);
+			expect(drawer()?.querySelector("h2")?.textContent).toBe("Old done task");
+			expect(drawer()?.textContent).toContain("The older task prompt.");
+		},
+	);
+});
+
+test("a pasted old task URL opens its drawer", async () => {
+	await withOldTaskFixture(
+		async () => jsonResponse(oldTaskView),
+		async () => {
+			await mountAt(oldTaskPath);
+			await waitFor(oldTaskDrawerLoaded);
+			expect(window.location.pathname).toBe(oldTaskPath);
+			expect(drawerOpen()).toBe(true);
+			expect(drawer()?.querySelector("h2")?.textContent).toBe("Old done task");
+			expect(drawer()?.textContent).toContain("The older task prompt.");
+		},
+	);
+});
+
+test("a slim state refresh keeps an older task drawer open", async () => {
+	await withOldTaskFixture(
+		async () => jsonResponse(oldTaskView),
+		async ({ stateRequests }) => {
+			await mountAt("/projects/alpha");
+			await openOlderDoneCard();
+			await waitFor(oldTaskDrawerLoaded);
+			const before = stateRequests();
+			await act(async () => {
+				refreshState();
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setTimeout(resolve, 10);
+				await promise;
+			});
+			expect(stateRequests()).toBeGreaterThan(before);
+			expect(oldTaskDrawerLoaded()).toBe(true);
+		},
+	);
+});
+
+test("an old pinned task stays open when its state row disappears", async () => {
+	const pinned = card({ ...oldTask, starred: true });
+	const pinnedView = { ...oldTaskView, ...pinned } as TaskView;
+	const pendingDetail = Promise.withResolvers<Response>();
+	const releaseDetail = pendingDetail.resolve;
+	const previousTasks = state.tasks;
+	state.tasks = [...previousTasks, pinned];
+	try {
+		await withOldTaskFixture(
+			(attempt) =>
+				attempt === 1
+					? Promise.resolve(jsonResponse(pinnedView))
+					: pendingDetail.promise,
+			async ({ detailRequests, stateRequests }) => {
+				try {
+					await mountAt("/projects/alpha");
+					await openCard(pinned.id);
+					await waitFor(() => detailRequests() === 1 && oldTaskDrawerLoaded());
+					const selectedDialog = drawer();
+					expect(selectedDialog).not.toBeNull();
+					const workSteps = selectedDialog!.querySelector<HTMLButtonElement>(
+						'button[aria-controls="drawer-steps"]',
+					);
+					expect(workSteps).not.toBeNull();
+					await click(workSteps!);
+					expect(workSteps!.getAttribute("aria-expanded")).toBe("true");
+					const expectPinnedDrawer = () => {
+						expect(drawer()).toBe(selectedDialog);
+						expect(drawerOpen()).toBe(true);
+						expect(drawerHasTitle(pinned.sessionTitle ?? pinned.title)).toBe(
+							true,
+						);
+						expect(selectedDialog!.textContent).toContain(
+							"The older task prompt.",
+						);
+						expect(workSteps!.getAttribute("aria-expanded")).toBe("true");
+					};
+
+					const before = stateRequests();
+					state.tasks = previousTasks;
+					await act(async () => {
+						refreshState();
+						const { promise, resolve } = Promise.withResolvers<void>();
+						setTimeout(resolve, 10);
+						await promise;
+					});
+					expect(stateRequests()).toBeGreaterThan(before);
+					expect(drawer()).toBe(selectedDialog);
+
+					await waitFor(() => detailRequests() === 2);
+					expectPinnedDrawer();
+
+					releaseDetail(jsonResponse(pinnedView));
+					await act(async () => {
+						const { promise, resolve } = Promise.withResolvers<void>();
+						setTimeout(resolve, 10);
+						await promise;
+					});
+					expectPinnedDrawer();
+				} finally {
+					releaseDetail(jsonResponse(pinnedView));
+				}
+			},
+		);
+	} finally {
+		state.tasks = previousTasks;
+	}
+});
+
+test("a late old task detail cannot replace a newly opened task", async () => {
+	const delayedOldDetail = Promise.withResolvers<Response>();
+	const releaseOldDetail = delayedOldDetail.resolve;
+	await withOldTaskFixture(
+		(attempt) =>
+			attempt === 1
+				? delayedOldDetail.promise
+				: Promise.resolve(jsonResponse(oldTaskView)),
+		async ({ detailRequests }) => {
+			try {
+				await mountAt("/projects/alpha");
+				await openOlderDoneCard();
+				await waitFor(() => detailRequests() === 1);
+				await openCard("AL-1");
+				await waitFor(() => drawerHasTitle("Alpha work"));
+				expect(window.location.pathname).toBe("/projects/alpha/tasks/AL-1");
+
+				releaseOldDetail(jsonResponse(oldTaskView));
+				await act(async () => {
+					const { promise, resolve } = Promise.withResolvers<void>();
+					setTimeout(resolve, 10);
+					await promise;
+				});
+				expect(drawerHasTitle("Alpha work")).toBe(true);
+				expect(drawer()?.textContent ?? "").not.toContain(
+					"The older task prompt.",
+				);
+				expect(window.location.pathname).toBe("/projects/alpha/tasks/AL-1");
+			} finally {
+				releaseOldDetail(jsonResponse(oldTaskView));
+			}
+		},
+	);
+});
+
+test("a late old task detail after Back keeps the board closed", async () => {
+	const pendingDetail = Promise.withResolvers<Response>();
+	const releaseDetail = pendingDetail.resolve;
+	await withOldTaskFixture(
+		() => pendingDetail.promise,
+		async ({ detailRequests }) => {
+			try {
+				await mountAt("/projects/alpha");
+				await openOlderDoneCard();
+				await waitFor(() => detailRequests() === 1);
+				expect(window.location.pathname).toBe(oldTaskPath);
+
+				await act(async () => {
+					window.history.back();
+				});
+				await waitFor(
+					() => window.location.pathname === "/projects/alpha" && !drawerOpen(),
+				);
+				releaseDetail(jsonResponse(oldTaskView));
+				await act(async () => {
+					const { promise, resolve } = Promise.withResolvers<void>();
+					setTimeout(resolve, 10);
+					await promise;
+				});
+				expect(drawerOpen()).toBe(false);
+				expect(window.location.pathname).toBe("/projects/alpha");
+			} finally {
+				releaseDetail(jsonResponse(oldTaskView));
+			}
+		},
+	);
+});
+
+test("a current state task keeps its title over a late old detail", async () => {
+	const pendingDetail = Promise.withResolvers<Response>();
+	const releaseDetail = pendingDetail.resolve;
+	const currentTask = card({
+		...oldTask,
+		title: "Current frame title",
+		sessionTitle: "Current frame title",
+		updatedAt: 200,
+	});
+	const currentTaskView: TaskView = {
+		...oldTaskView,
+		title: currentTask.title,
+		sessionTitle: currentTask.sessionTitle,
+	};
+	const previousTaskCount = state.tasks.length;
+	await withOldTaskFixture(
+		(attempt) =>
+			attempt === 1
+				? pendingDetail.promise
+				: Promise.resolve(jsonResponse(currentTaskView)),
+		async ({ detailRequests, stateRequests }) => {
+			try {
+				await mountAt("/projects/alpha");
+				await openOlderDoneCard();
+				await waitFor(() => detailRequests() === 1);
+				const before = stateRequests();
+				state.tasks.push(currentTask);
+				await act(async () => {
+					refreshState();
+					const { promise, resolve } = Promise.withResolvers<void>();
+					setTimeout(resolve, 10);
+					await promise;
+				});
+				expect(stateRequests()).toBeGreaterThan(before);
+				await waitFor(() => drawerHasTitle("Current frame title"));
+
+				releaseDetail(jsonResponse(oldTaskView));
+				await act(async () => {
+					const { promise, resolve } = Promise.withResolvers<void>();
+					setTimeout(resolve, 10);
+					await promise;
+				});
+				expect(drawerHasTitle("Current frame title")).toBe(true);
+				expect(window.location.pathname).toBe(oldTaskPath);
+			} finally {
+				state.tasks.length = previousTaskCount;
+				releaseDetail(jsonResponse(oldTaskView));
+			}
+		},
+	);
+});
+
+test("a newer current row stays selected after an old task leaves state", async () => {
+	const currentTask = card({
+		...oldTask,
+		title: "Current frame title",
+		sessionTitle: "Current frame title",
+		updatedAt: 200,
+	});
+	const currentTaskView = { ...oldTaskView, ...currentTask } as TaskView;
+	let currentDetail: TaskView = oldTaskView;
+	const pendingDetail = Promise.withResolvers<Response>();
+	const releaseDetail = pendingDetail.resolve;
+	const previousTasks = state.tasks;
+	let afterEviction = false;
+	try {
+		await withOldTaskFixture(
+			() =>
+				afterEviction
+					? pendingDetail.promise
+					: Promise.resolve(jsonResponse(currentDetail)),
+			async ({ detailRequests, stateRequests }) => {
+				try {
+					await mountAt("/projects/alpha");
+					await openOlderDoneCard();
+					await waitFor(oldTaskDrawerLoaded);
+					const selectedDialog = drawer();
+					expect(selectedDialog).not.toBeNull();
+					const expectCurrentDrawer = () => {
+						expect(drawer()).toBe(selectedDialog);
+						expect(drawerOpen()).toBe(true);
+						expect(drawerHasTitle("Current frame title")).toBe(true);
+						expect(selectedDialog!.textContent).toContain(
+							"The older task prompt.",
+						);
+					};
+					currentDetail = currentTaskView;
+
+					const before = stateRequests();
+					state.tasks = [...previousTasks, currentTask];
+					await act(async () => {
+						refreshState();
+						const { promise, resolve } = Promise.withResolvers<void>();
+						setTimeout(resolve, 10);
+						await promise;
+					});
+					expect(stateRequests()).toBeGreaterThan(before);
+					await waitFor(() => drawerHasTitle("Current frame title"));
+					expectCurrentDrawer();
+
+					const detailsBeforeEviction = detailRequests();
+					const stateBeforeEviction = stateRequests();
+					afterEviction = true;
+					state.tasks = previousTasks;
+					await act(async () => {
+						refreshState();
+						const { promise, resolve } = Promise.withResolvers<void>();
+						setTimeout(resolve, 10);
+						await promise;
+					});
+					expect(stateRequests()).toBeGreaterThan(stateBeforeEviction);
+					expect(drawer()).toBe(selectedDialog);
+					await waitFor(() => detailRequests() > detailsBeforeEviction);
+					expectCurrentDrawer();
+
+					releaseDetail(jsonResponse(currentTaskView));
+					await act(async () => {
+						const { promise, resolve } = Promise.withResolvers<void>();
+						setTimeout(resolve, 10);
+						await promise;
+					});
+					expectCurrentDrawer();
+				} finally {
+					releaseDetail(jsonResponse(currentTaskView));
+				}
+			},
+		);
+	} finally {
+		state.tasks = previousTasks;
+	}
+});
+
+test("Back and Forward restore old task URLs and Close exits the drawer", async () => {
+	await withOldTaskFixture(
+		async () => jsonResponse(oldTaskView),
+		async () => {
+			await mountAt(oldTaskPath);
+			await waitFor(oldTaskDrawerLoaded);
+			await openCard("AL-1");
+			await waitFor(() => drawerHasTitle("Alpha work"));
+			expect(window.location.pathname).toBe("/projects/alpha/tasks/AL-1");
+
+			await act(async () => {
+				window.history.back();
+			});
+			await waitFor(
+				() => window.location.pathname === oldTaskPath && oldTaskDrawerLoaded(),
+			);
+			await act(async () => {
+				window.history.forward();
+			});
+			await waitFor(
+				() =>
+					window.location.pathname === "/projects/alpha/tasks/AL-1" &&
+					drawerHasTitle("Alpha work"),
+			);
+
+			await act(async () => {
+				window.history.back();
+			});
+			await waitFor(
+				() => window.location.pathname === oldTaskPath && oldTaskDrawerLoaded(),
+			);
+			const close = drawer()?.querySelector<HTMLButtonElement>(
+				'button[aria-label="Close"]',
+			);
+			expect(close).not.toBeNull();
+			await click(close!);
+			await waitFor(
+				() => !drawerOpen() && window.location.pathname === "/projects/alpha",
+			);
+			expect(drawerOpen()).toBe(false);
+			expect(window.location.pathname).toBe("/projects/alpha");
+		},
+	);
+});
+
+test("a missing old task detail shows an error and can retry", async () => {
+	await expectOldTaskRetryAfter(async () =>
+		jsonResponse({ error: "Task not found" }, 404),
+	);
+});
+
+test("a server error for an old task detail can retry", async () => {
+	await expectOldTaskRetryAfter(async () =>
+		jsonResponse({ error: "Task unavailable" }, 500),
+	);
+});
+
+test("a transport error for an old task detail can retry", async () => {
+	await expectOldTaskRetryAfter(async () => {
+		throw new Error("Network unavailable");
+	});
 });
 
 test("opening a card of the current project keeps the mounted lanes", async () => {

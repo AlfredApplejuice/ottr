@@ -202,6 +202,10 @@ One card skips the requeue. A tracker death can land between the server merge pu
 | Done | The report passed the git checks. Worktree and branch are gone. The lane shows the newest 20 cards and every unread card (an answer or a PR review not opened yet). **Show more** loads 20 more. A star on a done research card pins its report in a collapsible **Starred** section above the normal done cards. A cancelled card also shows here, with a **Cancelled** chip that names the cancel time; its drawer opens read-only, with no action buttons. A project with a task that finished and whose drawer you have not opened yet shows a steel-blue dot in the left project list, ranked below needs action, asked and running; opening that task's drawer, by a click or a pasted link, clears it, and a task that lands in Done again shows the dot again. The read mark is kept on the server, so it holds across reloads and devices; tasks done before this dot shipped count as read. |
 | Backlog | Parks ideas that are not ready to run. The list sits under Todo below a divider. A grill session refines an idea; a grilled card moves to Todo. While the grill session runs, the card leaves the backlog row and shows as a normal card in the Todo lane. |
 
+The board state carries a small window, not full task history. **Show more** loads
+older cards a page at a time. Click any loaded card to open its drawer.
+A task URL also opens the drawer for a card outside the current state window.
+
 On phones, stage tabs keep equal widths and complete labels.
 Scroll the tab strip to reach more stages.
 The strip keeps the active stage label in view after a tap, swipe, or keyboard change.

@@ -48,6 +48,7 @@ import {
 	type AddProjectResponse,
 	APPROVE_REPLY,
 	type AskQuestion,
+	answeredCard,
 	askAnswerLine,
 	doneReadKey,
 	type GhStatus,
@@ -1031,7 +1032,7 @@ const Card = memo(function Card({
 	task: TaskCard;
 	github: string | null;
 	/** Opens this card's drawer; stable across frames, so memoized cards keep it. */
-	onOpen: (id: string) => void;
+	onOpen: (id: string, project?: string) => void;
 	unread: boolean;
 	delta?: number;
 	fuOf?: string | null;
@@ -1092,7 +1093,7 @@ const Card = memo(function Card({
 						? (task.needsReason ?? "Action required")
 						: undefined
 				}
-				onClick={(e) => navClick(e, () => onOpen(task.id))}
+				onClick={(e) => navClick(e, () => onOpen(task.id, task.project))}
 			>
 				{cardHead(task, unread, catalog)}
 				<span className="card-title">{task.sessionTitle ?? task.title}</span>
@@ -4360,7 +4361,7 @@ export function ProjectBoard({
 	project: ProjectView;
 	tasks: TaskCard[];
 	deltas: Map<string, number>;
-	open: (id: string) => void;
+	open: (id: string, project?: string) => void;
 	seenAnswers: Set<string>;
 	/** The server's done baseline; the unread rule reads it (OTTR-827). */
 	seenDoneSince: number;
@@ -6226,7 +6227,7 @@ export function LaneCol({
 	hasRules: boolean;
 	github: string | null;
 	deltas: Map<string, number>;
-	open: (id: string) => void;
+	open: (id: string, project?: string) => void;
 	unread: (t: TaskCard) => boolean;
 	onReorder: (dragId: string, beforeId: string | null) => Promise<boolean>;
 	filtering: boolean;
@@ -15377,6 +15378,7 @@ function appViewSelection(
 	view: string,
 	projects: ProjectView[],
 	selectedId: string | null,
+	selectedProjectName: string | null,
 	tasks: TaskCard[],
 	bootHosted: boolean,
 ): {
@@ -15403,7 +15405,11 @@ function appViewSelection(
 	const selected =
 		selectedId === null
 			? null
-			: (tasks.find((t) => t.id === selectedId) ?? null);
+			: (tasks.find(
+					(t) =>
+						t.id === selectedId &&
+						(selectedProjectName === null || t.project === selectedProjectName),
+				) ?? null);
 	const selectedProject =
 		selected === null
 			? null
@@ -15417,6 +15423,30 @@ function appViewSelection(
 		selected,
 		selectedProject,
 	};
+}
+
+/** Keep the selected old card small; the drawer reads its wide fields separately. */
+function taskCardFromDetail(detail: TaskView): TaskCard {
+	const {
+		turns,
+		prompt: _prompt,
+		summary: _summary,
+		details: _details,
+		report: _report,
+		diffFiles: _diffFiles,
+		workCheckLog: _workCheckLog,
+		workCheckReport: _workCheckReport,
+		gate: _gate,
+		worktreeFiles: _worktreeFiles,
+		savedFiles: _savedFiles,
+		prReview: _prReview,
+		prRun: _prRun,
+		lateCommits: _lateCommits,
+		retro: _retro,
+		findings: _findings,
+		...card
+	} = detail;
+	return { ...card, answered: answeredCard(turns) };
 }
 
 /** Server-frame notice fields the board's inbox and banner read; defaults while the
@@ -16891,6 +16921,18 @@ export function App() {
 	const [selectedId, setSelectedId] = useState<string | null>(
 		() => readPath().task,
 	);
+	const [selectedProjectName, setSelectedProjectName] = useState<string | null>(
+		() => {
+			const path = readPath();
+			return path.task === null ? null : path.view;
+		},
+	);
+	const [fallbackTask, setFallbackTask] = useState<TaskCard | null>(null);
+	const [fallbackTaskSource, setFallbackTaskSource] = useState<
+		"state" | "detail" | null
+	>(null);
+	const [fallbackAttempt, setFallbackAttempt] = useState(0);
+	const [error, setError] = useState<string | null>(null);
 	/** Cards with something to read (answers, PR reviews) that the user has opened; the unread badge on done cards reads its absence. Starts empty; the server owns the set. */
 	const [seenAnswers, setSeenAnswers] = useState(() => new Set<string>());
 	/** Done-read keys whose auto-mark POST failed; the read-mark effect must not re-post them in a loop. */
@@ -16901,6 +16943,7 @@ export function App() {
 	const migratedSeen = useRef(false);
 	// Hoisted above markRead/openTask: openTask looks cards up here, and a plain const is not a hook, so order with the useState lines is free.
 	const tasks = state?.tasks ?? [];
+	const projects = state?.projects ?? [];
 	// U6: rows an open (non-done, non-cancelled) update card already carries are not pending for the user.
 	const coveredUpdates = coveredUpdateIds(tasks);
 	/** OTTR-827: marks a card read — the plain id always, and (OTTR-566) the completion key
@@ -16977,24 +17020,31 @@ export function App() {
 		});
 	}, []);
 	const openTask = useCallback(
-		(id: string) => {
-			// Every card open is one history entry, so Back returns to the previous card
-			// (e.g. child → parent → child) before it leaves the page. The URL names the
-			// card: /projects/<project>/tasks/<id>, and the board follows the URL: a card
-			// of another project selects that project first, so header, rail, lanes and
-			// drawer always agree (OTTR-487). Closing the drawer then stays on that
-			// project. The same value is a no-op: a current-project open changes nothing.
-			const card = tasks.find((t) => t.id === id);
-			if (card === undefined) {
-				history.pushState({ ompTask: id }, "", location.pathname);
-			} else {
-				history.pushState({ ompTask: id }, "", taskPath(card.project, id));
-				setView(card.project);
+		(id: string, explicitProject?: string) => {
+			// Each open adds one history entry. The path names the task and its project.
+			const card =
+				explicitProject === undefined
+					? tasks.find((t) => t.id === id)
+					: tasks.find((t) => t.id === id && t.project === explicitProject);
+			const projectName =
+				card?.project ??
+				explicitProject ??
+				projects.find((p) => p.name === view)?.name;
+			if (projectName === undefined) {
+				setError(`Cannot open task ${id}: no project is selected.`);
+				return;
 			}
+			history.pushState({ ompTask: id }, "", taskPath(projectName, id));
+			setView(projectName);
+			setSelectedProjectName(projectName);
 			setSelectedId(id);
 			if (card !== undefined && autoMarkOnOpen(card)) markRead(card);
+			if (card === undefined) {
+				setError(null);
+				setFallbackAttempt((attempt) => attempt + 1);
+			}
 		},
-		[tasks, markRead],
+		[tasks, projects, view, markRead],
 	);
 	/** Plain-click navigation for the view links: pushes the path and swaps the view. The
 	 * drawer selection stays untouched, like the hashchange listener did. */
@@ -17006,11 +17056,11 @@ export function App() {
 	 * URL without a card. replaceState never adds an entry, so Back keeps walking cards. */
 	const closeDrawer = useCallback(() => {
 		setSelectedId(null);
+		setSelectedProjectName(null);
 		history.replaceState(null, "", viewPath(view));
 	}, [view]);
 	const [composeFor, setComposeFor] = useState<string | null>(null);
 	const [draftFor, setDraftFor] = useState<string | null>(null);
-	const [error, setError] = useState<string | null>(null);
 	const [notice, setNotice] = useState<string | null>(null);
 	const [offline, setOffline] = useState(false);
 	/** OTTR-964: why the board cannot reach the server, for the offline banner. */
@@ -17177,16 +17227,15 @@ export function App() {
 	const applied = theme === "system" ? (sysLight ? "light" : "dark") : theme;
 	const themeName = `Theme: ${THEME_META[applied].label}${theme === "system" ? " (match system)" : ""}`;
 
-	// Back/Forward walk the entries pushState()d by openTask and the view links; both the
-	// view and the drawer follow the entry. A vanished card id self-cleans: the drawer only
-	// renders a task the current state still lists. The explicit close (X, Esc, backdrop)
-	// only drops the selection: it must not traverse, or closing the parent of a child →
-	// parent walk would pop to the child's entry and reopen it instead of closing.
+	// Back and Forward select the task named by each path. Older task IDs can stay selected.
+	// Their detail lookup can report a missing task without clearing the URL selection.
 	useEffect(() => {
 		const onPop = (e: PopStateEvent): void => {
 			const path = readPath();
+			const id = historyTask(e.state, path.task);
 			setView(path.view);
-			setSelectedId(historyTask(e.state, path.task));
+			setSelectedId(id);
+			setSelectedProjectName(id === null ? null : path.view);
 		};
 		window.addEventListener("popstate", onPop);
 		return () => window.removeEventListener("popstate", onPop);
@@ -17220,11 +17269,6 @@ export function App() {
 				setState((prev) => reuseCards(prev, s));
 				// The frame carries the server's seen list, which now includes (or settled) every ack sent before it.
 				setAckLocal(new Set());
-				// The open card can vanish (cancelled in another tab): drop the selection,
-				// or the drawer would keep rendering a stale row.
-				setSelectedId((id) =>
-					id === null || s.tasks.some((t) => t.id === id) ? id : null,
-				);
 				// Drafts die with their ask: a sent, cancelled or other-device answer drops them.
 				pruneAskDrafts(
 					new Set(s.tasks.filter((t) => t.asked !== null).map((t) => t.id)),
@@ -17367,7 +17411,103 @@ export function App() {
 		[], // stable: setError and refreshState never change between renders
 	);
 
-	const projects = state?.projects ?? [];
+	const selectedStateTask =
+		selectedId === null
+			? undefined
+			: tasks.find(
+					(t) =>
+						t.id === selectedId &&
+						(selectedProjectName === null || t.project === selectedProjectName),
+				);
+	const lookupProject =
+		selectedStateTask?.project ??
+		selectedProjectName ??
+		(selectedId === null
+			? null
+			: (projects.find((p) => p.name === view)?.name ?? null));
+	const latestTaskSelection = useRef<{
+		id: string | null;
+		project: string | null;
+		task: TaskCard | undefined;
+		revision: number;
+	} | null>(null);
+	useLayoutEffect(() => {
+		const previousRevision = latestTaskSelection.current?.revision ?? 0;
+		latestTaskSelection.current = {
+			id: selectedId,
+			project: lookupProject,
+			task: selectedStateTask,
+			revision: previousRevision + 1,
+		};
+		if (selectedId === null) {
+			setFallbackTask(null);
+			setFallbackTaskSource(null);
+		} else if (selectedStateTask !== undefined) {
+			setFallbackTask(selectedStateTask);
+			setFallbackTaskSource("state");
+		}
+	}, [selectedId, lookupProject, selectedStateTask]);
+	const selectedProjectForView =
+		selectedStateTask?.project ?? selectedProjectName;
+	const hasSelectedStateTask = selectedStateTask !== undefined;
+	const stateLoaded = state !== null;
+	const fallbackMatches =
+		fallbackTask !== null &&
+		selectedId !== null &&
+		lookupProject !== null &&
+		fallbackTask.id === selectedId &&
+		fallbackTask.project === lookupProject;
+	const selectionTasks =
+		!hasSelectedStateTask && fallbackMatches && fallbackTask !== null
+			? [...tasks, fallbackTask]
+			: tasks;
+	useEffect(() => {
+		if (
+			selectedId === null ||
+			lookupProject === null ||
+			!stateLoaded ||
+			hasSelectedStateTask ||
+			(fallbackMatches && fallbackTaskSource === "detail")
+		)
+			return;
+		let alive = true;
+		const requestSelection = latestTaskSelection.current;
+		if (requestSelection === null) return;
+		const requestRevision = requestSelection.revision;
+		const url = `/api/projects/${encodeURIComponent(lookupProject)}/tasks/${encodeURIComponent(selectedId)}`;
+		void readDetail(url)
+			.then((detail) => {
+				if (!alive) return;
+				const currentSelection = latestTaskSelection.current;
+				if (
+					currentSelection === null ||
+					currentSelection.id !== selectedId ||
+					currentSelection.project !== lookupProject ||
+					currentSelection.task !== undefined ||
+					currentSelection.revision !== requestRevision
+				)
+					return;
+				setFallbackTask(taskCardFromDetail(detail));
+				setFallbackTaskSource("detail");
+			})
+			.catch((e: unknown) => {
+				if (!alive) return;
+				const reason = e instanceof Error ? e.message : String(e);
+				setError(`Task ${selectedId} could not be loaded: ${reason}`);
+			});
+		return () => {
+			alive = false;
+		};
+	}, [
+		selectedId,
+		lookupProject,
+		hasSelectedStateTask,
+		stateLoaded,
+		fallbackMatches,
+		fallbackTaskSource,
+		fallbackAttempt,
+	]);
+
 	// ponytail: a dev tool for the board that develops Ottr itself, so it shows only where a
 	// project tracks ottr-ai/ottr (that project holds the check card). Put it behind a release
 	// switch once Ottr ships releases.
@@ -17380,7 +17520,15 @@ export function App() {
 		overviewCurrent,
 		selected,
 		selectedProject,
-	} = appViewSelection(state, view, projects, selectedId, tasks, bootHosted);
+	} = appViewSelection(
+		state,
+		view,
+		projects,
+		selectedId,
+		selectedProjectForView,
+		selectionTasks,
+		bootHosted,
+	);
 	// Hosted mode: Alate, provisioning and the workers are the operator's, so no probe runs
 	// and the user layer stays unknown (the skill-gap markers stay out). The gate waits for
 	// the first state frame: `hosted` is false before it lands, and a mount-time fetch would
@@ -17444,6 +17592,19 @@ export function App() {
 		const t = setTimeout(() => setSheet(null), 300);
 		return () => clearTimeout(t);
 	}, [selected, selectedProject]);
+	const sheetTask = selected ?? sheet?.task ?? null;
+	const drawerHasFallback =
+		fallbackTask !== null &&
+		sheetTask !== null &&
+		fallbackTask.id === sheetTask.id &&
+		fallbackTask.project === sheetTask.project &&
+		!tasks.some(
+			(t) => t.id === fallbackTask.id && t.project === fallbackTask.project,
+		);
+	const drawerContextTasks =
+		drawerHasFallback && fallbackTask !== null
+			? [...tasks, fallbackTask]
+			: tasks;
 	const deltas = commitDeltas(tasks);
 	// Live agent counts for the drawer's Workflow modal: slots busy now machine-wide, against
 	// the global cap (SystemBar shows the same count in the app bar).
@@ -17898,7 +18059,7 @@ export function App() {
 				sheet={sheet}
 				state={state}
 				projects={projects}
-				tasks={tasks}
+				tasks={drawerContextTasks}
 				deltas={deltas}
 				draining={draining}
 				usedTotal={usedTotal}

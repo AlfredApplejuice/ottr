@@ -39,6 +39,19 @@ next. Web push still worked because it rides the browser push service.
   report, work check runs, and gate from that fetch. While the fetch is in
   flight the prompt panel holds its space with the drawer's loading line; the
   other sections appear when the fetch lands, like the turns already do.
+- The fix assumes that old tasks remain in the project store.
+- The state window is not the full task history. The existing
+  `GET /api/projects/<p>/tasks/<id>` resolves a selected card even when
+  `state.tasks` omits it. Keep the card separate from slim state.
+- A click on any loaded Done page row or a pasted task URL opens its correct
+  drawer. Keep the canonical project/task URL in sync. Back and Forward restore
+  the selected task. Close clears it.
+- A later slim state frame does not close an old task's drawer. A detail
+  response after Close or navigation has no effect.
+- If a frame omits the selected card, retain its last state row in the drawer.
+  The detail route refreshes that row without a drawer close.
+- If detail fails or the task is missing, show an error without another task.
+  Allow another open attempt.
 - The board search matches `title` and `sessionTitle` only, and only the cards
   the client holds (the state window plus fetched pages). Prompt and summary
   text no longer ride the state, so searching them would mean shipping them.
@@ -71,6 +84,8 @@ next. Web push still worked because it rides the browser push service.
 - A drawer opened from a fetched page card works like one opened from the
   state window: the detail fetch fills the large fields.
 - No schema change: the store, its tables, and `listTasks` stay as they are.
+- Do not add old cards to `state.tasks`. Keep the existing API, schema, and
+  20-card Done page size.
 
 ## Acceptance checks
 
@@ -83,6 +98,20 @@ next. Web push still worked because it rides the browser push service.
   the right total, and 400 on page 0.
 - A UI test opens a drawer for a row whose prompt the state does not carry and
   asserts the prompt renders from the task route fetch.
+- A UI test loads Done page 2, opens a card absent from `state.tasks`, and
+  checks the correct drawer and canonical task URL.
+- A UI test pastes a task URL for an older card and checks the correct drawer
+  and canonical URL. It then checks Back, Forward, and Close against the
+  drawer and URL.
+- A UI test keeps an old task open while a later slim state frame arrives.
+- A UI test removes an open pinned card from the next frame and delays its
+  detail response. The same drawer and its local state remain visible.
+- A UI test supplies a newer state row, then omits it. The drawer keeps the
+  newer row instead of an older detail cache.
+- A UI test delays a detail response, closes or changes tasks, then checks
+  that the late response changes no drawer or URL.
+- A UI test checks failed and missing detail responses separately. Each shows
+  an error and no wrong card. The test then opens a valid task each time.
 - `bun run check` and `bun test` exit 0.
 - Screenshots of the board and of an open drawer.
 - The live board's `GET /api/state` size gets measured after the deploy and
