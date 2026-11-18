@@ -2,6 +2,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { type Node as HappyNode, Window } from "happy-dom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { perfMetrics } from "../perf.ts";
 import type {
 	ContainerRow,
 	ProjectView,
@@ -187,7 +188,22 @@ const fetchMock = (async (input: RequestInfo | URL) => {
 		body = { onboarding: false, version: "vtest", live: false };
 	else if (url === "/api/state") body = state;
 	else if (url === "/api/update") body = { behind: 0, commits: [] };
-	else if (url === "/api/system")
+	else if (url === "/api/provisioning")
+		body = {
+			server: null,
+			workers: [],
+			userLayer: { skills: [], plugins: [], rules: [], mcp: [] },
+		};
+	else if (url === "/api/performance?range=all") {
+		const perf = perfMetrics({ tasks: [], turns: [] }, "all", 0);
+		body = {
+			range: "all",
+			bucketMs: perf.bucketMs,
+			seriesStart: perf.seriesStart,
+			fleet: perf.metrics,
+			projects: [],
+		};
+	} else if (url === "/api/system")
 		body = {
 			at: 1,
 			containers: [],
@@ -609,6 +625,17 @@ test("a pasted card URL loads that project's board with the drawer open", async 
 	}
 });
 
+test("an initial legacy hash URL opens its project", async () => {
+	await mountAt("/#alpha");
+	try {
+		expect(header()).toBe("Alpha");
+		expect(window.location.pathname).toBe("/projects/alpha");
+		expect(window.location.hash).toBe("");
+	} finally {
+		await unmountApp();
+	}
+});
+
 test("Show more opens an older done task at its canonical URL", async () => {
 	await withOldTaskFixture(
 		async () => jsonResponse(oldTaskView),
@@ -971,6 +998,42 @@ test("Back and Forward restore old task URLs and Close exits the drawer", async 
 		},
 	);
 });
+
+test.each(["/", "/#alpha"])(
+	"Back and Forward restore a legacy task entry at %s",
+	async (legacyPath) => {
+		await mountAt("/projects/beta/tasks/BE-1");
+		try {
+			window.history.pushState({ ompTask: "AL-1" }, "", legacyPath);
+			await openCard("BE-2");
+			await waitFor(() => drawerHasTitle("Beta follow-up"));
+
+			await act(async () => {
+				window.history.back();
+			});
+			await waitFor(() => drawerHasTitle("Alpha work"));
+			expect(appErrorRow()).toBeNull();
+
+			await act(async () => {
+				window.history.back();
+			});
+			await waitFor(() => drawerHasTitle("Beta needs you"));
+			await act(async () => {
+				window.history.forward();
+			});
+			await waitFor(() => drawerHasTitle("Alpha work"));
+			expect(appErrorRow()).toBeNull();
+
+			await act(async () => {
+				window.history.forward();
+			});
+			await waitFor(() => drawerHasTitle("Beta follow-up"));
+			expect(window.location.pathname).toBe("/projects/beta/tasks/BE-2");
+		} finally {
+			await unmountApp();
+		}
+	},
+);
 
 test("a missing old task detail shows an error and can retry", async () => {
 	await expectOldTaskRetryAfter(async () =>

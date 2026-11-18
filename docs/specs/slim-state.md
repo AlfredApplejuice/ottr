@@ -46,6 +46,10 @@ next. Web push still worked because it rides the browser push service.
 - A click on any loaded Done page row or a pasted task URL opens its correct
   drawer. Keep the canonical project/task URL in sync. Back and Forward restore
   the selected task. Close clears it.
+- If a history entry carries only `state.ompTask`, match the state card by ID.
+  Only a task URL supplies a project constraint.
+- Migrate hash URLs only for the initial view. Back and Forward preserve legacy
+  history entries.
 - A later slim state frame does not close an old task's drawer. A detail
   response after Close or navigation has no effect.
 - If a frame omits the selected card, retain its last state row in the drawer.
@@ -103,6 +107,8 @@ next. Web push still worked because it rides the browser push service.
 - A UI test pastes a task URL for an older card and checks the correct drawer
   and canonical URL. It then checks Back, Forward, and Close against the
   drawer and URL.
+- A UI test restores legacy entries at `/` and `/#alpha` with Back and Forward.
+  Each entry carries its task ID only in `state.ompTask`.
 - A UI test keeps an old task open while a later slim state frame arrives.
 - A UI test removes an open pinned card from the next frame and delays its
   detail response. The same drawer and its local state remain visible.

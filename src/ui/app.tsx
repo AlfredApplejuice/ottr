@@ -16911,11 +16911,13 @@ function AppOverlays(p: {
 
 /** The whole board. Exported for the DOM tests; index.html is its only real consumer. */
 export function App() {
-	// One-time client migration: an old hash URL becomes its path URL before the first
-	// readPath(), so the initial view and card come from the pathname.
-	migrateHash();
 	const [state, setState] = useState<StateResponse | null>(null);
-	const [view, setView] = useState(readPath().view);
+	const [view, setView] = useState(() => {
+		// One-time client migration: an old hash URL becomes its path URL before the first
+		// readPath(), so the initial view and card come from the pathname.
+		migrateHash();
+		return readPath().view;
+	});
 	const [showAdd, setShowAdd] = useState(false);
 	const [showUpdates, setShowUpdates] = useState(false);
 	const [selectedId, setSelectedId] = useState<string | null>(
@@ -17235,7 +17237,7 @@ export function App() {
 			const id = historyTask(e.state, path.task);
 			setView(path.view);
 			setSelectedId(id);
-			setSelectedProjectName(id === null ? null : path.view);
+			setSelectedProjectName(path.task === null ? null : path.view);
 		};
 		window.addEventListener("popstate", onPop);
 		return () => window.removeEventListener("popstate", onPop);
