@@ -59,7 +59,11 @@ const APPROVAL = [
 	/Accept starts it\. Edit task changes the prompt first\. Cancel task declines it\.?$/,
 ];
 // A park that names its own resume condition waits by design (for example a release-line date or two reviews).
-const WAITS = [/^Please resume .* after /, /^Re-run this card's .* after /];
+const WAITS = [
+	/^Please resume .* after /,
+	/^Please resume .* when /,
+	/^Re-run this card's .* after /,
+];
 const FINDINGS = /waiting for the review's findings/;
 const AHEAD = /ahead \d+/;
 

@@ -121,6 +121,19 @@ describe("verdict", () => {
 		expect(v.note).toContain("resumes on the condition");
 	});
 
+	test("needs_you with a resume-when reason waits by design", () => {
+		const v = verdict(
+			card({
+				state: "needs_you",
+				needsReason:
+					"Please resume this card when an upstream picomatch release fixes GHSA-fc5q-39xc-vjpf.",
+			}),
+			F,
+		);
+		expect(v.verdict).toBe("waits");
+		expect(v.note).toContain("resumes on the condition");
+	});
+
 	test("needs_you with a re-run-after reason waits by design", () => {
 		expect(
 			verdict(
