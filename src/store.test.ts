@@ -1049,6 +1049,7 @@ describe("settings", () => {
 			forkMergeHold: true,
 			retroSince: null,
 			retroFilter: true,
+			retroAutoStart: false,
 			forkResearch: false,
 			prReviews: false,
 			prReviewNotify: true,
@@ -1066,7 +1067,6 @@ describe("settings", () => {
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
-			pushSyncCommits: false,
 			taskIdPrefix: null,
 		});
 		await store.setSettings({ displayName: null, releaseCommand: null });
@@ -1087,6 +1087,7 @@ describe("settings", () => {
 			forkMergeHold: true,
 			retroSince: null,
 			retroFilter: true,
+			retroAutoStart: false,
 			forkResearch: false,
 			prReviews: false,
 			prReviewNotify: true,
@@ -1104,7 +1105,6 @@ describe("settings", () => {
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
-			pushSyncCommits: false,
 			taskIdPrefix: null,
 		});
 		await store.close();

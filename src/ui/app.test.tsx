@@ -61,6 +61,7 @@ const {
 	KpiStrip,
 	PerfTable,
 	coveredUpdateIds,
+	appNoticeKeys,
 	implementSteps,
 	recommendsSteps,
 	serverLine,
@@ -273,6 +274,51 @@ describe("windowGone", () => {
 		expect(windowGone(lim({ window: "5h", resetsAt: now + 9 * H }), now)).toBe(
 			0,
 		);
+	});
+});
+
+describe("appNoticeKeys upstream updates", () => {
+	test("skips a hands-off project's rows, keeps rows a person must file and removed rows", () => {
+		const row = (id: string, project: string | null, over = {}) => ({
+			id,
+			project,
+			target: "v2",
+			...over,
+		});
+		const state = {
+			projects: [
+				{ name: "auto", settings: { holdUpdateMerges: false } },
+				{ name: "manual", settings: { holdUpdateMerges: true } },
+			],
+			updates: {
+				checkedAt: "x",
+				rows: [
+					row("a@2", "auto"), // the board files it
+					row("m@2", "manual"),
+					row("u@2", null), // no project: a person maps or skips it
+					row("young@3", "manual", { target: null }),
+					row("gone@1", "auto", { target: null, removed: true }),
+					row("covered@2", "manual"),
+				],
+			},
+		} as unknown as StateResponse;
+		const covered = new Map([["covered@2", {} as TaskCard]]);
+		const keys = appNoticeKeys(
+			state,
+			covered,
+			null,
+			null,
+			false,
+			0,
+			null,
+			null,
+			false,
+			[],
+			null,
+			{ held: 0, stale: 0 } as StateResponse["keptWorktrees"],
+			0,
+		);
+		expect(keys.updateIds).toEqual(["m@2", "u@2", "gone@1"]);
 	});
 });
 
@@ -9595,12 +9641,32 @@ describe("Drawer proposal decision panel", () => {
 		expect(html).toContain("<dt>Gain</dt>");
 		expect(html).toContain("<dt>Risk</dt>");
 		expect(html).toContain("<dt>Check</dt>");
+		// No decision: no Decision line.
+		expect(html).not.toContain("<dt>Decision</dt>");
 		expect(html).toContain("Rework the proposal reason wording");
 		expect(html).toContain("One line less on every proposal card");
 		// The known id renders as a link to its card; the unknown one stays text.
 		expect(html).toContain('href="/projects/proj/tasks/OTTR-404"');
 		expect(html).not.toContain("tasks/ZZZ-9");
 		expect(html).toContain("ZZZ-9 never existed");
+	});
+
+	test("a proposal with a decision shows its question first", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+			needsReason: reason,
+			proposalSummary: {
+				...summary,
+				decision: "Keep the old flag or drop it?",
+			},
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		const decision = html.indexOf("<dt>Decision</dt>");
+		expect(decision).toBeGreaterThan(-1);
+		expect(decision).toBeLessThan(html.indexOf("<dt>What changes</dt>"));
+		expect(html).toContain("Keep the old flag or drop it?");
 	});
 
 	test("a proposal without a summary holds a loading line, no five labels", () => {
@@ -10847,6 +10913,34 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		}
 	});
 
+	test("clicking a source tab puts the caret in that tab's field", async () => {
+		const { container, root, restore } = await mountAdd(true);
+		const settle = (): Promise<void> =>
+			act(async () => {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				requestAnimationFrame(() => resolve());
+				await promise;
+			});
+		try {
+			await clickAction(container, "New");
+			await settle();
+			expect(document.activeElement).toBe(
+				container.querySelector("#add-panel-new input"),
+			);
+			await clickAction(container, "Git URL");
+			await settle();
+			expect(document.activeElement).toBe(
+				container.querySelector("#add-panel-url input"),
+			);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+	});
+
 	test("Cancel discards an unsaved token draft without browser storage", async () => {
 		const draft = "draft-value-not-a-credential";
 		const assertNoStoredDraft = (): void => {
@@ -11217,9 +11311,11 @@ describe("AddProjectModal board GitHub token reuse", () => {
 				const retro = container.querySelector(
 					'input[type="checkbox"]',
 				) as HTMLInputElement;
+				// Retro starts on; clearing it must save off, not drop the field.
+				expect(retro.checked).toBe(true);
 				await act(async () => {
 					onChangeOf(retro)({
-						target: { checked: true },
+						target: { checked: false },
 						currentTarget: retro,
 					});
 				});
@@ -11270,7 +11366,7 @@ describe("AddProjectModal board GitHub token reuse", () => {
 						.map((p) => p.body),
 				);
 				expect(saved).toMatchObject({
-					retro: true,
+					retro: false,
 					maxParallel: 3,
 					copyExtra: ["config/local.json"],
 					targetBranch: "release",
@@ -11303,6 +11399,129 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		});
 	}
 
+	test("Start retro proposals without asking starts on, waits on Retro, and saves a clear on Finish", async () => {
+		await withWizard("new", async ({ container, posts }) => {
+			await sourceNext(container);
+			const box = (label: string): HTMLInputElement => {
+				const row = [...container.querySelectorAll("label")].find((l) =>
+					l.textContent?.startsWith(label),
+				);
+				if (row === undefined) throw new Error(`no ${label} row`);
+				return row.querySelector("input") as HTMLInputElement;
+			};
+			const set = async (input: HTMLInputElement, checked: boolean) => {
+				await act(async () => {
+					onChangeOf(input)({ target: { checked }, currentTarget: input });
+				});
+			};
+			const auto = box("Start retro proposals without asking");
+			expect(auto.checked).toBe(true);
+			expect(auto.disabled).toBe(false);
+			// Retro cleared: the sub-option locks, as the friction filter does.
+			await set(box("Retro"), false);
+			expect(box("Start retro proposals without asking").disabled).toBe(true);
+			await set(box("Retro"), true);
+			await set(box("Start retro proposals without asking"), false);
+			for (let i = 0; i < 3; i += 1) await clickAction(container, "Next");
+			await clickAction(container, "Finish");
+			const saved = Object.assign(
+				{},
+				...posts.filter((p) => p.url.endsWith("/settings")).map((p) => p.body),
+			);
+			expect(saved).toMatchObject({ retro: true, retroAutoStart: false });
+		});
+	});
+
+	test("the Automation step offers the watches: PR review options need PR reviews, Finish sends only changes", async () => {
+		await withWizard("url", async ({ container, posts }) => {
+			await sourceNext(container);
+			const box = (label: string): HTMLInputElement => {
+				const row = [...container.querySelectorAll("label")].find((l) =>
+					l.textContent?.startsWith(label),
+				);
+				if (row === undefined) throw new Error(`no ${label} row`);
+				return row.querySelector("input") as HTMLInputElement;
+			};
+			const set = async (input: HTMLInputElement, checked: boolean) => {
+				await act(async () => {
+					onChangeOf(input)({ target: { checked }, currentTarget: input });
+				});
+			};
+			// The stored defaults: notifications and the Dependabot warning start on.
+			expect(box("PR review notifications").checked).toBe(true);
+			expect(box("Dependabot warning").checked).toBe(true);
+			expect(box("PR review approvals").disabled).toBe(true);
+			await set(box("PR reviews"), true);
+			expect(box("PR review approvals").disabled).toBe(false);
+			await set(box("PR review approvals"), true);
+			await set(box("Issue watch"), true);
+			await set(box("Trending scout"), true);
+			for (let i = 0; i < 3; i += 1) await clickAction(container, "Next");
+			await clickAction(container, "Finish");
+			const saved = Object.assign(
+				{},
+				...posts.filter((p) => p.url.endsWith("/settings")).map((p) => p.body),
+			);
+			expect(saved).toMatchObject({
+				prReviews: true,
+				prReviewApprove: true,
+				issueWatch: true,
+				trendingScout: true,
+			});
+			// Untouched rows keep the project's own values: never sent.
+			expect(saved).not.toHaveProperty("dependabotWarn");
+			expect(saved).not.toHaveProperty("ompWatch");
+		});
+	});
+
+	test("a project without GitHub gets no GitHub watch rows, but omp watch and trending scout", async () => {
+		await withWizard("new", async ({ container }) => {
+			await sourceNext(container);
+			const labels = [...container.querySelectorAll("label")].map(
+				(l) => l.textContent ?? "",
+			);
+			for (const gone of ["Issue watch", "PR reviews", "Dependabot warning"])
+				expect(labels.some((t) => t.startsWith(gone))).toBe(false);
+			for (const kept of ["omp watch", "Trending scout"])
+				expect(labels.some((t) => t.startsWith(kept))).toBe(true);
+		});
+	});
+
+	test("the Runners step offers the microVM switch, locked while no vm-runner reports ready", async () => {
+		await withWizard("new", async ({ container }) => {
+			await sourceNext(container);
+			await clickAction(container, "Next");
+			const row = [...container.querySelectorAll("label")].find((l) =>
+				l.textContent?.startsWith("Run work turns in microVMs"),
+			);
+			if (row === undefined) throw new Error("no microVM row");
+			const box = row.querySelector("input") as HTMLInputElement;
+			expect(box.checked).toBe(false);
+			// This board has no project yet, so no vm-runner state: the switch stays off.
+			expect(box.disabled).toBe(true);
+			expect(row.textContent).toContain("No vm-runner on this board");
+		});
+	});
+
+	test("a runner cap of 0 saves as no cap on Finish", async () => {
+		await withWizard("new", async ({ container, posts }) => {
+			await sourceNext(container);
+			await clickAction(container, "Next");
+			await changeField(
+				container.querySelector('input[type="number"]') as HTMLInputElement,
+				"0",
+			);
+			await clickAction(container, "Next");
+			await clickAction(container, "Next");
+			await clickAction(container, "Finish");
+			const saved = Object.assign(
+				{},
+				...posts.filter((p) => p.url.endsWith("/settings")).map((p) => p.body),
+			);
+			expect(saved).toHaveProperty("maxParallel", null);
+		});
+	});
+
 	for (const changed of [false, true]) {
 		test(`clone settings survive Finish with ${changed ? "one explicit change" : "untouched drafts"}`, async () => {
 			await withWizard(
@@ -11333,7 +11552,11 @@ describe("AddProjectModal board GitHub token reuse", () => {
 							.filter((p) => p.url.endsWith("/settings"))
 							.map((p) => p.body),
 					);
-					expect(saved).toEqual(changed ? { maxParallel: 2 } : {});
+					// Retro and its auto-start are the drafts Finish always sends: both start on.
+					const always = { retro: true, retroAutoStart: true };
+					expect(saved).toEqual(
+						changed ? { ...always, maxParallel: 2 } : always,
+					);
 					expect(closeCount()).toBe(1);
 				},
 				{
@@ -11380,6 +11603,8 @@ describe("AddProjectModal board GitHub token reuse", () => {
 					await clickAction(container, "Finish");
 					const settings = posts.filter((p) => p.url.endsWith("/settings"));
 					expect(settings[0]?.body).toEqual({
+						retro: true,
+						retroAutoStart: true,
 						copyExtra: lines
 							.map((value) => value.trim())
 							.filter((value) => value !== ""),
@@ -11531,9 +11756,12 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			"url",
 			async ({ container, posts, closeCount }) => {
 				await sourceNext(container);
-				const forkLabel = [...container.querySelectorAll("label")].find(
-					(label) => label.textContent?.includes("Fork research"),
-				);
+				// The row's own label starts with its name; the fork hold's text also names it.
+				const forkRow = (): HTMLLabelElement | undefined =>
+					[...container.querySelectorAll("label")].find((label) =>
+						label.textContent?.startsWith("Fork research"),
+					);
+				const forkLabel = forkRow();
 				if (forkLabel === undefined) throw new Error("no Fork research row");
 				const fork = forkLabel.querySelector("input") as HTMLInputElement;
 				await act(async () => {
@@ -11545,7 +11773,7 @@ describe("AddProjectModal board GitHub token reuse", () => {
 					"https://gitlab.com/o/wiz.git",
 				);
 				await sourceNext(container);
-				expect(container.textContent).not.toContain("Fork research");
+				expect(forkRow()).toBeUndefined();
 				await clickAction(container, "Next");
 				await clickAction(container, "Next");
 				await clickAction(container, "Next");
@@ -11553,7 +11781,9 @@ describe("AddProjectModal board GitHub token reuse", () => {
 				await clickAction(container, "Finish");
 				expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(1);
 				const settings = posts.filter((p) => p.url.endsWith("/settings"));
+				// Only Retro and its auto-start (on by default) and the checklist close: no fork draft.
 				expect(settings.map((p) => p.body)).toEqual([
+					{ retro: true, retroAutoStart: true },
 					{ setupChecklist: false },
 				]);
 				expect(posts.filter((p) => p.url.endsWith("/interview"))).toHaveLength(

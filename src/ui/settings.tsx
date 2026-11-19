@@ -130,10 +130,52 @@ const SETUP_STEPS = [
 	"Rules",
 ] as const;
 
+/** PR mode exists only for compatibility; both rows lead with why, since the pill is hidden
+ *  from screen readers. */
+const PR_MODE_LEGACY =
+	"Kept only for compatibility with enterprise SDLC processes that require a pull request for each change. ";
 /** PR mode's description, shared by the settings page's Merging card and the wizard's
  *  Project step (docs/specs/add-project-wizard.md). */
 const PR_MODE_DESC =
 	"Push finished card branches and open a pull request to the target branch instead of merging; the card waits in Merging until the pull request merges on GitHub";
+
+/** The two merge holds, named for what they hold and why, shared by the wizard's Automation
+ *  step and the settings page's Merging card. */
+const UPDATE_HOLD_NAME =
+	"Approve upstream provisioning updates before they merge";
+const UPDATE_HOLD_DESC =
+	"Cards from the Upstream updates list (Alate's provisioning updates) move a pinned image, MCP server, skill, plugin or rule set to a newer version. You file each card, and a ready card waits for your reply before it merges. Without this approval, the board files these cards itself after each hourly pull, and they merge on their own";
+const FORK_HOLD_NAME = "Approve fork ideas before they merge";
+const FORK_HOLD_DESC =
+	"Applies only after you accept a fork research proposal. That card, and every follow-up of it, waits for your reply when it is ready, before its work merges";
+
+/** Retro and its friction filter, as src/supervisor.ts retroPass and src/retro.ts
+ *  frictionFilter run them; shared by the wizard's Automation step and the Proposals card. */
+const RETRO_DESC =
+	"After a card reaches Done, an agent reviews how the task went and may propose one follow-up card. The proposal waits for your Accept, unless retro proposals start without asking";
+const RETRO_FILTER_DESC =
+	"Runs a retro only for tasks that hit friction: a reply or question, more than one work turn, an automatic continue, failed CI, or a cost of $0.50 or more. Smooth tasks get no retro, which saves model runs";
+const RETRO_AUTO_START_DESC =
+	"A retro proposal goes to Todo and starts like any card, with no Accept. A proposal that needs a decision still waits for you and shows its question";
+
+/** The Watches card's and the trending scout's texts; shared by the wizard's Automation step
+ *  and the Watches and Proposals cards. */
+const ISSUE_WATCH_DESC =
+	"Hourly watch of GitHub issues opened after you turn this on; each new issue becomes a backlog card and gets the ottr-tracked label";
+const PR_REVIEWS_DESC =
+	"Hourly watch of open pull requests on GitHub; each new head gets a read-only review draft you can post as a comment.";
+const PR_REVIEW_NOTIFY_DESC =
+	"Bell and push when a review draft arrives or is rewritten, and when new comments land after a posted review; needs PR reviews";
+const PR_REVIEW_APPROVE_DESC =
+	"The Post click also approves the PR (one APPROVE review with the comment as its body) when the draft has no blocking findings; needs PR reviews";
+const PR_REVIEW_REQUEST_CHANGES_DESC =
+	"When the draft has a blocking finding, the Post click requests changes on GitHub instead of commenting; needs PR reviews";
+const OMP_WATCH_DESC =
+	"Hourly, a model reads each new omp release's notes. A fail files a card and holds the pin. A pass files a card that bumps Dockerfile.worker.";
+const DEPENDABOT_DESC =
+	"Warns on the project page when Dependabot alerts are off for the repo on GitHub; the warning links to GitHub's page to turn them on. Probed at boot and hourly";
+const TRENDING_SCOUT_DESC =
+	"Weekly, when the general 'Weekly trending scan' is on: an agent judges GitHub trending repos for this project and files up to 3 backlog proposals.";
 
 /** Step strip styled like .add-tabs: steel underline on the current step, a check on
  *  settled ones (`seenUpTo` bounds them: a gitless start at the rules step must not
@@ -301,7 +343,7 @@ function SetupForkSection({
 				<span className="hint">
 					{!forkTouched && facts?.kind === "ok" && facts.facts.active > 0
 						? `${facts.facts.active} of ${facts.facts.forks} forks pushed in the last 90 days, so this starts checked.`
-						: "Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval."}
+						: "Hourly watch of the project's GitHub forks; ideas found there arrive as proposals you accept."}
 				</span>
 			</label>
 			{facts === undefined ? (
@@ -346,17 +388,42 @@ function SetupForkSection({
 	);
 }
 
+/** The stored runner cap of a number-field draft: empty or 0 means no cap (null); a
+ *  fraction truncates and a negative rises to 1, as the field's old clamp did. */
+export function capValue(draft: string): number | null {
+	if (draft.trim() === "") return null;
+	const n = Math.trunc(Number(draft));
+	return n === 0 ? null : Math.max(1, n);
+}
+
+/** The Runner cap row's help, shared by the wizard's Runners step and the Runners card. */
+const RUNNER_CAP_HELP =
+	"The most tasks of this project that run at the same time. The board-wide runner cap still applies.";
+/** The Extra paths row's help, shared by the wizard's Runners step and the Worktrees card. */
+const EXTRA_PATHS_HELP =
+	"Files that git ignores but agents need, for example local config. Ottr copies them into each new worktree.";
+
 /** Only the settings fields that the wizard edits; a draft is not a ProjectView. */
 export type SetupFields = {
 	retro: boolean;
 	retroFilter: boolean;
+	retroAutoStart: boolean;
 	forkResearch: boolean;
 	holdUpdateMerges: boolean;
 	forkMergeHold: boolean;
 	maxParallel: string;
 	copyExtra: string;
+	microVm: boolean;
 	prMode: boolean;
 	targetBranch: string;
+	trendingScout: boolean;
+	issueWatch: boolean;
+	prReviews: boolean;
+	prReviewNotify: boolean;
+	prReviewApprove: boolean;
+	prReviewRequestChanges: boolean;
+	ompWatch: boolean;
+	dependabotWarn: boolean;
 };
 
 /** Shared forms: the caller owns draft changes or immediate project saves. */
@@ -364,6 +431,7 @@ export function SetupSettingsFields({
 	step,
 	values,
 	github,
+	vmRunner,
 	facts,
 	forkTouched = true,
 	onForkDraft,
@@ -375,6 +443,8 @@ export function SetupSettingsFields({
 	step: number;
 	values: SetupFields;
 	github: boolean;
+	/** The board's vm-runner state (every project view carries it); null with no project yet. */
+	vmRunner: ProjectView["vmRunner"] | null;
 	facts?: GithubFactsState;
 	forkTouched?: boolean;
 	onForkDraft: (checked: boolean) => void;
@@ -383,7 +453,31 @@ export function SetupSettingsFields({
 	act: Act;
 	draft?: boolean;
 }) {
+	// No project on the board yet: nothing reported a vm-runner, so treat it as unset.
+	const vm = vmRunner ?? { configured: false, ok: false, reason: null };
 	const hosted = useContext(HostedContext);
+	/** One on/off row of the Automation step; a PR review sub-option locks while PR reviews is off. */
+	const check = (
+		key: keyof {
+			[K in keyof SetupFields as SetupFields[K] extends boolean
+				? K
+				: never]: true;
+		},
+		name: string,
+		desc: string,
+		prSub = false,
+	) => (
+		<label className={`add-check${prSub ? " setup-sub" : ""}`}>
+			<input
+				type="checkbox"
+				checked={values[key]}
+				disabled={prSub && !values.prReviews}
+				onChange={(e) => onChange({ [key]: e.target.checked })}
+			/>
+			{name}
+			<span className="hint">{desc}</span>
+		</label>
+	);
 	return (
 		<>
 			{step === 2 && (
@@ -398,10 +492,7 @@ export function SetupSettingsFields({
 								}}
 							/>
 							Retro
-							<span className="hint">
-								After each done task the supervisor proposes follow-up cards
-								from its retro.
-							</span>
+							<span className="hint">{RETRO_DESC}.</span>
 						</label>
 						<label className="add-check setup-sub">
 							<input
@@ -413,11 +504,26 @@ export function SetupSettingsFields({
 								}}
 							/>
 							Friction filter
-							<span className="hint">
-								Keep only retro proposals that fix a friction the task hit.
-							</span>
+							<span className="hint">{RETRO_FILTER_DESC}.</span>
+						</label>
+						<label className="add-check setup-sub">
+							<input
+								type="checkbox"
+								checked={values.retroAutoStart}
+								disabled={!values.retro}
+								onChange={(e) => {
+									onChange({ retroAutoStart: e.target.checked });
+								}}
+							/>
+							Start retro proposals without asking
+							<span className="hint">{RETRO_AUTO_START_DESC}.</span>
 						</label>
 					</section>
+					{!hostedHidden(hosted, "project-proposals-section") && (
+						<section className="setup-sec">
+							{check("trendingScout", "Trending scout", TRENDING_SCOUT_DESC)}
+						</section>
+					)}
 					{github && (
 						<SetupForkSection
 							facts={facts}
@@ -425,6 +531,40 @@ export function SetupSettingsFields({
 							forkTouched={forkTouched}
 							onForkDraft={onForkDraft}
 						/>
+					)}
+					{!hostedHidden(hosted, "project-watches-section") && (
+						<section className="setup-sec">
+							{github && (
+								<>
+									{check("issueWatch", "Issue watch", `${ISSUE_WATCH_DESC}.`)}
+									{check("prReviews", "PR reviews", PR_REVIEWS_DESC)}
+									{check(
+										"prReviewNotify",
+										"PR review notifications",
+										`${PR_REVIEW_NOTIFY_DESC}.`,
+										true,
+									)}
+									{check(
+										"prReviewApprove",
+										"PR review approvals",
+										`${PR_REVIEW_APPROVE_DESC}.`,
+										true,
+									)}
+									{check(
+										"prReviewRequestChanges",
+										"PR review request changes",
+										`${PR_REVIEW_REQUEST_CHANGES_DESC}.`,
+										true,
+									)}
+									{check(
+										"dependabotWarn",
+										"Dependabot warning",
+										`${DEPENDABOT_DESC}.`,
+									)}
+								</>
+							)}
+							{check("ompWatch", "omp watch", OMP_WATCH_DESC)}
+						</section>
 					)}
 					<section className="setup-sec">
 						<label className="add-check">
@@ -435,11 +575,8 @@ export function SetupSettingsFields({
 									onChange({ holdUpdateMerges: e.target.checked });
 								}}
 							/>
-							Hold merges of update cards until you approve
-							<span className="hint">
-								Update cards wait at needs_you after a ready turn; your reply
-								approves the merge.
-							</span>
+							{UPDATE_HOLD_NAME}
+							<span className="hint">{UPDATE_HOLD_DESC}.</span>
 						</label>
 						<label className="add-check">
 							<input
@@ -449,11 +586,8 @@ export function SetupSettingsFields({
 									onChange({ forkMergeHold: e.target.checked });
 								}}
 							/>
-							Hold merges of fork-born cards until you approve
-							<span className="hint">
-								Fork-born cards wait at needs_you after a ready turn; your reply
-								approves the merge of the card's work.
-							</span>
+							{FORK_HOLD_NAME}
+							<span className="hint">{FORK_HOLD_DESC}.</span>
 						</label>
 					</section>
 				</>
@@ -461,49 +595,54 @@ export function SetupSettingsFields({
 			{step === 3 && (
 				<section className="setup-sec">
 					<h3>Runners</h3>
-					<label className="settings-field">
-						Runner cap
-						<span className="hint">empty = no cap</span>
-						<input
-							type="number"
-							min={1}
-							max={8}
-							value={values.maxParallel}
-							onChange={(e) => onChange({ maxParallel: e.target.value })}
-						/>
-					</label>
-					<label className="settings-field">
-						Extra paths
-						<span className="hint">
-							copied into new worktrees, one per line
-						</span>
-						<textarea
-							rows={3}
-							value={values.copyExtra}
-							onChange={(e) => onChange({ copyExtra: e.target.value })}
-							placeholder="scripts/release.mjs"
-						/>
-					</label>
+					{/* The settings page's rows: name and hint left, the field right. */}
+					<div className="alate-def-rows">
+						<DefRow name="Runner cap" help={RUNNER_CAP_HELP} shape="0 = no cap">
+							<label>
+								<input
+									type="number"
+									min={0}
+									max={8}
+									value={values.maxParallel}
+									onChange={(e) => onChange({ maxParallel: e.target.value })}
+									aria-label="Runner cap"
+								/>
+							</label>
+						</DefRow>
+						<DefRow
+							name="Extra paths"
+							help={EXTRA_PATHS_HELP}
+							shape="one path per line"
+						>
+							<label>
+								<textarea
+									rows={3}
+									value={values.copyExtra}
+									onChange={(e) => onChange({ copyExtra: e.target.value })}
+									placeholder="e.g. scripts/release.mjs"
+									aria-label="Extra paths"
+								/>
+							</label>
+						</DefRow>
+					</div>
+					{/* The Runners card's switch; hosted mode runs no vm-runner (as on that card). */}
+					{!hosted && (
+						<label className="add-check">
+							<input
+								type="checkbox"
+								checked={values.microVm}
+								disabled={!vm.ok && !values.microVm}
+								onChange={(e) => onChange({ microVm: e.target.checked })}
+							/>
+							Run work turns in microVMs
+							<span className="hint">{microVmDesc(vm, values.microVm)}</span>
+						</label>
+					)}
 				</section>
 			)}
 			{step === 4 && (
 				<section className="setup-sec settings-sec">
 					<h3>Project</h3>
-					{!hostedHidden(hosted, "project-merging-section") && (
-						<div className="alate-def-rows">
-							<CheckRow
-								name="PR mode"
-								desc={`${!github ? "Needs a GitHub remote. " : ""}${PR_MODE_DESC}`}
-								checked={values.prMode}
-								disabled={!github && !values.prMode}
-								save={savePrMode}
-								act={act}
-								onDraftChange={
-									draft ? (v) => onChange({ prMode: v }) : undefined
-								}
-							/>
-						</div>
-					)}
 					<label className="settings-field">
 						Target branch
 						<span className="hint">
@@ -520,6 +659,23 @@ export function SetupSettingsFields({
 							onChange={(e) => onChange({ targetBranch: e.target.value })}
 						/>
 					</label>
+					{!hostedHidden(hosted, "project-merging-section") && (
+						<div className="alate-def-rows">
+							<CheckRow
+								name="PR mode"
+								tag="Legacy"
+								tagTone="warn"
+								desc={`${PR_MODE_LEGACY}${!github ? "Needs a GitHub remote. " : ""}${PR_MODE_DESC}`}
+								checked={values.prMode}
+								disabled={!github && !values.prMode}
+								save={savePrMode}
+								act={act}
+								onDraftChange={
+									draft ? (v) => onChange({ prMode: v }) : undefined
+								}
+							/>
+						</div>
+					)}
 				</section>
 			)}
 		</>
@@ -584,11 +740,7 @@ export function ProjectSetupSteps({
 	// GitHub facts for the fork panel, fetched once on entering step 2; null while loading.
 	const [facts, setFacts] = useState<GithubFactsState>(null);
 	// Runners drafts: persisted on Next, dropped by "Skip, use defaults".
-	const [mp, setMp] = useState(
-		project.settings.maxParallel === null
-			? ""
-			: String(project.settings.maxParallel),
-	);
+	const [mp, setMp] = useState(String(project.settings.maxParallel ?? 0));
 	const [extra, setExtra] = useState(project.settings.copyExtra.join("\n"));
 	// Project step's target branch draft: persisted on Next.
 	const [tb, setTb] = useState(project.settings.targetBranch ?? "");
@@ -665,8 +817,8 @@ export function ProjectSetupSteps({
 			return;
 		}
 		if (step === 3) {
-			const parallel =
-				mp.trim() === "" ? null : clamp(Math.trunc(Number(mp)) || 1, 1, 8);
+			const cap = capValue(mp);
+			const parallel = cap === null ? null : Math.min(cap, 8);
 			const paths = extra
 				.split("\n")
 				.map((s) => s.trim())
@@ -700,11 +852,7 @@ export function ProjectSetupSteps({
 			forkTouched.current = false;
 			setForkDraft(false);
 		} else if (step === 3) {
-			setMp(
-				view.settings.maxParallel === null
-					? ""
-					: String(view.settings.maxParallel),
-			);
+			setMp(String(view.settings.maxParallel ?? 0));
 			setExtra(view.settings.copyExtra.join("\n"));
 		} else if (step === 4) {
 			setTb(view.settings.targetBranch ?? "");
@@ -736,15 +884,26 @@ export function ProjectSetupSteps({
 				values={{
 					retro: view.settings.retroSince !== null,
 					retroFilter: view.settings.retroFilter,
+					retroAutoStart: view.settings.retroAutoStart,
 					forkResearch: forkEffective,
 					holdUpdateMerges: view.settings.holdUpdateMerges,
 					forkMergeHold: view.settings.forkMergeHold,
 					maxParallel: mp,
 					copyExtra: extra,
+					microVm: view.settings.microVm,
 					prMode: view.settings.prMode,
 					targetBranch: tb,
+					trendingScout: view.settings.trendingScout,
+					issueWatch: view.settings.issueWatch,
+					prReviews: view.settings.prReviews,
+					prReviewNotify: view.settings.prReviewNotify,
+					prReviewApprove: view.settings.prReviewApprove,
+					prReviewRequestChanges: view.settings.prReviewRequestChanges,
+					ompWatch: view.settings.ompWatch,
+					dependabotWarn: view.settings.dependabotWarn,
 				}}
 				github={view.github !== null}
+				vmRunner={view.vmRunner}
 				facts={facts}
 				forkTouched={forkTouched.current || view.settings.forkResearch}
 				onForkDraft={(checked) => {
@@ -935,15 +1094,17 @@ function TotalRunnersForm({
 	projects: ProjectView[];
 	act: Act;
 }) {
-	const [n, setN] = useState(maxTotal === null ? "" : String(maxTotal));
+	// No cap reads "0", as on the project caps; the field may still be cleared.
+	const shown = String(maxTotal ?? 0);
+	const [n, setN] = useState(shown);
 	const s = useInstantSave(act);
-	// "below 1 = no cap": an empty field or a figure under 1 clears the cap.
+	// "0 = no cap": an empty field or a figure under 1 clears the cap.
 	const typed = Math.trunc(Number(n));
 	const next = n.trim() === "" || !(typed >= 1) ? null : typed;
 	// The cap counts as edited only when the input moved off the server value: an
 	// untouched input must not save its clamped form (a server cap below 1, e.g.
 	// OMP_TRACKER_MAX_TOTAL=0, would otherwise jump to 1).
-	const capEdited = n !== (maxTotal === null ? "" : String(maxTotal));
+	const capEdited = n !== shown;
 	const dirty = capEdited && next !== maxTotal;
 	// Saves on its own, like a checkbox row: each click or keystroke restarts a short wait, so
 	// a burst of steps sends one save. A save never overlaps a running one, and a value that
@@ -994,16 +1155,16 @@ function TotalRunnersForm({
 								reason={s.reason}
 							/>
 						</b>
-						<code>below 1 = no cap</code>
+						<code>0 = no cap</code>
 					</div>
 					<div className="cap-ctl">
 						<div className="cap-step">
 							<button
 								type="button"
 								aria-label="One runner fewer"
-								disabled={n === ""}
+								disabled={next === null}
 								onClick={(e) => {
-									setN((v) => (Number(v) <= 1 ? "" : String(Number(v) - 1)));
+									setN((v) => (Number(v) <= 1 ? "0" : String(Number(v) - 1)));
 									rollFigure(e.currentTarget, -1);
 								}}
 							>
@@ -1011,24 +1172,25 @@ function TotalRunnersForm({
 							</button>
 							<input
 								type="number"
-								min={1}
+								min={0}
 								value={n}
-								placeholder="–"
 								onChange={(e) => setN(e.target.value)}
-								aria-label="Runner cap across all projects (empty = no cap)"
+								aria-label="Runner cap across all projects (0 = no cap)"
 							/>
 							<button
 								type="button"
 								aria-label="One runner more"
 								onClick={(e) => {
-									setN((v) => String(v === "" ? 1 : Number(v) + 1));
+									setN((v) =>
+										String(Math.max(0, Math.trunc(Number(v)) || 0) + 1),
+									);
 									rollFigure(e.currentTarget, 1);
 								}}
 							>
 								<Icon name="plus" size={14} />
 							</button>
 						</div>
-						{n === "" && <span className="cap-unlimited">unlimited</span>}
+						{next === null && <span className="cap-unlimited">unlimited</span>}
 					</div>
 				</div>
 				<div className="alate-def-row">
@@ -7686,6 +7848,7 @@ function CheckRow({
 	settingKey,
 	name,
 	tag,
+	tagTone,
 	desc,
 	checked,
 	disabled,
@@ -7702,6 +7865,8 @@ function CheckRow({
 	/** A short muted pill after the name, e.g. "Not needed: private repo". Put the same fact
 	 *  in `desc` too: the pill is hidden from screen readers. */
 	tag?: string;
+	/** "warn" paints the pill amber (`.state-chip.warn`), e.g. a legacy setting. */
+	tagTone?: "warn";
 	/** The saved value. */
 	checked: boolean;
 	disabled?: boolean;
@@ -7740,7 +7905,10 @@ function CheckRow({
 				<b>
 					<label htmlFor={id}>{name}</label>
 					{tag !== undefined && (
-						<span className="state-chip off" aria-hidden="true">
+						<span
+							className={`state-chip ${tagTone ?? "off"}`}
+							aria-hidden="true"
+						>
 							{tag}
 						</span>
 					)}
@@ -8714,9 +8882,42 @@ function ReviewCounter({
 	);
 }
 
-/** The microVM switch's desc: why the switch may be off, then the Firecracker explainer. */
-const microVmDesc = (project: ProjectView, on: boolean): string =>
-	`${project.vmRunner.ok ? "" : project.vmRunner.configured ? `vm-runner is not ready (${project.vmRunner.reason ?? "no answer"})${on ? "; work turns wait until it is" : ""}. ` : "Needs OTTR_VM_RUNNER_URL (docker compose --profile vm). "}Each work turn runs in its own Firecracker microVM with a fresh clone; merge turns stay on the board.`;
+/** What a microVM work turn is; the switch's desc ends with it. */
+const MICRO_VM_WHAT =
+	"Each work turn runs in its own Firecracker microVM with a fresh clone; merge turns stay on the board.";
+
+/** The setup guide on GitHub: host requirements and the "Turn it on" steps. */
+const MICRO_VM_DOCS =
+	"https://github.com/ottr-ai/ottr/blob/main/docs/WORKERS.md#microvm-workers";
+
+/** The microVM switch's desc: what it does, then a warning note while the board's vm-runner
+ * cannot take turns. The board never probes /dev/kvm itself: only vm-runner does, and its
+ * health reason names it ("/dev/kvm is missing: ..."). */
+function microVmDesc(vm: ProjectView["vmRunner"], on: boolean): ReactNode {
+	if (vm.ok) return MICRO_VM_WHAT;
+	return (
+		<>
+			{MICRO_VM_WHAT}
+			<span className="vm-warn" role="note">
+				<Mark kind="needs" />
+				<b>
+					{vm.configured
+						? "The vm-runner does not answer"
+						: "No vm-runner on this board"}
+				</b>
+				<span>
+					{vm.configured
+						? `${vm.reason ?? "no answer"}.${on ? " Work turns wait until it answers." : ""}`
+						: "OTTR_VM_RUNNER_URL is not set. The vm-runner needs a Linux host with /dev/kvm."}{" "}
+					<a href={MICRO_VM_DOCS} target="_blank" rel="noopener noreferrer">
+						Setup guide
+						<Icon name="external-link" size={12} />
+					</a>
+				</span>
+			</span>
+		</>
+	);
+}
 
 /** The switch tag when the repo is known-private: the outside watch is not needed. */
 const privateTagFor = (privateRepo: boolean | null): string | undefined =>
@@ -8742,28 +8943,14 @@ function ProjectMergingCard({
 		<SettingsCard
 			id="project-merging-section"
 			title="Merging"
-			status={onChip([
-				st.prMode,
-				st.holdUpdateMerges,
-				st.forkMergeHold,
-				st.pushSyncCommits,
-			])}
+			status={onChip([st.prMode, st.holdUpdateMerges, st.forkMergeHold])}
 		>
 			<div className="alate-def-rows">
-				<CheckRow
-					settingKey="prMode"
-					name="PR mode"
-					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${PR_MODE_DESC}`}
-					checked={st.prMode}
-					disabled={project.github === null && !st.prMode}
-					save={(v) => send({ prMode: v })}
-					act={act}
-				/>
 				{/* U7: hold update-card merges at needs_you until a reply approves them. */}
 				<CheckRow
 					settingKey="holdUpdateMerges"
-					name="Hold update merges"
-					desc="Update cards wait at needs_you after a ready turn; your reply approves the merge"
+					name={UPDATE_HOLD_NAME}
+					desc={UPDATE_HOLD_DESC}
 					checked={st.holdUpdateMerges}
 					save={(v) => send({ holdUpdateMerges: v })}
 					act={act}
@@ -8771,18 +8958,22 @@ function ProjectMergingCard({
 				{/* OTTR-689: hold fork-born card merges at needs_you until a reply approves them. */}
 				<CheckRow
 					settingKey="forkMergeHold"
-					name="Hold fork-born merges"
-					desc="Fork-born cards wait at needs_you; your reply approves the merge of the card's work before it reaches the target branch. Turning this off does not release parked cards"
+					name={FORK_HOLD_NAME}
+					desc={`${FORK_HOLD_DESC}. Turning this off does not release cards that already wait`}
 					checked={st.forkMergeHold}
 					save={(v) => send({ forkMergeHold: v })}
 					act={act}
 				/>
+				{/* Legacy last: the default merge flow reads first. */}
 				<CheckRow
-					settingKey="pushSyncCommits"
-					name="Push sync commits"
-					desc="When the local target branch holds commits origin lacks, the board pushes it to origin on its own (OTTR-531); off needs the board's Push to origin button"
-					checked={st.pushSyncCommits}
-					save={(v) => send({ pushSyncCommits: v })}
+					settingKey="prMode"
+					name="PR mode"
+					tag="Legacy"
+					tagTone="warn"
+					desc={`${PR_MODE_LEGACY}${project.github === null ? "Needs a GitHub remote. " : ""}${PR_MODE_DESC}`}
+					checked={st.prMode}
+					disabled={project.github === null && !st.prMode}
+					save={(v) => send({ prMode: v })}
 					act={act}
 				/>
 			</div>
@@ -8852,7 +9043,7 @@ function ProjectWatchesCard({
 				<CheckRow
 					settingKey="issueWatch"
 					name="Issue watch"
-					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("issues to watch")}Hourly watch of GitHub issues opened after you turn this on; each new issue becomes a backlog card and gets the ottr-tracked label`}
+					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("issues to watch")}${ISSUE_WATCH_DESC}`}
 					tag={privateTag}
 					checked={st.issueWatch}
 					disabled={project.github === null && !st.issueWatch}
@@ -8866,8 +9057,7 @@ function ProjectWatchesCard({
 						<>
 							{project.github === null ? "Needs a GitHub remote. " : ""}
 							{privateNote("pull requests to review")}
-							Hourly watch of open pull requests on GitHub; each new head gets a
-							read-only review draft you can post as a comment.{" "}
+							{PR_REVIEWS_DESC}{" "}
 							{st.prReviews
 								? `Last check: ${lastCheck}. Next regular check: ${nextCheck}.`
 								: "PR reviews are off: no checks run."}{" "}
@@ -8891,7 +9081,7 @@ function ProjectWatchesCard({
 					settingKey="prReviewNotify"
 					sub
 					name="PR review notifications"
-					desc="Bell and push when a review draft arrives or is rewritten, and when new comments land after a posted review; needs PR reviews"
+					desc={PR_REVIEW_NOTIFY_DESC}
 					checked={st.prReviewNotify}
 					disabled={!st.prReviews}
 					save={(v) => send({ prReviewNotify: v })}
@@ -8901,7 +9091,7 @@ function ProjectWatchesCard({
 					settingKey="prReviewApprove"
 					sub
 					name="PR review approvals"
-					desc="The Post click also approves the PR (one APPROVE review with the comment as its body) when the draft has no blocking findings; needs PR reviews"
+					desc={PR_REVIEW_APPROVE_DESC}
 					checked={st.prReviewApprove}
 					disabled={!st.prReviews}
 					save={(v) => send({ prReviewApprove: v })}
@@ -8911,7 +9101,7 @@ function ProjectWatchesCard({
 					settingKey="prReviewRequestChanges"
 					sub
 					name="PR review request changes"
-					desc="When the draft has a blocking finding, the Post click requests changes on GitHub instead of commenting; needs PR reviews"
+					desc={PR_REVIEW_REQUEST_CHANGES_DESC}
 					checked={st.prReviewRequestChanges}
 					disabled={!st.prReviews}
 					save={(v) => send({ prReviewRequestChanges: v })}
@@ -8920,7 +9110,7 @@ function ProjectWatchesCard({
 				<CheckRow
 					settingKey="forkResearch"
 					name="Fork research"
-					desc={`${privateNote("forks to watch")}Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval`}
+					desc={`${privateNote("forks to watch")}Hourly watch of the project's GitHub forks; ideas found there arrive as proposals you accept`}
 					tag={privateTag}
 					checked={st.forkResearch}
 					save={(v) => send({ forkResearch: v })}
@@ -8929,7 +9119,7 @@ function ProjectWatchesCard({
 				<CheckRow
 					settingKey="ompWatch"
 					name="omp watch"
-					desc="Hourly, a model reads each new omp release's notes. A fail files a card and holds the pin. A pass files a card that bumps Dockerfile.worker."
+					desc={OMP_WATCH_DESC}
 					checked={st.ompWatch}
 					save={(v) => send({ ompWatch: v })}
 					act={act}
@@ -8937,7 +9127,7 @@ function ProjectWatchesCard({
 				<CheckRow
 					settingKey="dependabotWarn"
 					name="Dependabot warning"
-					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Warns on the project page when Dependabot alerts are off for the repo on GitHub; the warning links to GitHub's page to turn them on. Probed at boot and hourly`}
+					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${DEPENDABOT_DESC}`}
 					checked={st.dependabotWarn}
 					disabled={project.github === null && !st.dependabotWarn}
 					save={(v) => send({ dependabotWarn: v })}
@@ -8973,13 +9163,18 @@ function ProjectProposalsCard({
 		<SettingsCard
 			id="project-proposals-section"
 			title="Proposals"
-			status={onChip([retro, retro && st.retroFilter, st.trendingScout])}
+			status={onChip([
+				retro,
+				retro && st.retroFilter,
+				retro && st.retroAutoStart,
+				st.trendingScout,
+			])}
 		>
 			<div className="alate-def-rows">
 				<CheckRow
 					settingKey="retro"
 					name="Retro"
-					desc="After each done task the supervisor proposes follow-up cards from its retro"
+					desc={RETRO_DESC}
 					checked={st.retroSince !== null}
 					save={(v) => send({ retro: v })}
 					act={act}
@@ -8988,10 +9183,20 @@ function ProjectProposalsCard({
 					settingKey="retroFilter"
 					sub
 					name="Friction filter"
-					desc="Keep only retro proposals that fix a friction the task hit; needs Retro"
+					desc={`${RETRO_FILTER_DESC}. Needs Retro`}
 					checked={st.retroFilter}
 					disabled={st.retroSince === null}
 					save={(v) => send({ retroFilter: v })}
+					act={act}
+				/>
+				<CheckRow
+					settingKey="retroAutoStart"
+					sub
+					name="Start retro proposals without asking"
+					desc={`${RETRO_AUTO_START_DESC}. Needs Retro`}
+					checked={st.retroAutoStart}
+					disabled={st.retroSince === null}
+					save={(v) => send({ retroAutoStart: v })}
 					act={act}
 				/>
 				<CheckRow
@@ -9017,7 +9222,7 @@ function ProjectProposalsCard({
 									project and files up to 3 backlog proposals.
 								</>
 							) : (
-								"Weekly, when the general 'Weekly trending scan' is on: an agent judges GitHub trending repos for this project and files up to 3 backlog proposals."
+								TRENDING_SCOUT_DESC
 							)}
 							{trendingStatus?.tokenPresent === false && (
 								<> {TRENDING_TOKEN_HINT}</>
@@ -9414,13 +9619,13 @@ function ProjectSlotsSection({
 							settingKey="maxParallel"
 							name="Runner cap"
 							action={save}
-							help="The most tasks of this project that run at the same time. The board-wide runner cap still applies."
-							shape="empty = no cap"
+							help={RUNNER_CAP_HELP}
+							shape="0 = no cap"
 						>
 							<label>
 								<input
 									type="number"
-									min={1}
+									min={0}
 									value={mp}
 									onChange={(e) => setMp(e.target.value)}
 									aria-label="Runner cap"
@@ -9431,7 +9636,7 @@ function ProjectSlotsSection({
 							<CheckRow
 								settingKey="microVm"
 								name="Run work turns in microVMs"
-								desc={microVmDesc(project, st.microVm)}
+								desc={microVmDesc(project.vmRunner, st.microVm)}
 								checked={st.microVm}
 								disabled={!project.vmRunner.ok && !st.microVm}
 								save={(v) => send({ microVm: v })}
@@ -9507,7 +9712,7 @@ function ProjectSlotsSection({
 						<DefRow
 							settingKey="copyExtra"
 							name="Extra paths"
-							help="Files that git ignores but agents need, for example local config. Ottr copies them into each new worktree."
+							help={EXTRA_PATHS_HELP}
 							shape="one path per line"
 						>
 							<label>
@@ -9515,7 +9720,7 @@ function ProjectSlotsSection({
 									rows={3}
 									value={extra}
 									onChange={(e) => setExtra(e.target.value)}
-									placeholder="scripts/release.mjs"
+									placeholder="e.g. scripts/release.mjs"
 									aria-label="Extra paths"
 								/>
 							</label>
@@ -9823,11 +10028,7 @@ export function ProjectSettingsForm({
 	hosted?: boolean;
 }) {
 	const shownP = (id: string): boolean => !hostedHidden(hosted === true, id);
-	const [mp, setMp] = useState(
-		project.settings.maxParallel === null
-			? ""
-			: String(project.settings.maxParallel),
-	);
+	const [mp, setMp] = useState(String(project.settings.maxParallel ?? 0));
 	const [cap, setCap] = useState(String(project.settings.archReviewCap));
 	const [mi, setMi] = useState(String(project.settings.maxImages));
 	const [kwd, setKwd] = useState(String(project.settings.keptWorktreeDays));
@@ -9886,8 +10087,7 @@ export function ProjectSettingsForm({
 		.split("\n")
 		.map((s) => s.trim())
 		.filter((s) => s.length > 0);
-	const parallel =
-		mp.trim() === "" ? null : clamp(Math.trunc(Number(mp)) || 1, 1, Infinity);
+	const parallel = capValue(mp);
 	const reviewCap = clamp(Math.trunc(Number(cap)) || 1, 1, 10000);
 	const imagesMax = Math.max(1, Math.trunc(Number(mi)) || 1);
 	// A blank field is caught by the input's required on submit, never clamped to min.

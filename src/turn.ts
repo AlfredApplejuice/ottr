@@ -2877,60 +2877,6 @@ export function createTurnLoop(
 		return lines;
 	}
 
-	/** OTTR-531: on the false→true edge of an unpushed main, a standing pushSyncCommits
-	 * approval pushes the local target ref once — no edge (a failed push leaves the flag true)
-	 * means no retry storm. */
-	async function syncUnpushedMain(
-		e: TurnProject,
-		branch: string,
-		unpushed: boolean,
-	): Promise<void> {
-		const edge = !e.mainUnpushed && unpushed;
-		e.mainUnpushed = unpushed;
-		if (!edge) return;
-		const settings = await e.store.getSettings();
-		if (!settings.pushSyncCommits) return;
-		void ops
-			.serverMergePush(
-				e.path,
-				e.path,
-				`origin/${branch}`,
-				"",
-				null,
-				settings.originUrl,
-			)
-			.then((p) => {
-				if (p.status === "pushed") {
-					// The hold lifts at once instead of waiting for the next tick.
-					e.mainUnpushed = false;
-					// OTTR-708: record the head this board-made push moved the
-					// main checkout to, so the checkout guard discounts it.
-					void ops
-						.checkoutState(e.path)
-						.then((s) => {
-							if (s.head !== null) boardPushedHeads.set(e.name, s.head);
-						})
-						.catch(() => {});
-					console.log(
-						`${e.store.name}: - pushed ${branch} from the server (push sync commits)`,
-					);
-				} else if (p.status === "skipped") {
-					console.log(
-						`${e.store.name}: ! sync-commit push of ${branch} skipped`,
-					);
-				} else {
-					console.log(
-						`${e.store.name}: ! sync-commit push of ${branch} failed: ${p.error}`,
-					);
-				}
-			})
-			.catch((err: unknown) => {
-				console.log(
-					`${e.store.name}: ! sync-commit push of ${branch} failed: ${errmsg(err)}`,
-				);
-			});
-	}
-
 	/** OTTR-884: one project's scheduler-refreshed flags as the cycle last saw them. The
 	 * previous snapshot starts undefined, so the first cycle after boot compares undefined
 	 * to value, counts that as a change, and the board's first tick still publishes. */
@@ -2972,8 +2918,8 @@ export function createTurnLoop(
 		archReview: e.archReview,
 	});
 
-	/** Per-project flag refresh of the schedule tick: dirty, mainUnpushed (with the standing
-	 * pushSyncCommits approval above), mainBranch, release/arch-review/PR flags. Resolves when
+	/** Per-project flag refresh of the schedule tick: dirty, mainUnpushed (only a click on
+	 * Push to origin pushes it, docs/specs/sync-commit-hygiene.md), mainBranch, release/arch-review/PR flags. Resolves when
 	 * the project's flag ops settle; every op keeps its own failure isolation (a failed op
 	 * keeps the last flag, the next tick retries), so the promise never rejects. True when any
 	 * flag changed against the project's last snapshot (OTTR-884): the cycle publishes only on
@@ -3000,7 +2946,9 @@ export function createTurnLoop(
 			settling.push(
 				ops
 					.branchUnpushed(e.path, branch)
-					.then((unpushed) => syncUnpushedMain(e, branch, unpushed))
+					.then((unpushed) => {
+						e.mainUnpushed = unpushed;
+					})
 					.catch(() => {
 						// git failed: keep the last mainUnpushed flag; the next tick retries.
 					}),
@@ -9859,8 +9807,10 @@ export function createTurnLoop(
 		});
 	}
 
-	/** A retro's proposal is filed as a held card (needs_you, followUpOf this retro): the
-	 * settle recheck above confirmed the card is still ours, so this write is safe.
+	/** A retro's proposal is filed as a card that follows up this retro: held at needs_you,
+	 * or queued when the target project starts proposals without asking and the proposal
+	 * carries no decision (docs/specs/retro-auto-start.md). The settle recheck above
+	 * confirmed the card is still ours, so this write is safe.
 	 * A proposal whose call named a project files on that project's store (OTTR-787):
 	 * a change to rules, skills or AGENTS.md sources targets agent-data, and a card
 	 * there edits that checkout without tripping the cross-project checkout guard.
@@ -9887,6 +9837,7 @@ export function createTurnLoop(
 			store = tp.store;
 		}
 		const proposed = st.result.proposed;
+		const decision = proposed.decision ?? null;
 		const sourceTask = (await st.store.getTask(st.id)) ?? st.task;
 		const turns = await st.store.listTurns(st.id);
 		const parent =
@@ -9894,20 +9845,30 @@ export function createTurnLoop(
 				? null
 				: await st.store.getTask(st.task.followUpOf);
 		const child = await store.transaction(async () => {
-			let openProposals = 0;
-			for (const task of await store.listTasks()) {
-				if (
-					task.cancelledAt === null &&
-					task.state === "needs_you" &&
-					isRetroProposalReason(task.needsReason) &&
-					(await store.listTurns(task.id)).length === 0
-				)
-					openProposals++;
+			// docs/specs/retro-auto-start.md: the filing project's setting decides; a
+			// decision always holds. A started card is no open proposal, so the cap skips it.
+			const held =
+				!(await store.getSettings()).retroAutoStart || decision !== null;
+			if (held) {
+				let openProposals = 0;
+				for (const task of await store.listTasks()) {
+					if (
+						task.cancelledAt === null &&
+						task.state === "needs_you" &&
+						isRetroProposalReason(task.needsReason) &&
+						(await store.listTurns(task.id)).length === 0
+					)
+						openProposals++;
+				}
+				if (openProposals >= 3) return null;
 			}
-			if (openProposals >= 3) return null;
 			const created = await store.createTask(proposed.prompt);
 			const handoffPath = join(store.tasksDir, "handoffs", `${created.id}.md`);
-			return await store.updateTask(created.id, {
+			const summary =
+				proposed.summary === null || decision === null
+					? proposed.summary
+					: { ...proposed.summary, decision };
+			const card = await store.updateTask(created.id, {
 				prompt: followUpPrompt({
 					text: proposed.prompt,
 					title: st.task.title,
@@ -9917,16 +9878,23 @@ export function createTurnLoop(
 				promptAuthor: "board",
 				followUpOfProject: store === st.store ? null : st.store.name,
 				model: proposed.model,
-				state: "needs_you",
-				needsReason: proposedReason(parent ?? { id: st.task.id }),
-				proposalSummary: proposed.summary,
+				// createTask queued it, as Accept would; a held card waits at needs_you.
+				...(held
+					? {
+							state: "needs_you" as const,
+							needsReason: proposedReason(parent ?? { id: st.task.id }),
+						}
+					: {}),
+				proposalSummary: summary,
 			});
+			return { card, held };
 		});
 		if (child === null) {
 			await st.log("retro: proposal dropped: cap of 3 open proposals reached");
 			return;
 		}
-		const handoffPath = join(store.tasksDir, "handoffs", `${child.id}.md`);
+		const { card, held } = child;
+		const handoffPath = join(store.tasksDir, "handoffs", `${card.id}.md`);
 		try {
 			const savedDir = join(st.store.tasksDir, "quarantine", st.id);
 			writeBelow(
@@ -9941,16 +9909,17 @@ export function createTurnLoop(
 			);
 		} catch (err) {
 			await store.transaction(async () => {
-				const current = await store.getTask(child.id);
-				if (current?.revision === child.revision)
-					await store.updateTask(child.id, { prompt: proposed.prompt });
+				const current = await store.getTask(card.id);
+				if (current?.revision === card.revision)
+					await store.updateTask(card.id, { prompt: proposed.prompt });
 			});
 			await st.log(`! handoff write failed: ${errmsg(err)}`);
 		}
+		const where = store === st.store ? "" : ` in project ${store.name}`;
 		await st.log(
-			store === st.store
-				? `- filed proposal ${child.id} (held for approval)`
-				: `- filed proposal ${child.id} in project ${store.name} (held for approval)`,
+			held
+				? `- filed proposal ${card.id}${where} (held for approval)`
+				: `retro: proposal started without asking: ${card.id}${where}`,
 		);
 	}
 

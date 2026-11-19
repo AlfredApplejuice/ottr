@@ -26,9 +26,9 @@ Both source paths use the same five steps.
 | # | Name | Content |
 |---|------|---------|
 | 1 | Source | New or Git URL, name, task ID prefix, and existing Git host access controls |
-| 2 | Automation | Retro, friction filter, fork research, and existing merge holds |
-| 3 | Runners | Runner cap (`maxParallel`) and extra paths (`copyExtra`) |
-| 4 | Project | PR mode (`prMode`) and target branch (`targetBranch`) |
+| 2 | Automation | Every switch of the Watches and Proposals cards: retro, friction filter, start retro proposals without asking, trending scout (`trendingScout`), omp watch (`ompWatch`), and, for a GitHub project only, fork research, issue watch (`issueWatch`), PR reviews (`prReviews` with `prReviewNotify`, `prReviewApprove` and `prReviewRequestChanges`, which need PR reviews) and the Dependabot warning (`dependabotWarn`); then the existing merge holds. The texts match the settings cards. In hosted mode the watch rows and trending scout are hidden, like the Watches card |
+| 3 | Runners | Runner cap (`maxParallel`), extra paths (`copyExtra`), and "Run work turns in microVMs" (`microVm`; hidden in hosted mode, locked off while the board's vm-runner is not ready) |
+| 4 | Project | Target branch (`targetBranch`), then PR mode (`prMode`, a **Legacy** row) |
 | 5 | Rules | Explain the rules action that Finish performs after creation and settings saves |
 
 Reuse the existing setup sections and field semantics.
@@ -61,6 +61,12 @@ At Finish, apply only settings that the user explicitly changes.
 Do not send a whole default settings object that overwrites the clone's committed `.tasks` settings.
 This rule applies to Automation, Runners, PR mode, and target branch.
 It also applies when Back revisits a step.
+
+Retro and "Start retro proposals without asking" are the exceptions.
+The Automation step starts with both on, and Finish sends `retro: true` and `retroAutoStart: true` for New and for Git URL.
+For a clone, this replaces the clone's own values of these two settings.
+When the user clears a box, Finish sends `false` for it.
+The friction filter stays a normal default: on, and sent only on an explicit change.
 
 Existing GitHub facts and fork suggestions need a real project.
 Do not create a project to obtain them before Finish.

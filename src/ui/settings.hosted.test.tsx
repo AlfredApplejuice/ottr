@@ -134,7 +134,6 @@ const project = (): ProjectView =>
 			prMode: false,
 			issueWatch: false,
 			microVm: false,
-			pushSyncCommits: false,
 			maxParallel: 2,
 			copyExtra: [],
 			displayName: null,

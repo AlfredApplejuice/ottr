@@ -213,7 +213,7 @@ When hosted mode is on, the UI hides these host-level surfaces:
   identity (global SSH key, commit identity), the three whole cards. Hosted git uses only the
   per-project control-plane tokens (section 6), so no setting on these cards has an effect.
 - Access and usage → API key, Session, omp usage.
-- Project → Merging, Watches and Proposals (merge holds, PR mode, push sync commits, PR
+- Project → Merging, Watches and Proposals (merge holds, PR mode, PR
   reviews, issue watch, fork research, omp watch, retro, trending scout), and the "Run work
   turns in microVMs" switch on the Runners card.
 - The provider quota in the app bar and in its detail popover. Provider quota is the

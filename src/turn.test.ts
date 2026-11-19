@@ -198,6 +198,7 @@ interface Recorded {
 		prompt: string;
 		model: string | null;
 		summary: ProposalSummary | null;
+		decision?: string | null;
 		project: string | null;
 	} | null;
 	/** The fake run resolves `done` with these findings (a review run's propose_task calls). */
@@ -896,6 +897,79 @@ describe("turn loop", () => {
 		).toHaveLength(0);
 		expect(await logText(store, retro.id)).toContain(
 			"retro: proposal dropped: cap of 3 open proposals reached",
+		);
+	});
+
+	test("with retroAutoStart a proposal without a decision starts queued past the cap; one with a decision is held", async () => {
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
+		await store.setSettings({ retroAutoStart: true });
+		// Three open proposals fill the cap: a started card is no open proposal.
+		for (let i = 0; i < 3; i++) {
+			const p = await store.createTask(`proposal ${i}`);
+			await store.updateTask(p.id, {
+				state: "needs_you",
+				needsReason: `${PROPOSED_REASON_PREFIX}an older retro. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
+			});
+		}
+		const summary = {
+			whatChanges: "w",
+			why: "y",
+			gain: "g",
+			risk: "none found",
+			check: "c",
+		};
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
+		record.proposal = {
+			prompt: "start me",
+			model: null,
+			summary,
+			project: null,
+		};
+		await loop.runTurn(store.name, retro.id);
+		const started = (await store.listTasks()).find(
+			(t) => t.followUpOf === retro.id,
+		)!;
+		expect(started.stage).toBe("todo");
+		expect(started.state).toBe("queued");
+		expect(started.needsReason).toBeNull();
+		// No "." reply: the board start never claims the user wrote it.
+		expect(started.pendingPrompt).toBeNull();
+		expect(started.promptAuthor).toBe("board");
+		expect(started.proposalSummary).toEqual(summary);
+		expect(await logText(store, retro.id)).toContain(
+			`retro: proposal started without asking: ${started.id}`,
+		);
+
+		// A decision holds the card, also with the setting on, and the summary keeps it.
+		for (const t of await store.listTasks())
+			if (t.state === "needs_you")
+				await store.updateTask(t.id, { cancelledAt: Date.now() });
+		const retro2 = await store.createTask(
+			`${RETRO_MARKER}the second retro`,
+			null,
+			"retro",
+		);
+		record.proposal = {
+			prompt: "ask first",
+			model: null,
+			summary,
+			decision: "Keep the old flag or drop it?",
+			project: null,
+		};
+		await loop.runTurn(store.name, retro2.id);
+		const held = (await store.listTasks()).find(
+			(t) => t.followUpOf === retro2.id,
+		)!;
+		expect(held.state).toBe("needs_you");
+		expect(held.needsReason?.startsWith(PROPOSED_REASON_PREFIX)).toBe(true);
+		expect(held.proposalSummary?.decision).toBe(
+			"Keep the old flag or drop it?",
 		);
 	});
 
@@ -22393,7 +22467,7 @@ describe("sync-commit hygiene (OTTR-531)", () => {
 		);
 	});
 
-	test("pushSyncCommits on: the tick pushes once on the unpushed edge and lifts the hold", async () => {
+	test("the tick never pushes an unpushed main, also under a stored legacy pushSyncCommits row", async () => {
 		const calls: unknown[][] = [];
 		const { store, projects, loop } = await targetedSetup({
 			branchUnpushed: async () => true,
@@ -22402,36 +22476,17 @@ describe("sync-commit hygiene (OTTR-531)", () => {
 				return { status: "pushed" as const, output: "" };
 			},
 		});
-		await store.setSettings({ pushSyncCommits: true });
+		// A board from before the removal stored the standing approval; it must stay inert.
+		await store.setSettings({ pushSyncCommits: true } as unknown as Parameters<
+			typeof store.setSettings
+		>[0]);
 		const e = projects.get(store.name)!;
 		await loop.schedule();
 		await flushPromises();
 
-		expect(calls).toHaveLength(1);
-		expect(calls[0]).toEqual([
-			e.path,
-			e.path,
-			"origin/main",
-			"",
-			null,
-			(await store.getSettings()).originUrl,
-		]);
-		expect(e.mainUnpushed).toBe(false);
-	});
-
-	test("pushSyncCommits off: the tick never pushes", async () => {
-		const calls: unknown[][] = [];
-		const { loop } = await setup({
-			branchUnpushed: async () => true,
-			serverMergePush: async (...args: unknown[]) => {
-				calls.push(args);
-				return { status: "pushed" as const, output: "" };
-			},
-		});
-		await loop.schedule();
-		await flushPromises();
-
 		expect(calls).toHaveLength(0);
+		// The hold stays until a click on Push to origin.
+		expect(e.mainUnpushed).toBe(true);
 	});
 });
 

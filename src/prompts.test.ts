@@ -916,7 +916,7 @@ describe("retro prompts", () => {
 			"You run the retro of a completed task. The handoff below holds the task, its outcome, the facts that Ottr computed, the open and declined proposals, and the lessons of earlier retros.",
 		);
 		expect(lines).toContain(
-			"Propose at most one improvement with the propose_task tool. Ottr files it as a card that waits until the user accepts, edits or declines it. Do not propose what the handoff lists as open or declined.",
+			"Propose at most one improvement with the propose_task tool. Ottr files it as a card. The card waits until the user accepts, edits or declines it, unless the project starts proposals without asking. Do not propose what the handoff lists as open or declined.",
 		);
 		expect(p).toContain("End details with the line `topic: retro`.");
 		const oneShot =
@@ -1023,7 +1023,7 @@ describe("retro prompts", () => {
 
 	test("PROPOSE_TOOL_DESCRIPTION verbatim", () => {
 		expect(PROPOSE_TOOL_DESCRIPTION).toBe(
-			"Propose ONE improvement task from this retro. Ottr files it as a held card when the retro ends: it starts only after the user accepts it. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. End the prompt with a section headed 'Acceptance' that holds at least one observable check (a command to run or a result to see); the tool refuses a prompt without one. model: optional model for the task. summary: five short strings the board shows next to the prompt, each the same fact as its prompt part: whatChanges: the file or setting and the edit, in one sentence; why: the cause and the evidence, with the card ids; gain: the saving in concrete units; risk: what can break, or \"none found\"; check: how the result is verified.",
+			"Propose ONE improvement task from this retro. Ottr files it as a card when the retro ends: it starts after the user accepts it, or at once when the project starts proposals without asking. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. End the prompt with a section headed 'Acceptance' that holds at least one observable check (a command to run or a result to see); the tool refuses a prompt without one. model: optional model for the task. summary: five short strings the board shows next to the prompt, each the same fact as its prompt part: whatChanges: the file or setting and the edit, in one sentence; why: the cause and the evidence, with the card ids; gain: the saving in concrete units; risk: what can break, or \"none found\"; check: how the result is verified. decision: optional; the question the user must answer before this task can start, for example a choice between two designs or a scope call. Leave it out when the task needs no decision. A proposal with a decision always waits for the user.",
 		);
 	});
 

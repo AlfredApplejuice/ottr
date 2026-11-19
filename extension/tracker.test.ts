@@ -768,7 +768,7 @@ describe("propose_task tool", () => {
 		expect(tool?.loadMode).toBe("essential");
 	});
 
-	test("declares exactly prompt, model, project and the five summary fields", () => {
+	test("declares exactly prompt, model, project, the five summary fields and decision", () => {
 		process.env.OTTR_RETRO = "1";
 		expect(Object.keys(fakePi().propose_task?.parameters ?? {})).toEqual([
 			"prompt",
@@ -779,6 +779,7 @@ describe("propose_task tool", () => {
 			"gain",
 			"risk",
 			"check",
+			"decision",
 		]);
 	});
 
@@ -848,11 +849,13 @@ describe("propose_task tool", () => {
 			{ prompt: `p${acceptance}`, gain: "" },
 			{ prompt: `p${acceptance}`, risk: {} },
 			{ prompt: `p${acceptance}`, check: "x".repeat(401) },
+			{ prompt: `p${acceptance}`, decision: "  " },
+			{ prompt: `p${acceptance}`, decision: "x".repeat(401) },
 		];
 		for (const params of bad) {
 			const out = await tools.propose_task!.execute("t1", params);
 			expect(text(out)).toMatch(
-				/^Error: (whatChanges|why|gain|risk|check) must be a string of 1-400 characters \(trimmed\) when given\.$/,
+				/^Error: (whatChanges|why|gain|risk|check|decision) must be a string of 1-400 characters \(trimmed\) when given\.$/,
 			);
 		}
 	});

@@ -3261,6 +3261,15 @@ describe("settings routes", () => {
 		});
 		expect(badFilter.status).toBe(400);
 		expect(await errorOf(badFilter)).toBe("retroFilter must be a boolean");
+		// retroAutoStart saves like the other switches and refuses a non-boolean.
+		await post("/api/projects/p1/settings", { retroAutoStart: true });
+		expect((await store.getSettings()).retroAutoStart).toBe(true);
+		const badStart = await post("/api/projects/p1/settings", {
+			retroAutoStart: "yes",
+		});
+		expect(badStart.status).toBe(400);
+		expect(await errorOf(badStart)).toBe("retroAutoStart must be a boolean");
+		await post("/api/projects/p1/settings", { retroAutoStart: false });
 		const unknown = await post("/api/projects/p1/settings", {
 			retroScope: "everything",
 		});
@@ -4840,8 +4849,14 @@ describe("alate routes", () => {
 			checkedAt: iso,
 			updates,
 		});
+		// These tests cover the manual flow (a person files each card): p1 approves updates,
+		// so a refresh files nothing on its own (docs/specs/hands-off-updates.md).
+		beforeAll(async () => {
+			await projects.get("p1")!.store.setSettings({ holdUpdateMerges: true });
+		});
 		afterAll(async () => {
 			// Leave the shared store and closure clean for later describes.
+			await projects.get("p1")!.store.setSettings({ holdUpdateMerges: false });
 			await gstore.set("updateSkips", []);
 			await gstore.set("updates", null);
 			await saveSubs(gstore, []);
@@ -5574,6 +5589,73 @@ describe("alate routes", () => {
 				expect(cards.length).toBe(1);
 			} finally {
 				p1.github = null;
+				alateBody = envelope([goodRec, otherRec]);
+			}
+		});
+
+		test("hands-off: with approval off a pull files qualified rows once, never again for a carried id", async () => {
+			const p1 = projects.get("p1")!;
+			p1.github = "https://github.com/Octo/Repo.GIT";
+			await p1.store.setSettings({ holdUpdateMerges: false });
+			const carries = async (id: string) =>
+				(await p1.store.listTasks()).filter((t) => t.updateIds.includes(id));
+			try {
+				const v20 = {
+					...goodRec,
+					id: "octo/repo@v20",
+					latest: "v20",
+					target: "v20",
+				};
+				const young = { ...goodRec, id: "octo/repo@v21", target: null };
+				const managed = {
+					...goodRec,
+					id: "octo/repo@v22",
+					managedBy: "renovate",
+				};
+				const removed = {
+					...goodRec,
+					id: "octo/repo@gone",
+					target: null,
+					removed: true,
+				};
+				const skipped = { ...goodRec, id: "octo/repo@v23", target: "v23" };
+				await gstore.set("updateSkips", [skipped.id]);
+				alateBody = envelope([v20, young, managed, removed, skipped]);
+				await post("/api/updates/refresh", {});
+				const filed = await carries(v20.id);
+				expect(filed).toHaveLength(1);
+				expect(filed[0]!.promptAuthor).toBe("board");
+				for (const id of [young.id, managed.id, removed.id, skipped.id])
+					expect(await carries(id)).toEqual([]);
+				// A second pull files nothing new, even after the card is cancelled.
+				await p1.store.updateTask(filed[0]!.id, { cancelledAt: Date.now() });
+				await post("/api/updates/refresh", {});
+				expect(await carries(v20.id)).toHaveLength(1);
+				// The next version of the same item has a new id and files.
+				const v24 = {
+					...v20,
+					id: "octo/repo@v24",
+					latest: "v24",
+					target: "v24",
+				};
+				alateBody = envelope([v20, v24]);
+				await post("/api/updates/refresh", {});
+				expect(await carries(v24.id)).toHaveLength(1);
+				// With approval on, a pull files nothing.
+				await p1.store.setSettings({ holdUpdateMerges: true });
+				const v25 = {
+					...v20,
+					id: "octo/repo@v25",
+					latest: "v25",
+					target: "v25",
+				};
+				alateBody = envelope([v25]);
+				await post("/api/updates/refresh", {});
+				expect(await carries(v25.id)).toEqual([]);
+			} finally {
+				p1.github = null;
+				await p1.store.setSettings({ holdUpdateMerges: true });
+				await gstore.set("updateSkips", []);
 				alateBody = envelope([goodRec, otherRec]);
 			}
 		});
@@ -11452,18 +11534,18 @@ describe("push-main on an empty origin (OTTR-605)", () => {
 	});
 });
 
-describe("pushSyncCommits setting and ProjectView fields", () => {
-	test("the settings route accepts the boolean and the view carries mainBranch/mainUnpushed", async () => {
+describe("ProjectView main checkout fields", () => {
+	test("the removed pushSyncCommits key from an old tab is ignored; the view carries mainBranch/mainUnpushed", async () => {
 		const res = await post("/api/projects/p1/settings", {
 			pushSyncCommits: true,
 		});
 		expect(res.status).toBe(200);
 		const b = (await res.json()) as {
-			settings: { pushSyncCommits: boolean };
+			settings: Record<string, unknown>;
 			mainBranch: string | null;
 			mainUnpushed: boolean;
 		};
-		expect(b.settings.pushSyncCommits).toBe(true);
+		expect(b.settings).not.toHaveProperty("pushSyncCommits");
 		expect(b.mainBranch).toBeNull();
 		expect(b.mainUnpushed).toBe(false);
 	});
@@ -11508,14 +11590,6 @@ describe("pushSyncCommits setting and ProjectView fields", () => {
 			else p1.homepageRepo = previousHomepageRepo;
 			app.publishSoon();
 		}
-	});
-
-	test("a non-boolean pushSyncCommits is 400", async () => {
-		const res = await post("/api/projects/p1/settings", {
-			pushSyncCommits: "yes",
-		});
-		expect(res.status).toBe(400);
-		expect(await errorOf(res)).toBe("pushSyncCommits must be a boolean");
 	});
 });
 

@@ -1718,6 +1718,7 @@ const BOOLEAN_SETTING_FIELDS = [
 	"holdUpdateMerges",
 	"forkMergeHold",
 	"retroFilter",
+	"retroAutoStart",
 	"forkResearch",
 	"trendingScout",
 	"prReviews",
@@ -1729,7 +1730,6 @@ const BOOLEAN_SETTING_FIELDS = [
 	"dependabotWarn",
 	"ompWatch",
 	"microVm",
-	"pushSyncCommits",
 	"setupChecklist",
 ] as const;
 
@@ -3236,6 +3236,52 @@ export async function createApp(deps: AppDeps) {
 		return [{ project: e.name, id: t.id }];
 	}
 
+	/** Whether any card, in any state, ever carried the update id. A done card whose pin
+	 *  Alate still reports, or a cancelled one, must not make the board file that version again. */
+	async function updateEverFiled(id: string): Promise<boolean> {
+		for (const pe of deps.projects.values())
+			if ((await pe.store.listTasks()).some((t) => t.updateIds.includes(id)))
+				return true;
+		return false;
+	}
+
+	/** Hands-off projects (holdUpdateMerges off): file the qualified rows' cards after a good
+	 *  pull, as a manual Allow would (docs/specs/hands-off-updates.md). A failure logs; the
+	 *  next pull retries. */
+	async function autoFileUpdates(): Promise<void> {
+		const view = await updatesView();
+		if (view === null) return;
+		const picked: Array<{ rec: UpdateRecord; e: Entry }> = [];
+		for (const row of view.rows) {
+			if (row.target === null) continue;
+			let filable: { rec: UpdateRecord; e: Entry };
+			try {
+				filable = fileableUpdate(row.id, false);
+			} catch {
+				continue; // removed, managed, unmapped or gitless: a person decides
+			}
+			if ((await filable.e.store.getSettings()).holdUpdateMerges) continue;
+			if (await updateEverFiled(row.id)) continue;
+			picked.push(filable);
+		}
+		if (picked.length === 0) return;
+		try {
+			const made = await createUpdateCards(picked, false);
+			console.log(
+				`updates: filed ${made.map((c) => `${c.project}/${c.id}`).join(", ")} on hands-off projects`,
+			);
+		} catch (err) {
+			// createUpdateCards throws the route's `{status, error}` objects, not Errors.
+			const reason =
+				err instanceof Error
+					? err.message
+					: typeof err === "object" && err !== null && "error" in err
+						? String(err.error)
+						: String(err);
+			console.log(`updates: hands-off filing failed: ${reason}`);
+		}
+	}
+
 	/** Single-flight pull from the alate provider; failure keeps the last good result. */
 	function refreshUpdates(): Promise<void> {
 		if (updatesInFlight !== null) return updatesInFlight;
@@ -3295,6 +3341,7 @@ export async function createApp(deps: AppDeps) {
 					),
 				};
 				await deps.gstore.set("updates", updates);
+				await autoFileUpdates();
 				if (good.dropped > 0)
 					console.log(
 						`updates: dropped ${good.dropped} invalid record(s) from alate`,

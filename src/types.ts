@@ -55,6 +55,9 @@ export interface ProposalSummary {
 	risk: string;
 	/** How the result is verified. */
 	check: string;
+	/** The question the user must answer before the task can start; absent when none. A
+	 *  proposal with a decision always waits for Accept (docs/specs/retro-auto-start.md). */
+	decision?: string;
 }
 
 /** One question of the agent's outstanding `ask` call; the UI renders options as click-to-answer buttons. */
@@ -230,6 +233,8 @@ export interface ProjectSettings {
 	retroSince: number | null;
 	/** Skip the retro of a smooth, cheap task (the friction filter); false gives every task a retro. */
 	retroFilter: boolean;
+	/** A retro proposal with no decision starts as a queued card instead of waiting for Accept (docs/specs/retro-auto-start.md). */
+	retroAutoStart: boolean;
 	/** Hourly fork watch: analyze new fork-only commits with a tool-free model call and file held proposals (off by default). */
 	forkResearch: boolean;
 	/** Hourly PR watch: file or requeue a read-only review card for each settled open PR (off by default). */
@@ -269,12 +274,6 @@ export interface ProjectSettings {
 	 * closed at the next push until the server pins again.
 	 */
 	originUrl: string | null;
-	/**
-	 * Standing approval for the board to push the main checkout's target branch to the pinned
-	 * origin when the tick finds local commits origin lacks (OTTR-531 sync commits); false
-	 * needs the one click on the board's push button instead. Without it nothing pushes.
-	 */
-	pushSyncCommits: boolean;
 	/** Task id handle like OTTR; null = derived from the folder name. Uppercase letters and digits, at most 8. */
 	taskIdPrefix: string | null;
 	/** Name of the board-level Jira connection this project imports from; null = none. */
@@ -750,6 +749,8 @@ export interface RunResult {
 		prompt: string;
 		model: string | null;
 		summary: ProposalSummary | null;
+		/** The question the user must answer before the card starts; absent or null when none. */
+		decision?: string | null;
 		project: string | null;
 	} | null;
 	/** Every valid `propose_task` call of the run, in order: a retro records at most one (the

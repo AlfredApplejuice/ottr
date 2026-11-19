@@ -222,6 +222,7 @@ import {
 	alateHint,
 	asError,
 	asTrust,
+	capValue,
 	type GitHostsView,
 	gitReq,
 	HostedContext,
@@ -7399,7 +7400,9 @@ function AddPrefixField({
 	);
 }
 
-/** The tab strip of the Add-project dialog. */
+/** The tab strip of the Add-project dialog. A click (or Enter/Space) opens the tab and puts
+ *  the caret in its field; arrow keys only move between the tabs, as the ARIA tabs pattern
+ *  expects. */
 function AddTabs({
 	mode,
 	setMode,
@@ -7407,6 +7410,15 @@ function AddTabs({
 	mode: "url" | "new";
 	setMode: (m: "url" | "new") => void;
 }) {
+	const open = (m: "url" | "new"): void => {
+		setMode(m);
+		// The panel unhides on the next render; focus its field after that.
+		requestAnimationFrame(() =>
+			document
+				.querySelector<HTMLInputElement>(`#add-panel-${m} input`)
+				?.focus(),
+		);
+	};
 	return (
 		<div className="add-tabs" role="tablist" aria-label="Project source">
 			<button
@@ -7417,7 +7429,7 @@ function AddTabs({
 				aria-selected={mode === "url"}
 				aria-controls="add-panel-url"
 				tabIndex={mode === "url" ? 0 : -1}
-				onClick={() => setMode("url")}
+				onClick={() => open("url")}
 				onKeyDown={(e) => switchTab(e, ["url", "new"], setMode)}
 			>
 				<Icon name="branch" />
@@ -7431,7 +7443,7 @@ function AddTabs({
 				aria-selected={mode === "new"}
 				aria-controls="add-panel-new"
 				tabIndex={mode === "new" ? 0 : -1}
-				onClick={() => setMode("new")}
+				onClick={() => open("new")}
 				onKeyDown={(e) => switchTab(e, ["url", "new"], setMode)}
 			>
 				<Icon name="plus" />
@@ -7586,17 +7598,33 @@ export function AddProjectModal({
 	const [ghRepo, setGhRepo] = useState(false);
 	const [err, setErr] = useState<string | null>(null);
 	const [step, setStep] = useState(1);
-	const [changes, setChanges] = useState<Partial<SetupFields>>({});
+	// Retro and its auto-start start on as explicit changes, so Finish saves them even over
+	// a clone's own settings (docs/specs/add-project-wizard.md "Drafts and clone settings").
+	const [changes, setChanges] = useState<Partial<SetupFields>>({
+		retro: true,
+		retroAutoStart: true,
+	});
 	const values: SetupFields = {
 		retro: false,
 		retroFilter: true,
+		retroAutoStart: false,
 		forkResearch: false,
 		holdUpdateMerges: false,
 		forkMergeHold: true,
-		maxParallel: "",
+		maxParallel: "0",
 		copyExtra: "",
+		microVm: false,
 		prMode: false,
 		targetBranch: "",
+		// The stored defaults (DEFAULT_SETTINGS in src/store.ts): Finish sends only changes.
+		trendingScout: false,
+		issueWatch: false,
+		prReviews: false,
+		prReviewNotify: true,
+		prReviewApprove: false,
+		prReviewRequestChanges: false,
+		ompWatch: false,
+		dependabotWarn: true,
 		...changes,
 	};
 	const change = (next: Partial<SetupFields>): void =>
@@ -7720,15 +7748,11 @@ export function AddProjectModal({
 			);
 			return false;
 		}
-		const parallel =
-			values.maxParallel.trim() === "" ? null : Number(values.maxParallel);
-		if (
-			parallel !== null &&
-			(!Number.isInteger(parallel) || parallel < 1 || parallel > 8)
-		) {
+		const parallel = capValue(values.maxParallel);
+		if (parallel !== null && parallel > 8) {
 			setStep(3);
 			setErr(
-				"Runner cap must be a whole number from 1 to 8, or empty for no cap.",
+				"Runner cap must be a whole number from 1 to 8, or empty or 0 for no cap.",
 			);
 			return false;
 		}
@@ -7807,9 +7831,19 @@ export function AddProjectModal({
 				const body: Record<string, unknown> = { ...switches };
 				if (forkResearch !== undefined && current.github !== null)
 					body.forkResearch = forkResearch;
-				if (maxParallel !== undefined)
-					body.maxParallel =
-						maxParallel.trim() === "" ? null : Number(maxParallel);
+				// The Automation step hides the GitHub-only watches for a non-GitHub source; a
+				// draft left from a GitHub source picked before Back is dropped like fork research.
+				if (current.github === null)
+					for (const key of [
+						"issueWatch",
+						"prReviews",
+						"prReviewNotify",
+						"prReviewApprove",
+						"prReviewRequestChanges",
+						"dependabotWarn",
+					])
+						delete body[key];
+				if (maxParallel !== undefined) body.maxParallel = capValue(maxParallel);
 				if (copyExtra !== undefined)
 					body.copyExtra = copyExtra
 						.split("\n")
@@ -7990,6 +8024,7 @@ export function AddProjectModal({
 							step={step}
 							values={values}
 							github={github}
+							vmRunner={projects[0]?.vmRunner ?? null}
 							onForkDraft={(v) => change({ forkResearch: v })}
 							onChange={change}
 							savePrMode={async (v) => {
@@ -9669,6 +9704,13 @@ function ProposalPanel({
 	const facts =
 		s !== null ? (
 			<dl className="decide-facts">
+				{/* The question this proposal waits on (docs/specs/retro-auto-start.md). */}
+				{s.decision !== undefined && (
+					<div>
+						<dt>Decision</dt>
+						<dd>{s.decision}</dd>
+					</div>
+				)}
 				<div>
 					<dt>What changes</dt>
 					<dd>{s.whatChanges}</dd>
@@ -15508,7 +15550,7 @@ function appUpdateNotices(
 /** Inbox entry keys for the board's notice lines: occurrence keys so a recurrence
  * counts as new. shortKey hashes a long body (an error text, an id list), so no key
  * outgrows the seen route's limit. */
-function appNoticeKeys(
+export function appNoticeKeys(
 	state: StateResponse | null,
 	coveredUpdates: Map<string, TaskCard>,
 	error: string | null,
@@ -15540,10 +15582,23 @@ function appNoticeKeys(
 	alatePendingKey: string | null;
 } {
 	// U6: rows an open (non-done, non-cancelled) update card already carries are not pending for the user.
-	/** Actionable upstream updates (rows with a pin target); drives the inbox entry (U5). */
+	// A hands-off project (approval off) files its own qualified rows, so only rows a person
+	// must file count, plus every removed row (docs/specs/hands-off-updates.md).
+	const handsOff = new Set(
+		state?.projects
+			.filter((p) => !p.settings.holdUpdateMerges)
+			.map((p) => p.name) ?? [],
+	);
+	/** Upstream updates a person must act on; drives the inbox entry (U5). */
 	const updateIds =
 		state?.updates?.rows
-			.filter((r) => r.target !== null && !coveredUpdates.has(r.id))
+			.filter(
+				(r) =>
+					!coveredUpdates.has(r.id) &&
+					(r.removed === true ||
+						(r.target !== null &&
+							(r.project === null || !handsOff.has(r.project)))),
+			)
 			.map((r) => r.id) ?? [];
 	const updateCount = updateIds.length;
 	const critKey = error !== null ? shortKey("crit", error) : null;

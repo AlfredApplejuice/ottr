@@ -124,7 +124,9 @@ const compiledFakeOmp = (
 	const jsTmp = `${js}.${process.pid}.tmp`;
 	writeFileSync(jsTmp, source);
 	renameSync(jsTmp, js);
-	const exeTmp = `${exe}.${process.pid}.tmp`;
+	// Ends in .exe: on Windows `bun build --compile` appends .exe to any other outfile, and
+	// the rename below then finds no file.
+	const exeTmp = `${exe}.${process.pid}.tmp.exe`;
 	Bun.spawnSync([
 		process.execPath,
 		"build",
@@ -2296,6 +2298,36 @@ describe("applyEvent", () => {
 			risk: "none found",
 			check: "bun test",
 		});
+	});
+
+	test("a decision rides in the summary and on the proposal, and survives a missing summary field", () => {
+		const full = newEventState();
+		const fields = { prompt: "P", whatChanges: "w", why: "y", gain: "g" };
+		feed(
+			full,
+			proposeStart("p1", { ...fields, check: "c", decision: " pick A or B " }),
+			proposeEnd("p1"),
+		);
+		expect(full.proposed?.decision).toBe("pick A or B");
+		expect(full.proposed?.summary?.decision).toBe("pick A or B");
+		// check missing: no summary, but the decision still holds the card.
+		const partial = newEventState();
+		feed(
+			partial,
+			proposeStart("p1", { ...fields, decision: "pick A or B" }),
+			proposeEnd("p1"),
+		);
+		expect(partial.proposed?.summary).toBeNull();
+		expect(partial.proposed?.decision).toBe("pick A or B");
+		// A blank decision is none.
+		const blank = newEventState();
+		feed(
+			blank,
+			proposeStart("p1", { ...fields, check: "c", decision: "  " }),
+			proposeEnd("p1"),
+		);
+		expect(blank.proposed?.decision).toBeUndefined();
+		expect(blank.proposed?.summary?.decision).toBeUndefined();
 	});
 
 	test("an absent or non-string risk defaults to none found", () => {

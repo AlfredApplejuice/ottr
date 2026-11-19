@@ -99,6 +99,7 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	forkMergeHold: true,
 	retroSince: null,
 	retroFilter: true,
+	retroAutoStart: false,
 	forkResearch: false,
 	trendingScout: false,
 	prReviews: false,
@@ -114,7 +115,6 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	setupChecklist: false,
 	targetBranch: null,
 	originUrl: null,
-	pushSyncCommits: false,
 	taskIdPrefix: null,
 	jiraConnection: null,
 	jiraLastJql: null,
@@ -680,7 +680,7 @@ function parseProposalSummary(raw: string | null): ProposalSummary | null {
 	try {
 		const value: unknown = JSON.parse(raw);
 		if (typeof value !== "object" || value === null) return null;
-		const { whatChanges, why, gain, risk, check } = value as Record<
+		const { whatChanges, why, gain, risk, check, decision } = value as Record<
 			string,
 			unknown
 		>;
@@ -697,7 +697,10 @@ function parseProposalSummary(raw: string | null): ProposalSummary | null {
 			!check
 		)
 			return null;
-		return { whatChanges, why, gain, risk, check };
+		// decision is optional: an older summary, or a wrong-shaped one, has none.
+		return typeof decision === "string" && decision !== ""
+			? { whatChanges, why, gain, risk, check, decision }
+			: { whatChanges, why, gain, risk, check };
 	} catch {
 		return null;
 	}
@@ -1273,6 +1276,7 @@ const SETTINGS_SHAPES = {
 	forkMergeHold: "boolean",
 	retroSince: "number",
 	retroFilter: "boolean",
+	retroAutoStart: "boolean",
 	forkResearch: "boolean",
 	trendingScout: "boolean",
 	prReviews: "boolean",
@@ -1288,7 +1292,6 @@ const SETTINGS_SHAPES = {
 	setupChecklist: "boolean",
 	targetBranch: "string|null",
 	originUrl: "string|null",
-	pushSyncCommits: "boolean",
 	taskIdPrefix: "string|null",
 	jiraConnection: "string|null",
 	jiraLastJql: "string|null",

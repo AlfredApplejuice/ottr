@@ -6804,6 +6804,50 @@ dialog.confirm-dialog {
 .setup-sec .settings-field {
 	width: 100%;
 }
+/* The wizard's typed fields (Runner cap, Extra paths) use the settings page's rows: the name
+   and its hint stack in the left column, the field fills the right one, a soft rule between. */
+.setup-sec .alate-def-rows {
+	display: grid;
+	align-self: stretch;
+}
+.setup-sec .alate-def-row:not(.check-row) {
+	display: grid;
+	grid-template-columns: 150px minmax(0, 1fr);
+	gap: 14px;
+	align-items: center;
+	padding: 8px 0;
+}
+.setup-sec .alate-def-row:not(.check-row) + .alate-def-row:not(.check-row) {
+	border-top: 1px solid var(--line-soft);
+}
+.setup-sec .alate-def-row:not(.check-row) > label {
+	display: flex;
+}
+.setup-sec .alate-def-row:not(.check-row) textarea {
+	flex: 1;
+	min-width: 0;
+}
+/* A number keeps its short field on the column's right edge, as on the Runners card. */
+.setup-sec .alate-def-row:not(.check-row) > label:has(input[type="number"]) {
+	justify-self: end;
+}
+.setup-sec .alate-def-row:not(.check-row) .alate-def-name {
+	display: grid;
+	gap: 2px;
+	font-size: 13px;
+}
+.setup-sec .alate-def-row:not(.check-row) .alate-def-name b {
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.setup-sec .alate-def-row:not(.check-row) .alate-def-name code {
+	font-family: var(--mono);
+	font-size: 11px;
+	color: var(--dim);
+}
+.setup-sec .alate-def-row:not(.check-row) input[type="number"] {
+	width: 64px;
+}
 /* Checkbox in column 1; the title and the hint share column 2, so a long title wraps beside the box. */
 .setup-sec label.add-check,
 .settings-sec label.add-check {
@@ -9247,6 +9291,10 @@ button.log-mode[aria-pressed="true"] {
 	font-size: 11.5px;
 	vertical-align: 1px;
 }
+/* The amber pill (e.g. "Legacy"): outranks `.settings-sec .alate-def-name span`'s dim color. */
+.check-row .alate-def-name b .state-chip.warn {
+	color: var(--alarm);
+}
 /* A dependent option hangs under its parent: one indent in, no rule between them. */
 .settings-sec .alate-def-row.check-row:has(+ .check-sub) {
 	border-bottom: none;
@@ -9720,6 +9768,32 @@ button.log-mode[aria-pressed="true"] {
 	margin: 0;
 	font-size: 12.5px;
 	line-height: 1.5;
+}
+/* The microVM switch's warning: the role-warn box, below the switch's description. */
+.vm-warn {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr);
+	gap: 2px 8px;
+	margin-top: 8px;
+	padding: 8px 10px;
+	background: var(--alarm-bg);
+	border: 1px solid var(--alarm-line);
+	border-radius: 6px;
+	color: var(--text);
+}
+.vm-warn > .mark {
+	grid-row: 1 / span 2;
+	margin-top: 3px;
+}
+.vm-warn > b {
+	color: var(--text-strong);
+	font-weight: 600;
+}
+.vm-warn a {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	color: var(--accent);
 }
 .role-warn-actions {
 	grid-column: 3;

@@ -16,6 +16,7 @@ import {
 	AppCheckLines,
 	appChip,
 	asError,
+	capValue,
 	dashboardLink,
 	EnvSection,
 	fmtCost,
@@ -46,6 +47,16 @@ import {
 	userLayerLine,
 } from "./settings.tsx";
 import { stamp } from "./time.ts";
+
+describe("runner cap draft", () => {
+	test("empty or 0 is no cap; a fraction truncates and a negative rises to 1", () => {
+		for (const none of ["", " ", "0", "00", "0.4"])
+			expect(capValue(none)).toBeNull();
+		expect(capValue("3")).toBe(3);
+		expect(capValue("2.9")).toBe(2);
+		expect(capValue("-4")).toBe(1);
+	});
+});
 
 // React interaction needs browser globals; bun test has none. happy-dom (added
 // with the card's approval) registers them here; afterAll puts the originals
@@ -611,7 +622,6 @@ describe("ProjectSettingsForm target branch", () => {
 			prReviews: false,
 			prMode: false,
 			microVm: false,
-			pushSyncCommits: false,
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
@@ -783,57 +793,6 @@ describe("ProjectSettingsForm target branch", () => {
 		}
 	});
 
-	test("the Updates card shows the push sync commits checkbox and toggling posts it", async () => {
-		let postBody: Record<string, unknown> | undefined;
-		const ok = (body: unknown): Response =>
-			new Response(JSON.stringify(body), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
-		const fetchMock = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (
-				url.endsWith("/api/projects/proj/settings") &&
-				init?.method === "POST"
-			) {
-				postBody = JSON.parse(String(init.body)) as Record<string, unknown>;
-				return ok(project);
-			}
-			if (url.endsWith("/api/projects/proj/ssh-key"))
-				return ok({ own: null, expiresAt: null });
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
-		const { container, unmount } = await mountForm(fetchMock);
-		try {
-			const card = container.querySelector("#project-merging-section");
-			expect(card).not.toBeNull();
-			const label = [...(card?.querySelectorAll("label") ?? [])].find((l) =>
-				l.textContent?.includes("Push sync commits"),
-			);
-			if (label === undefined) throw new Error("push sync commits row missing");
-			const input = card?.querySelector<HTMLInputElement>(
-				`input[id="${label.htmlFor}"]`,
-			);
-			if (input === null || input === undefined)
-				throw new Error("push sync commits checkbox did not render");
-			expect(input.checked).toBe(false);
-			await act(async () => {
-				onChangeOf(input)({ target: { checked: true }, currentTarget: input });
-			});
-			expect(postBody).not.toBeUndefined();
-			expect(postBody?.pushSyncCommits).toBe(true);
-			await act(async () => {
-				onChangeOf(input)({ target: { checked: false }, currentTarget: input });
-			});
-			expect(postBody?.pushSyncCommits).toBe(false);
-		} finally {
-			await unmount();
-		}
-	});
-
 	test("the Updates card shows the hold fork-born merges checkbox and toggling posts it", async () => {
 		let postBody: Record<string, unknown> | undefined;
 		const ok = (body: unknown): Response =>
@@ -861,16 +820,11 @@ describe("ProjectSettingsForm target branch", () => {
 		try {
 			const card = container.querySelector("#project-merging-section");
 			expect(card).not.toBeNull();
-			const label = [...(card?.querySelectorAll("label") ?? [])].find((l) =>
-				l.textContent?.includes("Hold fork-born merges"),
-			);
-			if (label === undefined)
-				throw new Error("hold fork-born merges row missing");
 			const input = card?.querySelector<HTMLInputElement>(
-				`input[id="${label.htmlFor}"]`,
+				'[data-setting-key="forkMergeHold"] input[type="checkbox"]',
 			);
 			if (input === null || input === undefined)
-				throw new Error("hold fork-born merges checkbox did not render");
+				throw new Error("fork hold checkbox did not render");
 			expect(input.checked).toBe(true);
 			await act(async () => {
 				onChangeOf(input)({ target: { checked: false }, currentTarget: input });
@@ -1702,7 +1656,6 @@ describe("Project switch cards", () => {
 			ompWatch: false,
 			dependabotWarn: true,
 			microVm: false,
-			pushSyncCommits: false,
 			...over,
 		}) as unknown as ProjectView["settings"];
 
@@ -1714,7 +1667,7 @@ describe("Project switch cards", () => {
 		expect(onChip([false, false])).toEqual({ label: "0 of 2 on", tone: "off" });
 	});
 
-	test("the Proposals chip does not count the friction filter while retro is off", async () => {
+	test("the Proposals chip does not count retro's sub-switches while retro is off", async () => {
 		const html = renderToStaticMarkup(
 			<ProjectSettingsForm
 				project={
@@ -1723,6 +1676,7 @@ describe("Project switch cards", () => {
 						settings: {
 							...project().settings,
 							retroFilter: true,
+							retroAutoStart: true,
 							trendingScout: true,
 						},
 					} as unknown as ProjectView
@@ -1734,7 +1688,7 @@ describe("Project switch cards", () => {
 			/>,
 		);
 		const card = html.slice(html.indexOf('id="project-proposals-section"'));
-		expect(card.slice(0, 600)).toContain("1 of 3 on");
+		expect(card.slice(0, 600)).toContain("1 of 4 on");
 	});
 
 	const TAG = "Not needed: private repo";
@@ -1852,7 +1806,6 @@ describe("PR reviews watch facts and Check PRs now", () => {
 			ompWatch: false,
 			dependabotWarn: true,
 			microVm: false,
-			pushSyncCommits: false,
 			maxParallel: 2,
 			copyExtra: [],
 			displayName: null,
@@ -2084,7 +2037,6 @@ describe("Trending scout depends on the general weekly scan", () => {
 				prMode: false,
 				issueWatch: false,
 				microVm: false,
-				pushSyncCommits: false,
 				maxParallel: 2,
 				copyExtra: [],
 				displayName: null,
@@ -2604,7 +2556,6 @@ describe("settings search", () => {
 			prReviews: false,
 			prMode: false,
 			microVm: false,
-			pushSyncCommits: false,
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
@@ -3225,7 +3176,7 @@ describe("provider sign-in actions", () => {
 });
 
 describe("runner cap stepper", () => {
-	test("no cap shows a dash and unlimited; plus starts at 1, minus from 1 goes back", async () => {
+	test("no cap shows 0 and unlimited; plus starts at 1, minus from 1 goes back to 0", async () => {
 		const { container, unmount } = await mountPage();
 		try {
 			const row = container.querySelector(".cap-row");
@@ -3242,8 +3193,8 @@ describe("runner cap stepper", () => {
 			expect(row.querySelector("button.settings-save")).toBeNull();
 			const unlimited = (): string | null =>
 				row.querySelector(".cap-unlimited")?.textContent ?? null;
-			expect(field.value).toBe("");
-			expect(field.placeholder).toBe("–");
+			expect(field.value).toBe("0");
+			expect(row.querySelector("code")?.textContent).toBe("0 = no cap");
 			expect(unlimited()).toBe("unlimited");
 			expect(fewer.disabled).toBe(true);
 
@@ -3255,7 +3206,7 @@ describe("runner cap stepper", () => {
 			expect(field.value).toBe("2");
 			await act(async () => fewer.click());
 			await act(async () => fewer.click());
-			expect(field.value).toBe("");
+			expect(field.value).toBe("0");
 			expect(unlimited()).toBe("unlimited");
 		} finally {
 			await unmount();
@@ -4063,7 +4014,7 @@ describe("GitHostsSection board GitHub token reuse", () => {
 				const input = microVmRow(container);
 				expect(input.checked).toBe(false);
 				expect(input.disabled).toBe(false);
-				expect(container.textContent).not.toContain("vm-runner is not ready");
+				expect(container.querySelector(".vm-warn")).toBeNull();
 				await act(async () => {
 					onChangeOf(input)({
 						target: { checked: true },
@@ -4095,9 +4046,10 @@ describe("GitHostsSection board GitHub token reuse", () => {
 			try {
 				const input = microVmRow(container);
 				expect(input.disabled).toBe(true);
-				expect(container.textContent).toContain(
-					"vm-runner is not ready (healthz answered 502). Each work turn runs",
-				);
+				const warn = container.querySelector(".vm-warn");
+				expect(warn?.getAttribute("role")).toBe("note");
+				expect(warn?.textContent).toContain("The vm-runner does not answer");
+				expect(warn?.textContent).toContain("healthz answered 502");
 			} finally {
 				await unmount();
 			}
@@ -4115,8 +4067,11 @@ describe("GitHostsSection board GitHub token reuse", () => {
 			);
 			try {
 				expect(microVmRow(first.container).disabled).toBe(true);
-				expect(first.container.textContent).toContain(
-					"Needs OTTR_VM_RUNNER_URL (docker compose --profile vm). ",
+				// The note names the missing env var and links the setup guide.
+				const warn = first.container.querySelector(".vm-warn");
+				expect(warn?.textContent).toContain("OTTR_VM_RUNNER_URL is not set");
+				expect(warn?.querySelector("a")?.getAttribute("href")).toBe(
+					"https://github.com/ottr-ai/ottr/blob/main/docs/WORKERS.md#microvm-workers",
 				);
 			} finally {
 				await first.unmount();
@@ -6772,7 +6727,6 @@ describe("Error-Says-Fix messages", () => {
 			prReviews: false,
 			prMode: false,
 			microVm: false,
-			pushSyncCommits: false,
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,

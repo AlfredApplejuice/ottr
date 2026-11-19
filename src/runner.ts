@@ -986,7 +986,11 @@ export interface EventState {
 			gain: string;
 			risk: string;
 			check: string;
+			decision?: string;
 		} | null;
+		/** The question the user must answer first; null when none. Kept apart from the
+		 *  summary, so a decision holds the card even when a summary field is missing. */
+		decision?: string | null;
 		/** The board project the card files on; null files on the retro's own project. */
 		project: string | null;
 	} | null;
@@ -1053,12 +1057,7 @@ function applyAsk(state: EventState, e: AnyRec): void {
 function proposedSummary(
 	args: AnyRec,
 ): NonNullable<EventState["proposed"]>["summary"] {
-	const part = (key: string): string | null => {
-		if (typeof args[key] !== "string") return null;
-		const value = (args[key] as string).trim();
-		if (value === "") return null;
-		return value.length > 400 ? `${value.slice(0, 399)}…` : value;
-	};
+	const part = (key: string): string | null => capped(args[key]);
 	const whatChanges = part("whatChanges");
 	const why = part("why");
 	const gain = part("gain");
@@ -1067,7 +1066,23 @@ function proposedSummary(
 		return null;
 	// Summary policy: whatChanges/why/gain/check are required, risk optional and defaults
 	// to "none found"; each field is capped at 400 characters (slice to 399 + "…").
-	return { whatChanges, why, gain, risk: part("risk") ?? "none found", check };
+	const decision = part("decision");
+	const summary = {
+		whatChanges,
+		why,
+		gain,
+		risk: part("risk") ?? "none found",
+		check,
+	};
+	return decision === null ? summary : { ...summary, decision };
+}
+
+/** A trimmed, non-empty tool string capped at 400 characters (399 + "…"); null otherwise. */
+function capped(v: unknown): string | null {
+	if (typeof v !== "string") return null;
+	const value = v.trim();
+	if (value === "") return null;
+	return value.length > 400 ? `${value.slice(0, 399)}…` : value;
 }
 
 /** A propose_task call's args wait on the shared remembered map until the end event
@@ -1104,16 +1119,19 @@ function recordProposal(state: EventState, args: AnyRec): void {
 	state.recorded.push(call);
 	// Retro semantics: the first succeeded call is the proposal (the extension
 	// refuses a second, and a refused call never records).
-	if (state.proposed === null)
+	if (state.proposed === null) {
+		const decision = capped(args.decision);
 		state.proposed = {
 			prompt: call.prompt,
 			model: call.model,
 			summary: proposedSummary(args),
+			...(decision === null ? {} : { decision }),
 			project:
 				typeof args.project === "string" && args.project.trim() !== ""
 					? args.project.trim()
 					: null,
 		};
+	}
 }
 
 /** The end of one propose_task call: record only a succeeded one. The extension's

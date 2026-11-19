@@ -51,11 +51,12 @@ banner. `ProjectView` carries `mainBranch` and `mainUnpushed` for this:
   landed push. A `pushed` result clears `e.mainUnpushed` at once (the hold lifts without
   waiting for the tick). Responses: 404 unknown project; 409 gitless or no target; else
   `{status: "pushed" | "skipped" | "failed" | "rejected", error?}`.
-- New project setting `pushSyncCommits` (boolean, default false): standing approval. When
-  it is on, the tick pushes once on the false-to-true edge of `mainUnpushed`. No edge (the
-  push failed and the state stays unpushed) means no retry storm; the user clicks the
-  button or fixes the cause.
-- Without the setting or a click nothing pushes.
+- Only a click on the button pushes. The board never pushes the local target branch on its
+  own: the push takes every commit on it, also commits that no card made and no check
+  reviewed.
+- Removed 2026-11-19: the project setting `pushSyncCommits` (a standing approval that pushed
+  on the false-to-true edge of `mainUnpushed`). A stored `pushSyncCommits` row stays in the
+  settings table, and the board ignores it, like any key without a settings shape.
 
 ## Boundaries and error cases
 
@@ -74,8 +75,8 @@ banner. `ProjectView` carries `mainBranch` and `mainUnpushed` for this:
   name the branch, and the project banner shows it.
 - An approved push moves origin to the local main (fixture: bare origin plus an ahead
   clone; the endpoint moves the bare ref).
-- With `pushSyncCommits` on, the tick pushes once on the unpushed edge; with it off,
-  nothing pushes.
+- The tick never pushes an unpushed main, also when a stored `pushSyncCommits` row says
+  `true`.
 - `bun run check` and `bun test` exit 0.
 
 ## Non-goals
