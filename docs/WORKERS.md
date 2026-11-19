@@ -1329,7 +1329,10 @@ run as a command — never does. Every board git also passes explicit
 --no-textconv` to `diff`, `log` and `show`, so a planted `remote.<name>.uploadpack`,
 `receivepack`, `diff.external` or textconv driver does not run. These flags do not reach
 the child git of a submodule, so board git also never recurses into submodules
-(`--submodule=short`, `--no-recurse-submodules`, `--recurse-submodules=no`). Residual limit: a planted
+(`--submodule=short`, `--no-recurse-submodules`, `--recurse-submodules=no`). Every board
+git also clears `http.cookieFile` and `http.saveCookies`: a planted cookie path would
+make libcurl rewrite that file as a cookie jar after a successful fetch, and the file
+may be a server-only one. Residual limit: a planted
 `http.<url>.proxy` with
 `http.<url>.sslVerify=false` can also see a token, because git prefers the most
 specific URL match over the env value. No turn's shell sees

@@ -557,6 +557,11 @@ export function gitAuthEnv(o: {
 	const config: (readonly [string, string])[] = [
 		["protocol.ext.allow", "never"],
 		["push.gpgSign", "false"],
+		// A planted http.cookieFile + http.saveCookies makes libcurl rewrite that file as a
+		// cookie jar after a successful fetch — a server-only volume file included. The empty
+		// path reads no cookie file and writes no jar.
+		["http.cookieFile", ""],
+		["http.saveCookies", "false"],
 	];
 	// Always: an empty value clears every helper read so far (repo config included), so a
 	// planted helper never runs next to GH_TOKEN or the key path, tokens stored or not.

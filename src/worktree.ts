@@ -353,6 +353,14 @@ export async function git(
 			// missing, empty or stale GIT_CONFIG_GLOBAL file.
 			"-c",
 			"safe.directory=*",
+			// libcurl rewrites http.cookieFile as a Netscape cookie jar after a successful
+			// network fetch: a planted cookieFile + saveCookies would replace any file the
+			// board git can write (the server-only databases included) with a cookie jar.
+			// The empty path reads no cookie file and writes no jar.
+			"-c",
+			"http.cookieFile=",
+			"-c",
+			"http.saveCookies=false",
 			...args.slice(0, at + 1),
 			...(PINNED_ARGS[sub] ?? []),
 			...args.slice(at + 1),

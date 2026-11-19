@@ -19,7 +19,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { GIT_AUTH_ENV_RE, gitAuthEnv } from "./gitHosts.ts";
 import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { platform } from "./platform/index.ts";
@@ -4132,6 +4132,116 @@ describe("git", () => {
 		const r = await git(["fetch", "origin"], main, 30_000, auth);
 		expect(r.code).not.toBe(0);
 		expect(existsSync(marker)).toBe(false);
+	}, 60_000);
+
+	test("never rewrites a planted http.cookieFile jar on a board fetch (R5-1)", async () => {
+		if (process.platform === "win32") return; // the TLS fixture cert needs openssl
+		const main = repo();
+		await must(main, "init", "-q", "-b", "main");
+		writeFileSync(join(main, "f.txt"), "one\n");
+		await must(main, "add", "-A");
+		await must(main, "commit", "-q", "-m", "init");
+		// Dumb-HTTPS origin on loopback: a successful fetch reaches libcurl, whose
+		// cleanup rewrites http.cookieFile as a Netscape jar — the sink the board
+		// git must not let a planted config reach. https because gitAuthEnv allows
+		// https:ssh:file only; sslVerify=false is this fixture's self-signed cert.
+		const bare = repo();
+		await must(main, "init", "-q", "--bare", "-b", "main", bare);
+		await must(main, "push", "-q", bare, "main");
+		await must(bare, "update-server-info");
+		const certs = repo();
+		const cert = spawnSync(
+			"openssl",
+			[
+				"req",
+				"-x509",
+				"-newkey",
+				"rsa:2048",
+				"-keyout",
+				join(certs, "key.pem"),
+				"-out",
+				join(certs, "cert.pem"),
+				"-days",
+				"2",
+				"-nodes",
+				"-subj",
+				"/CN=127.0.0.1",
+			],
+			{ windowsHide: true },
+		);
+		if (cert.status !== 0)
+			throw new Error(`openssl: ${cert.stderr?.toString()}`);
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			tls: {
+				cert: readFileSync(join(certs, "cert.pem")),
+				key: readFileSync(join(certs, "key.pem")),
+			},
+			fetch(req) {
+				const p = join(bare, decodeURIComponent(new URL(req.url).pathname));
+				if (!p.startsWith(bare + sep))
+					return new Response(null, { status: 404 });
+				try {
+					return new Response(readFileSync(p), {
+						headers: {
+							"content-type": "application/octet-stream",
+							"set-cookie": "plant=1; Path=/",
+						},
+					});
+				} catch {
+					return new Response(null, { status: 404 });
+				}
+			},
+		});
+		try {
+			const url = `https://127.0.0.1:${server.port}/`;
+			await must(main, "config", "remote.origin.url", url);
+			// The plant: a file a board-side git must never let libcurl rewrite, holding
+			// server-only bytes (the board databases sit under /app/.tasks in compose).
+			const jar = join(main, "server-only.db");
+			const bytes = "SERVER-ONLY-DATA\n";
+			writeFileSync(jar, bytes);
+			await must(main, "config", "http.cookieFile", jar);
+			await must(main, "config", "http.saveCookies", "true");
+			// Control: the plant is live — plain git's libcurl rewrites the file as a jar.
+			// Async spawn on purpose: must()'s spawnSync blocks this process's event loop,
+			// and the Bun.serve fixture above shares it — the fetch's HTTP client would
+			// starve waiting for a response the blocked loop never sends.
+			const control = Bun.spawn(
+				[gitExe(), "-c", "http.sslVerify=false", "fetch", "--quiet", "origin"],
+				{
+					cwd: main,
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "pipe",
+					windowsHide: true,
+				},
+			);
+			const controlErr = await new Response(control.stderr).text();
+			if ((await control.exited) !== 0)
+				throw new Error(`control git fetch: ${controlErr}`);
+			expect(readFileSync(jar, "utf8")).not.toBe(bytes);
+			// Board git with the auth env: the planted path keeps its bytes and inode.
+			writeFileSync(jar, bytes);
+			const before = statSync(jar);
+			const auth = gitAuthEnv({
+				tokens: [],
+				key: null,
+				knownHosts: "/nonexistent",
+			});
+			const r = await git(
+				["-c", "http.sslVerify=false", "fetch", "origin"],
+				main,
+				30_000,
+				auth,
+			);
+			expect(r.code).toBe(0);
+			expect(readFileSync(jar, "utf8")).toBe(bytes);
+			expect(statSync(jar).ino).toBe(before.ino);
+		} finally {
+			server.stop(true);
+		}
 	}, 60_000);
 
 	test("never runs planted filter, merge or gpg drivers (R5-1)", async () => {
