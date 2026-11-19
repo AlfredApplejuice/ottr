@@ -418,6 +418,33 @@ export function openQuestionsLines(text: string): string[] {
 	return out;
 }
 
+/** The text with every "Open questions" section removed: the heading line through
+ * the lines before the next heading (a section at the end runs to the text's end).
+ * Uses the same heading rules as hasOpenQuestionsSection; text without a section
+ * comes back unchanged. A grilled card's prompt loses the section this way, so the
+ * prompt gate cannot park the card for the questions the grill already answered. */
+export function removeOpenQuestionsSection(text: string): string {
+	let lines = text.split("\n");
+	for (;;) {
+		const start = lines.findIndex((line) => {
+			const t = line.trim();
+			return (
+				/^#{1,6}\s+open questions\s*$/i.test(t) ||
+				/^\*\*\s*open questions\s*\*\*:?\s*$/i.test(t)
+			);
+		});
+		if (start < 0) break;
+		let end = lines.length;
+		const stop = lines.slice(start + 1).findIndex((line) => {
+			const t = line.trim();
+			return /^#{1,6}\s/.test(t) || /^\*\*[^*]+\*\*/.test(t);
+		});
+		if (stop >= 0) end = start + 1 + stop;
+		lines = [...lines.slice(0, start), ...lines.slice(end)];
+	}
+	return lines.join("\n");
+}
+
 /** Maps the gate's blocking questions (default null) to ask questions the drawer
  * renders: max 5, max 5 options each, single choice, no recommendation. Assumption
  * questions (a non-null default) never park and never reach the ask (OTTR-904). */

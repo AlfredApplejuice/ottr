@@ -21,6 +21,7 @@ import {
 	openQuestionsLines,
 	parseGateCheck,
 	promptHandoffPaths,
+	removeOpenQuestionsSection,
 	replayGateParks,
 	START_ANYWAY,
 	skillBlock,
@@ -28,6 +29,7 @@ import {
 } from "./promptGate.ts";
 import { DEEPEN_POINTS, gatePrompt, gateSystem } from "./prompts.ts";
 import { ProjectStore } from "./store.ts";
+import fc from "./test/properties.ts";
 import type { PromptGateState } from "./types.ts";
 
 /** A minimal valid gate answer. */
@@ -190,6 +192,67 @@ describe("open questions section", () => {
 			...Array.from({ length: 7 }, (_, i) => `q${i}`),
 		];
 		expect(openQuestionsLines(many.join("\n"))).toHaveLength(5);
+	});
+
+	test("removeOpenQuestionsSection drops every section and keeps the rest", () => {
+		expect(
+			removeOpenQuestionsSection(
+				[
+					"top",
+					"",
+					"## Open questions",
+					"",
+					"Which database?",
+					"",
+					"## Context",
+					"",
+					"kept",
+				].join("\n"),
+			),
+		).toBe(["top", "", "## Context", "", "kept"].join("\n"));
+		// The bold heading form leaves too, and a section at the end runs to the text's end.
+		expect(removeOpenQuestionsSection("**Open questions**\nWhich port?")).toBe(
+			"",
+		);
+		expect(removeOpenQuestionsSection("a\n## open questions\nq\n\nb")).toBe(
+			"a",
+		);
+		// Two sections go: the loop removes one per pass; the last section's
+		// body runs to the next heading, "keep" survives under ## Notes.
+		expect(
+			removeOpenQuestionsSection(
+				"## Open questions\nq1\n## Open questions\nq2\n## Notes\nkeep",
+			),
+		).toBe("## Notes\nkeep");
+		// Text without a section comes back unchanged, trailing blanks included.
+		expect(removeOpenQuestionsSection("just prose\n\n")).toBe("just prose\n\n");
+	});
+
+	test("properties: removal leaves no section, keeps section-free text, and is idempotent", () => {
+		// Headings come from the constant pool; the free lines carry no "#" or
+		// "*", so only the pool can build a section or end one.
+		const piece = fc.oneof(
+			fc.constantFrom(
+				"## Open questions",
+				"### open questions",
+				"**Open questions**",
+				"**open questions**:",
+				"## Notes",
+				"## Context",
+			),
+			fc.stringMatching(/^[\w .,!?()/-]{0,40}$/),
+		);
+		fc.assert(
+			fc.property(
+				fc.array(piece, { maxLength: 14 }).map((lines) => lines.join("\n")),
+				(t) => {
+					const once = removeOpenQuestionsSection(t);
+					expect(hasOpenQuestionsSection(once)).toBe(false);
+					expect(removeOpenQuestionsSection(once)).toBe(once);
+					if (!hasOpenQuestionsSection(t)) expect(once).toBe(t);
+				},
+			),
+		);
 	});
 });
 

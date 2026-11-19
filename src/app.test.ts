@@ -70,6 +70,7 @@ import { summarizeCmd } from "./orphans.ts";
 import {
 	gateCompareText,
 	gateFingerprint,
+	hasOpenQuestionsSection,
 	startAnywayQuestion,
 } from "./promptGate.ts";
 import {
@@ -19583,6 +19584,69 @@ describe("backlog routes", () => {
 		expect(row.prompt).toContain("Definition of ready (grilled)");
 		expect(row.prompt).toContain("keep the API small");
 		expect(row.prompt).not.toContain("old draft");
+	});
+
+	test("backlog to-todo drops the answered Open questions section before the grill report lands", async () => {
+		const t = await store.createTask("grilled with questions");
+		await store.updateTask(t.id, {
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+			prompt: [
+				"Detect duplicate scene records.",
+				"",
+				"## Open questions",
+				"",
+				"Which dedupe key?",
+				"Which storage?",
+				"",
+				"## Context",
+				"",
+				"TPDB feeds the scene table.",
+			].join("\n"),
+		});
+		const grill = await store.startTurn(t.id, "work", "grill", null);
+		await store.finishTurn(grill.id, {
+			outcome: "ready",
+			details: "dedupe on (source, external id)",
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/backlog`, {
+			to: "todo",
+		});
+		expect(res.status).toBe(200);
+		const row = (await store.getTask(t.id))!;
+		expect(row.stage).toBe("todo");
+		expect(row.state).toBe("queued");
+		expect(row.prompt).toContain("## Definition of ready (grilled)");
+		expect(row.prompt).toContain("dedupe on (source, external id)");
+		// The old body stays; only the answered section goes.
+		expect(row.prompt).toContain("Detect duplicate scene records.");
+		expect(row.prompt).toContain("TPDB feeds the scene table.");
+		expect(row.prompt).not.toContain("Which dedupe key?");
+		// The prompt gate's own rule sees no section, so it cannot park the card.
+		expect(hasOpenQuestionsSection(row.prompt)).toBe(false);
+	});
+
+	test("backlog to-todo without a grill report keeps the prompt unchanged", async () => {
+		const t = await store.createTask("not grilled");
+		const prompt = [
+			"Detect duplicate scene records.",
+			"",
+			"## Open questions",
+			"",
+			"Which dedupe key?",
+		].join("\n");
+		await store.updateTask(t.id, {
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+			prompt,
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/backlog`, {
+			to: "todo",
+		});
+		expect(res.status).toBe(200);
+		expect((await store.getTask(t.id))!.prompt).toBe(prompt);
 	});
 
 	test("backlog to-backlog parks a queued todo task", async () => {

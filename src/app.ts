@@ -253,6 +253,7 @@ import {
 	gateJudgedPrompt,
 	gateUserText,
 	isStartAnywayReply,
+	removeOpenQuestionsSection,
 } from "./promptGate.ts";
 import {
 	BOARD_CHECK_PROMPT,
@@ -10709,11 +10710,13 @@ export async function createApp(deps: AppDeps) {
 		const model = modelParam(body);
 		if (model instanceof Response) return model;
 		// The latest finished grill report carries the refinement; fold it into the prompt.
+		// The grill retired the card's own Open questions, so the section leaves the
+		// prompt too; keeping it would park the card again (OTTR-1137).
 		await withTask(e, task, async () => {
 			const details = await latestGrillDetails(e, task.id);
 			const refined =
 				details !== null
-					? `${task.prompt}\n\n## Definition of ready (grilled)\n\n${details}`
+					? `${removeOpenQuestionsSection(task.prompt)}\n\n## Definition of ready (grilled)\n\n${details}`
 					: null;
 			await updateSnapshot(e, task, {
 				...(refined !== null ? { prompt: refined } : {}),
