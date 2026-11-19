@@ -1231,6 +1231,7 @@ describe("restoreSnapshot", () => {
 				now: RESTORE_AT,
 				trackerDb,
 				projectDbFor: (name) => join(base, "server", name, "tasks.db"),
+				projectAnchor: join(base, "server"),
 				adoptedMarker: marker,
 				...change,
 			});

@@ -59,7 +59,8 @@ const { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND } =
 export type WriteMode = "truncate" | "exclusive" | "append";
 const FLAGS: Record<WriteMode, number> = {
 	truncate: O_WRONLY | O_CREAT | O_TRUNC,
-	exclusive: O_WRONLY | O_CREAT | O_EXCL,
+	// "exclusive" is read-write so a caller can read the fresh copy back through the held fd.
+	exclusive: O_RDWR | O_CREAT | O_EXCL,
 	append: O_WRONLY | O_CREAT | O_APPEND,
 };
 
@@ -299,6 +300,52 @@ export function renameBelow(anchor: string, from: string, to: string): void {
 			renameSync(src.at(basename(from)), dst.at(basename(to))),
 		),
 	);
+}
+
+/**
+ * Opens `name` in the held dir `d` for writing, created exclusively: an entry already there
+ * fails with EEXIST and a symlink there is never followed. Callers hold the fd across the
+ * steps that follow (an integrity check, an install rename), so a worker cannot swap the
+ * entry in between, and the fd is readable, so the caller can read its own copy back.
+ * Close the result.
+ */
+export function openExclusive(d: Dir, name: string, perm = 0o666): number {
+	return openEntry(
+		d.at(entryName(name)),
+		`${d.path}/${entryName(name)}`,
+		"exclusive",
+		perm,
+	);
+}
+
+/**
+ * Renames entry `from` to `to` inside the held dir `d` and proves the installed entry is
+ * still the file `fd` holds: rename(2) refuses a /proc/self/fd path (EXDEV), so the rename
+ * runs on the real paths of `d` and re-resolves the names. A worker who swaps an entry in
+ * between is caught by the ino checks (the held fd pins our inode, so it cannot be
+ * recycled), and an entry that is not ours is removed, never followed.
+ */
+export function renameProven(
+	d: Dir,
+	from: string,
+	to: string,
+	fd: number,
+): void {
+	const dst = join(d.path, to);
+	const mine = fstatSync(fd).ino;
+	const pre = lstatSync(d.at(from), { throwIfNoEntry: false });
+	if (pre === undefined || pre.ino !== mine)
+		throw new Error(`refusing ${dst}: the entry changed before the rename`);
+	renameSync(join(d.path, from), dst);
+	const post = lstatSync(d.at(to), { throwIfNoEntry: false });
+	if (post === undefined || post.ino !== mine) {
+		try {
+			unlinkSync(d.at(to));
+		} catch {
+			// the proof failed: report it, and leave no entry of theirs behind when it unlinks
+		}
+		throw new Error(`refusing ${dst}: the entry changed during the rename`);
+	}
 }
 
 /** Where a copy goes: the lexical paths of source and destination, and the tree holding the source. */

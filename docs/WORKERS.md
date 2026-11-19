@@ -1765,6 +1765,9 @@ Restore in the compose stack:
    - The tool renames each existing database to `<file>.before-restore-<stamp>`. It deletes
      nothing.
    - The tool stops and replaces no database when a live board holds a database.
+   - The tool follows no symlink below a target root. A project dir that is a symlink, or a
+     link planted at `<target>.restoring` or at the target, fails that database with exit
+     code 1, and nothing is written through the link.
    - When the snapshot is incomplete, the list line ends with `; incomplete:` and the
      databases that failed. The tool restores the databases that the snapshot holds. For
      each missing database it prints an error line with the newest snapshot that holds a

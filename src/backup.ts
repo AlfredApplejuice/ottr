@@ -3,15 +3,18 @@
 
 import { Database } from "bun:sqlite";
 import {
-	copyFileSync,
+	closeSync,
+	fstatSync,
 	lstatSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	readSync,
 	realpathSync,
 	renameSync,
 	rmSync,
 	writeFileSync,
+	writeSync,
 } from "node:fs";
 import {
 	basename,
@@ -22,7 +25,13 @@ import {
 	resolve,
 	sep,
 } from "node:path";
-
+import {
+	type Dir,
+	openExclusive,
+	openRegular,
+	renameProven,
+	withDir,
+} from "./confine.ts";
 import { closeLocked, openLocked, StoreLockedError } from "./dblock.ts";
 import type { SQLiteDatabase } from "./sqliteDriver.ts";
 
@@ -414,8 +423,14 @@ async function assertNotHeld(target: string): Promise<void> {
 	await closeLocked(db);
 }
 
-function integrityOf(dbPath: string): string {
-	const db = new Database(dbPath);
+/** The same PRAGMA integrity_check as before, but on bytes held in memory: the caller has
+ * read the copy back through its own held fd, so the check cannot create -wal or -shm files
+ * next to the target. */
+function integrityOfBytes(bytes: Buffer): string {
+	// bun:sqlite opens a Buffer's bytes as an in-memory database; bun-types declares only
+	// a string filename, so this alias names the real runtime contract.
+	const MemoryDatabase = Database as unknown as new (bytes: Buffer) => Database;
+	const db = new MemoryDatabase(bytes);
 	try {
 		const row = db
 			.query<{ integrity_check: string }, []>("PRAGMA integrity_check")
@@ -431,26 +446,60 @@ const sidecars = (dbPath: string): string[] => [
 	`${dbPath}-shm`,
 ];
 
-function moveAside(target: string, now: Date, movedAside: string[]): void {
+/** lstat through the held dir: an entry that is a symlink is seen, never followed. */
+const presentIn = (d: Dir, name: string): boolean =>
+	lstatSync(d.at(name), { throwIfNoEntry: false }) !== undefined;
+
+/** Reads the open file fully; the caller holds the fd, so no path is resolved again. */
+function readFull(fd: number): Buffer {
+	const buf = Buffer.alloc(fstatSync(fd).size);
+	for (let off = 0; off < buf.length; ) {
+		const n = readSync(fd, buf, off, buf.length - off, off);
+		if (n === 0) break; // the file shrank under the held fd: the check below fails
+		off += n;
+	}
+	return buf;
+}
+
+/** Removes the copy and its -wal/-shm sidecars in the held dir. rmSync unlinks a planted
+ * symlink itself, never its target, and a missing entry is no error. */
+function removeCopyIn(d: Dir, copyName: string): void {
+	for (const name of [copyName, ...sidecars(copyName)])
+		rmSync(d.at(name), { force: true });
+}
+
+function moveAsideIn(
+	d: Dir,
+	name: string,
+	now: Date,
+	movedAside: string[],
+): void {
 	const suffix = `.before-restore-${formatStamp(now)}`;
-	const moves = [target, ...sidecars(target)]
-		.filter(present)
+	const moves = [name, ...sidecars(name)]
+		.filter((n) => presentIn(d, n))
 		.map((from) => ({ from, aside: `${from}${suffix}` }));
 	// A rename onto an existing file deletes that file, and the restore deletes no data.
-	const taken = moves.find((m) => present(m.aside));
-	if (taken !== undefined) throw new Error(`${taken.aside} exists already`);
+	const taken = moves.find((m) => presentIn(d, m.aside));
+	if (taken !== undefined)
+		throw new Error(`${d.path}/${taken.aside} exists already`);
 	for (const m of moves) {
-		renameSync(m.from, m.aside);
-		movedAside.push(m.aside);
+		// Real paths of the held dir: rename(2) refuses a /proc/self/fd path. A rename moves
+		// the entry itself, so a planted symlink at `from` is renamed aside, not followed.
+		renameSync(join(d.path, m.from), join(d.path, m.aside));
+		movedAside.push(`${d.path}/${m.aside}`);
 	}
 }
 
-function removeCopy(copy: string): void {
-	for (const path of [copy, ...sidecars(copy)]) rmSync(path, { force: true });
-}
-
+/**
+ * Restores one database from its snapshot copy. Every target-side step runs through a
+ * directory held open below `anchor` (a trusted dir no worker can replace, strictly above
+ * every worker-writable component of `to`): the walk refuses a symlinked component, the
+ * copy is created exclusively, the check reads the copy back through its own fd, and the
+ * install rename proves the installed entry by ino. A worker-planted symlink is unlinked or
+ * renamed aside, never followed, so a victim file outside the anchor is never written.
+ */
 function restoreOne(
-	job: { file: string; from: string; to: string },
+	job: { file: string; from: string; to: string; anchor: string },
 	now: Date,
 	result: {
 		restored: { file: string; to: string }[];
@@ -458,20 +507,45 @@ function restoreOne(
 		movedAside: string[];
 	},
 ): void {
-	const copy = `${job.to}.restoring`;
+	const copyName = `${basename(job.to)}.restoring`;
 	try {
-		mkdirSync(dirname(job.to), { recursive: true });
-		removeCopy(copy);
-		copyFileSync(job.from, copy);
-		const check = integrityOf(copy);
-		if (check !== "ok") throw new Error(`integrity check failed: ${check}`);
-		moveAside(job.to, now, result.movedAside);
-		// The check can leave -wal and -shm files: they must not move next to the target.
-		for (const path of sidecars(copy)) rmSync(path, { force: true });
-		renameSync(copy, job.to);
-		result.restored.push({ file: job.file, to: job.to });
+		withDir(job.anchor, dirname(job.to), { create: true }, (d) => {
+			removeCopyIn(d, copyName);
+			// confine: refuses a symlinked or FIFO source, it is never followed.
+			const sid = openRegular(job.from);
+			try {
+				const fd = openExclusive(d, copyName, fstatSync(sid).mode & 0o777);
+				try {
+					const buf = Buffer.allocUnsafe(1 << 20);
+					for (;;) {
+						const n = readSync(sid, buf, 0, buf.length, null);
+						if (n === 0) break;
+						for (let off = 0; off < n; )
+							off += writeSync(fd, buf, off, n - off);
+					}
+					const check = integrityOfBytes(readFull(fd));
+					if (check !== "ok")
+						throw new Error(`integrity check failed: ${check}`);
+					moveAsideIn(d, basename(job.to), now, result.movedAside);
+					// Installs our inode, proven by ino: a planted entry under either name is
+					// caught and removed, never followed.
+					renameProven(d, copyName, basename(job.to), fd);
+					result.restored.push({ file: job.file, to: job.to });
+				} finally {
+					closeSync(fd);
+				}
+			} finally {
+				closeSync(sid);
+			}
+		});
 	} catch (err) {
-		removeCopy(copy);
+		try {
+			withDir(job.anchor, dirname(job.to), {}, (d) =>
+				removeCopyIn(d, copyName),
+			);
+		} catch {
+			// cleanup of a failed restore must not mask the recorded failure
+		}
 		result.failed.push({ file: job.file, error: errorText(err) });
 	}
 }
@@ -518,6 +592,10 @@ function missingFiles(dir: string, stamp: string, found: string[]): Failure[] {
  * no database file: it renames an existing target to `<file>.before-restore-<stamp of now>`.
  * `failed` also holds each database that the snapshot's manifest names but the snapshot does
  * not hold: a restore of an incomplete snapshot is never a clean result.
+ *
+ * Each job's target side is written through a directory held open below its anchor: the
+ * walk below the anchor refuses a symlinked component, so a planted `<name>` dir symlink
+ * or `<to>.restoring` symlink fails that file instead of writing through the link.
  */
 export async function restoreSnapshot(o: {
 	dir: string;
@@ -525,6 +603,11 @@ export async function restoreSnapshot(o: {
 	now: Date;
 	trackerDb: string;
 	projectDbFor: (name: string) => string | null;
+	/**
+	 * The trusted anchor above every project db target (the resolved OTTR_SERVER_DATA_DIR
+	 * or OTTR_DATA_DIR root); required when `projectDbFor` returns a target.
+	 */
+	projectAnchor?: string;
 	adoptedMarker: string | null;
 }): Promise<{
 	restored: { file: string; to: string }[];
@@ -536,7 +619,7 @@ export async function restoreSnapshot(o: {
 	if (!listSnapshots(dir).includes(o.stamp))
 		throw new Error(`no snapshot ${o.stamp} in ${o.dir}`);
 	const manual: { file: string; from: string }[] = [];
-	const jobs: { file: string; from: string; to: string }[] = [];
+	const jobs: { file: string; from: string; to: string; anchor: string }[] = [];
 	const files = restorableFiles(join(dir, o.stamp));
 	const missing = missingFiles(
 		dir,
@@ -545,8 +628,18 @@ export async function restoreSnapshot(o: {
 	);
 	for (const f of files) {
 		const to = f.project === null ? o.trackerDb : o.projectDbFor(f.project);
-		if (to === null) manual.push({ file: f.file, from: f.from });
-		else jobs.push({ file: f.file, from: f.from, to });
+		if (to === null) {
+			manual.push({ file: f.file, from: f.from });
+			continue;
+		}
+		let anchor: string;
+		if (f.project === null) anchor = dirname(resolve(o.trackerDb));
+		else if (o.projectAnchor === undefined)
+			throw new Error(
+				"projectAnchor is required when projectDbFor returns a target",
+			);
+		else anchor = resolve(o.projectAnchor);
+		jobs.push({ file: f.file, from: f.from, to, anchor });
 	}
 	for (const job of jobs) await assertNotHeld(job.to);
 	const result = {

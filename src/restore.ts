@@ -65,6 +65,7 @@ async function restore(
 		trackerDb: join(resolve(stateDir), ".tasks", "tracker.db"),
 		projectDbFor: (name) =>
 			projectRoot ? join(resolve(projectRoot), name, "tasks.db") : null,
+		projectAnchor: projectRoot ? resolve(projectRoot) : undefined,
 		adoptedMarker: serverData
 			? join(resolve(serverData), ADOPTED_MARKER)
 			: null,
