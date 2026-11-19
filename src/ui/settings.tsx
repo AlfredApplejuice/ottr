@@ -167,9 +167,9 @@ const PR_REVIEWS_DESC =
 const PR_REVIEW_NOTIFY_DESC =
 	"Bell and push when a review draft arrives or is rewritten, and when new comments land after a posted review; needs PR reviews";
 const PR_REVIEW_APPROVE_DESC =
-	"The Post click also approves the PR (one APPROVE review with the comment as its body) when the draft has no blocking findings; needs PR reviews";
+	"Posting a review approves the PR once all blocking issues are resolved.";
 const PR_REVIEW_REQUEST_CHANGES_DESC =
-	"When the draft has a blocking finding, the Post click requests changes on GitHub instead of commenting; needs PR reviews";
+	"Posting a review requests changes when it finds a blocking issue. The comment still posts.";
 const OMP_WATCH_DESC =
 	"Hourly, a model reads each new omp release's notes. A fail files a card and holds the pin. A pass files a card that bumps Dockerfile.worker.";
 const DEPENDABOT_DESC =
@@ -546,14 +546,14 @@ export function SetupSettingsFields({
 									)}
 									{check(
 										"prReviewApprove",
-										"PR review approvals",
-										`${PR_REVIEW_APPROVE_DESC}.`,
+										"Approve when no blocking issues remain",
+										PR_REVIEW_APPROVE_DESC,
 										true,
 									)}
 									{check(
 										"prReviewRequestChanges",
-										"PR review request changes",
-										`${PR_REVIEW_REQUEST_CHANGES_DESC}.`,
+										"Request changes on blocking issues",
+										PR_REVIEW_REQUEST_CHANGES_DESC,
 										true,
 									)}
 									{check(
@@ -9151,8 +9151,8 @@ function ProjectWatchesCard({
 				<CheckRow
 					settingKey="prReviewApprove"
 					sub
-					name="PR review approvals"
-					desc={PR_REVIEW_APPROVE_DESC}
+					name="Approve when no blocking issues remain"
+					desc={`${st.prReviews ? "" : "Needs PR reviews. "}${PR_REVIEW_APPROVE_DESC}`}
 					checked={st.prReviewApprove}
 					disabled={!st.prReviews}
 					save={(v) => send({ prReviewApprove: v })}
@@ -9161,8 +9161,8 @@ function ProjectWatchesCard({
 				<CheckRow
 					settingKey="prReviewRequestChanges"
 					sub
-					name="PR review request changes"
-					desc={PR_REVIEW_REQUEST_CHANGES_DESC}
+					name="Request changes on blocking issues"
+					desc={`${st.prReviews ? "" : "Needs PR reviews. "}${PR_REVIEW_REQUEST_CHANGES_DESC}`}
 					checked={st.prReviewRequestChanges}
 					disabled={!st.prReviews}
 					save={(v) => send({ prReviewRequestChanges: v })}

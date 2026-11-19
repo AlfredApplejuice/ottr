@@ -11450,10 +11450,10 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			// The stored defaults: notifications and the Dependabot warning start on.
 			expect(box("PR review notifications").checked).toBe(true);
 			expect(box("Dependabot warning").checked).toBe(true);
-			expect(box("PR review approvals").disabled).toBe(true);
+			expect(box("Approve when no blocking issues remain").disabled).toBe(true);
 			await set(box("PR reviews"), true);
-			expect(box("PR review approvals").disabled).toBe(false);
-			await set(box("PR review approvals"), true);
+			expect(box("Approve when no blocking issues remain").disabled).toBe(false);
+			await set(box("Approve when no blocking issues remain"), true);
 			await set(box("Issue watch"), true);
 			await set(box("Trending scout"), true);
 			for (let i = 0; i < 3; i += 1) await clickAction(container, "Next");

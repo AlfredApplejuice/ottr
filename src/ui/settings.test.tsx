@@ -1845,12 +1845,13 @@ describe("PR reviews watch facts and Check PRs now", () => {
 			headers: { "Content-Type": "application/json" },
 		});
 
-	const watchRow = (container: Element): Element => {
-		const row = [
-			...container.querySelectorAll("#project-watches-section .check-row"),
-		].find((r) => r.querySelector("label")?.textContent === "PR reviews");
-		return row as Element;
-	};
+	const rowByLabel = (container: Element, label: string): Element =>
+		[...container.querySelectorAll("#project-watches-section .check-row")].find(
+			(r) => r.querySelector("label")?.textContent === label,
+		) as Element;
+
+	const watchRow = (container: Element): Element =>
+		rowByLabel(container, "PR reviews");
 
 	const checkButton = (container: Element): HTMLButtonElement =>
 		Array.from(container.querySelectorAll("button")).find(
@@ -2014,6 +2015,56 @@ describe("PR reviews watch facts and Check PRs now", () => {
 			const row = watchRow(container);
 			expect(row.textContent).toContain("Last check: Never");
 			expect(row.textContent).toContain("Next regular check: unknown");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the approve and request-changes rows show their short names and descriptions", async () => {
+		const { container, unmount } = await prForm(
+			project(true, { lastPollAt: null, lastError: null, nextPollAt: null }),
+			[],
+		);
+		try {
+			const approve = rowByLabel(
+				container,
+				"Approve when no blocking issues remain",
+			);
+			expect(approve.querySelector('[id$="-desc"]')?.textContent).toBe(
+				"Posting a review approves the PR once all blocking issues are resolved.",
+			);
+			const requestChanges = rowByLabel(
+				container,
+				"Request changes on blocking issues",
+			);
+			expect(requestChanges.querySelector('[id$="-desc"]')?.textContent).toBe(
+				"Posting a review requests changes when it finds a blocking issue. The comment still posts.",
+			);
+			expect(container.textContent).not.toContain("Needs PR reviews");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("with PR reviews off the two rows are disabled and name the reason", async () => {
+		const { container, unmount } = await prForm(
+			project(false, { lastPollAt: null, lastError: null, nextPollAt: null }),
+			[],
+		);
+		try {
+			for (const label of [
+				"Approve when no blocking issues remain",
+				"Request changes on blocking issues",
+			]) {
+				const row = rowByLabel(container, label);
+				const input = row.querySelector("input") as HTMLInputElement;
+				expect(input.disabled).toBe(true);
+				const desc = row.querySelector('[id$="-desc"]') as Element;
+				expect(desc.textContent).toContain("Needs PR reviews.");
+				expect(desc.getAttribute("id")).toBe(
+					input.getAttribute("aria-describedby"),
+				);
+			}
 		} finally {
 			await unmount();
 		}
