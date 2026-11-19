@@ -238,10 +238,15 @@ export function openRegular(path: string): number {
 	return regularOrClose(openSync(path, O_RDONLY | O_NONBLOCK), path);
 }
 
-/** readFileSync for a path on a worker-writable volume: openRegular's refusals apply. */
-export function readRegular(path: string): Buffer {
+/** readFileSync for a path on a worker-writable volume: openRegular's refusals apply, and
+ * `maxBytes` refuses an oversized file before any read (worker-writable volumes must not
+ * be read whole). */
+export function readRegular(path: string, maxBytes: number): Buffer {
 	const fd = openRegular(path);
 	try {
+		const st = fstatSync(fd);
+		if (st.size > maxBytes)
+			throw new Error(`refusing ${path}: larger than ${maxBytes} bytes`);
 		return readFileSync(fd);
 	} finally {
 		closeSync(fd);

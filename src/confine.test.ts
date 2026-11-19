@@ -5,6 +5,7 @@ import {
 	closeSync,
 	constants,
 	existsSync,
+	ftruncateSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
@@ -558,15 +559,58 @@ describe("a FIFO in place of the task log", () => {
 
 	test.skipIf(!fifoOk)("readRegular refuses it without hanging", () => {
 		const { log } = fifoLog();
-		expect(() => readRegular(log)).toThrow(/not a regular file/);
+		expect(() => readRegular(log, 1024 * 1024)).toThrow(/not a regular file/);
 	});
 
 	test("readRegular reads a regular file", () => {
 		const { anchor } = fixture();
 		const f = join(anchor, "f");
 		writeFileSync(f, "bytes");
-		expect(readRegular(f).toString()).toBe("bytes");
+		expect(readRegular(f, 1024 * 1024).toString()).toBe("bytes");
 	});
+
+	test("readRegular enforces the cap before reading", () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "f");
+		writeFileSync(f, "1234");
+		expect(() => readRegular(f, 3)).toThrow(/larger than 3 bytes/);
+		expect(readRegular(f, 4).toString()).toBe("1234");
+	});
+
+	test.skipIf(!linux)("readRegular refuses a sparse oversized file", () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "sparse");
+		const fd = openSync(f, "w");
+		ftruncateSync(fd, 64 * 1024 * 1024);
+		closeSync(fd);
+		// fstat before read: the refusal never allocates the 64 MiB.
+		expect(() => readRegular(f, 1024 * 1024)).toThrow(
+			/larger than 1048576 bytes/,
+		);
+	});
+
+	test.skipIf(!linux)(
+		"readRegular property: a cap at or above the size reads exactly",
+		() => {
+			const { anchor } = fixture();
+			const f = join(anchor, "f");
+			fc.assert(
+				fc.property(
+					fc.uint8Array({ minLength: 0, maxLength: 64 }),
+					fc.integer({ min: -2, max: 2 }),
+					(bytes, slack) => {
+						const cap = bytes.length + slack;
+						writeFileSync(f, bytes);
+						if (cap < bytes.length) {
+							expect(() => readRegular(f, cap)).toThrow(/larger than/);
+						} else {
+							expect(readRegular(f, cap)).toEqual(Buffer.from(bytes));
+						}
+					},
+				),
+			);
+		},
+	);
 });
 
 describe("readBelow", () => {

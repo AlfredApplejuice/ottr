@@ -2845,6 +2845,10 @@ export class ProjectStore {
 	 * the retry, and the card falls back to using the transcript title as before. */
 	private titleHolds = new Map<string, () => void>();
 
+	/** Sessions whose transcript exceeded the read cap: cost stays NULL, and this memo
+	 * spares every later capture in this process from re-running the refusal. */
+	private oversizeSessions = new Set<string>();
+
 	/** Holds the task's transcript title back until a pending generation retry settles. */
 	async holdTitle(id: string, cancelRetry: () => void): Promise<void> {
 		this.titleHolds.get(id)?.();
@@ -4845,13 +4849,18 @@ export class ProjectStore {
 				? ((await this.getTask(taskId))?.sessionId ?? null)
 				: expectedSessionId;
 		if (sessionId === null) return;
+		if (this.oversizeSessions.has(sessionId)) return;
 		let sum: UsageSum | null;
 		try {
-			sum = sumUsageIn(
-				await readTranscript(this.sessionsDir, sessionId),
-				startedAt,
-				endedAt,
-			);
+			const texts = await readTranscript(this.sessionsDir, sessionId);
+			if (texts.oversize) {
+				// An over-cap transcript is refused unread, so its cost stays unknown; without
+				// the memo every store open would re-run the refusal, so skip the session for
+				// this process (a restart re-checks once — a stat, not a read).
+				this.oversizeSessions.add(sessionId);
+				return;
+			}
+			sum = sumUsageIn(texts, startedAt, endedAt);
 		} catch {
 			return;
 		}

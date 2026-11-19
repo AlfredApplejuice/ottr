@@ -8,9 +8,12 @@ import {
 	test,
 } from "bun:test";
 import {
+	closeSync,
 	existsSync,
+	ftruncateSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readdirSync,
 	rmSync,
 	symlinkSync,
@@ -26,6 +29,7 @@ import {
 	RULES_INTERVIEW_MARKER,
 } from "./prompts.ts";
 import { FINDINGS_HOLD, mergeHold } from "./scheduler.ts";
+import { TRANSCRIPT_MAX_BYTES } from "./session.ts";
 import { SQLiteDatabase } from "./sqliteDriver.ts";
 import {
 	adoptSharedProjectData,
@@ -2818,6 +2822,61 @@ describe("turn cost capture", () => {
 			"cost",
 		])
 			expect(cols).toContain(col);
+	});
+
+	// A transcript over TRANSCRIPT_MAX_BYTES is refused unread by the reader, so the
+	// turn's cost stays unknown: NULL at turn end and on every later reopen.
+	test("an oversize transcript keeps cost and tokens NULL at turn end and on reopen", async () => {
+		const dir = join(root, "cost-oversize");
+		const store = await open(dir);
+		const t = await store.updateTask((await store.createTask("huge log")).id, {
+			sessionId: sid,
+		});
+		const turn = await store.startTurn(t.id, "work", "p", null);
+		writeTranscript(store.sessionsDir, sid, [
+			usageLine(turn.startedAt + 100, { input: 9, output: 9, cost: 9 }),
+		]);
+		const fd = openSync(
+			join(store.sessionsDir, `2026-09-27T10-00-00-000Z_${sid}.jsonl`),
+			"r+",
+		);
+		ftruncateSync(fd, TRANSCRIPT_MAX_BYTES + 1);
+		closeSync(fd);
+
+		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
+		await store.close();
+
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		const rows = raw
+			.query<
+				{
+					tokens_in: number | null;
+					tokens_out: number | null;
+					cache_read: number | null;
+					cache_write: number | null;
+					cost: number | null;
+				},
+				[]
+			>(
+				"SELECT tokens_in, tokens_out, cache_read, cache_write, cost FROM turns",
+			)
+			.all();
+		raw.close();
+		expect(rows).toEqual([
+			{
+				tokens_in: null,
+				tokens_out: null,
+				cache_read: null,
+				cache_write: null,
+				cost: null,
+			},
+		]);
+
+		// Reopen runs the backfill over the same oversize transcript: still refused,
+		// still NULL, and no error surfaces.
+		const reopened = await open(dir);
+		expect((await reopened.perfFacts()).turns[0]?.cost).toBeNull();
+		await reopened.close();
 	});
 });
 

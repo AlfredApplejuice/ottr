@@ -1324,6 +1324,8 @@ const MERGE_PUSH_RETRY_WAIT_MS = 30_000;
 const REPORT_MAX_BYTES = 4 * 1024 * 1024;
 // ponytail: a fixed cap on the work check's transcript read; raise it when a real transcript hits it.
 const TRANSCRIPT_MAX_BYTES = 128 * 1024 * 1024;
+// OTTR-991: a task log can be large, but the board must not read worker-written logs whole without bound.
+const TASK_LOG_MAX_BYTES = 64 * 1024 * 1024;
 /** The park reason of a stopped turn (the board's Esc). */
 const TURN_STOPPED_REASON =
 	"Turn stopped. Reply to continue the session, Resume to rerun it, or cancel the card.";
@@ -6874,7 +6876,10 @@ export function createTurnLoop(
 	): Promise<void> {
 		for (const name of st.task.shots) {
 			try {
-				const bytes = readRegular(join(await st.store.imagesDir(st.id), name));
+				const bytes = readRegular(
+					join(await st.store.imagesDir(st.id), name),
+					MAX_IMAGE_BYTES,
+				);
 				seen.add(createHash("sha256").update(bytes).digest("hex"));
 				const gray = pngGray16(bytes);
 				if (gray !== null) stored.push({ name, gray });
@@ -9801,9 +9806,15 @@ export function createTurnLoop(
 			.catch(() => [] as string[]);
 		const ui = uiFiles(changed);
 		if (ui.length === 0) return next;
-		const priorLog = existsSync(await st.store.logPath(st.id))
-			? readRegular(await st.store.logPath(st.id)).toString("utf8")
-			: "";
+		let priorLog = "";
+		try {
+			priorLog = readRegular(
+				await st.store.logPath(st.id),
+				TASK_LOG_MAX_BYTES,
+			).toString("utf8");
+		} catch {
+			// a missing or over-cap log holds no known prior warning
+		}
 		await appendLog(st.store, st.id, `${UI_SHOT_WARNING}: ${listed(ui)}`);
 		if (next.needsReason !== null || st.steered) return next;
 		if (!priorLog.includes(UI_SHOT_WARNING))

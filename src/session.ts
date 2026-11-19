@@ -9,7 +9,7 @@ import {
 	readFileSync,
 	readSync,
 } from "node:fs";
-import { readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { SessionContext } from "./types.ts";
@@ -226,6 +226,13 @@ function modelSelector(
 		: (provider ?? model);
 }
 
+/** The largest transcript file the board reads whole; larger files stay unread. */
+export const TRANSCRIPT_MAX_BYTES = 64 * 1024 * 1024;
+/** The most subagent transcripts read for one session; beyond it the rest stay unread. */
+export const TRANSCRIPT_MAX_SUB_FILES = 32;
+/** The total byte budget for one session's subagent transcripts. */
+export const TRANSCRIPT_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
+
 /** The full transcript of one omp session: the main session text plus its subagent files.
  *  `complete` is false when a subagent source exists but could not be read, so a sum over
  *  these texts would miss usage. */
@@ -233,14 +240,19 @@ export interface TranscriptTexts {
 	sessionText: string | null;
 	subagentTexts: string[];
 	complete: boolean;
+	/** True when a size or count cap refused part of the transcript, so usage is unknown. */
+	oversize: boolean;
 }
 
 /**
  * The omp transcript of one session: the `<ts>_<sessionId>.jsonl` file plus every
  * subagent file in its sibling `<ts>_<sessionId>/` folder. Reads never throw (R1): a
  * missing main file gives null, an absent subagent folder gives [], and any other
- * subagent read failure sets `complete` to false. Async: whole transcripts are the
- * largest reads on the board, so they must never block the request path.
+ * subagent read failure sets `complete` to false. Caps refuse oversized worker-writable
+ * files before reading them whole: an over-cap file, an over-cap subagent count, or a
+ * subagent set over its byte budget sets `oversize` and keeps `complete` false. Async:
+ * whole transcripts are the largest reads on the board, so they must never block the
+ * request path.
  */
 export async function readTranscript(
 	dir: string,
@@ -248,34 +260,82 @@ export async function readTranscript(
 ): Promise<TranscriptTexts> {
 	const file = sessionFile(dir, sessionId);
 	if (file === null)
-		return { sessionText: null, subagentTexts: [], complete: true };
-	let sessionText: string | null = null;
+		return {
+			sessionText: null,
+			subagentTexts: [],
+			complete: true,
+			oversize: false,
+		};
+	let size: number;
+	try {
+		size = (await stat(file)).size;
+	} catch {
+		return {
+			sessionText: null,
+			subagentTexts: [],
+			complete: false,
+			oversize: false,
+		};
+	}
+	if (size > TRANSCRIPT_MAX_BYTES)
+		return {
+			sessionText: null,
+			subagentTexts: [],
+			complete: false,
+			oversize: true,
+		};
+	let sessionText: string | null;
 	try {
 		sessionText = await readFile(file, "utf8");
 	} catch {
-		return { sessionText: null, subagentTexts: [], complete: false };
+		return {
+			sessionText: null,
+			subagentTexts: [],
+			complete: false,
+			oversize: false,
+		};
 	}
 	const subagentTexts: string[] = [];
 	const subDir = file.slice(0, -".jsonl".length);
 	let names: string[];
 	try {
-		names = await readdir(subDir);
+		names = (await readdir(subDir)).filter((n) => n.endsWith(".jsonl"));
 	} catch (err) {
 		// Only a folder that does not exist means "no subagents"; any other failure hides files.
 		const absent =
 			err instanceof Error && "code" in err && err.code === "ENOENT";
-		return { sessionText, subagentTexts, complete: absent };
+		return { sessionText, subagentTexts, complete: absent, oversize: false };
 	}
+	if (names.length > TRANSCRIPT_MAX_SUB_FILES)
+		return { sessionText, subagentTexts, complete: false, oversize: true };
 	let complete = true;
+	let oversize = false;
+	let total = 0;
 	for (const name of names) {
-		if (!name.endsWith(".jsonl")) continue;
+		let subSize: number;
 		try {
-			subagentTexts.push(await readFile(join(subDir, name), "utf8"));
+			subSize = (await stat(join(subDir, name))).size;
+		} catch {
+			complete = false; // unreadable subagent transcript: its usage is unknown
+			continue;
+		}
+		if (
+			subSize > TRANSCRIPT_MAX_BYTES ||
+			total + subSize > TRANSCRIPT_MAX_TOTAL_BYTES
+		) {
+			complete = false; // over a cap: this subagent and the rest stay unread
+			oversize = true;
+			break;
+		}
+		try {
+			const text = await readFile(join(subDir, name), "utf8");
+			subagentTexts.push(text);
+			total += subSize;
 		} catch {
 			complete = false; // unreadable subagent transcript: its usage is unknown
 		}
 	}
-	return { sessionText, subagentTexts, complete };
+	return { sessionText, subagentTexts, complete, oversize };
 }
 
 /**

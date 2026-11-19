@@ -506,9 +506,10 @@ export async function sealedGit(
 			`[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = ${format}\n`,
 		);
 		try {
+			// A git exclude file is small; the cap refuses a planted oversized one.
 			writeFileSync(
 				path.join(stub, "info", "exclude"),
-				readRegular(path.join(common, "info", "exclude")),
+				readRegular(path.join(common, "info", "exclude"), 1024 * 1024),
 			);
 		} catch (e) {
 			if (!(e instanceof Error && "code" in e && e.code === "ENOENT"))
@@ -1320,7 +1321,11 @@ async function logSkippedTracked(
 ): Promise<void> {
 	await o.log(`skipped ${relFwd}: ${o.base} tracks it`);
 	if (relFwd !== "AGENTS.md") return;
-	const local = readRegular(path.join(o.mainPath, relFwd)).toString("utf8");
+	// AGENTS.md is small; the cap refuses a planted oversized one.
+	const local = readRegular(
+		path.join(o.mainPath, relFwd),
+		1024 * 1024,
+	).toString("utf8");
 	const atBase = await git(["show", `${o.base}:AGENTS.md`], o.mainPath);
 	if (atBase.code !== 0)
 		throw new Error(`git show failed: ${atBase.stderr.trim()}`);
