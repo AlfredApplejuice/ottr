@@ -1433,7 +1433,11 @@ remote name, only the server-pinned origin URL (docs/specs/pinned-origin-url.md)
 board git call also sets
 `commit.gpgSign=false` and `tag.gpgSign=false`, and sets `gpg.program`, `gpg.x509.program`
 and `gpg.ssh.program` to `false`. Thus a planted signing or `log.showSignature` setting
-cannot run a program.
+cannot run a program. Local agent runs (a merge turn, a work turn with no worker, a
+retro, a check) carry the same overrides as `GIT_CONFIG_*` env config (`localGitPinEnv`
+in `src/runner.ts`): the shell git that such a run's verification drives reads the
+worker-writable common gitdir, so its hooks, fsmonitor and signing paths stay pinned the
+same way.
 
 Filter drivers (`filter.<driver>.clean`, `smudge`, `process`) need one more step. The
 driver name comes from attributes, so no `-c` can clear the driver. Also, git reads
@@ -1702,7 +1706,14 @@ writes, ref updates), so no read-only mount can wall the config off without brea
 inside the worktrees, and projects are onboarded at run time, so compose cannot pre-mount
 each config. The board's network subcommands still read `credential.helper`,
 `core.sshCommand` and `url.*.insteadOf` from that file. Turn processes run shell git with
-whatever the turn's env holds. Closing the board's repo-config reads fully is code-side
+whatever the turn's env holds; a server-side turn (a merge turn, a work turn with no
+worker, a retro, a check) now carries the same overrides as env config
+(`localGitPinEnv` in `src/runner.ts`, `GIT_CONFIG_*` names), so its shell git reads no
+hooks, fsmonitor command, or signing program from the worker-writable gitdir. The
+remaining server-side residual: a merge turn re-runs the project's verification —
+worker-written test and build code — in the server container, by design of the merge
+prompt (`mergePrompt` in `src/prompts.ts`); the env pins close its git execution paths,
+not its direct process spawns. Closing the board's repo-config reads fully is code-side
 work in `src/worktree.ts` (per-call `-c` overrides and the `sealedGit` stub gitdir), not
 topology. The stub copies only these probed keys from the repo config:
 `core.filemode`, `symlinks`, `ignorecase`, `precomposeunicode`, `autocrlf` and `eol`. These
