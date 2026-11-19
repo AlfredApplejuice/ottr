@@ -35,8 +35,12 @@ const REDACT_PATTERNS: RegExp[] = [
 	/\b(sk|pk)_live_[A-Za-z0-9]{16,}\b/g,
 	/AIza[0-9A-Za-z_-]{35}/g,
 	/\bxox[baprs]-[A-Za-z0-9-]{10,}/g,
-	/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
-	/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+	// OTTR-997: every quantifier before a required literal is bounded, so a failed
+	// start cannot rescan the rest of attacker-written text (quadratic backtracking).
+	// JWT segments: header <=128, payload/signature <=2048 (real tokens are smaller).
+	/eyJ[A-Za-z0-9_-]{10,128}\.[A-Za-z0-9_-]{10,2048}\.[A-Za-z0-9_-]{10,2048}/g,
+	// PEM key: header word <=32 chars, gap <=8 KiB (a real key PEM is smaller).
+	/-----BEGIN [A-Z ]{0,32}PRIVATE KEY-----[\s\S]{0,8192}?-----END [A-Z ]{0,32}PRIVATE KEY-----/g,
 	/\b\w+:\/\/[^/\s:]+:[^/\s@]{8,}@/g,
 ];
 
@@ -144,6 +148,17 @@ function commitBlock(c: ForkCommit): string {
 	return lines.join("\n");
 }
 
+/** capPatches' per-patch cap: the longest patches trim to this (min 2000 chars each). */
+function patchCap(commitCount: number): number {
+	return Math.max(2000, Math.floor(PROMPT_CHAR_BUDGET / commitCount));
+}
+
+/** OTTR-997: clean() runs before the budget cut, so each raw patch is cut here first:
+ * bounded regexes stay linear in patch length, and length itself stays bounded. The
+ * +4 KiB slack keeps any real token straddling the cut fully inside the cleaned
+ * region, so capPatches trims redacted text instead of half a raw secret. */
+const PATCH_PRECAP_SLACK = 4096;
+
 /** All labelled blocks after stripInvisible + redactSecrets, before budget capping. */
 function cleanBlocks(
 	range: ForkRange,
@@ -156,12 +171,16 @@ function cleanBlocks(
 	upstreamDocs: string;
 	priorSection: string;
 } {
+	const precap =
+		patchCap([...range.commits, ...range.merges].length) + PATCH_PRECAP_SLACK;
 	return {
 		fork: clean(
 			`owner/name: ${range.fork.owner}/${range.fork.name}\n` +
 				range.heads.map((h) => `${h.branch}: ${h.head}`).join("\n"),
 		),
-		patches: [...range.commits, ...range.merges].map((c) => clean(c.patch)),
+		patches: [...range.commits, ...range.merges].map((c) =>
+			clean(c.patch.length > precap ? c.patch.slice(0, precap) : c.patch),
+		),
 		upstreamCommits: clean(range.upstreamCommits.join("\n")),
 		upstreamFiles: clean(range.upstreamFiles.join("\n")),
 		upstreamDocs: clean(range.upstreamDocs),
@@ -183,7 +202,7 @@ function capPatches(
 	if (total <= PROMPT_CHAR_BUDGET) {
 		return { patches, total, note: "" };
 	}
-	const cap = Math.max(2000, Math.floor(PROMPT_CHAR_BUDGET / commitCount));
+	const cap = patchCap(commitCount);
 	let out = patches;
 	let used = total;
 	const order = out

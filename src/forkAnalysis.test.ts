@@ -168,6 +168,41 @@ describe("redactSecrets", () => {
 		expect(r.hits).toBe(1);
 		expect(r.text).toBe("before [REDACTED] after");
 	});
+	test("JWT at the segment bounds still redacts", () => {
+		const jwt = `eyJ${"h".repeat(118)}.${"a".repeat(2048)}.${"S".repeat(2048)}`;
+		const r = redactSecrets(`x ${jwt} y`);
+		expect(r.hits).toBe(1);
+		expect(r.text).toBe("x [REDACTED] y");
+	});
+	test("JWT segment beyond the bound stays visible (OTTR-997)", () => {
+		const jwt = `eyJ${"h".repeat(118)}.${"a".repeat(2049)}.SflKxwRJSMeKKF2QT4`;
+		const r = redactSecrets(jwt);
+		expect(r.hits).toBe(0);
+		expect(r.text).toBe(jwt);
+	});
+	test("PEM gap beyond 8 KiB stays visible (OTTR-997)", () => {
+		const block =
+			`-----BEGIN RSA PRIVATE KEY-----\n${"a".repeat(8193)}\n` +
+			"-----END RSA PRIVATE KEY-----";
+		const r = redactSecrets(`before ${block} after`);
+		expect(r.hits).toBe(0);
+		expect(r.text).toBe(`before ${block} after`);
+	});
+	test("stays fast on attacker-shaped text that cannot match (OTTR-997)", () => {
+		// Before the fix these two ran the old unbounded patterns for 81 s and 16 s.
+		const t0 = performance.now();
+		const jwtText = redactSecrets("eyJ".repeat(333_333));
+		const jwtMs = performance.now() - t0;
+		expect(jwtText.hits).toBe(0);
+		expect(jwtMs).toBeLessThan(1000);
+		const t1 = performance.now();
+		const pemText = redactSecrets(
+			"-----BEGIN PRIVATE KEY-----\n".repeat(40000),
+		);
+		const pemMs = performance.now() - t1;
+		expect(pemText.hits).toBe(0);
+		expect(pemMs).toBeLessThan(1000);
+	});
 	test("URL with credentials", () => {
 		const r = redactSecrets("postgres://admin:supersecret12@db.example.com/x");
 		expect(r.hits).toBe(1);
@@ -249,6 +284,36 @@ describe("redactSecrets", () => {
 			),
 		);
 	});
+	test("property: bounded token shapes never survive redaction (OTTR-997)", () => {
+		const secret = fc.constantFrom(
+			"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4",
+			"-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----",
+			"postgres://admin:supersecret12@db.example.com/x",
+			`ghp_${"x".repeat(36)}`,
+		);
+		// Fillers carry match prefixes without the required literals; the newline
+		// keeps the \b boundary of the token prefixes intact.
+		const filler = fc.constantFrom(
+			"plain code",
+			"eyJ",
+			"-----BEGIN PRIVATE KEY-----",
+			".",
+			"a",
+			"postgres://",
+		);
+		fc.assert(
+			fc.property(
+				fc.array(filler, { maxLength: 3 }),
+				secret,
+				fc.array(filler, { maxLength: 3 }),
+				(pre, s, post) => {
+					const text = `${pre.join("")}\n${s}\n${post.join("")}`;
+					const r = redactSecrets(text);
+					expect(r.text).not.toContain(s);
+				},
+			),
+		);
+	});
 });
 
 describe("hasCredentialShape", () => {
@@ -307,6 +372,61 @@ describe("buildUserMessage", () => {
 		const msg = buildUserMessage(r, { titles: [], declines: [] });
 		expect(msg).toContain('password = "[REDACTED]"');
 		expect(msg).not.toContain("abcdefghijklmnop");
+	});
+	test("caps a raw patch before cleaning so a huge one cannot stall (OTTR-997)", () => {
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "eyJ".repeat(333_334),
+					branches: [],
+				},
+			],
+			merges: [],
+		});
+		const t0 = performance.now();
+		expect(() => buildUserMessage(r, { titles: [], declines: [] })).toThrow(
+			RangeError,
+		);
+		expect(performance.now() - t0).toBeLessThan(1000);
+	});
+	test("a token straddling the raw cut still redacts (OTTR-997)", () => {
+		const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4";
+		// Two commits -> per-patch cap 200_000, raw cut at 204_096. The token
+		// straddles the cap; the 4 KiB slack keeps it inside the cleaned region,
+		// so it redacts before any budget trim instead of leaking its prefix.
+		const patch = `${"a".repeat(199_990)}${jwt}${"b".repeat(9000)}ZZTAILZZ`;
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch,
+					branches: [],
+				},
+				{
+					sha: SHA2,
+					subject: "t",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "+x",
+					branches: [],
+				},
+			],
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("[REDACTED]");
+		expect(msg).not.toContain("eyJ");
+		expect(msg).not.toContain("ZZTAILZZ");
 	});
 	test("throws RangeError when oversized patches bust the budget", () => {
 		const big = "x".repeat(600_000);
