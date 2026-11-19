@@ -1,12 +1,19 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	aptListPath,
 	auditedPackages,
 	ensurePackages,
 	ensureProjectPackages,
+	exec,
 	install,
 	missingFrom,
 	parseAptTxt,
@@ -230,5 +237,22 @@ describe("install repairs an interrupted dpkg", () => {
 			),
 		).toEqual(["a-b", "c+d"]);
 		expect(auditedPackages("")).toEqual([]);
+	});
+});
+
+describe("exec keeps HOME off the shared home", () => {
+	// The server and the workers share home:/root, and dpkg runs its ~/.dpkg.cfg hooks
+	// as root (OTTR-981). Every apt command must see a container-local HOME instead.
+	test("commands run with a container-local HOME that holds no dpkg.cfg", async () => {
+		const out = await exec([
+			process.execPath,
+			"-e",
+			'process.stdout.write(process.env.HOME + "\\n" + process.env.DEBIAN_FRONTEND)',
+		]);
+		const [spawnHome = "", frontend = ""] = out.trimEnd().split("\n");
+		expect(spawnHome).toBe(join(tmpdir(), "ottr-apt-home"));
+		expect(spawnHome).not.toBe(homedir());
+		expect(frontend).toBe("noninteractive");
+		expect(existsSync(join(spawnHome, ".dpkg.cfg"))).toBe(false);
 	});
 });
