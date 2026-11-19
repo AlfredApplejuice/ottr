@@ -34,10 +34,13 @@ import {
 	alateHealth,
 	alateRotateKey,
 	alateUrlError,
+	BRANCH,
 	commitConfigYml,
+	configBlobAt,
 	ensureAlateProjectsRoot,
 	loadConfigYml,
 	noRedirectFetch,
+	REPO_NAME,
 	readOnlyMountError,
 	refreshAlateSnapshot,
 	saveConfigYml,
@@ -2635,11 +2638,15 @@ export async function createApp(deps: AppDeps) {
 	/** Outgoing public key recovered from a stored vapid row whose private key is unreadable
 	 * (ADR-0011 recovery): covers upgraded/restored boards that predate the push_vapid_key kv. */
 	let previousVapidPublicKey: string | null = null;
-	/** Alate server settings; key is sealed at rest like apiKey (ADR-0011). */
-	let alate: { url: string | null; key: string | null } = {
-		url: null,
-		key: null,
-	};
+	/** Alate server settings; key is sealed at rest like apiKey (ADR-0011). `repo`/`branch`
+	 *  pin the trusted model-role write target (owner/name and branch): a save fails closed
+	 *  when alate's reported source differs. Null means unpinned (alate's source decides). */
+	let alate: {
+		url: string | null;
+		key: string | null;
+		repo: string | null;
+		branch: string | null;
+	} = { url: null, key: null, repo: null, branch: null };
 	/** GitHub token from onboarding or Settings; sealed at rest like apiKey (ADR-0011). */
 	let githubToken: string | null = null;
 	/**
@@ -3418,6 +3425,8 @@ export async function createApp(deps: AppDeps) {
 			keySet: alate.key !== null || keptUnreadable.has("alateKey"),
 			keyReadable: alate.key !== null,
 			lastProvisionError: alateProvisionError,
+			repo: alate.repo,
+			branch: alate.branch,
 		};
 	}
 	/** Maps the provision POST's transport timeout. A TimeoutError alone does not prove
@@ -3903,7 +3912,12 @@ export async function createApp(deps: AppDeps) {
 								},
 				alate:
 					deps.secretBox !== undefined
-						? { url: alate.url, key: sealForStore("alateKey", alate.key) }
+						? {
+								url: alate.url,
+								key: sealForStore("alateKey", alate.key),
+								repo: alate.repo,
+								branch: alate.branch,
+							}
 						: (() => {
 								const storedAlate = stored?.alate;
 								const storedKey =
@@ -3919,6 +3933,8 @@ export async function createApp(deps: AppDeps) {
 										? null
 										: ((keptUnreadable.get("alateKey") as string | undefined) ??
 											storedKey),
+									repo: alate.repo,
+									branch: alate.branch,
 								};
 							})(),
 				githubToken: storedSpot("githubToken", githubToken),
@@ -4207,7 +4223,12 @@ export async function createApp(deps: AppDeps) {
 			const a = p.alate as Record<string, unknown>;
 			const str = (v: unknown): string | null =>
 				typeof v === "string" ? v : null;
-			alate = { url: str(a.url), key: loadSecret("alateKey", a.key) };
+			alate = {
+				url: str(a.url),
+				key: loadSecret("alateKey", a.key),
+				repo: str(a.repo),
+				branch: str(a.branch),
+			};
 		}
 	}
 	/** Restores the git token rows; a malformed row is dropped, a kept-unreadable sealed token stays as an unusable row (ADR-0011). */
@@ -10181,7 +10202,7 @@ export async function createApp(deps: AppDeps) {
 		if (!r.ok) return json({ error: r.error }, r.status);
 		const prev = alate;
 		try {
-			alate = { url: alate.url, key: r.body.key };
+			alate = { ...alate, key: r.body.key };
 			await saveConfig();
 		} catch (err) {
 			// The assignment mutated the closure before saveConfig read it, so a failed
@@ -13201,7 +13222,7 @@ export async function createApp(deps: AppDeps) {
 	}
 
 	function validateAlateValue(
-		key: "url" | "key",
+		key: "url" | "key" | "repo" | "branch",
 		v: unknown,
 	): string | null | Response {
 		if (v === null || v === "") return null;
@@ -13212,6 +13233,11 @@ export async function createApp(deps: AppDeps) {
 			return json({ error: `${key} is too long (max 500 chars)` }, 400);
 		if (/[\p{Cc}]/u.test(trimmed))
 			return json({ error: `${key} contains control characters` }, 400);
+		// The pin reaches gh api paths only through the same shapes the source fields use.
+		if (key === "repo" && !REPO_NAME.test(trimmed))
+			return json({ error: "repo must be owner/name" }, 400);
+		if (key === "branch" && !BRANCH.test(trimmed))
+			return json({ error: "branch must be a plain ref name" }, 400);
 		return key === "url" ? validateAlateUrl(trimmed) : trimmed;
 	}
 
@@ -13229,7 +13255,7 @@ export async function createApp(deps: AppDeps) {
 		// key live — health, provision and the turns read the old config until the
 		// whole body validates.
 		const next = { ...alate };
-		for (const key of ["url", "key"] as const) {
+		for (const key of ["url", "key", "repo", "branch"] as const) {
 			const v = body[key];
 			if (v === undefined) continue;
 			const valid = validateAlateValue(key, v);
@@ -13596,8 +13622,10 @@ export async function createApp(deps: AppDeps) {
 			parent as string,
 			content,
 			message,
+			alate.branch ?? undefined,
 		);
 		if (!w.ok) {
+			if (w.pinMismatch) return json({ error: w.error }, 409);
 			if (w.status !== 409) return json({ error: w.error }, w.status);
 			// The data repo moved: show the user its current roles.
 			const again = await loadConfigYml(alate, true);
@@ -13650,6 +13678,19 @@ export async function createApp(deps: AppDeps) {
 		// stale form sees the current roles even when they already hold its values.
 		const f = await loadConfigYml(alate, true);
 		if (!f.ok) return json({ error: f.error }, f.status);
+		// The pin is the board's own trusted write target, independent of alate's
+		// snapshot: when it is set, alate's source must name that repository — a
+		// path source is a mismatch too. Fail closed before any value or write.
+		if (
+			alate.repo !== null &&
+			(f.body.repo === null || f.body.repo.name !== alate.repo)
+		)
+			return json(
+				{
+					error: `alate's data source does not match the pinned data repository ${alate.repo}; check Settings → Alate`,
+				},
+				409,
+			);
 		const current = readRoles(f.body.content);
 		const currentFallbacks = readFallbacks(f.body.content);
 		if (f.body.base !== base || f.body.hash !== hash)
@@ -13664,6 +13705,41 @@ export async function createApp(deps: AppDeps) {
 				},
 				409,
 			);
+		// Bind the snapshot to the parent commit: the bytes this save edits must be
+		// the bytes GitHub holds at `base`. A mismatch (or a missing blob) means
+		// alate's snapshot does not sit at `base`; fail closed with the parent
+		// commit's values so the rows reload from the repo's truth.
+		if (f.body.repo !== null && f.body.base !== null) {
+			const at = await configBlobAt(gh, f.body.repo, f.body.base);
+			if (!at.ok) return json({ error: at.error }, at.status);
+			const blob = at.body.bytes;
+			const blobBuf =
+				blob === null
+					? null
+					: Buffer.from(blob.buffer, blob.byteOffset, blob.byteLength);
+			if (
+				blobBuf === null ||
+				!blobBuf.equals(Buffer.from(f.body.content, "utf8"))
+			)
+				return json(
+					blobBuf === null
+						? {
+								error:
+									"the data repo has no config.yml at the loaded commit; re-import in alate and load the roles again",
+							}
+						: {
+								error:
+									"alate's snapshot does not match the data repo at the loaded commit; check the current roles and save again",
+								base: f.body.base,
+								hash: new Bun.CryptoHasher("sha256")
+									.update(blobBuf)
+									.digest("hex"),
+								roles: readRoles(blobBuf.toString("utf8")),
+								fallbacks: readFallbacks(blobBuf.toString("utf8")),
+							},
+					409,
+				);
+		}
 		const catalog = new Set(
 			(await (deps.models ?? modelList)()).map((m) => m.selector),
 		);

@@ -6136,11 +6136,15 @@ type AlateMockHandlers = {
 		keySet: boolean;
 		keyReadable?: boolean;
 		lastProvisionError?: string | null;
+		repo?: string | null;
+		branch?: string | null;
 	};
 	// A Response is handed out on every fetch; a factory builds a fresh one per call
 	// and can count the calls it serves.
 	keyGet?: Response | (() => Response);
 	keyPost?: Response | (() => Response);
+	// The POST /api/alate answer: a factory that sees the JSON body the form sent.
+	configPost?: (body: Record<string, unknown>) => Response;
 	// The body POST /api/alate/provision answers with, or a factory for one.
 	provisionPost?:
 		| {
@@ -6195,8 +6199,17 @@ function alateFetchMock(handlers: AlateMockHandlers): typeof fetch {
 				keySet: false,
 				keyReadable: true,
 				lastProvisionError: null,
+				repo: null,
+				branch: null,
 				...handlers.config,
 			});
+		if (url.endsWith("/api/alate") && init?.method === "POST") {
+			const h = handlers.configPost;
+			if (h === undefined) throw new Error(`unexpected fetch POST ${url}`);
+			return h(
+				JSON.parse(String(init.body ?? "{}")) as Record<string, unknown>,
+			);
+		}
 		if (url.endsWith("/api/alate/health")) throw new Error("no server");
 		if (url.endsWith("/api/alate/provision") && init?.method === "POST")
 			return alateProvisionResponse(handlers, url);
@@ -6923,6 +6936,90 @@ describe("ProjectSetupSteps gitless init jump", () => {
 			});
 			container.remove();
 			globalThis.fetch = realFetch;
+		}
+	});
+});
+
+describe("AlateSection data repo pin", () => {
+	test("the data repo and branch fields load, save and clear", async () => {
+		const bodies: Record<string, unknown>[] = [];
+		const view = (repo: string | null, branch: string | null) =>
+			okJson({
+				url: "http://127.0.0.1:4570",
+				keySet: true,
+				keyReadable: true,
+				lastProvisionError: null,
+				repo,
+				branch,
+			});
+		const { container, unmount } = await mountAlate(
+			alateFetchMock({
+				config: {
+					url: "http://127.0.0.1:4570",
+					keySet: true,
+					repo: "o/data",
+					branch: "main",
+				},
+				configPost: (body) => {
+					bodies.push(body);
+					const str = (k: string) =>
+						typeof body[k] === "string" && body[k] !== ""
+							? (body[k] as string)
+							: null;
+					return view(str("repo"), str("branch"));
+				},
+			}),
+		);
+		try {
+			const repoInput = container.querySelector<HTMLInputElement>(
+				'input[aria-label="Data repository"]',
+			);
+			const branchInput = container.querySelector<HTMLInputElement>(
+				'input[aria-label="Data branch"]',
+			);
+			expect(repoInput?.value).toBe("o/data");
+			expect(branchInput?.value).toBe("main");
+			// A save sends the loaded pin.
+			const form = container.querySelector("form");
+			expect(form).not.toBeNull();
+			await act(async () => {
+				form!.dispatchEvent(submitEvent());
+			});
+			expect(bodies).toHaveLength(1);
+			expect(bodies[0]).toMatchObject({ repo: "o/data", branch: "main" });
+			// Editing the repo saves the typed value.
+			await act(async () => {
+				typeInto(repoInput!, "o/other");
+				onChangeOf(repoInput!)({
+					target: repoInput!,
+					currentTarget: repoInput!,
+				});
+			});
+			await act(async () => {
+				form!.dispatchEvent(submitEvent());
+			});
+			expect(bodies[1]).toMatchObject({ repo: "o/other", branch: "main" });
+			// An empty field is an explicit clear (unpin).
+			await act(async () => {
+				typeInto(repoInput!, "");
+				onChangeOf(repoInput!)({
+					target: repoInput!,
+					currentTarget: repoInput!,
+				});
+				typeInto(branchInput!, "");
+				onChangeOf(branchInput!)({
+					target: branchInput!,
+					currentTarget: branchInput!,
+				});
+			});
+			await act(async () => {
+				form!.dispatchEvent(submitEvent());
+			});
+			expect(bodies[2]).toMatchObject({ repo: "", branch: "" });
+			expect(repoInput?.value).toBe("");
+			expect(branchInput?.value).toBe("");
+		} finally {
+			await unmount();
 		}
 	});
 });

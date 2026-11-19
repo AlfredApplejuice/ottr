@@ -4310,6 +4310,8 @@ describe("alate routes", () => {
 			keySet: false,
 			keyReadable: false,
 			lastProvisionError: null,
+			repo: null,
+			branch: null,
 		});
 	});
 
@@ -4324,6 +4326,8 @@ describe("alate routes", () => {
 			keySet: true,
 			keyReadable: true,
 			lastProvisionError: null,
+			repo: null,
+			branch: null,
 		});
 		const raw = await (await get("/api/alate")).text();
 		expect(raw).not.toContain("alate_secret");
@@ -6025,6 +6029,8 @@ describe("alate env seeding", () => {
 				keySet: true,
 				keyReadable: true,
 				lastProvisionError: null,
+				repo: null,
+				branch: null,
 			});
 			// Write-only: the view says the key is set, never what it is.
 			expect(await (await m.call("/api/alate")).text()).not.toContain(
@@ -6056,6 +6062,8 @@ describe("alate env seeding", () => {
 			keySet: true,
 			keyReadable: true,
 			lastProvisionError: null,
+			repo: null,
+			branch: null,
 		});
 		expect((await m2.call("/api/alate/provision", {})).status).toBe(502);
 	});
@@ -6076,6 +6084,8 @@ describe("alate env seeding", () => {
 				keySet: true,
 				keyReadable: true,
 				lastProvisionError: null,
+				repo: null,
+				branch: null,
 			});
 			const res = await m.call("/api/alate/provision", {});
 			expect(res.status).toBe(400);
@@ -6117,6 +6127,8 @@ describe("alate url policy", () => {
 				keySet: true,
 				keyReadable: true,
 				lastProvisionError: null,
+				repo: null,
+				branch: null,
 			});
 			const res = await m.call("/api/alate/provision", {});
 			expect(res.status).toBe(400);
@@ -6779,6 +6791,13 @@ extensions:
 		// gh api calls; `pending` holds the tree content until the ref moves.
 		let ghCalls: string[][] = [];
 		let pending: { content: string; parent: string } | null = null;
+		// The branch alate's source reports; "" plays a repo source on the default branch.
+		let repoRef = "main";
+		// config.yml bytes pinned per commit for the save's parent-blob binding check
+		// (a test plants a doctored entry to play a snapshot that lies about `base`).
+		let blobs: Record<string, string> = {};
+		let blobMissing = false;
+		const blobAt = (s: string) => blobs[s] ?? (s === headSha ? head : ORIGINAL);
 		const reset = () => {
 			head = snapshot = ORIGINAL;
 			headSha = snapSha = BASE;
@@ -6794,6 +6813,9 @@ extensions:
 			puts = [];
 			ghCalls = [];
 			pending = null;
+			repoRef = "main";
+			blobs = {};
+			blobMissing = false;
 		};
 		const source = () =>
 			pathMode
@@ -6808,7 +6830,7 @@ extensions:
 						kind: "repo",
 						spec: "o/data",
 						name: "o/data",
-						ref: "main",
+						ref: repoRef,
 						importedSha: snapSha,
 					};
 		const alatePut = async (req: Request): Promise<Response> => {
@@ -6904,6 +6926,16 @@ extensions:
 				stdout: JSON.stringify(body),
 				stderr: "",
 			});
+			if (path.startsWith("repos/o/data/contents/user/omp/agent/config.yml")) {
+				if (blobMissing)
+					return { code: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)" };
+				const refSha = path.split("ref=")[1] ?? "";
+				return ok({
+					content: Buffer.from(blobAt(refSha), "utf8").toString("base64"),
+					encoding: "base64",
+				});
+			}
+			if (path === "repos/o/data") return ok({ default_branch: "main" });
 			if (path.startsWith("repos/o/data/git/commits/"))
 				return ok({ sha: path.split("/").at(-1), tree: { sha: "t0" } });
 			if (path === "repos/o/data/git/trees") {
@@ -7069,7 +7101,13 @@ cycleOrder:
 				const b = (await res.json()) as { fields: Record<string, string> };
 				expect(b.fields.default).toBe("unknown model nope/model");
 				expect(b.fields.slow).toStartWith("unknown thinking level");
-				expect(ghCalls).toEqual([]);
+				// The parent-blob read ran (spec step 3, before validation); no write did.
+				expect(ghCalls).toEqual([
+					[
+						"api",
+						`repos/o/data/contents/user/omp/agent/config.yml?ref=${BASE}`,
+					],
+				]);
 			});
 
 			test("a save commits only the changed value line on top of the loaded commit", async () => {
@@ -7098,6 +7136,10 @@ cycleOrder:
 				});
 				expect(head).toBe(want);
 				expect(ghCalls).toEqual([
+					[
+						"api",
+						`repos/o/data/contents/user/omp/agent/config.yml?ref=${BASE}`,
+					],
 					["api", `repos/o/data/git/commits/${BASE}`],
 					[
 						"api",
@@ -7678,7 +7720,13 @@ cycleOrder:
 						fallbackFields: Record<string, string>;
 					};
 					expect(Object.keys(b.fallbackFields)).toEqual(Object.keys(fallbacks));
-					expect(ghCalls).toEqual([]);
+					// The parent-blob read ran (spec step 3, before validation); no write did.
+					expect(ghCalls).toEqual([
+						[
+							"api",
+							`repos/o/data/contents/user/omp/agent/config.yml?ref=${BASE}`,
+						],
+					]);
 					expect(head).toBe(CHAINS);
 				}
 				loadChains();
@@ -7722,6 +7770,197 @@ cycleOrder:
 					},
 				});
 				expect(ghCalls).toEqual([]);
+			});
+
+			test("a pinned data repository refuses a save whose alate source names another repo", async () => {
+				reset();
+				expect((await m.call("/api/alate", { repo: "o/other" })).status).toBe(
+					200,
+				);
+				const res = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5" },
+				});
+				expect(res.status).toBe(409);
+				expect(await res.json()).toEqual({
+					error:
+						"alate's data source does not match the pinned data repository o/other; check Settings → Alate",
+				});
+				expect(ghCalls).toEqual([]);
+				expect((await m.call("/api/alate", { repo: "" })).status).toBe(200);
+			});
+
+			test("a pinned data repository accepts a matching source and writes", async () => {
+				reset();
+				expect((await m.call("/api/alate", { repo: "o/data" })).status).toBe(
+					200,
+				);
+				const res = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5:high" },
+				});
+				expect(res.status).toBe(200);
+				// The parent-blob read sits before the parent commit read.
+				expect(ghCalls[0]).toEqual([
+					"api",
+					`repos/o/data/contents/user/omp/agent/config.yml?ref=${BASE}`,
+				]);
+				expect((await m.call("/api/alate", { repo: "" })).status).toBe(200);
+			});
+
+			test("a pinned data repository refuses a path source", async () => {
+				reset();
+				pathMode = true;
+				expect((await m.call("/api/alate", { repo: "o/data" })).status).toBe(
+					200,
+				);
+				const res = await m.call("/api/model-roles", {
+					base: null,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5" },
+				});
+				expect(res.status).toBe(409);
+				expect(puts).toEqual([]);
+				expect(ghCalls).toEqual([]);
+				expect((await m.call("/api/alate", { repo: "" })).status).toBe(200);
+			});
+
+			test("a pinned branch refuses a save whose source names another branch", async () => {
+				reset();
+				expect((await m.call("/api/alate", { branch: "live" })).status).toBe(
+					200,
+				);
+				const res = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5:high" },
+				});
+				expect(res.status).toBe(409);
+				expect(await res.json()).toMatchObject({
+					error: "the data repo branch is main, but the pinned branch is live",
+				});
+				// The refusal is a pin mismatch, not a moved-branch conflict: no write ran.
+				expect(
+					ghCalls.filter((a) => (a[1] ?? "").startsWith("repos/o/data/git/")),
+				).toEqual([]);
+				expect((await m.call("/api/alate", { branch: "" })).status).toBe(200);
+			});
+
+			test("a pinned branch compares the resolved default branch when the source names none", async () => {
+				reset();
+				repoRef = "";
+				expect((await m.call("/api/alate", { branch: "live" })).status).toBe(
+					200,
+				);
+				const refused = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5:high" },
+				});
+				expect(refused.status).toBe(409);
+				expect(await refused.json()).toMatchObject({
+					error: "the data repo branch is main, but the pinned branch is live",
+				});
+				// The parent-blob read ran first (spec step 3), then only the
+				// default-branch read; no tree, commit or ref write.
+				expect(ghCalls).toEqual([
+					[
+						"api",
+						`repos/o/data/contents/user/omp/agent/config.yml?ref=${BASE}`,
+					],
+					["api", "repos/o/data"],
+				]);
+				expect((await m.call("/api/alate", { branch: "main" })).status).toBe(
+					200,
+				);
+				const saved = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5:high" },
+				});
+				expect(saved.status).toBe(200);
+				expect((await m.call("/api/alate", { branch: "" })).status).toBe(200);
+			});
+
+			test("a snapshot whose bytes differ from the parent commit's blob gives 409 with the commit's values", async () => {
+				reset();
+				blobs[BASE] = ORIGINAL.replace(
+					"zai/glm-5.3-flash:max",
+					"zai/glm-5.3-flash",
+				);
+				const res = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5:high" },
+				});
+				expect(res.status).toBe(409);
+				expect(await res.json()).toEqual({
+					error:
+						"alate's snapshot does not match the data repo at the loaded commit; check the current roles and save again",
+					base: BASE,
+					hash: sha(blobs[BASE]),
+					roles: {
+						default: "zai/glm-5.3-flash",
+						slow: "anthropic/claude-opus-5-5:medium",
+					},
+					fallbacks: {},
+				});
+				expect(
+					ghCalls.filter((a) => (a[1] ?? "").startsWith("repos/o/data/git/")),
+				).toEqual([]);
+			});
+
+			test("a missing config blob at the loaded commit gives 409 without values", async () => {
+				reset();
+				blobMissing = true;
+				const res = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5:high" },
+				});
+				expect(res.status).toBe(409);
+				expect(await res.json()).toEqual({
+					error:
+						"the data repo has no config.yml at the loaded commit; re-import in alate and load the roles again",
+				});
+				expect(
+					ghCalls.filter((a) => (a[1] ?? "").startsWith("repos/o/data/git/")),
+				).toEqual([]);
+			});
+
+			test("an invalid pinned repo or branch is refused with 400 and pins persist", async () => {
+				reset();
+				expect((await m.call("/api/alate", { repo: "no-slash" })).status).toBe(
+					400,
+				);
+				expect((await m.call("/api/alate", { branch: "a..b" })).status).toBe(
+					400,
+				);
+				const cfg = (await (await m.call("/api/alate")).json()) as {
+					repo: string | null;
+					branch: string | null;
+				};
+				expect(cfg.repo).toBeNull();
+				expect(cfg.branch).toBeNull();
+				expect(
+					(await m.call("/api/alate", { repo: "o/data", branch: "main" }))
+						.status,
+				).toBe(200);
+				const pinned = (await (await m.call("/api/alate")).json()) as {
+					repo: string | null;
+					branch: string | null;
+				};
+				expect(pinned).toMatchObject({ repo: "o/data", branch: "main" });
+				expect(
+					(await m.call("/api/alate", { repo: "", branch: "" })).status,
+				).toBe(200);
+				const cleared = (await (await m.call("/api/alate")).json()) as {
+					repo: string | null;
+					branch: string | null;
+				};
+				expect(cleared).toMatchObject({ repo: null, branch: null });
 			});
 		};
 	})(),

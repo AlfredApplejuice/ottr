@@ -142,7 +142,7 @@ export async function alateHealth(
 
 export type AlateOut<T> =
 	| { ok: true; body: T }
-	| { ok: false; status: number; error: string };
+	| { ok: false; status: number; error: string; pinMismatch?: true };
 function outError(
 	body: Record<string, unknown> | null,
 	status: number,
@@ -357,9 +357,9 @@ export async function ensureAlateProjectsRoot(
 export const CONFIG_YML = "user/omp/agent/config.yml";
 // Alate's source fields reach gh api paths: only plain names, hex commits and safe branches.
 // GitHub owners hold no dots, and a repo is never "." or "..": no segment can climb the path.
-const REPO_NAME = /^[A-Za-z0-9-]+\/(?!\.\.?$)[A-Za-z0-9_.-]+$/;
+export const REPO_NAME = /^[A-Za-z0-9-]+\/(?!\.\.?$)[A-Za-z0-9_.-]+$/;
 const SHA = /^[0-9a-f]{40}$/;
-const BRANCH = /^(?!.*\.\.)[A-Za-z0-9._/-]+$/;
+export const BRANCH = /^(?!.*\.\.)[A-Za-z0-9._/-]+$/;
 /** The data repo's omp config.yml from alate's last import. */
 export async function readConfigYml(
 	alate: Alate,
@@ -519,14 +519,43 @@ export async function ghApi(
 				error: "GitHub returned an invalid response",
 			};
 }
+/** The data repo's config.yml bytes at `base`, decoded from the contents API. `null` bytes
+ *  mean GitHub holds no such file at that ref (a 404): the caller fails the save closed.
+ *  A blob above the contents API's inline size answers no content, which also fails closed. */
+export async function configBlobAt(
+	gh: GhFn,
+	repo: { name: string },
+	base: string,
+): Promise<AlateOut<{ bytes: Uint8Array | null }>> {
+	const at = await ghApi(gh, [
+		`repos/${repo.name}/contents/${CONFIG_YML}?ref=${base}`,
+	]);
+	if (!at.ok) {
+		if (/not found/i.test(at.error)) return { ok: true, body: { bytes: null } };
+		return at;
+	}
+	if (typeof at.body.content !== "string")
+		return {
+			ok: false,
+			status: 502,
+			error: "GitHub returned an invalid response",
+		};
+	return {
+		ok: true,
+		body: { bytes: new Uint8Array(Buffer.from(at.body.content, "base64")) },
+	};
+}
 /** Commits config.yml with `base` as its parent and moves the branch only as a fast-forward
- *  (`force: false`): a branch that moved since `base` gives 409, never a force push. */
+ *  (`force: false`): a branch that moved since `base` gives 409, never a force push.
+ *  `expectBranch` pins the write branch: after the branch resolves (Alate's ref, else the
+ *  repo's default), a mismatch gives 409 before the first write call. */
 export async function commitConfigYml(
 	gh: GhFn,
 	repo: { name: string; ref: string },
 	base: string,
 	content: string,
 	message: string,
+	expectBranch?: string,
 ): Promise<AlateOut<{ commit: string }>> {
 	const bad = {
 		ok: false,
@@ -547,6 +576,15 @@ export async function commitConfigYml(
 			ok: false,
 			status: 502,
 			error: `invalid data repo branch: ${branch.slice(0, 100)}`,
+		};
+	if (expectBranch !== undefined && branch !== expectBranch)
+		return {
+			ok: false,
+			status: 409,
+			// The caller must not treat this as a moved-branch conflict: the ref
+			// never moved, so there is nothing to re-import.
+			error: `the data repo branch is ${branch.slice(0, 100)}, but the pinned branch is ${expectBranch}`,
+			pinMismatch: true,
 		};
 	const parent = await ghApi(gh, [`repos/${repo.name}/git/commits/${base}`]);
 	if (!parent.ok) return parent;

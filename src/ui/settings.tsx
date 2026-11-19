@@ -7409,6 +7409,8 @@ export function AlateSection() {
 	const [keySet, setKeySet] = useState(false);
 	const [keyReadable, setKeyReadable] = useState(true);
 	const [key, setKey] = useState("");
+	const [repo, setRepo] = useState("");
+	const [branch, setBranch] = useState("");
 	const [lastErr, setLastErr] = useState<string | null>(null);
 	const [saved, flashSaved] = useFlash(1500);
 	const [error, setError] = useState<string | null>(null);
@@ -7593,6 +7595,8 @@ export function AlateSection() {
 					keySet: boolean;
 					keyReadable: boolean;
 					lastProvisionError: string | null;
+					repo: string | null;
+					branch: string | null;
 				}>(res),
 			)
 			.then((cfg) => {
@@ -7601,6 +7605,8 @@ export function AlateSection() {
 				setConn(cfg.url ?? "");
 				setKeySet(cfg.keySet);
 				setKeyReadable(cfg.keyReadable);
+				setRepo(cfg.repo ?? "");
+				setBranch(cfg.branch ?? "");
 				setLoaded(true);
 				setLastErr(cfg.lastProvisionError);
 				loadHealth(cfg.url ?? "", () => live);
@@ -7620,16 +7626,27 @@ export function AlateSection() {
 			if (url.trim() !== "") body.url = url.trim();
 			const k = key.trim();
 			if (k !== "") body.key = k;
+			// The pin saves only once loaded: an empty field is then an explicit
+			// clear (unpin). Before the GET answers, omit both, so an early save
+			// cannot clear a pin it has not seen.
+			if (loaded) {
+				body.repo = repo.trim();
+				body.branch = branch.trim();
+			}
 			const cfg = await post<{
 				url: string | null;
 				keySet: boolean;
 				keyReadable: boolean;
 				lastProvisionError: string | null;
+				repo: string | null;
+				branch: string | null;
 			}>("/api/alate", body);
 			setUrl(cfg.url ?? "");
 			setConn(cfg.url ?? "");
 			setKeySet(cfg.keySet);
 			setKeyReadable(cfg.keyReadable);
+			setRepo(cfg.repo ?? "");
+			setBranch(cfg.branch ?? "");
 			setLastErr(cfg.lastProvisionError);
 			loadHealth(cfg.url ?? "");
 			setKey("");
@@ -7776,6 +7793,52 @@ export function AlateSection() {
 							onRegenerate={regenerateKey}
 						/>
 					)}
+					<div className="alate-def-row" data-setting-key="repo">
+						<div className="alate-def-name">
+							<b>
+								Data repository
+								<Help
+									label="Data repository"
+									text="The GitHub repository (owner/name) that model-role saves commit to. When set, a save fails when alate's data source names another repository. Empty keeps alate's source as the target."
+								/>
+								<span className="opt-mark">(optional)</span>
+							</b>
+							<code>owner/name</code>
+						</div>
+						<label>
+							<input
+								type="text"
+								value={repo}
+								onChange={(e) => setRepo(e.target.value)}
+								spellCheck={false}
+								placeholder="owner/name"
+								aria-label="Data repository"
+							/>
+						</label>
+					</div>
+					<div className="alate-def-row" data-setting-key="branch">
+						<div className="alate-def-name">
+							<b>
+								Data branch
+								<Help
+									label="Data branch"
+									text="The branch that model-role saves commit to. When set, a save fails when the write branch resolves elsewhere. Empty uses the branch alate reports, or the repository's default branch."
+								/>
+								<span className="opt-mark">(optional)</span>
+							</b>
+							<code>ref name</code>
+						</div>
+						<label>
+							<input
+								type="text"
+								value={branch}
+								onChange={(e) => setBranch(e.target.value)}
+								spellCheck={false}
+								placeholder="main"
+								aria-label="Data branch"
+							/>
+						</label>
+					</div>
 				</div>
 				<AlateActions
 					saved={saved}
