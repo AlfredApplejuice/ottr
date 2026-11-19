@@ -25,6 +25,10 @@ docker compose build
 docker compose up -d
 ```
 
+Use Docker Compose ≥ 2.20.0, including as the external provider for `podman compose`:
+the optional Alate dependency uses `depends_on.required: false`. Check the selected
+provider with `podman compose version`; see [Podman setup](install.md#podman).
+
 Source builds support Linux amd64 and arm64 and use the build host's architecture
 by default: arm64 on an ARM MacBook, amd64 on an amd64 host. The target Debian
 image selects each tool's filename and pinned checksum; no build argument is
@@ -846,10 +850,9 @@ real podman.
   board reads the two values only while **Settings -> Alate** holds no URL or
   key, and a value saved there wins at every boot. Set both in the env file,
   for example `ALATE_URL=http://alate:4570` and a random `ALATE_API_KEY` (32
-  hex bytes); the alate container itself requires the same key. The self-hosted
-  startup banner prints the Compose key at the operator's request; keep those
-  logs private. The runner still strips it from every turn's env, since no turn
-  calls alate. Compose waits for the bundled service's `/health` before starting
+  hex bytes); the alate container itself requires the same key. The board
+  never logs the key, and the runner strips it from every turn's env, since
+  no turn calls alate. Compose waits for the bundled service's `/health` before starting
   the board. A user whose Alate server already runs on another host
   omits the profile and saves the URL and key under **Settings -> Alate**.
   The service also mounts the stack's `workspace` volume at `/workspace`

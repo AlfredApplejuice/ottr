@@ -210,21 +210,21 @@ RUN case "$(dpkg --print-architecture)" in \
 
 # Regression check: emulation must not hide a wrong-architecture tool archive.
 # Chrome's libraries are project packages, so inspect ELF without launching Chrome.
-RUN python3 - <<'PY'
-import struct
-import subprocess
-
-arch = subprocess.check_output(["dpkg", "--print-architecture"], text=True).strip()
-expected = {"amd64": 62, "arm64": 183}[arch]
-for path in ("/usr/local/bin/rtk", "/usr/local/bin/ripwire", "/usr/local/bin/gitleaks",
-             "/usr/local/bin/gh", "/usr/local/bin/buildctl", "/usr/local/bin/node",
-             "/opt/google/chrome/chrome"):
-    with open(path, "rb") as binary:
-        header = binary.read(20)
-    assert header[:4] == b"\x7fELF" and header[5] == 1, f"{path}: not little-endian ELF"
-    assert struct.unpack_from("<H", header, 18)[0] == expected, f"{path}: not {arch}"
-print(f"Worker tools verified: {arch}")
-PY
+# Use ordinary RUN syntax so Podman/Buildah needs no Dockerfile heredoc support.
+RUN python3 -c "$(printf '%s\n' \
+    'import struct' \
+    'import subprocess' \
+    '' \
+    'arch = subprocess.check_output(["dpkg", "--print-architecture"], text=True).strip()' \
+    'expected = {"amd64": 62, "arm64": 183}[arch]' \
+    'for path in ("/usr/local/bin/rtk", "/usr/local/bin/ripwire", "/usr/local/bin/gitleaks",' \
+    '             "/usr/local/bin/gh", "/usr/local/bin/buildctl", "/usr/local/bin/node",' \
+    '             "/opt/google/chrome/chrome"):' \
+    '    with open(path, "rb") as binary:' \
+    '        header = binary.read(20)' \
+    '    assert header[:4] == b"\x7fELF" and header[5] == 1, f"{path}: not little-endian ELF"' \
+    '    assert struct.unpack_from("<H", header, 18)[0] == expected, f"{path}: not {arch}"' \
+    'print(f"Worker tools verified: {arch}")')"
 
 # The pinned agent-browser doctor finds Chrome by its standard PATH name.
 RUN bun install -g --ignore-scripts --minimum-release-age 604800 "agent-browser@${AGENT_BROWSER_VERSION}" \
