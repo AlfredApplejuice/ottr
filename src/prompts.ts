@@ -358,7 +358,10 @@ export function workCheckPrompt(o: {
 	report: string;
 	/** The ready report the first check judged, on a re-check: the original result this update changes. */
 	originalReport?: string;
-	transcriptPath: string;
+	/** The transcript path when the server read the transcript below its trusted anchor;
+	 * undefined when it is missing or refused, so the check never gets a worker-writable
+	 * path to follow (OTTR-989). */
+	transcriptPath?: string;
 	earlier: { id: number; finding: string; quote: string }[];
 	replies: string[];
 }): string {
@@ -416,9 +419,11 @@ ${
 		: `Diff of the branch (may be cut at the end; read files in the worktree for the rest):`
 }
 
-${o.diff}
-
-Work transcript of the agent (evidence for claimed runs only — verify fabricated-actions claims here; can be large; read it in ranges): ${o.transcriptPath}`;
+${o.diff}${
+	o.transcriptPath === undefined
+		? ""
+		: `\n\nWork transcript of the agent (evidence for claimed runs only — verify fabricated-actions claims here; can be large; read it in ranges): ${o.transcriptPath}`
+}`;
 }
 
 /** First words of every workCheckSendBack text; turn.ts tells tracker send-backs from human

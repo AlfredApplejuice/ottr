@@ -20567,7 +20567,8 @@ describe("turn survivor round 5 — work card to merging", () => {
 
 		const prompt = checkPrompts(record)[0]!.prompt;
 		expect(prompt).toContain("Diff of only the new commits");
-		expect(prompt).toContain("\n\nconst y = 2;\n\n");
+		// No transcript rode: the new-commits diff is the prompt's last section.
+		expect(prompt.endsWith("\n\nconst y = 2;\n")).toBe(true);
 		expect(prompt).not.toContain("const x = 1;\nconst y = 2;");
 	});
 
@@ -20632,6 +20633,38 @@ describe("turn survivor round 5 — work card to merging", () => {
 		expect(after.workCheckSendbacks).toBe(1);
 	});
 
+	test.skipIf(process.platform !== "linux")(
+		"a planted transcript symlink is refused: its quote demotes and the prompt holds no path",
+		async () => {
+			const { store, record, loop } = await checkCase([
+				verdict({
+					blockers: [
+						{ finding: "claims tests ran", quote: "bun test: 12 pass" },
+					],
+				}),
+			]);
+			// The work turn planted the transcript path as a symlink (OTTR-989): the
+			// read refuses it, so the check oracle never holds the target's text and
+			// the checker gets no path to follow.
+			mkdirSync(store.sessionsDir, { recursive: true });
+			const outside = join(store.path, "server-only.txt");
+			writeFileSync(outside, '{"text":"bun test: 12 pass"}\n');
+			const transcript = join(store.sessionsDir, "1_sess-1.jsonl");
+			symlinkSync(outside, transcript);
+			const task = await store.createTask("work please");
+			await loop.runTurn(store.name, task.id);
+
+			const prompt = checkPrompts(record)[0]!.prompt;
+			expect(prompt).not.toContain("read it in ranges");
+			expect(prompt).not.toContain(transcript);
+			expect(await logText(store, task.id)).toContain("refusing");
+			const after = (await store.getTask(task.id))!;
+			expect(after.stage).toBe("merging");
+			expect(after.workCheckLog[0]!.outcome).toBe("pass");
+			expect(after.workCheckLog[0]!.notes[0]).toContain("claims tests ran");
+		},
+	);
+
 	test("with no diff and no transcript every quote demotes and the prompt holds neither", async () => {
 		const { store, record, loop } = await checkCase(
 			[verdict({ blockers: [{ finding: "looks wrong", quote: "here" }] })],
@@ -20641,10 +20674,11 @@ describe("turn survivor round 5 — work card to merging", () => {
 		await loop.runTurn(store.name, task.id);
 
 		const prompt = checkPrompts(record)[0]!.prompt;
-		expect(prompt).toContain(
-			"read files in the worktree for the rest):\n\n\n\n",
-		);
-		expect(prompt.endsWith("read it in ranges): ")).toBe(true);
+		expect(
+			prompt.endsWith("read files in the worktree for the rest):\n\n"),
+		).toBe(true);
+		// No transcript on disk: the prompt names no transcript path to follow.
+		expect(prompt).not.toContain("read it in ranges");
 		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.workCheckLog[0]!.outcome).toBe("pass");

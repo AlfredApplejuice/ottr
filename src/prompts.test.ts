@@ -701,6 +701,13 @@ describe("workCheckPrompt", () => {
 		expect(prompt).not.toContain("Human messages to the work agent");
 	});
 
+	test("a check with no readable transcript names no transcript path", () => {
+		const prompt = workCheckPrompt({ ...input, transcriptPath: undefined });
+		expect(prompt).not.toContain("read it in ranges");
+		expect(prompt).not.toContain("/data/sessions/123_sess.jsonl");
+		expect(prompt.endsWith("diff --git a/src/w.ts b/src/w.ts")).toBe(true);
+	});
+
 	test("a re-check numbers the earlier blockers and demands per-blocker confirmations", () => {
 		const prompt = workCheckPrompt({
 			...input,

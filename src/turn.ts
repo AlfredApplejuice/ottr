@@ -1294,6 +1294,8 @@ const MERGE_PUSH_RETRIES = 2;
 const MERGE_PUSH_RETRY_WAIT_MS = 30_000;
 // ponytail: a fixed cap on the archived research report; raise it when a real report hits it.
 const REPORT_MAX_BYTES = 4 * 1024 * 1024;
+// ponytail: a fixed cap on the work check's transcript read; raise it when a real transcript hits it.
+const TRANSCRIPT_MAX_BYTES = 128 * 1024 * 1024;
 /** The park reason of a stopped turn (the board's Esc). */
 const TURN_STOPPED_REASON =
 	"Turn stopped. Reply to continue the session, Resume to rerun it, or cancel the card.";
@@ -10924,10 +10926,22 @@ export function createTurnLoop(
 		const transcriptPath =
 			sessionFile(st.store.sessionsDir, st.result.sessionId) ?? "";
 		let transcriptText = "";
-		try {
-			transcriptText = readRegular(transcriptPath).toString("utf8");
-		} catch {
-			// No transcript file on disk: the check works from the diff alone.
+		if (transcriptPath !== "") {
+			try {
+				// Below the data root, no symlink followed: the sessions dir is
+				// worker-writable (OTTR-989), and a planted symlink at the transcript
+				// path must not feed a server-only file to the quote oracle.
+				transcriptText =
+					readBelow(
+						st.store.dataRoot,
+						resolve(transcriptPath),
+						TRANSCRIPT_MAX_BYTES,
+					)?.toString("utf8") ?? "";
+			} catch (err) {
+				// A refused transcript (a planted symlink, a FIFO, oversized): the
+				// check works from the diff alone, and the checker gets no path.
+				await st.log(`! transcript: ${errmsg(err)}`);
+			}
 		}
 		// The ready report of the run being checked; on a re-check the report the
 		// first completed check judged rides along as the original result.
@@ -10941,7 +10955,7 @@ export function createTurnLoop(
 			sincePreviousCheck,
 			report: readyReport,
 			originalReport: cur.workCheckReport ?? undefined,
-			transcriptPath,
+			transcriptPath: transcriptText === "" ? undefined : transcriptPath,
 			earlier: open.map((b, i) => ({
 				id: i + 1,
 				finding: b.finding,
