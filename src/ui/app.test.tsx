@@ -11452,7 +11452,9 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			expect(box("Dependabot warning").checked).toBe(true);
 			expect(box("Approve when no blocking issues remain").disabled).toBe(true);
 			await set(box("PR reviews"), true);
-			expect(box("Approve when no blocking issues remain").disabled).toBe(false);
+			expect(box("Approve when no blocking issues remain").disabled).toBe(
+				false,
+			);
 			await set(box("Approve when no blocking issues remain"), true);
 			await set(box("Issue watch"), true);
 			await set(box("Trending scout"), true);
