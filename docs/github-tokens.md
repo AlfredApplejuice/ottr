@@ -16,7 +16,7 @@ Use a fine-grained personal access token:
 | Contents: Read and write | clone, fetch, merge pushes, releases, and the Alate data-repo `config.yml` commit |
 | Pull requests: Read and write | Dependabot/PR watch cards, posting PR reviews |
 | Issues: Read and write | Issue watch: reading new issues and adding the `ottr-tracked` label |
-| Actions: Read and write | CI watch after merges; **Re-run failed jobs** on a card whose text links a run |
+| Actions: Read and write | CI watch after merges; **Re-run failed jobs** on a card whose text links a run in the project's own repository |
 | Workflows: Read and write | only if tasks may change `.github/workflows` files; without it, a push that touches a workflow file fails |
 | Administration: Read and write | only for **Add project → New** with a GitHub repo (`gh repo create`); the repo is created under your user account, not an org |
 

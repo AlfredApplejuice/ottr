@@ -20391,11 +20391,13 @@ describe("POST /api/projects/:project/tasks/:id/rerun-failed-jobs", () => {
 	const RUN_URL = "https://github.com/ottr-ai/ottr/actions/runs/42313545100";
 
 	/** A fresh app with one project "ci" and a task whose text links a run; saves the
-	 * board token through the settings route (the probe stub keeps it off the network). */
+	 * board token through the settings route (the probe stub keeps it off the network).
+	 * `github` is the project's GitHub remote; null models a project with no remote. */
 	const setup = async (
 		fetchStub?: typeof fetch,
 		prompt = `Fix CI\n${RUN_URL}`,
 		saveToken = true,
+		github: string | null = "https://github.com/ottr-ai/ottr",
 	) => {
 		const dir = mkdtempSync(join(root, "rerun-"));
 		const store = await ProjectStore.open(dir);
@@ -20406,7 +20408,7 @@ describe("POST /api/projects/:project/tasks/:id/rerun-failed-jobs", () => {
 			store,
 			target: null,
 			gitless: false,
-			github: null,
+			github,
 			protectedTarget: false,
 			remote: null,
 			dirty: false,
@@ -20527,6 +20529,73 @@ describe("POST /api/projects/:project/tasks/:id/rerun-failed-jobs", () => {
 		);
 		expect(res.status).toBe(400);
 		expect(await errorOf(res)).toBe("no GitHub Actions run link on this card");
+	});
+
+	test("a card linking another repository's run is a 400 with no fetch", async () => {
+		const calls: { url: string; init?: RequestInit }[] = [];
+		const stub = (async (url: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({ url: String(url), init });
+			return new Response(null, { status: 201 });
+		}) as unknown as typeof fetch;
+		const { m, task } = await setup(
+			stub,
+			"See https://github.com/octocat/other/actions/runs/777",
+		);
+		const res = await m.call(
+			`/api/projects/ci/tasks/${task.id}/rerun-failed-jobs`,
+			undefined,
+			{ method: "POST" },
+		);
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			"this card links a run in octocat/other, not the project's repository ottr-ai/ottr",
+		);
+		expect(calls).toHaveLength(0);
+	});
+
+	test("a project with no GitHub repository is a 409 with no fetch", async () => {
+		const calls: { url: string; init?: RequestInit }[] = [];
+		const stub = (async (url: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({ url: String(url), init });
+			return new Response(null, { status: 201 });
+		}) as unknown as typeof fetch;
+		const { m, task } = await setup(stub, undefined, true, null);
+		const res = await m.call(
+			`/api/projects/ci/tasks/${task.id}/rerun-failed-jobs`,
+			undefined,
+			{ method: "POST" },
+		);
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe(
+			"this project has no GitHub repository to re-run in",
+		);
+		expect(calls).toHaveLength(0);
+	});
+
+	test("the repository binding ignores case and the .git suffix", async () => {
+		const calls: { url: string; init?: RequestInit }[] = [];
+		const stub = (async (url: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({ url: String(url), init });
+			return new Response(
+				JSON.stringify({ message: "Requested", url: RUN_URL }),
+				{ status: 201 },
+			);
+		}) as unknown as typeof fetch;
+		const { m, task } = await setup(
+			stub,
+			undefined,
+			true,
+			"https://github.com/Ottr-AI/Ottr.git",
+		);
+		const res = await m.call(
+			`/api/projects/ci/tasks/${task.id}/rerun-failed-jobs`,
+			undefined,
+			{ method: "POST" },
+		);
+		expect(res.status).toBe(200);
+		expect(calls[0]!.url).toBe(
+			"https://api.github.com/repos/ottr-ai/ottr/actions/runs/42313545100/rerun-failed-jobs",
+		);
 	});
 
 	test("no board token at all is a 400", async () => {

@@ -11290,7 +11290,16 @@ export async function createApp(deps: AppDeps) {
 	): Promise<Response> {
 		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
-		const { task } = found;
+		const { e, task } = found;
+		// OTTR-1005: card text is external input and never picks the target of a
+		// GH_TOKEN-authorized write. The run must live in the project's own
+		// repository; owner/repo compares case-insensitively, `.git` ignored.
+		const repo = e.github === null ? null : ownerRepo(e.github);
+		if (repo === null)
+			return json(
+				{ error: "this project has no GitHub repository to re-run in" },
+				409,
+			);
 		const token = process.env.GH_TOKEN;
 		if (!token)
 			return json(
@@ -11309,6 +11318,13 @@ export async function createApp(deps: AppDeps) {
 		);
 		if (!match)
 			return json({ error: "no GitHub Actions run link on this card" }, 400);
+		if (`${match[1]}/${match[2]}`.toLowerCase() !== repo.toLowerCase())
+			return json(
+				{
+					error: `this card links a run in ${match[1]}/${match[2]}, not the project's repository ${repo}`,
+				},
+				400,
+			);
 		const url = `https://github.com/${match[1]}/${match[2]}/actions/runs/${match[3]}`;
 		const done = await rerunApiCall(token, match);
 		if (done.status !== 200) return done;

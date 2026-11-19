@@ -12721,10 +12721,16 @@ function DrawerActions(p: {
 							Merge anyway
 						</button>
 					)}
-				{/* OTTR-604: cards whose text links a GitHub Actions run offer a
-						    re-run of that run's failed jobs; errors surface inline. */}
+				{/* OTTR-604: cards whose text links a GitHub Actions run of the
+					    project's own repository offer a re-run of that run's failed
+					    jobs; the title names the run, errors surface inline. */}
 				{rerunUrl !== null && !cancelled && (
-					<BusyButton run={rerunFailedJobs}>Re-run failed jobs</BusyButton>
+					<BusyButton
+						title={`Re-runs the failed jobs of ${rerunUrl}`}
+						run={rerunFailedJobs}
+					>
+						Re-run failed jobs
+					</BusyButton>
 				)}
 				{/* A cancelled card is final: its drawer is read-only, so the delete
 						    action goes too (an uncancel does not exist). */}
@@ -13686,10 +13692,13 @@ export function Drawer({
 	const [triageReason, setTriageReason] = useState("");
 	const [triageError, setTriageError] = useState<string | null>(null);
 	const triageSave = useBusy();
-	// OTTR-604 re-run failed jobs: the action exists only while the card's text
-	// links a GitHub Actions run; a cancelled card's drawer is read-only, so no
-	// action there either. The server's error string names the missing scope.
-	const rerunUrl = ciRunUrl(
+	// OTTR-604 re-run failed jobs. OTTR-1005 binds the target: the action exists
+	// only while the card's text links a GitHub Actions run in this project's
+	// repository (owner/repo compared case-insensitively, `.git` ignored, the
+	// same rule the server enforces), and a project with no GitHub remote has no
+	// target at all. The button title names the exact run it re-runs.
+	const projectRepo = project.github === null ? null : repoSlug(project.github);
+	const linkedRun = ciRunUrl(
 		[
 			task.prompt,
 			task.needsReason ?? "",
@@ -13697,6 +13706,16 @@ export function Drawer({
 			detail?.details ?? "",
 		].join("\n"),
 	);
+	const rerunUrl =
+		linkedRun !== null &&
+		projectRepo !== null &&
+		linkedRun
+			.toLowerCase()
+			.startsWith(
+				`https://github.com/${projectRepo.toLowerCase()}/actions/runs/`,
+			)
+			? linkedRun
+			: null;
 	const [rerunError, setRerunError] = useState<string | null>(null);
 	const [rerunDone, setRerunDone] = useState(false);
 	// A new card's drawer starts without the previous card's re-run status or error.

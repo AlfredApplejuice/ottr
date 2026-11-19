@@ -13057,7 +13057,7 @@ describe("Optimistic taps (client)", () => {
 describe("Drawer re-run failed jobs action", () => {
 	const project = {
 		name: "proj",
-		github: null,
+		github: "https://github.com/ottr-ai/ottr",
 		hasRules: true,
 		sessionsDir: "/tmp/proj/.tasks/sessions",
 		settings: {},
@@ -13143,7 +13143,8 @@ describe("Drawer re-run failed jobs action", () => {
 	};
 
 	/** Renders a drawer for `card` under a fetch stub; the stub records the
-	 * rerun POSTs and answers them with `rerun`, everything else with 404. */
+	 * rerun POSTs and answers them with `rerun`, everything else with 404.
+	 * `projectView` overrides the suite's project fixture (OTTR-1005 binding cases). */
 	const withRoot = async (
 		card: TaskCard,
 		rerun: { status: number; body: unknown },
@@ -13152,6 +13153,7 @@ describe("Drawer re-run failed jobs action", () => {
 			container: HTMLDivElement;
 			root: ReturnType<typeof createRoot>;
 		}) => Promise<void>,
+		projectView: ProjectView = project,
 	): Promise<void> => {
 		const posts: { url: string; body: unknown }[] = [];
 		const realFetch = globalThis.fetch;
@@ -13183,7 +13185,7 @@ describe("Drawer re-run failed jobs action", () => {
 		const root = createRoot(container);
 		try {
 			await act(async () => {
-				root.render(<Drawer {...base} task={card} />);
+				root.render(<Drawer {...base} task={card} project={projectView} />);
 			});
 			// One more act lets the detail fetch land before the run callback queries.
 			await act(async () => {});
@@ -13288,6 +13290,37 @@ describe("Drawer re-run failed jobs action", () => {
 			async ({ container }) => {
 				expect(container.textContent).not.toContain("Re-run failed jobs");
 			},
+		);
+	});
+
+	test("a card linking another repository's run renders no button", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			prompt:
+				"See https://github.com/octocat/other/actions/runs/777 — same failure shape",
+		}) as TaskCard;
+		await withRoot(
+			card,
+			{ status: 200, body: { ok: true, url: "" } },
+			async ({ container }) => {
+				expect(container.textContent).not.toContain("Re-run failed jobs");
+			},
+		);
+	});
+
+	test("a project with no GitHub repository renders no button even on a project-repo link", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			prompt:
+				"Fix the CI failure in https://github.com/ottr-ai/ottr/actions/runs/42313545100",
+		}) as TaskCard;
+		await withRoot(
+			card,
+			{ status: 200, body: { ok: true, url: "" } },
+			async ({ container }) => {
+				expect(container.textContent).not.toContain("Re-run failed jobs");
+			},
+			{ ...project, github: null } as unknown as ProjectView,
 		);
 	});
 });
