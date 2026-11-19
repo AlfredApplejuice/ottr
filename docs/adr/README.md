@@ -72,3 +72,4 @@ existing number plus one.
 | 0013 | PostgreSQL backend and async stores | accepted |
 | 0014 | The dependency license allowlist covers the mermaid tree | accepted |
 | 0015 | The microVM runner has a validation mode for audit target code | accepted |
+| 0016 | omp runs as a runtime layer behind a published verified list | proposed |
