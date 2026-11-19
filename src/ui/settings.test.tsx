@@ -1653,6 +1653,7 @@ describe("Project switch cards", () => {
 			prReviews: false,
 			prMode: false,
 			issueWatch: false,
+			codeScanWatch: false,
 			ompWatch: false,
 			dependabotWarn: true,
 			microVm: false,
@@ -1781,6 +1782,7 @@ describe("Project switch cards", () => {
 	test("a private repo marks fork research, PR reviews and issue watch", async () => {
 		expect(await taggedRows(json(200, { private: true }))).toEqual([
 			"Issue watch",
+			"Code scanning",
 			"PR reviews",
 			"Fork research",
 		]);
@@ -1803,6 +1805,7 @@ describe("PR reviews watch facts and Check PRs now", () => {
 			prReviews,
 			prMode: false,
 			issueWatch: false,
+			codeScanWatch: false,
 			ompWatch: false,
 			dependabotWarn: true,
 			microVm: false,
@@ -1832,6 +1835,7 @@ describe("PR reviews watch facts and Check PRs now", () => {
 			gitless: false,
 			archReview: null,
 			prWatch,
+			codeScanWatch: { lastPollAt: null, lastError: null, nextPollAt: null },
 			settings: settings(prReviews),
 		}) as unknown as ProjectView;
 
@@ -2016,6 +2020,229 @@ describe("PR reviews watch facts and Check PRs now", () => {
 	});
 });
 
+describe("Code scanning watch facts and Check alerts now", () => {
+	const settings = (codeScanWatch: boolean): ProjectView["settings"] =>
+		({
+			holdUpdateMerges: false,
+			retroSince: null,
+			retroFilter: false,
+			forkResearch: false,
+			trendingScout: false,
+			prReviews: false,
+			prMode: false,
+			issueWatch: false,
+			codeScanWatch,
+			ompWatch: false,
+			dependabotWarn: true,
+			microVm: false,
+			pushSyncCommits: false,
+			maxParallel: 2,
+			copyExtra: [],
+			displayName: null,
+			releaseCommand: null,
+			archReviewCap: 30,
+			maxImages: 4,
+			keptWorktreeDays: 7,
+			autoTend: false,
+			autoTendLimit: 5,
+			tendChurnGlobs: [],
+			setupChecklist: false,
+			targetBranch: null,
+			originUrl: null,
+		}) as unknown as ProjectView["settings"];
+
+	const project = (codeScanWatch: boolean, status: unknown): ProjectView =>
+		({
+			name: "proj",
+			icon: null,
+			remote: null,
+			github: "octo/repo",
+			vmRunner: { configured: false, ok: false, reason: "not set" },
+			hasRules: true,
+			gitless: false,
+			archReview: null,
+			prWatch: null,
+			codeScanWatch: status,
+			settings: settings(codeScanWatch),
+		}) as unknown as ProjectView;
+
+	const json = (status: number, body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status,
+			headers: { "Content-Type": "application/json" },
+		});
+
+	const watchRow = (container: Element): Element => {
+		const row = [
+			...container.querySelectorAll("#project-watches-section .check-row"),
+		].find((r) => r.querySelector("label")?.textContent === "Code scanning");
+		return row as Element;
+	};
+
+	const checkButton = (container: Element): HTMLButtonElement =>
+		Array.from(container.querySelectorAll("button")).find(
+			(b) => b.textContent?.trim() === "Check alerts now",
+		) as HTMLButtonElement;
+
+	/** Renders the form with the settings POST and the check route recorded; returns
+	 *  the container, the posted settings body, and the recorded check calls. The
+	 *  fetch stub answers the two mount calls, same as the PR reviews form. */
+	async function csForm(p: ProjectView): Promise<{
+		container: HTMLDivElement;
+		posted: { body: Record<string, unknown> | undefined };
+		checkCalls: { url: string; method: string }[];
+		unmount: () => Promise<void>;
+	}> {
+		const checkCalls: { url: string; method: string }[] = [];
+		const posted: { body: Record<string, unknown> | undefined } = {
+			body: undefined,
+		};
+		const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = String(input);
+			if (url.endsWith("/api/projects/proj/code-scanning/check")) {
+				checkCalls.push({ url, method: init?.method ?? "GET" });
+				return json(200, { ok: true });
+			}
+			if (
+				url.endsWith("/api/projects/proj/settings") &&
+				init?.method === "POST"
+			) {
+				posted.body = JSON.parse(String(init.body)) as Record<string, unknown>;
+				return json(200, p);
+			}
+			if (url.endsWith("/api/projects/proj/github/visibility"))
+				return json(200, { private: false });
+			if (url.endsWith("/api/projects/proj/ssh-key"))
+				return json(200, { own: null, expiresAt: null });
+			throw new Error(`unexpected fetch ${url}`);
+		}) as typeof fetch;
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchMock;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(
+				<ProjectSettingsForm
+					project={p}
+					tasks={[]}
+					trendingScan={true}
+					act={async (fn) => {
+						await fn();
+						return true;
+					}}
+					openTask={() => {}}
+				/>,
+			);
+		});
+		return {
+			container,
+			posted,
+			checkCalls,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+			},
+		};
+	}
+
+	const LAST = 1_730_634_000_000;
+	const NEXT = LAST + 3_600_000;
+	const OFF = { lastPollAt: null, lastError: null, nextPollAt: null };
+
+	test("the off row renders without check times and a disabled button", async () => {
+		const { container, unmount } = await csForm(project(false, OFF));
+		try {
+			const row = watchRow(container);
+			expect(row?.textContent).toContain(
+				"Code scanning is off: no checks run.",
+			);
+			expect(row?.textContent).not.toContain("Last check:");
+			expect(checkButton(container)?.disabled).toBe(true);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("toggling the row posts the setting on", async () => {
+		const { container, posted, unmount } = await csForm(project(false, OFF));
+		try {
+			const card = container.querySelector("#project-watches-section");
+			const label = [...(card?.querySelectorAll("label") ?? [])].find((l) =>
+				l.textContent?.includes("Code scanning"),
+			);
+			if (label === undefined) throw new Error("code scanning row missing");
+			const input = container.querySelector<HTMLInputElement>(
+				`input[id="${label.htmlFor}"]`,
+			);
+			if (input === null || input === undefined)
+				throw new Error("code scanning checkbox did not render");
+			expect(input.checked).toBe(false);
+			await act(async () => {
+				onChangeOf(input)({ target: { checked: true }, currentTarget: input });
+			});
+			expect(posted.body).not.toBeUndefined();
+			expect(posted.body?.codeScanWatch).toBe(true);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the on row shows the last and next check and an enabled button", async () => {
+		const { container, unmount } = await csForm(
+			project(true, { lastPollAt: LAST, lastError: null, nextPollAt: NEXT }),
+		);
+		try {
+			const row = watchRow(container);
+			expect(row.textContent).toContain(`Last check: ${stamp(LAST)}`);
+			expect(row.textContent).toContain(`Next regular check: ${stamp(NEXT)}`);
+			expect(checkButton(container)?.disabled).toBe(false);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a failed last check replaces the time with its reason", async () => {
+		const { container, unmount } = await csForm(
+			project(true, {
+				lastPollAt: LAST,
+				lastError: "GitHub answered 502",
+				nextPollAt: null,
+			}),
+		);
+		try {
+			expect(watchRow(container).textContent).toContain(
+				"Last check: Failed: GitHub answered 502",
+			);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("Check alerts now posts once and reports Check started", async () => {
+		const { container, checkCalls, unmount } = await csForm(
+			project(true, { lastPollAt: LAST, lastError: null, nextPollAt: NEXT }),
+		);
+		try {
+			await act(async () => checkButton(container).click());
+			expect(checkCalls).toEqual([
+				{ url: "/api/projects/proj/code-scanning/check", method: "POST" },
+			]);
+			const status = watchRow(container).querySelector(
+				'[id$="-desc"] [role="status"]',
+			);
+			expect(status?.textContent).toBe("Check started.");
+		} finally {
+			await unmount();
+		}
+	});
+});
+
 describe("Trending scout depends on the general weekly scan", () => {
 	const project = (trendingScout: boolean): ProjectView =>
 		({
@@ -2036,6 +2263,7 @@ describe("Trending scout depends on the general weekly scan", () => {
 				prReviews: false,
 				prMode: false,
 				issueWatch: false,
+				codeScanWatch: false,
 				microVm: false,
 				maxParallel: 2,
 				copyExtra: [],

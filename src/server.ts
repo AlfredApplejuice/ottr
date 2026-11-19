@@ -1042,6 +1042,9 @@ every(() => ompStatsDashboard.tick(), 60_000);
 // below moves it forward each regular poll. The boot poll is irregular, so the
 // grid starts one hour out.
 const prPollGrid = { nextAt: Date.now() + 3_600_000 };
+// OTTR-1087: the code-scanning poll grid for the Settings watches row; the
+// hourly wiring below moves it forward each regular poll, like the PR grid.
+const codeScanPollGrid = { nextAt: Date.now() + 3_600_000 };
 const app = await createApp({
 	gstore,
 	defaultDir: resolve(ROOTS[0] ?? resolve(import.meta.dir, "..", "..")),
@@ -1081,6 +1084,8 @@ const app = await createApp({
 	runnerTurns: () => loop.runnerTurns(),
 	// OTTR-1071: the Settings watches row shows when the next regular PR poll runs.
 	prPollNextAt: () => prPollGrid.nextAt,
+	// OTTR-1087: the same for the code-scanning watch's next regular poll.
+	codeScanPollNextAt: () => codeScanPollGrid.nextAt,
 	// OTTR-763: the checkout guard's ambiguous-change notices for the bell.
 	checkoutNotices: () => loop.checkoutNotices(),
 	// The /system view's live runs: the loop keys entries `${project}/${id}`; split at the first "/".
@@ -1242,6 +1247,15 @@ every(() => {
 // Issue watch: hourly poll; files new open GitHub issues as backlog cards, capped per day.
 runWork(() => app.issueWatchTick());
 every(() => app.issueWatchTick(), 3_600_000);
+
+// Code scanning watch: hourly poll; files GitHub code scanning alerts as backlog cards.
+// OTTR-1087: the grid feeds the state payload's nextPollAt for the Settings watches row.
+runWork(() => app.codeScanWatchTick());
+every(() => {
+	codeScanPollGrid.nextAt = Date.now() + 3_600_000;
+	// Returned, not voided: runWork's chain awaits and logs the tick's rejections.
+	return app.codeScanWatchTick();
+}, 3_600_000);
 
 // omp watch: hourly npm poll; a model reviews each new omp release, files fail and bump cards.
 runWork(() => app.ompWatchTick());

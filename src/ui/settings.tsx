@@ -9027,12 +9027,43 @@ function ProjectWatchesCard({
 				: "Never";
 	const nextCheck =
 		prWatch?.nextPollAt != null ? stamp(prWatch.nextPollAt) : "unknown";
+	// Check code scanning alerts now: the server runs the same tick the hourly poll runs.
+	const [csResult, setCsResult] = useState<
+		{ ok: true } | { ok: false; error: string } | null
+	>(null);
+	const checkCodeScanning = async (): Promise<boolean> => {
+		setCsResult(null);
+		try {
+			await post(
+				`/api/projects/${encodeURIComponent(project.name)}/code-scanning/check`,
+				{},
+			);
+			setCsResult({ ok: true });
+			return true;
+		} catch (err) {
+			setCsResult({
+				ok: false,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return false;
+		}
+	};
+	const csWatch = project.codeScanWatch;
+	const csLastCheck =
+		csWatch?.lastError != null && csWatch?.lastPollAt != null
+			? `Failed: ${csWatch.lastError}`
+			: csWatch?.lastPollAt != null
+				? stamp(csWatch.lastPollAt)
+				: "Never";
+	const csNextCheck =
+		csWatch?.nextPollAt != null ? stamp(csWatch.nextPollAt) : "unknown";
 	return (
 		<SettingsCard
 			id="project-watches-section"
 			title="Watches"
 			status={onChip([
 				st.issueWatch,
+				st.codeScanWatch,
 				st.prReviews,
 				st.prReviews && st.prReviewNotify,
 				st.forkResearch,
@@ -9049,6 +9080,36 @@ function ProjectWatchesCard({
 					disabled={project.github === null && !st.issueWatch}
 					save={(v) => send({ issueWatch: v })}
 					act={act}
+				/>
+				<CheckRow
+					settingKey="codeScanWatch"
+					name="Code scanning"
+					desc={
+						<>
+							{project.github === null ? "Needs a GitHub remote. " : ""}
+							{privateNote("code scanning alerts to watch")}
+							Hourly watch of the repo's open CodeQL code scanning alerts; each
+							rule with open alerts becomes a backlog card listing them, at most
+							20 alerts per card. Test-file alerts carry a note. Never dismisses
+							anything on GitHub.{" "}
+							{st.codeScanWatch
+								? `Last check: ${csLastCheck}. Next regular check: ${csNextCheck}.`
+								: "Code scanning is off: no checks run."}{" "}
+							<span role="status">
+								{csResult?.ok === true ? "Check started." : ""}
+							</span>
+						</>
+					}
+					tag={privateTag}
+					checked={st.codeScanWatch}
+					disabled={project.github === null && !st.codeScanWatch}
+					save={(v) => send({ codeScanWatch: v })}
+					act={act}
+					action={
+						<BusyButton run={checkCodeScanning} disabled={!st.codeScanWatch}>
+							Check alerts now
+						</BusyButton>
+					}
 				/>
 				<CheckRow
 					settingKey="prReviews"
@@ -9137,6 +9198,11 @@ function ProjectWatchesCard({
 			{prsResult?.ok === false && (
 				<p className="auth-error" role="alert">
 					{prsResult.error}
+				</p>
+			)}
+			{csResult?.ok === false && (
+				<p className="auth-error" role="alert">
+					{csResult.error}
 				</p>
 			)}
 		</SettingsCard>

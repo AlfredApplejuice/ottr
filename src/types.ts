@@ -253,6 +253,8 @@ export interface ProjectSettings {
 	trendingScout: boolean;
 	/** Hourly issue watch: file each new open GitHub issue as a backlog card and label it ottr-tracked (off by default). */
 	issueWatch: boolean;
+	/** Hourly code scanning watch: file each open CodeQL alert rule as a backlog card, grouped by rule (off by default; docs/specs/code-scanning-watch.md). */
+	codeScanWatch: boolean;
 	/** When issueWatch last turned on (epoch ms); null while never enabled. */
 	issueWatchSince: number | null;
 	/** Hourly omp release watch: a model reviews each new omp release; fail and bump cards (off by default; docs/specs/omp-watch.md). */
@@ -338,6 +340,19 @@ export interface TrendingStatus {
  * Watches card (OTTR-1071). In-memory only: a restart clears the times and the next
  * polls refill them. */
 export interface PrWatchStatus {
+	/** Clock value when the project's last poll completed; null before the first. */
+	lastPollAt: number | null;
+	/** The last poll's failure reason; null when it completed clean or never ran. */
+	lastError: string | null;
+	/** Clock value of the next regular hourly poll (the server's interval grid);
+	 * null when the wiring names no grid. */
+	nextPollAt: number | null;
+}
+
+/** OTTR-1087: the code scanning watch's poll facts, shipped in the project's view for the
+ * Settings Watches card. Mirrors PrWatchStatus; in-memory only: a restart clears the
+ * times and the next polls refill them. */
+export interface CodeScanWatchStatus {
 	/** Clock value when the project's last poll completed; null before the first. */
 	lastPollAt: number | null;
 	/** The last poll's failure reason; null when it completed clean or never ran. */
@@ -1063,6 +1078,9 @@ export interface ProjectView {
 	/** OTTR-1071: the PR watch's poll facts (last check, its error, next regular check),
 	 * shown by the Settings Watches card's PR reviews row. */
 	prWatch: PrWatchStatus;
+	/** OTTR-1087: the code scanning watch's poll facts (last check, its error, next
+	 * regular check), shown by the Settings Watches card's Code scanning row. */
+	codeScanWatch: CodeScanWatchStatus;
 	settings: ProjectSettings;
 	/** Effective task id handle: the taskIdPrefix override or the folder-derived default. */
 	taskPrefix: string;

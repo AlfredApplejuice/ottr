@@ -108,6 +108,7 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	prReviewRequestChanges: false,
 	prMode: false,
 	issueWatch: false,
+	codeScanWatch: false,
 	issueWatchSince: null,
 	ompWatch: false,
 	dependabotWarn: true,
@@ -277,6 +278,21 @@ CREATE TABLE IF NOT EXISTS issue_watch (
   filed_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_issue_watch_filed_at ON issue_watch (filed_at);
+CREATE TABLE IF NOT EXISTS code_scan_alert (
+  number INTEGER PRIMARY KEY,
+  rule TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  url TEXT NOT NULL,
+  message TEXT NOT NULL,
+  skipped INTEGER NOT NULL DEFAULT 0 CHECK (skipped IN (0,1)),
+  filed_at INTEGER NOT NULL,
+  card_filed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_code_scan_alert_task ON code_scan_alert (task_id);
+CREATE INDEX IF NOT EXISTS idx_code_scan_alert_card_filed ON code_scan_alert (card_filed_at);
 CREATE TABLE IF NOT EXISTS review_findings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   card_id TEXT NOT NULL,
@@ -515,6 +531,70 @@ function toPrReview(r: PrReviewDbRow): PrReviewRow {
 		commentsUnseen: r.comments_unseen !== 0,
 	};
 }
+
+/** One code_scan_alert row: one open GitHub code scanning alert, grouped onto its rule's card (OTTR-1087). */
+export interface CodeScanAlertRow {
+	/** The GitHub alert number; the table's primary key, so a refetch never files it twice. */
+	number: number;
+	rule: string;
+	/** The rule's backlog card that owns this alert. */
+	taskId: string;
+	severity: string;
+	path: string;
+	line: number;
+	url: string;
+	message: string;
+	/** True when the card was cancelled ("do not file"): the alert waits skipped until a new number re-files the rule. */
+	skipped: boolean;
+	/** Epoch ms of the row's last insert or append. */
+	filedAt: number;
+	/** Epoch ms of the owning card's creation; appends keep the card's value, the daily cap counts on it. */
+	cardFiledAt: number;
+}
+
+/** A fetched alert not yet in the store, ready for fileCodeScanCards or appendCodeScanAlerts. */
+export interface NewCodeScanAlert {
+	number: number;
+	rule: string;
+	severity: string;
+	path: string;
+	line: number;
+	url: string;
+	message: string;
+}
+
+interface CodeScanAlertDbRow {
+	number: number;
+	rule: string;
+	task_id: string;
+	severity: string;
+	path: string;
+	line: number;
+	url: string;
+	message: string;
+	skipped: number;
+	filed_at: number;
+	card_filed_at: number;
+}
+
+function toCodeScanAlert(r: CodeScanAlertDbRow): CodeScanAlertRow {
+	return {
+		number: r.number,
+		rule: r.rule,
+		taskId: r.task_id,
+		severity: r.severity,
+		path: r.path,
+		line: r.line,
+		url: r.url,
+		message: r.message,
+		skipped: r.skipped !== 0,
+		filedAt: r.filed_at,
+		cardFiledAt: r.card_filed_at,
+	};
+}
+
+/** Worst first: the shared severity order for card rows and rule grouping (githubAlerts ALERT_SEVERITY_RANK). */
+const CODE_SCAN_SEVERITY_SQL = `CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END`;
 
 interface TurnRow {
 	id: number;
@@ -1285,6 +1365,7 @@ const SETTINGS_SHAPES = {
 	prReviewRequestChanges: "boolean",
 	prMode: "boolean",
 	issueWatch: "boolean",
+	codeScanWatch: "boolean",
 	issueWatchSince: "number",
 	ompWatch: "boolean",
 	dependabotWarn: "boolean",
@@ -3618,6 +3699,227 @@ export class ProjectStore {
 				"UPDATE issue_watch SET labelled = 1 WHERE number = ?",
 				[number],
 			);
+		});
+	}
+
+	/** One code_scan_alert row by GitHub alert number, or null. */
+	async getCodeScanAlert(number: number): Promise<CodeScanAlertRow | null> {
+		return this.queue.run(async () => {
+			const r = await this.db
+				.query<CodeScanAlertDbRow, [number]>(
+					"SELECT * FROM code_scan_alert WHERE number = ?",
+				)
+				.get(number);
+			return r ? toCodeScanAlert(r) : null;
+		});
+	}
+
+	/** Count of distinct code scanning cards filed at or after `since` (the daily cap). */
+	async codeScanCardsFiledSince(since: number): Promise<number> {
+		return this.queue.run(async () => {
+			return (
+				(
+					await this.db
+						.query<{ n: number }, [number]>(
+							"SELECT COUNT(DISTINCT task_id) AS n FROM code_scan_alert WHERE card_filed_at >= ?",
+						)
+						.get(since)
+				)?.n ?? 0
+			);
+		});
+	}
+
+	/** A rule's open (skipped = 0) rows grouped by card: taskId, row count, and the card's newest filed_at (the append target). */
+	async codeScanRuleCards(
+		rule: string,
+	): Promise<{ taskId: string; rows: number; newestFiledAt: number }[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<
+						{ task_id: string; rows: number; newestFiledAt: number },
+						[string]
+					>(
+						"SELECT task_id, COUNT(*) AS rows, MAX(filed_at) AS newestFiledAt FROM code_scan_alert WHERE rule = ? AND skipped = 0 GROUP BY task_id",
+					)
+					.all(rule)
+			).map((r) => ({
+				taskId: r.task_id,
+				rows: r.rows,
+				newestFiledAt: r.newestFiledAt,
+			}));
+		});
+	}
+
+	/** Files one backlog card per item and records its alert rows in one transaction; throws when an alert number already has a store row. */
+	async fileCodeScanCards(o: {
+		items: {
+			rule: string;
+			title: string;
+			prompt: string;
+			alerts: NewCodeScanAlert[];
+		}[];
+		now: number;
+	}): Promise<Task[]> {
+		return this.queue.transaction(async () => {
+			const filed: Task[] = [];
+			for (const item of o.items) {
+				// The primary key would throw an opaque constraint error; name the number instead.
+				for (const a of item.alerts) {
+					if ((await this.getCodeScanAlert(a.number)) !== null)
+						throw new Error(
+							`code scanning alert ${a.number} already has a store row`,
+						);
+				}
+				const card = await this.createTask(item.prompt, null, "work");
+				await this.updateTask(card.id, {
+					title: item.title,
+					// The prompt embeds the alerts' GitHub text, which people wrote, so
+					// the card stays user-authored and the prompt gate judges it (OTTR-850).
+					topic: "code scanning",
+					stage: "backlog",
+					state: "idle",
+					queuedAt: null,
+				});
+				for (const a of item.alerts) {
+					await this.db.run(
+						"INSERT INTO code_scan_alert (number, rule, task_id, severity, path, line, url, message, skipped, filed_at, card_filed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+						[
+							a.number,
+							a.rule,
+							card.id,
+							a.severity,
+							a.path,
+							a.line,
+							a.url,
+							a.message,
+							o.now,
+							o.now,
+						],
+					);
+				}
+				const task = await this.getTask(card.id);
+				if (task === null) throw new Error(`unknown task: ${card.id}`);
+				filed.push(task);
+			}
+			return filed;
+		});
+	}
+
+	/** Adds new alert numbers to an existing rule card; rows keep the card's card_filed_at, so appends need no daily-cap slot. */
+	async appendCodeScanAlerts(o: {
+		taskId: string;
+		alerts: NewCodeScanAlert[];
+		now: number;
+	}): Promise<void> {
+		return this.queue.transaction(async () => {
+			const first = await this.db
+				.query<{ card_filed_at: number }, [string]>(
+					"SELECT card_filed_at FROM code_scan_alert WHERE task_id = ? LIMIT 1",
+				)
+				.get(o.taskId);
+			const cardFiledAt = first?.card_filed_at ?? o.now;
+			for (const a of o.alerts) {
+				await this.db.run(
+					"INSERT INTO code_scan_alert (number, rule, task_id, severity, path, line, url, message, skipped, filed_at, card_filed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+					[
+						a.number,
+						a.rule,
+						o.taskId,
+						a.severity,
+						a.path,
+						a.line,
+						a.url,
+						a.message,
+						o.now,
+						cardFiledAt,
+					],
+				);
+			}
+		});
+	}
+
+	/** One card's open alert rows, worst severity first, then alert number. */
+	async codeScanCardRows(taskId: string): Promise<CodeScanAlertRow[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<CodeScanAlertDbRow, [string]>(
+						`SELECT * FROM code_scan_alert WHERE task_id = ? AND skipped = 0 ORDER BY ${CODE_SCAN_SEVERITY_SQL}, number`,
+					)
+					.all(taskId)
+			).map(toCodeScanAlert);
+		});
+	}
+
+	/** Deletes the alert rows of closed alerts and returns the ids of the cards that lost rows; unknown numbers are ignored. */
+	async removeCodeScanAlerts(numbers: number[]): Promise<string[]> {
+		if (numbers.length === 0) return [];
+		return this.queue.transaction(async () => {
+			const marks = numbers.map(() => "?").join(",");
+			const ids = (
+				await this.db
+					.query<{ task_id: string }, number[]>(
+						`SELECT DISTINCT task_id FROM code_scan_alert WHERE number IN (${marks})`,
+					)
+					.all(...numbers)
+			).map((r) => r.task_id);
+			await this.db.run(
+				`DELETE FROM code_scan_alert WHERE number IN (${marks})`,
+				numbers,
+			);
+			return ids;
+		});
+	}
+
+	/** Rewrites a rule card's prompt after its alert set changed (a fix or an append). */
+	async rebuildCodeScanPrompt(taskId: string, prompt: string): Promise<void> {
+		return this.queue.transaction(async () => {
+			await this.db.run("UPDATE tasks SET prompt = ? WHERE id = ?", [
+				prompt,
+				taskId,
+			]);
+		});
+	}
+
+	/** Cancels a rule card when its last alert left; already-cancelled cards stay untouched, so the call is idempotent. */
+	async cancelCodeScanCard(taskId: string, now: number): Promise<void> {
+		return this.queue.transaction(async () => {
+			await this.db.run(
+				"UPDATE tasks SET cancelled_at = ? WHERE id = ? AND cancelled_at IS NULL",
+				[now, taskId],
+			);
+		});
+	}
+
+	/** Marks the alert rows of cancelled cards skipped ("do not file") and returns the distinct card ids it touched. */
+	async skipCancelledCodeScanCards(): Promise<string[]> {
+		return this.queue.transaction(async () => {
+			const where =
+				"skipped = 0 AND task_id IN (SELECT id FROM tasks WHERE cancelled_at IS NOT NULL)";
+			const ids = (
+				await this.db
+					.query<{ task_id: string }, []>(
+						`SELECT DISTINCT task_id FROM code_scan_alert WHERE ${where}`,
+					)
+					.all()
+			).map((r) => r.task_id);
+			if (ids.length > 0)
+				await this.db.run(
+					`UPDATE code_scan_alert SET skipped = 1 WHERE ${where}`,
+				);
+			return ids;
+		});
+	}
+
+	/** Clears the skipped flag of a rule the user cancelled before, so the next tick re-files all open alerts; returns the count. */
+	async resetCodeScanSkipped(rule: string): Promise<number> {
+		return this.queue.transaction(async () => {
+			const r = await this.db.run(
+				"UPDATE code_scan_alert SET skipped = 0 WHERE rule = ? AND skipped = 1",
+				[rule],
+			);
+			return r.changes;
 		});
 	}
 

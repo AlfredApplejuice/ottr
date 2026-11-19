@@ -579,6 +579,8 @@ async function mount(
 		prReviewSpawn?: Parameters<typeof createApp>[0]["prReviewSpawn"];
 		/** OTTR-1071: the server wiring's next regular PR poll for the state payload. */
 		prPollNextAt?: Parameters<typeof createApp>[0]["prPollNextAt"];
+		/** OTTR-1087: the server wiring's next regular code-scanning poll. */
+		codeScanPollNextAt?: Parameters<typeof createApp>[0]["codeScanPollNextAt"];
 		/** Fetch seam for the weekly trending scan; passed through to createApp. */
 		trendingFetch?: typeof fetch;
 		/** Fetch seam for the re-run-failed-jobs GitHub call; passed through to createApp. */
@@ -659,6 +661,7 @@ async function mount(
 		releaseSummarySpawn: input.releaseSummarySpawn,
 		prReviewSpawn: input.prReviewSpawn,
 		prPollNextAt: input.prPollNextAt,
+		codeScanPollNextAt: input.codeScanPollNextAt,
 		trendingFetch: input.trendingFetch,
 		rerunFetch: input.rerunFetch,
 		turnTokenFetch: input.turnTokenFetch,
@@ -17114,6 +17117,8 @@ describe(
 			// OTTR-1071: the state payload's nextPollAt reads the server wiring's grid;
 			// the test pins it to a known value.
 			prPollNextAt: () => 1234567890,
+			// OTTR-1087: the same pin for the code-scanning watch row.
+			codeScanPollNextAt: () => 1234567890,
 			gh: async (args) => {
 				ghCalls.push(args);
 				const input = args.indexOf("--input");
@@ -17642,6 +17647,20 @@ describe(
 				).toBeGreaterThanOrEqual(again);
 			});
 
+			test("codeScanWatch rejects a non-boolean, round trips, and starts off", async () => {
+				const bad = await post("/api/projects/p1/settings", {
+					codeScanWatch: "yes",
+				});
+				expect(bad.status).toBe(400);
+				expect(await errorOf(bad)).toBe("codeScanWatch must be a boolean");
+				// Off is the stored default; a save round trips through the store.
+				expect((await store.getSettings()).codeScanWatch).toBe(false);
+				await post("/api/projects/p1/settings", { codeScanWatch: true });
+				expect((await store.getSettings()).codeScanWatch).toBe(true);
+				await post("/api/projects/p1/settings", { codeScanWatch: false });
+				expect((await store.getSettings()).codeScanWatch).toBe(false);
+			});
+
 			test("project settings route turns microVm on only with a reachable vm-runner", async () => {
 				const saved = vmState.health;
 				try {
@@ -17685,6 +17704,17 @@ describe(
 				expect(res.status).toBe(409);
 				expect(await errorOf(res)).toBe("project has no GitHub remote");
 				const unknown = await post("/api/projects/nope/prs/check", {});
+				expect(unknown.status).toBe(404);
+			});
+
+			test("code-scanning/check refuses an unknown project and one without a GitHub remote", async () => {
+				const res = await post("/api/projects/p1/code-scanning/check", {});
+				expect(res.status).toBe(409);
+				expect(await errorOf(res)).toBe("project has no GitHub remote");
+				const unknown = await post(
+					"/api/projects/nope/code-scanning/check",
+					{},
+				);
 				expect(unknown.status).toBe(404);
 			});
 
@@ -17734,6 +17764,37 @@ describe(
 					expect(second.lastPollAt).toBeGreaterThanOrEqual(first.lastPollAt!);
 				} finally {
 					await prStore.setSettings({ prReviews: false });
+				}
+			});
+
+			test("the state payload carries the code-scanning watch's poll facts", async () => {
+				await prStore.setSettings({ codeScanWatch: true });
+				try {
+					const csWatchOf = async () => {
+						const state = (await (await m.call("/api/state")).json()) as {
+							projects: {
+								name: string;
+								codeScanWatch: {
+									lastPollAt: number | null;
+									lastError: string | null;
+									nextPollAt: number | null;
+								};
+							}[];
+						};
+						return state.projects.find((p) => p.name === "pg")!.codeScanWatch;
+					};
+					// The manual check runs the same tick the hourly poll uses: a
+					// clean poll stamps the view, and the pinned grid fills nextPollAt.
+					ghResult = { code: 0, stdout: "[]", stderr: "" };
+					const res = await m.call("/api/projects/pg/code-scanning/check", {});
+					expect(res.status).toBe(200);
+					expect(await res.json()).toEqual({ ok: true });
+					const first = await csWatchOf();
+					expect(first.lastError).toBe(null);
+					expect(first.nextPollAt).toBe(1234567890);
+					expect(first.lastPollAt).toBeGreaterThan(0);
+				} finally {
+					await prStore.setSettings({ codeScanWatch: false });
 				}
 			});
 

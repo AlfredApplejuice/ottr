@@ -68,6 +68,7 @@ import {
 } from "./auth.ts";
 import { acceptsGzip, boardBundle, bundleResponse } from "./boardBundle.ts";
 import { lookupBranchRules } from "./branchRules.ts";
+import { createCodeScanWatcher } from "./codeScanWatch.ts";
 import {
 	openRegular,
 	readBelow,
@@ -645,6 +646,10 @@ interface AppDeps {
 	 * Settings watches row. Absent in narrow test mounts, so the state payload then
 	 * reports null. */
 	prPollNextAt?: () => number | null;
+	/** OTTR-1087: the server wiring's next regular hourly code-scanning poll (its
+	 * grid), for the Settings watches row. Absent in narrow test mounts, so the
+	 * state payload then reports null. */
+	codeScanPollNextAt?: () => number | null;
 	serverVersion: string;
 	port: number;
 	publicHosts: string[];
@@ -1727,6 +1732,7 @@ const BOOLEAN_SETTING_FIELDS = [
 	"prReviewRequestChanges",
 	"prMode",
 	"issueWatch",
+	"codeScanWatch",
 	"dependabotWarn",
 	"ompWatch",
 	"microVm",
@@ -3058,6 +3064,14 @@ export async function createApp(deps: AppDeps) {
 	const issueWatcher = createIssueWatcher({
 		projects: () => deps.projects.values(),
 		log: (msg: string) => console.log(`[issues] ${msg}`),
+		gh,
+	});
+
+	// Code scanning watcher: same live project Map; files GitHub code scanning
+	// alerts as backlog cards, grouped by rule.
+	const codeScanWatcher = createCodeScanWatcher({
+		projects: () => deps.projects.values(),
+		log: (msg: string) => console.log(`[code-scanning] ${msg}`),
 		gh,
 	});
 
@@ -5181,6 +5195,7 @@ export async function createApp(deps: AppDeps) {
 		const settings = await e.store.getSettings();
 		const homepageRepo = e.github === null ? null : ownerRepo(e.github);
 		const poll = prWatcher.pollStatus(e.name);
+		const csPoll = codeScanWatcher.pollStatus(e.name);
 		// OTTR-965: the Done lane's first "Show more" needs the settled count before any
 		// fetch. One list read counting rows, no card build.
 		const doneTotal = (await e.store.listTasks()).filter(
@@ -5220,6 +5235,12 @@ export async function createApp(deps: AppDeps) {
 				lastPollAt: poll?.at ?? null,
 				lastError: poll?.error ?? null,
 				nextPollAt: deps.prPollNextAt?.() ?? null,
+			},
+			// OTTR-1087: the code-scanning watch's poll facts, same shape and rule.
+			codeScanWatch: {
+				lastPollAt: csPoll?.at ?? null,
+				lastError: csPoll?.error ?? null,
+				nextPollAt: deps.codeScanPollNextAt?.() ?? null,
 			},
 			settings,
 			taskPrefix: settings.taskIdPrefix ?? derivedTaskPrefix(e.name),
@@ -8768,6 +8789,18 @@ export async function createApp(deps: AppDeps) {
 			return json({ error: "project has no GitHub remote" }, 409);
 		// Body optional: a manual run of the same watch the hourly poll uses.
 		await prWatcher.tick({ manual: req.params.project });
+		return json({ ok: true });
+	}
+
+	async function handlePOSTProjectsCodeScanningCheckByProject(
+		req: BunRequest<"/api/projects/:project/code-scanning/check">,
+	): Promise<Response> {
+		const e = deps.projects.get(req.params.project);
+		if (!e) return json({ error: "unknown project" }, 404);
+		if (e.github === null)
+			return json({ error: "project has no GitHub remote" }, 409);
+		// Body optional: a manual run of the same watch the hourly poll uses.
+		await codeScanWatcher.tick({ manual: req.params.project });
 		return json({ ok: true });
 	}
 
@@ -14450,6 +14483,16 @@ export async function createApp(deps: AppDeps) {
 					},
 				),
 		},
+		"/api/projects/:project/code-scanning/check": {
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsCodeScanningCheckByProject(req),
+					{
+						costly: true,
+					},
+				),
+		},
 		"/api/projects/:project/tasks/:id/pr-review/post": {
 			POST: async (req) =>
 				await api(
@@ -14717,6 +14760,8 @@ export async function createApp(deps: AppDeps) {
 			backgroundTick("PR review drain", () => prWatcher.reviewIdle()),
 		issueWatchTick: (opts?: { manual?: string }) =>
 			backgroundTick("issue watch", () => issueWatcher.tick(opts)),
+		codeScanWatchTick: (opts?: { manual?: string }) =>
+			backgroundTick("code scanning watch", () => codeScanWatcher.tick(opts)),
 		ompWatchTick: () => backgroundTick("omp watch", () => ompWatcher.tick()),
 		dependabotTick: () => backgroundTick("dependabot", () => dependabotTick()),
 	};
