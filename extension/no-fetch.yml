@@ -1,0 +1,8 @@
+# Overlay for the board's own runs (startLocalRun appends it after no-discovery.yml):
+# fetch.enabled false makes omp's read tool refuse URL reads. A board-side run reads
+# worker-written content (the diff, the transcript, the worktree) inside the server
+# container, next to the board's own zero-auth loopback API, so a URL read that
+# injected text steers must not become a lever on that API. Worker and microVM runs
+# keep URL reads: their container cannot reach the loopback API without a credential.
+fetch:
+  enabled: false

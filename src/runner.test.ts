@@ -34,6 +34,7 @@ import {
 	findHttp400Rejection,
 	hitUsageLimit,
 	NO_DISCOVERY_CONFIG,
+	NO_FETCH_CONFIG,
 	newEventState,
 	OOM_KILL,
 	QUOTA_LIMIT,
@@ -3206,6 +3207,9 @@ describe("startRun", () => {
 			expect(seen[0]).toContain("--no-extensions");
 			expect(seen[0]).toContain("--no-lsp");
 			expect(seen[0]).toContain(NO_DISCOVERY_CONFIG);
+			// OTTR-982: a board-side run reads worker-written content next to the server's
+			// zero-auth loopback API, so the read tool must not fetch URLs.
+			expect(seen[0]).toContain(NO_FETCH_CONFIG);
 			expect(r.ranOn).toBe(`board (${hostname()})`);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
@@ -3293,11 +3297,13 @@ describe("startRun", () => {
 				"--config",
 				"--config",
 				"--config",
+				"--config",
 			]);
 			expect(seen[0]!.filter((a) => a.endsWith(".yml"))).toEqual([
 				NO_DISCOVERY_CONFIG,
 				pluginSkillsOverlayPath({ OTTR_DATA_DIR: dataDir }, empty),
 				join(dataDir, "omp-memory.yml"),
+				NO_FETCH_CONFIG,
 			]);
 		} finally {
 			if (ambientDataDir === undefined) delete process.env.OTTR_DATA_DIR;
@@ -3938,6 +3944,35 @@ describe("startRun worker dispatch", () => {
 			expect(r.stderrTail).toContain(
 				`worker http://127.0.0.1:${server.port} responded 500: spawn failed: no such image`,
 			);
+		} finally {
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a worker run carries no board-side no-fetch overlay", async () => {
+		// OTTR-982: the no-fetch overlay hardens only the server's own runs (they sit
+		// next to the zero-auth loopback API); a worker run keeps its URL reads.
+		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-nofetch-"));
+		let argv: string[] | null = null;
+		const server = Bun.serve({
+			port: 0,
+			fetch: async (req) => {
+				const body = (await req.json()) as { argv?: string[] };
+				argv = body.argv ?? null;
+				return new Response("spawn failed: recorded", { status: 500 });
+			},
+		});
+		try {
+			const handle = await startRun({
+				...baseOpts(dir, join(dir, "run.log")),
+				worker: { urls: [`http://127.0.0.1:${server.port}`] },
+			});
+			await handle.done;
+			const sent: string[] = argv ?? [];
+			expect(sent.length).toBeGreaterThan(0);
+			expect(sent).not.toContain(NO_FETCH_CONFIG);
+			expect(sent).toContain(NO_DISCOVERY_CONFIG);
 		} finally {
 			server.stop(true);
 			rmSync(dir, { recursive: true, force: true });
@@ -5903,6 +5938,9 @@ describe("startRun microVM dispatch", () => {
 			for (let i = 0; i < body.argv.length; i++)
 				if (body.argv[i] === "--config" && dirname(body.argv[i + 1]!) === dir)
 					expect(copyIn).toContain(body.argv[i + 1]!);
+			// OTTR-982: the no-fetch overlay is the board's own runs only; a VM run
+			// keeps URL reads.
+			expect(body.argv).not.toContain(NO_FETCH_CONFIG);
 			// The raw VM token never reaches the task log.
 			expect(readFileSync(join(dir, "run.log"), "utf8")).not.toContain(token);
 		} finally {

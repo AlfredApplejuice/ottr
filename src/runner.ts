@@ -154,6 +154,19 @@ export const NO_DISCOVERY_CONFIG = resolve(
 	"no-discovery.yml",
 );
 
+/**
+ * Overlay that turns off the read tool's URL fetch (OTTR-982): the board's own runs read
+ * worker-written content inside the server container, next to the board's zero-auth
+ * loopback API, so an injected URL read must not pass the auth wall. startLocalRun
+ * appends it; worker and VM runs keep URL reads.
+ */
+export const NO_FETCH_CONFIG = resolve(
+	import.meta.dir,
+	"..",
+	"extension",
+	"no-fetch.yml",
+);
+
 /** `images` are absolute paths; omp attaches each `@<path>` to the user message of the stdin prompt. */
 export function buildOmpArgs(o: {
 	sessionDir: string;
@@ -1882,13 +1895,18 @@ function startLocalRun(s: RunStart): RunHandle {
 	const {
 		o,
 		sink,
-		args,
 		startedAt,
 		layerEnv,
 		identityEnv,
 		layerId,
 		unregisterLayer,
 	} = s;
+	// The board's own runs (checks, merge turns, retro, the board check; also work turns
+	// on a worker-less board) read worker-written content and sit next to the server's
+	// zero-auth loopback API, so the read tool must not fetch URLs (OTTR-982): an
+	// injected read of a loopback /api URL would otherwise pass the auth wall. The key
+	// names no other overlay's key, so the position after the memory overlay cannot clash.
+	const args = [...s.args, "--config", NO_FETCH_CONFIG];
 	// Every local child gets an explicit env so worker credentials never reach a turn (R3-6/D6).
 	const launch: RunLauncher = o.launcher ?? spawn;
 	// The provision guard's untracked scan compares against the rules dir as it

@@ -48,7 +48,10 @@ Unlike desktop loopback, the board asks for the admin login (or the API key)
 there: the published port arrives from the Docker gateway, not loopback, and
 worker turns reach it too (`host.docker.internal`). Only processes in the
 board's own container (merge turns, `docker compose exec server ...`) keep
-zero-auth access.
+zero-auth access. The board's own agent runs (checks, merge turns, retro, the
+board check, release) read worker-written content, so the server starts them
+with the read tool's URL fetch off (`extension/no-fetch.yml`): an injected
+read of a loopback `/api` URL must not pass the auth wall.
 
 Each container keeps at most 30 MB of logs: the `local` log driver keeps 3 files of 10 MB.
 Each container also has a RAM limit. The default is `8g` for the server and for each
