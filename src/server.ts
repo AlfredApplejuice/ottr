@@ -85,7 +85,7 @@ import {
 	type TurnLoop,
 } from "./turn.ts";
 import type { LatestImage, OpenPrsView } from "./types.ts";
-import { VM_UNCONFIGURED, vmState } from "./vmState.ts";
+import { probeVmRunner } from "./vmHealth.ts";
 import { VmTokens } from "./vmTokens.ts";
 import {
 	detachedRuns as detachedRunsRequest,
@@ -796,49 +796,9 @@ if (vmTarget !== null)
 			logError("the microVM provider gateway did not start", err),
 		);
 
-/** One GET /healthz of the microVM runner into vmState.health; unconfigured stays unconfigured. */
-async function probeVmRunner(): Promise<void> {
-	if (vmTarget === null) {
-		vmState.health = { configured: false, ok: false, reason: VM_UNCONFIGURED };
-		return;
-	}
-	const url = vmTarget.urls[0];
-	if (url === undefined) {
-		vmState.health = { configured: false, ok: false, reason: VM_UNCONFIGURED };
-		return;
-	}
-	try {
-		const res = await fetch(`${url}/healthz`, {
-			headers: vmTarget.token ? { "x-otwr-token": vmTarget.token } : {},
-			// The worker token never follows a redirect off-host.
-			redirect: "manual",
-			signal: AbortSignal.timeout(5000),
-		});
-		// vm-runner's 503 body is its own one-line reason ("vm-runner: /dev/kvm is missing");
-		// the UI already names vm-runner, so the prefix and the URL stay out of the text.
-		const body = (await res.text())
-			.trim()
-			.replace(/^vm-runner:\s*/, "")
-			.slice(0, 300);
-		vmState.health =
-			res.status === 200
-				? { configured: true, ok: true, reason: null }
-				: {
-						configured: true,
-						ok: false,
-						reason: body || `/healthz answered HTTP ${res.status}`,
-					};
-	} catch (err) {
-		vmState.health = {
-			configured: true,
-			ok: false,
-			reason: `no answer from ${url} (${err instanceof Error ? err.message : String(err)})`,
-		};
-	}
-}
 // Boot probe without blocking boot: until it answers, microVM cards wait unclaimed.
-runWork(() => probeVmRunner());
-every(() => probeVmRunner(), 30_000);
+runWork(() => probeVmRunner(vmTarget));
+every(() => probeVmRunner(vmTarget), 30_000);
 // Demo board (src/dev.ts): the seeded gate card's meter needs a fabricated progress line,
 // because no agent runs and loop.running stays empty. Real boards never set OTTR_DEMO and
 // take loop.running only. The import is dynamic: the image ships src/ only, never scripts/,

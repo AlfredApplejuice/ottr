@@ -103,7 +103,8 @@ if [ -n "$PI_CODING_AGENT_DIR" ]; then
 fi
 # Podman injects the host proxy env (HTTP_PROXY/HTTPS_PROXY/NO_PROXY) into every
 # container and its NO_PROXY names no compose services, so internal calls
-# (http://alate:4570, http://worker-a:8787, http://ottr:<port>) would go to the
+# (http://alate:4570, http://worker-a:8787, http://vm-runner:8787,
+# http://ottr:<port>) would go to the
 # corporate proxy and bounce. Sourced: appends the service names, keeping the
 # injected host list. Compose cannot see the injected value; the entry script can.
 # Sibling-relative: the image COPYs both scripts to /, and the host-side gate
