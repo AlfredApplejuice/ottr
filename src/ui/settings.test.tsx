@@ -3955,7 +3955,7 @@ describe("HindsightSection memory backend", () => {
 			);
 			const warning = container.querySelector('p[role="alert"].notif-line');
 			expect(warning?.textContent).toBe(
-				"omp runs with no memory: mnemopi store not writable: /data/home",
+				"The omp process runs with no memory: mnemopi store not writable: /data/home",
 			);
 			expect(container.textContent).toContain("never config.yml");
 		} finally {
@@ -3975,7 +3975,9 @@ describe("HindsightSection memory backend", () => {
 			expect(container.textContent).toContain(
 				"Memory backend: mnemopi (the default)",
 			);
-			expect(container.textContent).not.toContain("omp runs with no memory");
+			expect(container.textContent).not.toContain(
+				"The omp process runs with no memory",
+			);
 		} finally {
 			await unmount();
 		}
@@ -3992,7 +3994,9 @@ describe("HindsightSection memory backend", () => {
 		try {
 			expect(container.textContent).toContain("Memory backend: hindsight");
 			expect(container.textContent).toContain("http://hindsight.local:8888");
-			expect(container.textContent).not.toContain("omp runs with no memory");
+			expect(container.textContent).not.toContain(
+				"The omp process runs with no memory",
+			);
 		} finally {
 			await unmount();
 		}

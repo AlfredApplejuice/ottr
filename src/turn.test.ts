@@ -21747,7 +21747,9 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 	/** The ops override whose /tmp rule holds only `runner` (the worker hostname or "local"). */
 	const tmpHolds = (...runners: string[]): Partial<TurnOps> => ({
 		tmpFullLine: (r) =>
-			runners.includes(r) ? `/tmp of ${r} is full (512 MiB)` : null,
+			runners.includes(r)
+				? `The temp disk (/tmp) of ${r} is full (512 MiB free)`
+				: null,
 	});
 
 	test("a tmp-full worker gets no dispatch while the other still does", async () => {
@@ -21775,7 +21777,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 		expect((await store.getTask(task.id))?.state).toBe("queued");
 		// OTTR-754: the queued card carries the hold reason with the runner's free space.
 		expect((await store.getTask(task.id))?.needsReason).toBe(
-			"/tmp of worker-a is full (512 MiB)",
+			"The temp disk (/tmp) of worker-a is full (512 MiB free)",
 		);
 	});
 
@@ -21801,7 +21803,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 		expect(record.runs).toHaveLength(0);
 		expect((await store.getTask(check.id))?.state).toBe("queued");
 		expect((await store.getTask(check.id))?.needsReason).toBe(
-			"/tmp of local is full (512 MiB)",
+			"The temp disk (/tmp) of local is full (512 MiB free)",
 		);
 	});
 
@@ -21813,7 +21815,9 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			tmpFullLine: (r) =>
-				full && r === "worker-a" ? "/tmp of worker-a is full (512 MiB)" : null,
+				full && r === "worker-a"
+					? "The temp disk (/tmp) of worker-a is full (512 MiB free)"
+					: null,
 			resolveTarget: async () => {
 				full = true; // the /tmp limit reaches the runner mid-prepare
 				return { target: "origin/main", sha: "sha0", warning: null };
@@ -21824,14 +21828,16 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 		expect(record.runs).toHaveLength(0);
 		const card = await store.getTask(task.id);
 		expect(card?.state).toBe("needs_you");
-		expect(card?.needsReason).toContain("/tmp of worker-a is full (512 MiB)");
+		expect(card?.needsReason).toContain(
+			"The temp disk (/tmp) of worker-a is full (512 MiB free)",
+		);
 	});
 
 	test("an apt disk-failure reason names the free /tmp of the runner it ran on", async () => {
 		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
-			tmpSpaceLine: (r) => `/tmp of ${r} has 512 MiB free`,
+			tmpSpaceLine: (r) => `The temp disk (/tmp) of ${r} has 512 MiB free`,
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => ({
 				pid: 4242,
 				// The dispatch record the settle reads the runner from; the reason text
@@ -21852,7 +21858,9 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 
 		const after = (await store.getTask(task.id))!;
 		expect(
-			after.needsReason?.endsWith("/tmp of worker-a has 512 MiB free"),
+			after.needsReason?.endsWith(
+				"The temp disk (/tmp) of worker-a has 512 MiB free",
+			),
 		).toBe(true);
 	});
 
@@ -21860,7 +21868,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
-			tmpSpaceLine: (r) => `/tmp of ${r} has 512 MiB free`,
+			tmpSpaceLine: (r) => `The temp disk (/tmp) of ${r} has 512 MiB free`,
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => ({
 				pid: 4242,
 				url: o.worker?.urls[0],
@@ -21879,7 +21887,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 	test("tmpEnrichNeedsReason appends only on an apt signature, only with a phrase", () => {
 		const space = (r: string) =>
 			r === "worker-a" || r === "local"
-				? `/tmp of ${r} has 512 MiB free`
+				? `The temp disk (/tmp) of ${r} has 512 MiB free`
 				: null;
 		expect(
 			tmpEnrichNeedsReason(
@@ -21888,7 +21896,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 				space,
 			),
 		).toBe(
-			"omp exited with code 1 before finishing: Splitting up failed; /tmp of worker-a has 512 MiB free",
+			"omp exited with code 1 before finishing: Splitting up failed; The temp disk (/tmp) of worker-a has 512 MiB free",
 		);
 		// "is not signed" is the other apt disk-failure signature; a local run passes null.
 		expect(
@@ -21898,7 +21906,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 				space,
 			),
 		).toBe(
-			"omp exited with code 1: package X is not signed; /tmp of local has 512 MiB free",
+			"omp exited with code 1: package X is not signed; The temp disk (/tmp) of local has 512 MiB free",
 		);
 		// No signature, or a null line (space unknown): the reason stays.
 		expect(
@@ -21915,7 +21923,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 
 	test("the /tmp hold's reason write publishes its own edge (OTTR-884)", async () => {
 		const { store, record, loop } = await setup({
-			tmpFullLine: () => "/tmp of local is full (0 MiB free)",
+			tmpFullLine: () => "The temp disk (/tmp) of local is full (0 MiB free)",
 		});
 		const task = await store.createTask("queued work");
 		await loop.schedule(); // entry + first cycle + the hold write's edge
@@ -21923,7 +21931,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 		const first = record.publishSoon;
 		expect(first).toBeGreaterThan(0);
 		expect((await store.getTask(task.id))!.needsReason).toContain(
-			"/tmp of local is full",
+			"The temp disk (/tmp) of local is full",
 		);
 		await loop.scheduleTick(); // the hold persists (the reason text matches): quiet
 		await flushPromises();
@@ -21936,7 +21944,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 		await flushPromises();
 		expect(record.publishSoon).toBe(base + 2);
 		expect((await store.getTask(task.id))!.needsReason).toContain(
-			"/tmp of local",
+			"The temp disk (/tmp) of local",
 		);
 	});
 });

@@ -1317,6 +1317,19 @@ export function tmpFull(freeBytes: number, totalBytes: number): boolean {
 	);
 }
 
+/** The bell's tmp-full advisory for one runner (a worker hostname or "local"). The
+ *  subject leads as words and the path rides in brackets (OTTR-1097): the bell's
+ *  collapsed line strips path tokens, so a leading "/tmp" left a short line that
+ *  named no disk. */
+export function tmpFullNotice(runner: string, freeBytes: number): string {
+	return `The temp disk (/tmp) of ${runner} is full (${formatBytes(freeBytes)} free)`;
+}
+
+/** The free-space line an apt disk-failure reason appends; same subject-first shape. */
+export function tmpSpaceNotice(runner: string, freeBytes: number): string {
+	return `The temp disk (/tmp) of ${runner} has ${formatBytes(freeBytes)} free`;
+}
+
 /**
  * OTTR-754: one bell warning per runner whose /tmp is below the free-space limit — worker
  * hostnames from the sign-ins tick's cache, the local runner from a statfs probe. Advisory:
@@ -1332,7 +1345,7 @@ export function workerTmpWarnings(
 	for (const [host, report] of reports) {
 		if (!report?.tmp) continue; // Unknown /tmp space warns nothing.
 		if (!tmpFull(report.tmp.freeBytes, report.tmp.totalBytes)) continue;
-		const line = `/tmp of ${host} is full (${formatBytes(report.tmp.freeBytes)})`;
+		const line = tmpFullNotice(host, report.tmp.freeBytes);
 		if (!seen.has(line)) {
 			seen.add(line);
 			out.push(line);
@@ -1342,7 +1355,7 @@ export function workerTmpWarnings(
 		localSpace !== null &&
 		tmpFull(localSpace.freeBytes, localSpace.totalBytes)
 	) {
-		const line = `/tmp of local is full (${formatBytes(localSpace.freeBytes)})`;
+		const line = tmpFullNotice("local", localSpace.freeBytes);
 		if (!seen.has(line)) out.push(line);
 	}
 	return out;
@@ -5976,7 +5989,7 @@ export async function createApp(deps: AppDeps) {
 					(w) => w !== null,
 				),
 				...(memoryHealth?.reason !== null && memoryHealth !== null
-					? [`omp runs with no memory: ${memoryHealth.reason}`]
+					? [`The omp process runs with no memory: ${memoryHealth.reason}`]
 					: []),
 			],
 			updates: await updatesView(),
@@ -15346,7 +15359,7 @@ export async function createApp(deps: AppDeps) {
 					: (workerSignInReports.get(runner)?.tmp ?? null);
 			if (space === null || !tmpFull(space.freeBytes, space.totalBytes))
 				return null;
-			return `/tmp of ${runner} is full (${formatBytes(space.freeBytes)})`;
+			return tmpFullNotice(runner, space.freeBytes);
 		},
 		// OTTR-754: the free space itself, for an apt disk-failure reason; known space
 		// always reports, so a recovered sweep still explains the failure it caused.
@@ -15355,9 +15368,7 @@ export async function createApp(deps: AppDeps) {
 				runner === "local"
 					? tmpDiskSpace()
 					: (workerSignInReports.get(runner)?.tmp ?? null);
-			return space === null
-				? null
-				: `/tmp of ${runner} has ${formatBytes(space.freeBytes)} free`;
+			return space === null ? null : tmpSpaceNotice(runner, space.freeBytes);
 		},
 		socketCount: () => sockets,
 		sampleStats,

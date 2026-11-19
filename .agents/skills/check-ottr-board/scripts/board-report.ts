@@ -331,7 +331,7 @@ export async function report(s: BoardState, now: number): Promise<string> {
 			? " **ahead: check for a failed server push (skill step 4)**"
 			: "";
 		out.push(
-			`- ${p.name}: ${head}${files.length > 0 ? " DIRTY: " + files.join(" ; ") : " clean"}${flag}`,
+			`- ${p.name}: ${head}${files.length > 0 ? ` DIRTY: ${files.join(" ; ")}` : " clean"}${flag}`,
 		);
 	}
 	if (questions.length > 0) out.push("", "## Questions", ...questions);

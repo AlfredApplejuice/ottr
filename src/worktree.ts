@@ -1967,7 +1967,7 @@ export async function lfsPointerOids(
 		undefined,
 		undefined,
 		{},
-		shas.join("\n") + "\n",
+		`${shas.join("\n")}\n`,
 	);
 	if (check.code !== 0) return [];
 	const small: string[] = [];

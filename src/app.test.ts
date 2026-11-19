@@ -43,6 +43,8 @@ import {
 	reconcileLayerUse,
 	storedProjectPaths,
 	tmpFull,
+	tmpFullNotice,
+	tmpSpaceNotice,
 	type WorkerSignInReport,
 	workerSignInWarnings,
 	workerTmpWarnings,
@@ -10703,7 +10705,7 @@ describe("hindsight settings", () => {
 			expect(v.backend).toBe("hindsight");
 			expect(v.memoryReason).toMatch(/did not answer/);
 			expect(await stateWarnings(booted.call)).toContain(
-				`omp runs with no memory: ${v.memoryReason}`,
+				`The omp process runs with no memory: ${v.memoryReason}`,
 			);
 		});
 	});
@@ -10725,7 +10727,7 @@ describe("hindsight settings", () => {
 			expect(v.memoryReason).toMatch(/rejected the key/);
 			expect(v.memoryReason).not.toContain("secret-token-value");
 			expect(await stateWarnings(booted.call)).toContain(
-				`omp runs with no memory: ${v.memoryReason}`,
+				`The omp process runs with no memory: ${v.memoryReason}`,
 			);
 		} finally {
 			rejector.stop(true);
@@ -10748,7 +10750,7 @@ describe("hindsight settings", () => {
 			).json()) as { memoryReason: string | null };
 			expect(v.memoryReason).toBeNull();
 			expect(await stateWarnings(booted.call)).not.toContainEqual(
-				expect.stringMatching(/^omp runs with no memory:/),
+				expect.stringMatching(/^The omp process runs with no memory:/),
 			);
 		} finally {
 			healthy.stop(true);
@@ -10767,7 +10769,7 @@ describe("hindsight settings", () => {
 			).json()) as { memoryReason: string };
 			expect(v.memoryReason).toMatch(/did not answer/);
 			expect(await stateWarnings(booted.call)).toContain(
-				`omp runs with no memory: ${v.memoryReason}`,
+				`The omp process runs with no memory: ${v.memoryReason}`,
 			);
 			return booted;
 		});
@@ -10789,7 +10791,7 @@ describe("hindsight settings", () => {
 				memoryReason: null,
 			});
 			expect(await stateWarnings(booted.call)).not.toContainEqual(
-				expect.stringMatching(/^omp runs with no memory:/),
+				expect.stringMatching(/^The omp process runs with no memory:/),
 			);
 		} finally {
 			healthy.stop(true);
@@ -23258,13 +23260,30 @@ describe("worker /tmp full warnings (OTTR-754)", () => {
 			["worker-d", null], // A failed probe.
 		]);
 		expect(workerTmpWarnings(reports, AMPLE)).toEqual([
-			"/tmp of worker-a is full (512 MiB)",
+			"The temp disk (/tmp) of worker-a is full (512 MiB free)",
 		]);
 		// The local runner joins when its own statfs reads full; never a duplicate.
 		expect(workerTmpWarnings(reports, LOW)).toEqual([
-			"/tmp of worker-a is full (512 MiB)",
-			"/tmp of local is full (512 MiB)",
+			"The temp disk (/tmp) of worker-a is full (512 MiB free)",
+			"The temp disk (/tmp) of local is full (512 MiB free)",
 		]);
+	});
+
+	test("the tmp advisory texts lead with words, never a path token", () => {
+		// OTTR-1097: a text that starts with a path loses its subject in the bell's
+		// collapsed line (stripNoticeTokens drops path tokens). The old texts led
+		// with "/tmp", so the short line started with "of". The path survives only
+		// as bracketed detail behind a worded subject.
+		const runners = ["worker-a", "127.0.0.1", "local"];
+		const texts = [
+			...runners.map((r) => tmpFullNotice(r, 512 * 1024 * 1024)),
+			...runners.map((r) => tmpSpaceNotice(r, 512 * 1024 * 1024)),
+		];
+		for (const text of texts) {
+			const first = text.split(/\s+/)[0] ?? "";
+			expect(first.startsWith("/")).toBe(false);
+			expect(first).toBe("The");
+		}
 	});
 
 	test("stateResponse warns on a low worker report and clears when space returns", async () => {
@@ -23326,7 +23345,9 @@ describe("worker /tmp full warnings (OTTR-754)", () => {
 		try {
 			await workerApp.workerSignInTick();
 			let warnings = (await state()).warnings;
-			expect(warnings).toContain("/tmp of 127.0.0.1 is full (512 MiB)");
+			expect(warnings).toContain(
+				"The temp disk (/tmp) of 127.0.0.1 is full (512 MiB free)",
+			);
 
 			// Space returns: the advisory warning recomputes away on the next tick.
 			answer = { signIns: [], tmp: AMPLE };

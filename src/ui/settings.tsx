@@ -7066,7 +7066,7 @@ export function HindsightSection() {
 			{view?.memoryReason != null && (
 				<p className="hint notif-line" role="alert">
 					<Mark kind="warn" />
-					<span>omp runs with no memory: {view.memoryReason}</span>
+					<span>The omp process runs with no memory: {view.memoryReason}</span>
 				</p>
 			)}
 			{urlError !== null && (

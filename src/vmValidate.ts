@@ -214,7 +214,8 @@ class TailBuffer {
 		this.length += chunk.byteLength;
 		let excess = this.length - this.cap;
 		while (excess > 0 && this.chunks.length > 0) {
-			const first = this.chunks[0]!;
+			const first = this.chunks[0];
+			if (first === undefined) break;
 			if (first.byteLength <= excess) {
 				this.chunks.shift();
 				this.length -= first.byteLength;
@@ -618,7 +619,7 @@ function promoteOne(
 	const parts = name.split("/");
 	if (parts.some((p) => p === "" || p === "." || p === ".."))
 		return drop("a path component is empty, . or ..");
-	const root = SCRATCH_ROOTS[parts[0]!];
+	const root = SCRATCH_ROOTS[parts[0] ?? ""];
 	if (root === undefined)
 		return drop("not under a scratch root (tmp, home, work)");
 	const below = parts.slice(1);
@@ -683,12 +684,12 @@ export function encodeResult(result: ValidateResult): Uint8Array | null {
 	let encoded = encodeLengthPrefixed(JSON.stringify(current));
 	while (encoded.byteLength > VM_VALIDATE.resultDriveBytes) {
 		let largest = -1;
-		for (let i = 0; i < current.artifacts.length; i++)
-			if (
-				largest === -1 ||
-				current.artifacts[i]!.size > current.artifacts[largest]!.size
-			)
-				largest = i;
+		for (let i = 0; i < current.artifacts.length; i++) {
+			const size = current.artifacts[i]?.size ?? -1;
+			const best =
+				largest === -1 ? -1 : (current.artifacts[largest]?.size ?? -1);
+			if (size > best) largest = i;
+		}
 		const victim = current.artifacts[largest];
 		if (largest === -1 || victim === undefined || victim.bytes === "")
 			return null;

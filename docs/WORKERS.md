@@ -321,7 +321,8 @@ omp. Two parts do the work:
    open and an entry whose newest write happened after a live turn started. Each
    worker self-reports its `/tmp` space on `GET /signins` (`tmp`); a runner below
    the free-space limit (1 GiB or 5%) gets no new turn, and the bell shows one
-   `/tmp of <runner> is full (<free>)` notice until the space is back.
+   `The temp disk (/tmp) of <runner> is full (<free> free)` notice until the
+   space is back.
 
    When the board is too old for the runner API (`GET /api/drain` answers
    nothing), the script keeps the old whole-board rule, with the old hold-first
@@ -1255,8 +1256,8 @@ turns get the overlay, so the whole compose topology runs one backend.
 
 The server checks memory health at boot and every 60 seconds. When the check fails, the
 board header and the Settings Hindsight section show the sentence
-`omp runs with no memory: <reason>` — for example an unreachable Hindsight URL or a
-mnemopi store that refuses writes.
+`The omp process runs with no memory: <reason>` — for example an unreachable
+Hindsight URL or a mnemopi store that refuses writes.
 
 The Hindsight server requires its tenant API key on every request. Set it under
 **Settings -> Hindsight** (the same place holds the server address): the board saves a

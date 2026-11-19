@@ -1454,27 +1454,26 @@ describe("runWorker", () => {
 			const gate = Promise.withResolvers<void>();
 			const started = Promise.withResolvers<void>();
 			const persisted: string[] = [];
-			const payload =
-				[
-					{ type: "session", id: "worker-session" },
-					{
-						type: "tool_execution_start",
-						toolName: "propose_task",
-						toolCallId: "finding",
-						args: { prompt: "worker finding" },
-					},
-					{
-						type: "tool_execution_end",
-						toolName: "propose_task",
-						toolCallId: "finding",
-						isError: false,
-					},
-					...(ending === "sentinel"
-						? [{ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } }]
-						: []),
-				]
-					.map((event) => JSON.stringify(event))
-					.join("\n") + "\n";
+			const payload = `${[
+				{ type: "session", id: "worker-session" },
+				{
+					type: "tool_execution_start",
+					toolName: "propose_task",
+					toolCallId: "finding",
+					args: { prompt: "worker finding" },
+				},
+				{
+					type: "tool_execution_end",
+					toolName: "propose_task",
+					toolCallId: "finding",
+					isError: false,
+				},
+				...(ending === "sentinel"
+					? [{ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } }]
+					: []),
+			]
+				.map((event) => JSON.stringify(event))
+				.join("\n")}\n`;
 			const server = Bun.serve({
 				port: 0,
 				fetch: () =>
@@ -1534,24 +1533,23 @@ describe("runWorker", () => {
 		const gate = Promise.withResolvers<void>();
 		const started = Promise.withResolvers<void>();
 		const failure = new Error("finding persistence failed");
-		const payload =
-			[
-				{
-					type: "tool_execution_start",
-					toolName: "propose_task",
-					toolCallId: "rejected",
-					args: { prompt: "rejected finding" },
-				},
-				{
-					type: "tool_execution_end",
-					toolName: "propose_task",
-					toolCallId: "rejected",
-					isError: false,
-				},
-				{ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } },
-			]
-				.map((event) => JSON.stringify(event))
-				.join("\n") + "\n";
+		const payload = `${[
+			{
+				type: "tool_execution_start",
+				toolName: "propose_task",
+				toolCallId: "rejected",
+				args: { prompt: "rejected finding" },
+			},
+			{
+				type: "tool_execution_end",
+				toolName: "propose_task",
+				toolCallId: "rejected",
+				isError: false,
+			},
+			{ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } },
+		]
+			.map((event) => JSON.stringify(event))
+			.join("\n")}\n`;
 		const server = Bun.serve({
 			port: 0,
 			fetch: () => new Response(payload),
