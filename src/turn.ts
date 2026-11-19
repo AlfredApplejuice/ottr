@@ -1592,6 +1592,12 @@ export interface TurnLoop {
 		reviewId?: string,
 		strictReview?: boolean,
 	): Promise<{ id: string } | { error: string; status: number }>;
+	/** OTTR-1139: the periodic catch-up sweep, on the supervisor tick's cadence.
+	 * Calls filePendingValidationRun(e) for every project, so a done review whose
+	 * settle event never fired (a deploy gap, a crash between the done write and
+	 * the filing, a 409 from the one-open-run rule) still gets its batch run. A
+	 * refusal ({ error, status }) logs nothing; a thrown error logs one line. */
+	validationSweep(): Promise<void>;
 	/** Stops the running turn without cancelling the task (the board's Esc). */
 	stopTurn(e: TurnProject, id: string): Promise<StopOutcome>;
 	/** Hosted mode: sets the credit hold and stops every turn in flight (work or merge runs like
@@ -9272,6 +9278,18 @@ export function createTurnLoop(
 		});
 	}
 
+	/** OTTR-1139: the periodic catch-up sweep. The filing rules live entirely in
+	 * filePendingValidationRun: same one-open-run-per-project rule, same declined
+	 * rule, same batch cap. A refusal ({ error, status }) logs nothing — the same
+	 * quiet no-op the settle triggers rely on; a thrown error logs one line,
+	 * like the settle triggers' catch. */
+	async function validationSweep(): Promise<void> {
+		for (const e of projects.values())
+			await filePendingValidationRun(e).catch((err) =>
+				logStoreError(e.store.name, err),
+			);
+	}
+
 	/** UI-shot guard: a work turn whose diff touches UI files (uiFiles) but attached no
 	 * screenshot warns — the board would otherwise show UI work without visual proof. On a
 	 * clean settle it re-prompts: the session resumes with a request to capture the shot.
@@ -11975,6 +11993,7 @@ export function createTurnLoop(
 		runTurn,
 		cancel,
 		filePendingValidationRun,
+		validationSweep,
 		stopTurn,
 		creditStop,
 		creditRelease,

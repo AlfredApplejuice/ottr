@@ -1140,6 +1140,11 @@ every(() => loop.scheduleTick(), 5000);
 
 every(() => supervisor.tick(), 60_000);
 
+// OTTR-1139: the catch-up sweep files the batch validation a done review still
+// waits for when its settle event never fired. Same 60 s cadence as the
+// supervisor tick; the filing rules live in the loop's filePendingValidationRun.
+every(() => loop.validationSweep(), 60_000);
+
 // U9: when the alate server holds an unprovisioned import and no turn runs, run the same
 // provision path as Settings → Alate → Provision; a failed attempt waits an hour.
 every(() => app.alateProvisionTick(), 5 * 60_000);

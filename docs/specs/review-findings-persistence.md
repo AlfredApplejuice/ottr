@@ -327,8 +327,7 @@ exact prompt; a lead with no stored rank sorts last), ties by card id
 ascending, capped at `validationBatchSize` (a stored value below 1 behaves as
 1).
 
-Triggers, and only these (older done reviews drain through the chain and the
-manual start, not through a periodic sweep):
+Triggers:
 
 1. After a review's Done write: the live settle path after `writePostCheckState`
    lands `done` for a review card, and the scheduled `settleReviewCard` and
@@ -338,6 +337,19 @@ manual start, not through a periodic sweep):
    lands `needs_you` triggers nothing, so a run that records no results, or
    none that apply, stops its chain.
 3. The manual start below.
+4. The periodic catch-up sweep (OTTR-1139): the server's 60 s background tick
+   calls `filePendingValidationRun(e)` for every project (`validationSweep` on
+   the turn loop, `src/turn.ts`, wired in `src/server.ts` next to the
+   supervisor tick). It files nothing new on its own: the same filing rules
+   above decide, so a review whose leads are all deployment-fact, a declined
+   review, and a project with an open validation run stay untouched, and a
+   409 or "nothing to file" result logs nothing. A thrown error logs one
+   line, like the settle triggers' catch.
+
+The sweep is the safety net for a done review that missed its event: a deploy
+gap, a crash between the done write and the filing, or a 409 from the
+one-open-run rule at settle time. Older done reviews drain through the sweep,
+the chain, and the manual start.
 
 The batch prompt is a new builder in `src/prompts.ts`,
 `validationRunPrompt({ reviewId, leads })`, where `leads` is

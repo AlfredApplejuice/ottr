@@ -27846,6 +27846,89 @@ describe("stored review findings", () => {
 		expect(card4.prompt).toContain(`#${m1.id}`);
 	});
 
+	test("the validation sweep files a missed batch with no settle event (OTTR-1139)", async () => {
+		const record = baseRecord();
+		const { store, loop } = await validationCase(record);
+		// The missed-event shape: the review went done, its sandbox lead waits,
+		// no validation card exists, and no trigger fired (no settle call below).
+		const review = await doneReview(store, "missed event");
+		const lead = await leadCard(
+			store,
+			review.id,
+			"Needs validation: missed sweep lead\nBlocker: sandbox run: ms",
+		);
+		await loop.validationSweep();
+		const cards = (await store.listTasks()).filter(
+			(t) => t.kind === "validation",
+		);
+		expect(cards).toHaveLength(1);
+		const card = (await store.getTask(cards[0]!.id))!;
+		expect(card.followUpOf).toBe(review.id);
+		expect(card.stage).toBe("todo");
+		expect(card.state).toBe("queued");
+		expect(card.prompt).toContain(`#${lead.id}`);
+		// The sweep files only: it runs no turn, and the lead and the review
+		// stay as they were.
+		expect(record.runs).toHaveLength(0);
+		expect((await store.getTask(lead.id))!.stage).toBe("backlog");
+		expect((await store.getTask(review.id))!.stage).toBe("done");
+	});
+
+	test("the validation sweep files nothing when the rules refuse (OTTR-1139)", async () => {
+		const record = baseRecord();
+		const { store, loop } = await validationCase(record);
+
+		// A review whose leads are all deployment-fact: nothing batchable.
+		const factReview = await doneReview(store, "deployment facts");
+		await leadCard(
+			store,
+			factReview.id,
+			"Needs validation: proxy header\nBlocker: deployment fact: Which proxy?",
+		);
+
+		// A declined review: its newest validation card is cancelled.
+		const declinedReview = await doneReview(store, "declined");
+		await leadCard(
+			store,
+			declinedReview.id,
+			"Needs validation: declined lead\nBlocker: sandbox run: dl",
+		);
+		const declinedCard = await store.createTask(
+			"validation run",
+			null,
+			"validation",
+		);
+		await store.updateTask(declinedCard.id, {
+			followUpOf: declinedReview.id,
+			cancelledAt: Date.now(),
+		});
+
+		// An open validation card anywhere in the project: the one-open-run rule.
+		const openReview = await doneReview(store, "open run");
+		await leadCard(
+			store,
+			openReview.id,
+			"Needs validation: waiting lead\nBlocker: sandbox run: wl",
+		);
+		const openCard = await store.createTask(
+			"validation run",
+			null,
+			"validation",
+		);
+		await store.updateTask(openCard.id, { followUpOf: openReview.id });
+
+		await loop.validationSweep();
+		const cards = (await store.listTasks()).filter(
+			(t) => t.kind === "validation",
+		);
+		// Only the two cards the test created; the sweep filed none.
+		expect(cards).toHaveLength(2);
+		for (const t of cards)
+			expect([declinedCard.id, openCard.id]).toContain(t.id);
+		for (const id of [factReview.id, declinedReview.id, openReview.id])
+			expect((await store.getTask(id))!.stage).toBe("done");
+	});
+
 	test("a validation card holds no merge and never commits (OTTR-1047)", async () => {
 		const record = baseRecord();
 		const { store, projects, loop, outcome } = await validationCase(record, {
