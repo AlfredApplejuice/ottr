@@ -1634,6 +1634,19 @@ sha256, so the homes share the data dir but never the file — every run reads a
 converges only its own home's list (the ensure step runs before the spawn, the same
 guard as the memory overlay).
 
+Custom tools have no such gate in the pinned omp line (18.15.0): omp imports every
+module under the worktree's `.omp/tools`, `.omp/plugins`, `.claude/tools`,
+`.claude/plugins` and `.codex/tools` at session start, before any model call, and no
+flag or config key turns that off (OTTR-990; verified on omp 18.15.0). So every local
+run (`startLocalRun`, the runs in the server container) renames these five dirs to
+siblings with a `.ottr-boardrun` suffix before the spawn and restores them when the run
+settles. The rename stays inside the parent dir, so git sees only the move while the
+park holds. A park error aborts the run before the spawn, and undoes the renames that
+did happen. A crash between the rename and the restore leaves the suffix behind; the
+next local run restores such a leftover before it parks again. Worker and VM turns keep
+loading project custom tools: they run inside the worker sandbox, where this code
+execution is the point.
+
 ### The data boundary
 
 The spec is `docs/specs/server-only-project-state.md`.

@@ -3013,6 +3013,149 @@ function fakeStart(o: {
 	}).then((handle) => ({ handle, fake }));
 }
 
+/** OTTR-990: a local run must park the worktree's custom-tool dirs out of omp's
+ * discovery for the run and restore them at settle. The launcher sees the cwd exactly
+ * when omp would import the planted modules, so the parked state is asserted there. */
+describe("startRun custom-tool park", () => {
+	/** Plants `.omp/tools/` and runs one local startRun whose launcher records the cwd's
+	 * park shape at spawn, then closes the child cleanly. */
+	async function plantedRun(cwd: string) {
+		const atSpawn: { tools: boolean; plugins: boolean } = {
+			tools: false,
+			plugins: false,
+		};
+		const fake = new FakeOmp(4242);
+		const launcher: RunLauncher = (_c, _a, options) => {
+			atSpawn.tools = existsSync(join(String(options.cwd), ".omp", "tools"));
+			atSpawn.plugins = existsSync(
+				join(String(options.cwd), ".omp", "plugins"),
+			);
+			queueMicrotask(() => fake.emit("close", 0));
+			return fake as unknown as ChildProcess;
+		};
+		const handle = await startRun({
+			cwd,
+			prompt: "check the work",
+			sessionDir: cwd,
+			extensionPath: "/unused.ts",
+			resumeId: null,
+			logPath: join(dirname(cwd), `${basename(cwd)}-park.log`),
+			dataRoot: dirname(cwd),
+			launcher,
+		});
+		return { handle, atSpawn };
+	}
+
+	test("parks planted custom-tool dirs at spawn and restores their content after", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-park-"));
+		try {
+			const planted =
+				'.omp/tools/planted.ts\nexport default () => ({ name: "planted" });\n';
+			for (const rel of [
+				join(".omp", "tools"),
+				join(".omp", "plugins"),
+				join(".claude", "tools"),
+				join(".claude", "plugins"),
+				join(".codex", "tools"),
+			]) {
+				mkdirSync(join(dir, rel), { recursive: true });
+				writeFileSync(join(dir, rel, "planted.ts"), planted);
+			}
+			const { handle, atSpawn } = await plantedRun(dir);
+			const result = await handle.done;
+			// omp would import the planted modules from these exact paths at spawn:
+			// both the discovery targets must be gone while the run owns the cwd.
+			expect(atSpawn).toEqual({ tools: false, plugins: false });
+			expect(result.exitCode).toBe(0);
+			// Every planted dir is back, byte for byte, and no park sibling remains.
+			for (const rel of [
+				join(".omp", "tools"),
+				join(".omp", "plugins"),
+				join(".claude", "tools"),
+				join(".claude", "plugins"),
+				join(".codex", "tools"),
+			]) {
+				expect(readFileSync(join(dir, rel, "planted.ts"), "utf8")).toBe(
+					planted,
+				);
+				expect(existsSync(join(dir, `${rel}.ottr-boardrun`))).toBe(false);
+			}
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("heals a crash leftover parked at the stable sibling", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-park-heal-"));
+		try {
+			mkdirSync(join(dir, ".omp", "tools.ottr-boardrun"), { recursive: true });
+			writeFileSync(
+				join(dir, ".omp", "tools.ottr-boardrun", "planted.ts"),
+				"committed\n",
+			);
+			const { handle, atSpawn } = await plantedRun(dir);
+			await handle.done;
+			// The heal runs before the spawn, so the leftover content sits at the park
+			// target again while the run owns the cwd.
+			expect(atSpawn).toEqual({ tools: false, plugins: false });
+			expect(
+				readFileSync(join(dir, ".omp", "tools", "planted.ts"), "utf8"),
+			).toBe("committed\n");
+			expect(existsSync(join(dir, ".omp", "tools.ottr-boardrun"))).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("fails closed before the spawn when a park target cannot be freed", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-park-full-"));
+		try {
+			mkdirSync(join(dir, ".omp", "tools"), { recursive: true });
+			writeFileSync(join(dir, ".omp", "tools", "planted.ts"), "committed\n");
+			// Exhaust `.omp/plugins`' park targets: the dir exists and the stable sibling
+			// plus every numbered one, so its park fails after `.omp/tools` parked.
+			mkdirSync(join(dir, ".omp", "plugins"), { recursive: true });
+			mkdirSync(join(dir, ".omp", "plugins.ottr-boardrun"), {
+				recursive: true,
+			});
+			for (let n = 2; n < 64; n++)
+				mkdirSync(join(dir, `.omp`, `plugins.ottr-boardrun-${n}`), {
+					recursive: true,
+				});
+			let spawned = false;
+			const fake = new FakeOmp();
+			const launcher: RunLauncher = () => {
+				spawned = true;
+				return fake as unknown as ChildProcess;
+			};
+			let failure: unknown = null;
+			try {
+				await startRun({
+					cwd: dir,
+					prompt: "check the work",
+					sessionDir: dir,
+					extensionPath: "/unused.ts",
+					resumeId: null,
+					logPath: join(dirname(dir), "park-full.log"),
+					dataRoot: dirname(dir),
+					launcher,
+				});
+			} catch (err) {
+				failure = err;
+			}
+			expect(spawned).toBe(false);
+			expect(String(failure)).toContain("custom-tool park failed");
+			// The partial park unwound: the planted content sits at its own path again.
+			expect(
+				readFileSync(join(dir, ".omp", "tools", "planted.ts"), "utf8"),
+			).toBe("committed\n");
+			expect(existsSync(join(dir, ".omp", "tools.ottr-boardrun"))).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("startRun", () => {
 	test("session and findings persist in arrival order before local completion", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-startrun-"));

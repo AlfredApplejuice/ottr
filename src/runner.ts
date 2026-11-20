@@ -3,11 +3,19 @@ import {
 	type SpawnOptions,
 	spawn,
 } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+	existsSync,
+	lstatSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	statSync,
+} from "node:fs";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { aptListPath } from "./apt.ts";
 import { mkdirBelow, touchBelow, writeBelow } from "./confine.ts";
+import { errmsg } from "./errmsg.ts";
 import {
 	type CommitIdentity,
 	commitIdentityEnv,
@@ -1908,6 +1916,112 @@ async function resolveIdentityEnv(
 	return commitIdentityEnv(identity, probe);
 }
 
+/**
+ * OTTR-990: the run-cwd directories the pinned omp line (18.15.0) scans for project
+ * custom tools. omp imports every `.ts`/`.js` module it finds there at session start,
+ * before any model call, and no CLI flag or config key turns that off (`--no-extensions`,
+ * `--no-lsp` and the no-discovery overlay cover extensions, plugin code, LSP and project
+ * MCP only; validation #OTTR-1089 planted `.omp/tools/x.ts` and its top-level code ran in
+ * the server process). The plugin dirs matter because a project plugin registry
+ * (`.omp/plugins/installed_plugins.json`, the `.claude` analog) adds its plugins' own
+ * `tools/` dirs; the foreign dirs come from omp's `claude`/`codex` discovery providers.
+ * A work turn plants these dirs in its worktree and commits them, and every board-side
+ * run uses that worktree as its cwd, so a local run parks them out of omp's sight.
+ */
+const CUSTOM_TOOL_DIRS = [
+	".omp/tools",
+	".omp/plugins",
+	".claude/tools",
+	".claude/plugins",
+	".codex/tools",
+] as const;
+
+/** Park suffix. omp's discovery scans the exact dir names `tools` and `plugins` inside
+ * each config dir, so the suffixed sibling stays invisible for the run. A crash leftover
+ * keeps the content on disk under this name; the next run heals it (restores, then parks
+ * it again), so committed content never stays parked. */
+const PARK_SUFFIX = ".ottr-boardrun";
+
+/** One parked dir: its discovery path in the run cwd and where it sits until settle. */
+interface ParkedDir {
+	from: string;
+	to: string;
+}
+
+/** Park target for `abs`: the stable sibling when free, else numbered siblings when a
+ * crash left both the original and the stable park behind. Throws when 63 numbered
+ * siblings are taken too: that is fail-closed, the same as every park error below. */
+function parkTarget(abs: string): string {
+	if (!lstatQuiet(`${abs}${PARK_SUFFIX}`)) return `${abs}${PARK_SUFFIX}`;
+	for (let n = 2; n < 64; n++) {
+		const candidate = `${abs}${PARK_SUFFIX}-${n}`;
+		if (!lstatQuiet(candidate)) return candidate;
+	}
+	throw new Error(
+		`custom-tool park failed for ${basename(abs)}: no free park target`,
+	);
+}
+
+/** Whether `abs` exists as any entry (a dangling symlink counts): the park moves links
+ * like files, so the run's cwd keeps its exact shape across the park. */
+function lstatQuiet(abs: string): boolean {
+	try {
+		lstatSync(abs);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Parks every custom-tool source dir in the run cwd out of omp's sight, appending each
+ * pair to the caller-owned `parked` (so a throw still leaves every parked dir restorable)
+ * and returning it. Renames stay inside the parent dir, so the worktree keeps its content
+ * and git only sees the moves while the park holds. Absent dirs are skipped. Fail-closed:
+ * an unexpected rename error throws before the spawn, so a run never starts on a cwd
+ * whose park is incomplete. */
+function parkCustomToolDirs(cwd: string, parked: ParkedDir[]): ParkedDir[] {
+	for (const rel of CUSTOM_TOOL_DIRS) {
+		const from = join(cwd, rel);
+		if (!lstatQuiet(from)) {
+			// Nothing to park here — but heal a crash leftover parked at the stable
+			// sibling, so committed content never stays parked after a tracker crash.
+			const stable = `${from}${PARK_SUFFIX}`;
+			if (!lstatQuiet(stable)) continue;
+			try {
+				renameSync(stable, from);
+			} catch (err) {
+				throw new Error(
+					`custom-tool park heal failed for ${rel}: ${errmsg(err)}`,
+				);
+			}
+		}
+		const to = parkTarget(from);
+		try {
+			renameSync(from, to);
+		} catch (err) {
+			throw new Error(`custom-tool park failed for ${rel}: ${errmsg(err)}`);
+		}
+		parked.push({ from, to });
+	}
+	return parked;
+}
+
+/** Restores the parked custom-tool dirs. A failed rename is logged, not thrown: the run
+ * already happened, and its result must not turn into a failure by a restore error. The
+ * parked content stays on disk at `to`; the next run's heal or the card's untracked
+ * quarantine picks it up, and this line names the pair for that cleanup. */
+function restoreParkedToolDirs(parked: ParkedDir[], sink: RunSink): void {
+	for (const { from, to } of parked.reverse()) {
+		try {
+			renameSync(to, from);
+		} catch (err) {
+			sink.line(
+				`! custom-tool park restore failed for ${from}: ${errmsg(err)} — content stays at ${to}`,
+			);
+		}
+	}
+}
+
 /** The local dispatch: omp spawns on this host and streams its events into the sink. */
 function startLocalRun(s: RunStart): RunHandle {
 	const {
@@ -1941,6 +2055,18 @@ function startLocalRun(s: RunStart): RunHandle {
 	);
 	if (layerEnv !== null) Object.assign(base, layerEnv);
 	Object.assign(base, identityEnv);
+	// OTTR-990: the run cwd is a worker-writable worktree, and omp imports its project
+	// custom tools (`.omp/tools`, plugins, foreign `.claude`/`.codex` tool dirs) into
+	// this server process at session start. Park them out of discovery for the run and
+	// restore them at settle; a park error throws before the spawn (fail-closed), after
+	// unwinding the dirs that did park, so the worktree keeps its committed content.
+	let parked: ParkedDir[] = [];
+	try {
+		parkCustomToolDirs(o.cwd, parked);
+	} catch (err) {
+		restoreParkedToolDirs(parked, sink);
+		throw err;
+	}
 	const child = launch("omp", args, {
 		cwd: o.cwd,
 		stdio: ["pipe", "pipe", "pipe"],
@@ -1982,6 +2108,8 @@ function startLocalRun(s: RunStart): RunHandle {
 		settled = true;
 		void (async () => {
 			try {
+				// Restore before the drain, so a restore warning lands in the run log.
+				if (parked.length > 0) restoreParkedToolDirs(parked, sink);
 				await sink.drain();
 				// Audit only after the run's output and persistence callbacks finish.
 				const drift = o.auditProvisioned?.(startedAt, rulesAtStart) ?? [];
