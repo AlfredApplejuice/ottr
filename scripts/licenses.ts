@@ -52,16 +52,32 @@ export function checkLicenses(
 	};
 }
 
+/** One `bun pm licenses --json` read, retried: a registry fetch timeout or a spawn
+ * refusal under a loaded machine fails the gate for no policy reason, so the read
+ * retries with a short sync pause before it gives up. The license check itself is
+ * data-based and runs once on the first successful read, unchanged. */
+function licensesJson():
+	| { ok: true; json: string }
+	| { ok: false; stderr: string } {
+	let stderr = "";
+	for (let attempt = 1; attempt <= 3; attempt++) {
+		const proc = Bun.spawnSync([process.execPath, "pm", "licenses", "--json"]);
+		if (proc.exitCode === 0) return { ok: true, json: proc.stdout.toString() };
+		stderr = proc.stderr.toString().trim();
+		if (attempt < 3)
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);
+	}
+	return { ok: false, stderr };
+}
+
 function main(): number {
-	const proc = Bun.spawnSync([process.execPath, "pm", "licenses", "--json"]);
-	if (proc.exitCode !== 0) {
-		console.error(
-			`bun pm licenses failed (exit ${proc.exitCode}): ${proc.stderr.toString().trim()}`,
-		);
+	const read = licensesJson();
+	if (!read.ok) {
+		console.error(`bun pm licenses failed: ${read.stderr}`);
 		return 1;
 	}
 	// License key -> packages. Another shape throws here: that fails the gate.
-	const check = checkLicenses(JSON.parse(proc.stdout.toString()));
+	const check = checkLicenses(JSON.parse(read.json));
 	for (const problem of check.problems) console.error(problem);
 	return check.ok ? 0 : 1;
 }
