@@ -109,9 +109,17 @@ lead.
 The reply route applies the answers (`src/app.ts`). A reply to a card whose prompt
 starts with the question-card prefix and whose `asked` is set parses one answer per
 question — from the drawer's wire line `For "<question>": <answer>` (shared helper
-`askAnswerLine`), or, on a single-question card, from the whole reply text (that
-drawer sends the raw answer without the wire line) — applies it to the question's
-lead card, records free text no question consumed on the unanswered open leads, and
+`askAnswerLine`), from a plain form `Q<n>: <answer>` or `<n>. <answer>` whose n is
+the question's 1-based position in `asked`, or, on a single-question card, from the
+whole reply text (the drawer sends the raw answer without the wire line). An
+answer matches an option label case-insensitively, with one trailing period
+ignored. A multi-question reply that matches no question is refused with 400 and
+an error that shows the expected line format; the card and the leads stay
+unchanged (OTTR-1130). When some questions match and others do not, the matched
+answers apply, and the card stays at `needs_you` with `asked` holding only the
+unanswered questions and a `needsReason` naming them, so the next reply answers
+the rest. A reply that answers every question applies it to each question's lead
+card, records free text no question consumed on the unanswered open leads, and
 lands the question card Done (`stage: "done"`, `state: "idle"`, `asked: null`,
 `doneAt` set by the store's Done stamp):
 
@@ -129,8 +137,10 @@ lands the question card Done (`stage: "done"`, `state: "idle"`, `asked: null`,
   question consumed appends to the details of every open lead that got no
   per-question answer.
 - Answers only touch lead cards of the same review (`followUpOf` match) that are
-  still open (not cancelled, not done). The question card lands Done inside the
-  same reply, so a second reply is refused (409, not needs_you).
+  still open (not cancelled, not done). A complete reply lands the card Done
+  inside the same reply, so a second reply is refused (409, not needs_you). A
+  partial reply keeps the card at `needs_you`, so the operator replies again with
+  the remaining questions (OTTR-1130).
 
 No schema change: the question card reuses the existing `asked` column and its
 `AskQuestion` normalization.

@@ -11763,10 +11763,24 @@ export async function createApp(deps: AppDeps) {
 		await deps.schedule();
 		return await taskResponse(e, task.id);
 	}
-	/** One parsed answer per asked question: the drawer's wire line, or — on a
-	 * single-question card, whose drawer sends the raw answer text instead of the
-	 * wire line — the whole reply. The range marks the consumed text, so the reply's
-	 * free text can be recovered afterwards. Pure. */
+	/** One plain-form answer line: `Q<n>: <answer>` or `<n>. <answer>`, n the 1-based
+	 * question order. Null: the line starts no answer. Pure. */
+	function plainAskAnswer(
+		line: string,
+		count: number,
+	): { n: number; answer: string } | null {
+		const parsed = /^\s*(?:Q\s*(\d+)\s*:|(\d+)\.\s+)(.*)$/i.exec(line);
+		if (parsed === null) return null;
+		const n = Number(parsed[1] ?? parsed[2]);
+		const answer = (parsed[3] ?? "").trim();
+		if (n < 1 || n > count || answer === "") return null;
+		return { n, answer };
+	}
+	/** One parsed answer per asked question: the drawer's wire line, a plain
+	 * `Q<n>:`/`<n>.` line by question order, or — on a single-question card, whose
+	 * drawer sends the raw answer text instead of the wire line — the whole reply.
+	 * The range marks the consumed text, so the reply's free text can be recovered
+	 * afterwards. Pure. */
 	function leadAskMatches(
 		asked: AskQuestion[],
 		text: string,
@@ -11787,7 +11801,21 @@ export async function createApp(deps: AppDeps) {
 			const at = text.indexOf(marker);
 			if (at !== -1) {
 				const rest = text.slice(at + marker.length);
-				const stop = rest.indexOf('\nFor "');
+				// The answer ends at the next answer line of any form, so wire lines
+				// and plain lines mix in one reply.
+				let stop = -1;
+				let offset = 0;
+				for (const line of rest.split("\n")) {
+					if (
+						offset > 0 &&
+						(line.startsWith('For "') ||
+							plainAskAnswer(line, asked.length) !== null)
+					) {
+						stop = offset;
+						break;
+					}
+					offset += line.length + 1;
+				}
 				const answer = (stop === -1 ? rest : rest.slice(0, stop)).trim();
 				if (answer !== "")
 					matches.push({
@@ -11796,16 +11824,31 @@ export async function createApp(deps: AppDeps) {
 						start: at,
 						end: at + marker.length + (stop === -1 ? rest.length : stop),
 					});
-				continue;
 			}
-			if (asked.length === 1 && text.trim() !== "")
-				matches.push({
-					question: q.question,
-					answer: text.trim(),
-					start: 0,
-					end: text.length,
-				});
 		}
+		// Plain-form lines fill the questions the wire lines left unmatched.
+		const taken = new Set(matches.map((m) => m.question));
+		let at = 0;
+		for (const line of text.split("\n")) {
+			const plain = plainAskAnswer(line, asked.length);
+			if (plain !== null && !taken.has(asked[plain.n - 1]!.question)) {
+				taken.add(asked[plain.n - 1]!.question);
+				matches.push({
+					question: asked[plain.n - 1]!.question,
+					answer: plain.answer,
+					start: at,
+					end: at + line.length,
+				});
+			}
+			at += line.length + 1;
+		}
+		if (asked.length === 1 && matches.length === 0 && text.trim() !== "")
+			matches.push({
+				question: asked[0]!.question,
+				answer: text.trim(),
+				start: 0,
+				end: text.length,
+			});
 		return matches;
 	}
 	/** A reply to a review's lead-question card (OTTR-869): the drawer sends one
@@ -11817,8 +11860,11 @@ export async function createApp(deps: AppDeps) {
 	 * lead with the answer as its reason; a started lead cancels through the
 	 * sanctioned cancel (it stops the run, disposes the worktree, deletes the
 	 * branch), never through the bare patch. Free text no question consumed appends
-	 * to the details of every open lead that got no per-question answer. The question
-	 * card lands Done either way, so a second reply is refused. Null: a plain reply. */
+	 * to the details of every open lead that got no per-question answer. A
+	 * multi-question reply that matches no question is refused with 400 before any
+	 * write (OTTR-1130). A partial reply applies the matched answers and leaves the
+	 * card at needs_you with only the unanswered questions; a complete reply lands
+	 * the card Done, so a second reply is refused. Null: a plain reply. */
 	async function reviewLeadAskReply(
 		e: Entry,
 		task: Task,
@@ -11851,7 +11897,21 @@ export async function createApp(deps: AppDeps) {
 		for (const m of [...matches].sort((a, b) => b.start - a.start))
 			free = free.slice(0, m.start) + free.slice(m.end);
 		free = free.trim();
+		// OTTR-1130: a multi-question reply matching no question is refused before
+		// anything is written, so a mis-formatted reply cannot land the card Done
+		// with the whole text as a note on every lead.
+		if (asked.length > 1 && matches.length === 0)
+			return json(
+				{
+					error: `no answer line matched any of the ${asked.length} questions. Answer with one line per question, as: ${askAnswerLine(asked[0]!.question, "<answer>")}`,
+				},
+				400,
+			);
 		const remaining = matches.values();
+		// An answer matches an option label case-insensitively, with one trailing
+		// period of the answer ignored (OTTR-1130).
+		const appliesLabel = LEAD_APPLIES_OPTION.toLowerCase();
+		const notApplyLabel = LEAD_NOT_APPLY_OPTION.toLowerCase();
 		type LeadCancellation = { id: string; reason: string; answer: string };
 		let cancelled: (LeadCancellation & { outcome: CancelOutcome }) | null =
 			null;
@@ -11898,7 +11958,8 @@ export async function createApp(deps: AppDeps) {
 						continue;
 					const live = await e.store.getTask(lead.id);
 					if (live === null) continue;
-					if (m.answer === LEAD_APPLIES_OPTION) {
+					const answerLabel = m.answer.trim().replace(/\.$/, "").toLowerCase();
+					if (answerLabel === appliesLabel) {
 						if (live.stage === "backlog" && live.state === "idle")
 							await e.store.updateTask(lead.id, {
 								stage: "todo",
@@ -11910,7 +11971,7 @@ export async function createApp(deps: AppDeps) {
 						answered.add(lead.id);
 						continue;
 					}
-					if (m.answer === LEAD_NOT_APPLY_OPTION) {
+					if (answerLabel === notApplyLabel) {
 						const reason = `Cancelled by the user's answer to the review's question: ${m.answer}`;
 						answered.add(lead.id);
 						if (live.stage !== "backlog" || live.state !== "idle")
@@ -11937,12 +11998,23 @@ export async function createApp(deps: AppDeps) {
 						if (answered.has(lead.id)) continue;
 						await appendDetails(lead.id, free);
 					}
-				await e.store.updateTask(task.id, {
-					stage: "done",
-					state: "idle",
-					asked: null,
-					needsReason: null,
-				});
+				// A complete reply lands the card Done; a partial reply keeps it at
+				// needs_you with only the unanswered questions (OTTR-1130).
+				const left = asked.filter(
+					(q) => !matches.some((m) => m.question === q.question),
+				);
+				if (left.length === 0)
+					await e.store.updateTask(task.id, {
+						stage: "done",
+						state: "idle",
+						asked: null,
+						needsReason: null,
+					});
+				else
+					await e.store.updateTask(task.id, {
+						asked: left,
+						needsReason: `Waiting for answers to ${left.length} of ${asked.length} questions: ${left.map((q) => `"${q.question}"`).join(", ")}`,
+					});
 				return null;
 			};
 			// A completed external cancel must keep its note, even after another reply wins.

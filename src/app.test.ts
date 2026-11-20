@@ -2196,7 +2196,7 @@ describe("task routes", () => {
 		expect(await errorOf(again)).toBe("task is not waiting for you");
 	});
 
-	test("a lead-question free-text answer appends to the lead's details and keeps both leads in backlog", async () => {
+	test("a lead-question free-text answer appends to the lead's details and keeps the card waiting for the other question", async () => {
 		const { lead1, lead2, ask } = await seedLeadAsk();
 		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
 			text: askAnswerLine(
@@ -2218,10 +2218,17 @@ describe("task routes", () => {
 		expect(two.state).toBe("idle");
 		expect(two.cancelledAt).toBeNull();
 		expect(two.details).toBeNull();
-		const done = (await store.getTask(ask.id))!;
-		expect(done.stage).toBe("done");
-		expect(done.state).toBe("idle");
-		expect(done.asked).toBeNull();
+		// A partial reply keeps the card at needs_you with only the unanswered question.
+		const card = (await store.getTask(ask.id))!;
+		expect(card.state).toBe("needs_you");
+		expect(card.stage).toBe("backlog");
+		expect(card.doneAt).toBeNull();
+		expect(card.asked).toEqual([
+			expect.objectContaining({ question: `Q two? (card #${lead2.id})` }),
+		]);
+		expect(card.needsReason).toBe(
+			`Waiting for answers to 1 of 2 questions: "Q two? (card #${lead2.id})"`,
+		);
 	});
 
 	/** The one-question shape: the drawer sends the raw answer text for it, not the
@@ -2315,22 +2322,117 @@ describe("task routes", () => {
 		expect((await store.getTask(ask.id))?.stage).toBe("done");
 	});
 
-	test("a plain reply on a multi-question card reaches every unanswered lead's details", async () => {
+	test("a multi-question reply matching no question is refused and changes nothing", async () => {
 		const { lead1, lead2, ask } = await seedLeadAsk();
 		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
 			text: "it is behind our staging proxy",
 		});
-		expect(res.status).toBe(200);
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			`no answer line matched any of the 2 questions. Answer with one line per question, as: ${askAnswerLine(`Q one? (card #${lead1.id})`, "<answer>")}`,
+		);
 		for (const id of [lead1.id, lead2.id]) {
 			const lead = (await store.getTask(id))!;
 			expect(lead.stage).toBe("backlog");
 			expect(lead.state).toBe("idle");
 			expect(lead.cancelledAt).toBeNull();
-			expect(lead.details).toBe(
-				"\n\nThe user answered the review's question: it is behind our staging proxy",
-			);
+			expect(lead.details).toBeNull();
 		}
-		expect((await store.getTask(ask.id))?.stage).toBe("done");
+		const card = (await store.getTask(ask.id))!;
+		expect(card.state).toBe("needs_you");
+		expect(card.stage).toBe("backlog");
+		expect(card.asked).toHaveLength(2);
+		expect(card.doneAt).toBeNull();
+		expect(card.needsReason).toBe(
+			"Wants your answer: 2 questions about the review's needs-validation leads",
+		);
+	});
+
+	test.each(["Q1: Yes, the risk applies.", "1. Yes, the risk applies"])(
+		"a plain-form reply %s moves its lead and keeps the card waiting for the rest",
+		async (text) => {
+			const { lead1, lead2, ask } = await seedLeadAsk();
+			const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+				text,
+			});
+			expect(res.status).toBe(200);
+			const one = (await store.getTask(lead1.id))!;
+			expect(one.stage).toBe("todo");
+			expect(one.state).toBe("queued");
+			expect(one.queuedAt).not.toBeNull();
+			const two = (await store.getTask(lead2.id))!;
+			expect(two.stage).toBe("backlog");
+			expect(two.state).toBe("idle");
+			expect(two.details).toBeNull();
+			const card = (await store.getTask(ask.id))!;
+			expect(card.state).toBe("needs_you");
+			expect(card.asked).toEqual([
+				expect.objectContaining({ question: `Q two? (card #${lead2.id})` }),
+			]);
+			expect(card.needsReason).toBe(
+				`Waiting for answers to 1 of 2 questions: "Q two? (card #${lead2.id})"`,
+			);
+		},
+	);
+
+	test("plain-form answers for every question land the card Done", async () => {
+		const { lead1, lead2, ask } = await seedLeadAsk();
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "Q1: Yes, the risk applies\nQ2: no, it does not apply.",
+		});
+		expect(res.status).toBe(200);
+		const one = (await store.getTask(lead1.id))!;
+		expect(one.stage).toBe("todo");
+		expect(one.state).toBe("queued");
+		const two = (await store.getTask(lead2.id))!;
+		expect(two.cancelledAt).not.toBeNull();
+		expect(two.needsReason).toBe(
+			"Cancelled by the user's answer to the review's question: no, it does not apply.",
+		);
+		const done = (await store.getTask(ask.id))!;
+		expect(done.stage).toBe("done");
+		expect(done.state).toBe("idle");
+		expect(done.asked).toBeNull();
+	});
+
+	test("wire lines and plain answers mix in one reply", async () => {
+		const { lead1, lead2, ask } = await seedLeadAsk();
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: `${askAnswerLine(`Q one? (card #${lead1.id})`, LEAD_APPLIES_OPTION)}\n2. ${LEAD_NOT_APPLY_OPTION}`,
+		});
+		expect(res.status).toBe(200);
+		expect(await store.getTask(lead1.id)).toMatchObject({
+			stage: "todo",
+			state: "queued",
+		});
+		expect((await store.getTask(lead2.id))!.cancelledAt).not.toBeNull();
+		expect(await store.getTask(ask.id)).toMatchObject({
+			stage: "done",
+			asked: null,
+		});
+	});
+
+	test("a partial reply finishes on the second reply's remaining question", async () => {
+		const { lead1, lead2, ask } = await seedLeadAsk();
+		const first = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(`Q one? (card #${lead1.id})`, LEAD_APPLIES_OPTION),
+		});
+		expect(first.status).toBe(200);
+		const waiting = (await store.getTask(ask.id))!;
+		expect(waiting.state).toBe("needs_you");
+		expect(waiting.asked).toEqual([
+			expect.objectContaining({ question: `Q two? (card #${lead2.id})` }),
+		]);
+		const second = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(`Q two? (card #${lead2.id})`, LEAD_APPLIES_OPTION),
+		});
+		expect(second.status).toBe(200);
+		const two = (await store.getTask(lead2.id))!;
+		expect(two.stage).toBe("todo");
+		expect(two.state).toBe("queued");
+		const done = (await store.getTask(ask.id))!;
+		expect(done.stage).toBe("done");
+		expect(done.asked).toBeNull();
 	});
 
 	test("a started lead cancels through the sanctioned cancel", async () => {
