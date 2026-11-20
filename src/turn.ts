@@ -65,8 +65,9 @@ import {
 	gateJudgedPrompt,
 	gateUserText,
 	hasOpenQuestionsSection,
+	matchOpenQuestionIndex,
 	missingCheckQuestion,
-	openQuestionsLines,
+	parseOpenQuestions,
 	promptGateCheck,
 	skillBlock,
 	startAnywayQuestion,
@@ -4607,28 +4608,83 @@ export function createTurnLoop(
 			return true;
 		}
 		// Deterministic park: the Deepen rewrite left an Open questions section and no user
-		// answers exist yet. No model call; the section's lines become the ask questions.
+		// answers exist yet. The section parses into questions and context; inline choices
+		// become the ask options and the gate model builds options for the rest (one call,
+		// readiness never judged).
 		if (
 			pending === null &&
 			seen === null &&
 			hasOpenQuestionsSection(live.prompt)
 		) {
-			const lines = openQuestionsLines(live.prompt);
-			const asked = lines.map((question) => ({
-				question,
-				options: [],
+			const parsed = parseOpenQuestions(live.prompt);
+			let asked: AskQuestion[] = parsed.questions.map((q) => ({
+				question: q.question,
+				options: q.options.map((label) => ({ label })),
 				multi: false,
 				recommended: null,
 			}));
-			const sig = lines.join("\n");
+			// Questions without inline choices get their options from the gate model (the
+			// same seam the evaluation uses); the call never judges readiness and never
+			// stamps the fingerprint.
+			if (parsed.questions.some((q) => q.options.length === 0)) {
+				try {
+					const check = await (ops.gateCheck ?? promptGateCheck)({
+						prompt: judged,
+						userMessages: null,
+						skills: null,
+					});
+					asked = asked.map((a, i) => {
+						const q = parsed.questions[i]!;
+						if (q.options.length > 0) return a;
+						const m = matchOpenQuestionIndex(q.question, check.questions);
+						if (m < 0) return a;
+						const mq = check.questions[m]!;
+						if (mq.options.length < 2) return a;
+						const rec =
+							mq.default === null
+								? -1
+								: mq.options.findIndex(
+										(o) =>
+											o.trim().toLowerCase() ===
+											mq.default!.trim().toLowerCase(),
+									);
+						return {
+							question: a.question,
+							options: mq.options.map((label) => ({ label })),
+							multi: false,
+							recommended: rec >= 0 ? rec : null,
+						};
+					});
+				} catch (e) {
+					await log(
+						`! prompt gate: open-question options call failed: ${errmsg(e)}`,
+					);
+				}
+			}
+			const bare = asked.filter((q) => q.options.length === 0);
+			if (bare.length > 0)
+				await log(
+					`! prompt gate: parked without options: ${bare.map((q) => `"${q.question}"`).join("; ")}`,
+				);
+			const sig = [
+				...parsed.questions.map((q) => q.question),
+				...parsed.context,
+			].join("\n");
 			const fails = live.gate?.sig === sig ? live.gate.fails + 1 : 1;
 			await parkGate(
 				store,
 				id,
 				{
 					needsReason: `${GATE_REASON}the prompt still carries an Open questions section`,
-					asked,
-					gate: { hash: null, seen, fails, sig, parked: true },
+					asked: asked.length > 0 ? asked : null,
+					gate: {
+						hash: null,
+						seen,
+						fails,
+						sig,
+						parked: true,
+						...(parsed.context.length > 0 ? { context: parsed.context } : {}),
+					},
 				},
 				log,
 			);

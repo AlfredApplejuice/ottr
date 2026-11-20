@@ -822,6 +822,11 @@ function parseGate(raw: string | null): PromptGateState | null {
 					typeof a.answer === "string",
 			);
 		if (typeof g.check === "string" && g.check !== "") state.check = g.check;
+		// OTTR-1160: the parked section's context lines ride through when they parse.
+		if (Array.isArray(g.context))
+			state.context = g.context.filter(
+				(l): l is string => typeof l === "string",
+			);
 		// OTTR-941: the duplicate-work gate's stamp rides through when it parses.
 		const dup = parseDupStamp(g.dup);
 		if (dup !== null) state.dup = dup;

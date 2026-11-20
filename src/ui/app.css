@@ -5136,6 +5136,18 @@ dialog.diff-view {
 .gate-start .needs-reason {
 	margin: 0;
 }
+/* A parked gate's section context lines above the ask questions. */
+.gate-context {
+	margin: 0 0 8px;
+	color: var(--dim);
+	font-size: 12.5px;
+}
+.gate-context p {
+	margin: 0 0 4px;
+}
+.gate-context p:last-child {
+	margin-bottom: 0;
+}
 .diff-empty {
 	padding: 18px 14px;
 }

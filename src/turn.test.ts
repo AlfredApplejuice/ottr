@@ -29750,13 +29750,27 @@ describe("prompt gate", () => {
 		expect(after.gate?.parked).toBe(false);
 	});
 
-	test("a board-authored prompt with an Open questions section still parks with no model call", async () => {
+	test("a board-authored prompt with an Open questions section parks on one options call, never the evaluation", async () => {
 		let calls = 0;
 		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
-				throw new Error("the seam must not run");
+				return {
+					...clearCheck(),
+					questions: [
+						{
+							question: "Which database?",
+							default: "postgres",
+							options: ["postgres", "sqlite"],
+						},
+						{
+							question: "Which migration tool?",
+							default: null,
+							options: ["golang-migrate", "dbmate"],
+						},
+					],
+				};
 			},
 		});
 		const task = await store.createTask("build a thing");
@@ -29775,8 +29789,8 @@ describe("prompt gate", () => {
 		await loop.runTurn(store.name, task.id);
 
 		const after = (await store.getTask(task.id))!;
-		// The deterministic park ran first: needs_you with the section's lines,
-		// and the model never ran.
+		// The deterministic park ran first: neither question names choices inline,
+		// so one options call fills both and the evaluation never runs.
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
 			"Prompt gate: the prompt still carries an Open questions section",
@@ -29784,22 +29798,169 @@ describe("prompt gate", () => {
 		expect(after.asked).toEqual([
 			{
 				question: "Which database?",
-				options: [],
+				options: [{ label: "postgres" }, { label: "sqlite" }],
 				multi: false,
-				recommended: null,
+				recommended: 0,
 			},
 			{
 				question: "Which migration tool?",
-				options: [],
+				options: [{ label: "golang-migrate" }, { label: "dbmate" }],
 				multi: false,
 				recommended: null,
 			},
 		]);
 		expect(after.gate?.parked).toBe(true);
 		expect(after.gate?.sig).toBe("Which database?\nWhich migration tool?");
-		expect(calls).toBe(0);
+		expect(calls).toBe(1);
 		expect(record.runs).toHaveLength(0);
 		expect(record.createWorktree).toHaveLength(0);
+	});
+
+	test("an Open questions section with inline choices parks on parsed options with no model call", async () => {
+		let calls = 0;
+		const { store, loop } = await setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				throw new Error("the seam must not run");
+			},
+		});
+		const task = await store.createTask("build a thing");
+		await store.updateTask(task.id, {
+			promptAuthor: "board",
+			prompt: [
+				"polish the landing page",
+				"",
+				"## Open questions",
+				"",
+				"Ask the user with the ask tool before building, each with a recommended option and an HTML mockup per the repo rules:",
+				"",
+				"1. Which to ship: border beam only, shimmer only, both, or neither?",
+				"2. Border beam target: the hero screenshot frame `.stage .shot` or the install terminal `.term`?",
+			].join("\n"),
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		// Both questions carry inline choices: the park asks them as written and
+		// the model never runs; the intro line is an agent instruction, not context.
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Prompt gate: the prompt still carries an Open questions section",
+		);
+		expect(after.asked).toEqual([
+			{
+				question:
+					"Which to ship: border beam only, shimmer only, both, or neither?",
+				options: [
+					{ label: "border beam only" },
+					{ label: "shimmer only" },
+					{ label: "both" },
+					{ label: "neither" },
+				],
+				multi: false,
+				recommended: null,
+			},
+			{
+				question:
+					"Border beam target: the hero screenshot frame `.stage .shot` or the install terminal `.term`?",
+				options: [
+					{ label: "the hero screenshot frame `.stage .shot`" },
+					{ label: "the install terminal `.term`" },
+				],
+				multi: false,
+				recommended: null,
+			},
+		]);
+		for (const q of after.asked ?? []) {
+			expect(q.question.includes("Ask the user with the ask tool")).toBe(
+				false,
+			);
+			expect(/^(?:[-*+]|\d+[.)])\s/.test(q.question)).toBe(false);
+		}
+		expect(calls).toBe(0);
+		expect(after.gate?.parked).toBe(true);
+		expect(after.gate?.sig).toBe(
+			"Which to ship: border beam only, shimmer only, both, or neither?\nBorder beam target: the hero screenshot frame `.stage .shot` or the install terminal `.term`?",
+		);
+		expect(after.gate?.context).toBeUndefined();
+	});
+
+	test("a failed options call parks with the bare question and logs the cause", async () => {
+		const { store, loop } = await setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				throw new Error("gateway down");
+			},
+		});
+		const task = await store.createTask("build a thing");
+		await store.updateTask(task.id, {
+			promptAuthor: "board",
+			prompt: [
+				"migrate the store",
+				"",
+				"## Open questions",
+				"",
+				"Which database?",
+			].join("\n"),
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		// The options call failed open: the park still runs, with the bare question.
+		expect(after.state).toBe("needs_you");
+		expect(after.asked).toEqual([
+			{
+				question: "Which database?",
+				options: [],
+				multi: false,
+				recommended: null,
+			},
+		]);
+		expect(await logText(store, task.id)).toContain(
+			"prompt gate: open-question options call failed: gateway down",
+		);
+		expect(after.gate?.parked).toBe(true);
+	});
+
+	test("an Open questions section with only context parks with no ask panel", async () => {
+		let calls = 0;
+		const { store, loop } = await setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				throw new Error("the seam must not run");
+			},
+		});
+		const task = await store.createTask("build a thing");
+		await store.updateTask(task.id, {
+			promptAuthor: "board",
+			prompt: [
+				"plan the rollout",
+				"",
+				"## Open questions",
+				"",
+				"We need a decision on the rollout timing.",
+			].join("\n"),
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		// The prose line is context, not a question: the park keeps it on the gate
+		// state and sends no ask panel; the options seam never runs.
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Prompt gate: the prompt still carries an Open questions section",
+		);
+		expect(after.asked).toBeNull();
+		expect(after.gate?.parked).toBe(true);
+		expect(after.gate?.context).toEqual([
+			"We need a decision on the rollout timing.",
+		]);
+		expect(calls).toBe(0);
 	});
 
 	test("a model-restore requeue with a mid-run steer titles the queue user", async () => {

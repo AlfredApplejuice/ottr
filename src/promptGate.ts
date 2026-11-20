@@ -396,12 +396,31 @@ export function hasOpenQuestionsSection(text: string): boolean {
 	return false;
 }
 
-/** The non-empty body lines of the text's "Open questions" section, max 5. Empty when no section exists. */
-export function openQuestionsLines(text: string): string[] {
-	const lines = text.split("\n");
-	const out: string[] = [];
+/** One question parsed from an "Open questions" section (OTTR-1160). */
+export interface OpenQuestion {
+	/** The question text: the list marker stripped, trimmed; keeps its "?" when the line had one. */
+	question: string;
+	/** The choices named inline ("A, B, or C?"), 2 to 5; empty when the text names none. */
+	options: string[];
+}
+
+/** The parsed "Open questions" section: its questions plus the context lines that are not agent instructions. */
+export interface OpenQuestionsParsed {
+	/** The section's question lines, max 5, in order. */
+	questions: OpenQuestion[];
+	/** The section's other lines that are not agent instructions, max 3. */
+	context: string[];
+}
+
+/** The text's "Open questions" section, parsed (OTTR-1160): question lines — they
+ * end with "?" or start with a list marker — become questions with the choices
+ * named inline; other lines become context unless they name the ask tool, mockups,
+ * or repo rules (agent instructions the answering user never sees). Section rules
+ * are the section helpers'; text without a section parses to empty lists. */
+export function parseOpenQuestions(text: string): OpenQuestionsParsed {
+	const out: OpenQuestionsParsed = { questions: [], context: [] };
 	let inside = false;
-	for (const line of lines) {
+	for (const line of text.split("\n")) {
 		const t = line.trim();
 		const heading = /^#{1,6}\s+open questions\s*$/i.test(t);
 		const bold = /^\*\*\s*open questions\s*\*\*:?\s*$/i.test(t);
@@ -412,10 +431,91 @@ export function openQuestionsLines(text: string): string[] {
 		if (!inside) continue;
 		// A next heading of any level ends the section.
 		if (/^#{1,6}\s/.test(t) || /^\*\*[^*]+\*\*/.test(t)) break;
-		if (t !== "") out.push(t);
-		if (out.length >= 5) break;
+		if (t === "") continue;
+		const isQuestion = t.endsWith("?") || /^([-*+]|\d+[.)])\s+/.test(t);
+		if (isQuestion) {
+			// One leading list marker comes off; questions cap at 5 but the scan continues.
+			const content = t.replace(/^([-*+]|\d+[.)])\s+/, "").trim();
+			if (content === "") continue;
+			if (out.questions.length < 5) {
+				out.questions.push({
+					question: content,
+					options: inlineOptions(content),
+				});
+			}
+		} else if (
+			out.context.length < 3 &&
+			!/(\bask tool\b|\bask the user\b|\bmockups?\b|\brepo rules\b)/i.test(t)
+		) {
+			out.context.push(t);
+		}
 	}
 	return out;
+}
+
+/** The choices a question names inline ("A, B, or C?", "Which port: 8080 or 9090?"),
+ * 2 to 5 after dedupe; [] when the text names none — a comma list without a colon
+ * is prose, not choices. */
+function inlineOptions(question: string): string[] {
+	const body = question.trim().replace(/\?+\s*$/, "");
+	const colon = body.indexOf(":");
+	const candidate = colon > 0 ? body.slice(colon + 1) : body;
+	const hasOr = /\bor\b/i.test(candidate);
+	const hasComma = candidate.includes(",");
+	if (!(hasOr || (colon > 0 && hasComma))) return [];
+	const seen = new Set<string>();
+	for (const part of candidate
+		.split(/\s+\bor\b\s*/i)
+		.flatMap((s) => s.split(","))
+		.map((s) => s.trim().replace(/[.,;:]+$/, ""))
+		.filter((s) => s !== "")) {
+		seen.add(part);
+	}
+	if (seen.size < 2 || seen.size > 5) return [];
+	return [...seen];
+}
+
+/** The index of the model question the section question names: equal normalized
+ * text scores 1, one containing the other 0.9, else the token Jaccard; the best
+ * score wins, ties go to the earliest index, and below 0.5 the answer is -1. */
+export function matchOpenQuestionIndex(
+	question: string,
+	modelQuestions: GateCheck["questions"],
+): number {
+	const norm = (s: string): string =>
+		s
+			.toLowerCase()
+			.replace(/[^a-z0-9\s]/g, " ")
+			.replace(/\s+/g, " ")
+			.trim();
+	const target = norm(question);
+	let best = -1;
+	let bestScore = 0;
+	modelQuestions.forEach((mq, i) => {
+		const candidate = norm(mq.question);
+		let score: number;
+		if (target === candidate) {
+			score = 1;
+		} else if (
+			target !== "" &&
+			candidate !== "" &&
+			(target.includes(candidate) || candidate.includes(target))
+		) {
+			score = 0.9;
+		} else {
+			const a = new Set(target.split(" "));
+			const b = new Set(candidate.split(" "));
+			let shared = 0;
+			for (const tok of a) if (b.has(tok)) shared++;
+			const union = a.size + b.size - shared;
+			score = union > 0 ? shared / union : 0;
+		}
+		if (score > bestScore) {
+			bestScore = score;
+			best = i;
+		}
+	});
+	return bestScore >= 0.5 ? best : -1;
 }
 
 /** The text with every "Open questions" section removed: the heading line through

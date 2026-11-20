@@ -1631,6 +1631,23 @@ describe("AskBlock", () => {
 		expect(html).toContain('value=""');
 		expect(html).toContain("(2)");
 	});
+
+	test("the Other field's placeholder stays neutral, never a suggested answer", () => {
+		const html = renderToStaticMarkup(
+			<AskBlock
+				{...base}
+				q={{
+					question: "Which database?",
+					options: [{ label: "Postgres" }],
+					multi: false,
+					recommended: null,
+				}}
+			/>,
+		);
+		expect(html).toContain('placeholder="Your answer"');
+		// A fixed composer example would read as a suggested answer under a park question.
+		expect(html).not.toContain("Deploy only the API");
+	});
 });
 
 describe("AskBlock multi answers", () => {
@@ -9056,6 +9073,99 @@ describe("Drawer prompt gate Start anyway", () => {
 		);
 		expect(html).not.toContain("Start anyway");
 		expect(html).not.toContain("gate-start");
+	});
+
+	test("a parked gate's section context renders once above the ask panel", async () => {
+		const realFetch = globalThis.fetch;
+		const gate = gateTask({
+			hash: null,
+			seen: null,
+			fails: 1,
+			sig: "Which environment deploys this?",
+			parked: true,
+			context: ["We need a decision on the rollout timing.", "Pick one"],
+		});
+		// The drawer body renders only once the detail fetch lands, so the GET
+		// serves the same context-carrying fixture back.
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			if (String(input).endsWith("/tasks/t1")) {
+				return new Response(
+					JSON.stringify({ ...gate, prompt: "gate park prompt", turns: [] }),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(<Drawer {...drawerBase} task={gate} />);
+			});
+			// One more act lets the detail fetch land, so the ask body renders.
+			await act(async () => {});
+			const ctx = container.querySelector(".gate-context");
+			expect(ctx).not.toBeNull();
+			expect(ctx!.textContent).toContain(
+				"We need a decision on the rollout timing.",
+			);
+			expect(ctx!.textContent).toContain("Pick one");
+			// Once: the lines are context, never an ask question.
+			const hits =
+				container.innerHTML.split("We need a decision on the rollout timing.")
+					.length - 1;
+			expect(hits).toBe(1);
+			// Above the questions: the ask panel follows the context block.
+			const panel = container.querySelector(".ask-panel");
+			expect(panel).not.toBeNull();
+			expect(
+				ctx!.compareDocumentPosition(panel!) & Node.DOCUMENT_POSITION_FOLLOWING,
+			).toBeTruthy();
+		} finally {
+			globalThis.fetch = realFetch;
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+		}
+	});
+
+	test("a parked gate without section context renders no gate-context", () => {
+		const html = renderToStaticMarkup(
+			<Drawer
+				{...drawerBase}
+				task={gateTask({
+					hash: null,
+					seen: null,
+					fails: 1,
+					sig: "Which environment deploys this?",
+					parked: true,
+				})}
+			/>,
+		);
+		expect(html).not.toContain("gate-context");
+	});
+
+	test("a needs_you card without a parked gate renders no stale context", () => {
+		// The context lines stay in the gate state after an un-park; only a live
+		// park may show them above the ask.
+		const html = renderToStaticMarkup(
+			<Drawer
+				{...drawerBase}
+				task={gateTask({
+					hash: null,
+					seen: null,
+					fails: 0,
+					sig: null,
+					parked: false,
+					context: ["Pick one"],
+				})}
+			/>,
+		);
+		expect(html).not.toContain("gate-context");
 	});
 });
 

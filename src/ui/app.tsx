@@ -8586,7 +8586,7 @@ function AskCustom({
 						setCustom(e.target.value);
 						if (multi) onDraft(askMultiText(picked, customOn, e.target.value));
 					}}
-					placeholder="Deploy only the API"
+					placeholder="Your answer"
 					disabled={busy}
 				/>
 			</label>
@@ -10353,6 +10353,18 @@ function DrawerAskPanel(p: {
 	return (
 		<>
 			{" "}
+			{/* A parked gate's section context rides once above the questions;
+			    it is never a question. */}
+			{task.state === "needs_you" &&
+				task.gate?.parked === true &&
+				task.gate.context !== undefined &&
+				task.gate.context.length > 0 && (
+					<div className="gate-context">
+						{task.gate.context.map((line, i) => (
+							<p key={i}>{line}</p>
+						))}
+					</div>
+				)}
 			{/* The ask leads the body: an outstanding question is the card's one
 					    action item, so it sits right below the lineage, before the file lists. */}
 			{task.asked !== null && task.state === "needs_you" && (

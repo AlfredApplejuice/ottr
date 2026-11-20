@@ -93,6 +93,9 @@ export interface PromptGateState {
 	assumptions?: GateAssumption[];
 	/** The outside check the gate adopted when the prompt text carried none (OTTR-904); absent when the text carried one. */
 	check?: string;
+	/** The parked "Open questions" section's context lines that are not questions and not
+	 * agent instructions (OTTR-1160); absent when none. The drawer renders them once above the ask questions. */
+	context?: string[];
 	/** The duplicate-work gate's stamp (OTTR-941); absent = the gate never ran on this card. */
 	dup?: DupGateStamp;
 }

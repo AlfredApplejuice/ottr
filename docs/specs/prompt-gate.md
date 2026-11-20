@@ -399,10 +399,27 @@ logs under it. Parked gate turns write no turn row (rows appear at startRun).
 2. Unresolved-section check: when the compared text carries an `Open questions`
    section (a markdown heading `#`–`######` "Open questions", or a bold
    `**Open questions**` line) **and** no user text is queued (`pending === null`
-   and `seen === null`), park without a model call: the section's non-empty
-   lines (max 5) become the ask questions, options `[]` (custom answer only).
-   Once user answers exist, the gate runs the model on prompt + answers; the
-   model judges whether the section is settled.
+   and `seen === null`), park on the parsed section (OTTR-1160).
+   `parseOpenQuestions` (`src/promptGate.ts`) splits the section's body lines:
+   a question is a list item or a line that ends with `?`; one leading list
+   marker (`-`, `*`, `+`, `1.`) is stripped from the question text, max 5
+   questions. Every other line is context, and a line that only instructs the
+   agent (it names the ask tool, the user, a mockup, or the repo rules) is
+   dropped; the rest rides in `gate.context` (max 3) and renders once above
+   the questions. A question that names its choices inline ("A, B, or C?")
+   uses them as its options without a call, no recommendation marked. Every
+   question without inline choices gets 2–5 options from one gate-model call
+   (the `ops.gateCheck` seam of step 4, `@plan`): the model's question that
+   matches the parsed one (normalized containment or token overlap, at least
+   0.5) lends its options, and its `default` marks the recommended one. The
+   call never judges readiness and never stamps the fingerprint. A failed
+   call parks with the parsed questions and the inline options that exist
+   and logs `! prompt gate: open-question options call failed: ...`; options
+   are never invented, and questions left without options log
+   `! prompt gate: parked without options: ...`. Zero parsed questions park
+   with no ask panel (the reason and Start anyway remain). Once user answers
+   exist, the gate runs the model on prompt + answers; the model judges
+   whether the section is settled.
 3. Board-written skip (OTTR-850, spec `docs/specs/prompt-gate-board-prompts.md`):
    when the row's `prompt_author` is `board` and no user text is queued or
    accumulated, log one `+ prompt gate: board-written prompt runs without the
@@ -496,6 +513,9 @@ next start (the reply text rides the accumulated user text).
   anyway** button whenever `task.state === "needs_you" && task.gate?.parked`;
   it POSTs the reply `Start anyway`. The park reason (`needsReason`) renders
   above it as today's needs-you reason.
+- The park's context lines (`gate.context`, OTTR-1160) render once above the
+  ask questions as muted text; they are never questions, and instruction
+  lines (ask tool, mockups, repo rules) never render.
 - No change to the board's default view.
 
 ## Error cases
@@ -504,10 +524,11 @@ next start (the reply text rides the accumulated user text).
 |---|---|
 | Gate call fails twice (gateway, timeout, malformed) | `needs_you`, reason in `needsReason`, Start anyway available |
 | Malformed check JSON (Part 1) | review shows "Check unavailable: <reason>"; rewrite unaffected, still 200 |
-| `Open questions` section, no answers yet | park without a model call, section lines as questions |
+| `Open questions` section, no answers yet | park on the parsed questions; inline choices become options, the gate model builds the rest; a failed options call parks with the parsed questions and logs |
+| Options call fails (gateway, timeout, malformed) | park with the parsed questions and the inline options that exist; the failure is logged; options are never invented |
 | Same questions twice | second park carries the Start-anyway ask question; no third identical round |
 | Gate-skipped kinds | no call, no state write, turn starts as today |
-| Model returns 0 questions but section present, answers absent | deterministic park (step 2) never reaches the model |
+| Model returns no matching questions, section present, answers absent | park with the parsed questions, no options invented; questions left without options are logged |
 
 ## Acceptance checks
 
@@ -555,6 +576,9 @@ next start (the reply text rides the accumulated user text).
 - No UI for assumptions: the drawer park shows only the blocking questions;
   assumptions live in the card log and the turn prompt, and the ready report
   must list the ones the agent used.
+- The park builds options only (OTTR-1160): its model call never judges
+  readiness, never stamps the fingerprint, and never makes HTML mockups (an
+  agent turn makes those). When the gate parks is unchanged.
 
 ## Alternatives considered
 
