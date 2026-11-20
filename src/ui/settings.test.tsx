@@ -1179,6 +1179,115 @@ describe("OmpStatsSection", () => {
 		}
 	});
 
+	test("a refreshing report shows its caption and re-fetches until the build lands", async () => {
+		const totals = (requests: number) => ({
+			totalRequests: requests,
+			successfulRequests: requests,
+			failedRequests: 0,
+			errorRate: 0,
+			totalInputTokens: 1_000,
+			totalOutputTokens: 100,
+			totalCacheReadTokens: 0,
+			totalCacheWriteTokens: 0,
+			cacheRate: 0,
+			cacheSavings: 0,
+			totalCost: requests * 0.5,
+			unpricedRequests: 0,
+			totalPremiumRequests: 0,
+			avgDuration: 0,
+			avgTtft: 0,
+			avgTokensPerSecond: 0,
+			firstTimestamp: null,
+			lastTimestamp: null,
+		});
+		let reportCalls = 0;
+		const fetchMock = (async (input: RequestInfo | URL): Promise<Response> => {
+			if (String(input).endsWith("/api/settings/omp-stats/dashboard"))
+				return new Response(JSON.stringify({ port: 3848, error: null }));
+			reportCalls += 1;
+			return new Response(
+				JSON.stringify({
+					at: Date.now(),
+					sources: [],
+					overall: totals(reportCalls === 1 ? 7 : 9),
+					byModel: [],
+					refreshing: reportCalls === 1,
+				}),
+			);
+		}) as unknown as typeof fetch;
+		const { container, unmount } = await mountOmpStats(fetchMock);
+		try {
+			const card = container.querySelector("#omp-stats-section");
+			// The first answer carries the stale totals plus the refreshing caption.
+			expect(card?.textContent).toContain("Refreshing…");
+			expect(card?.textContent).toContain("7");
+			// The 2 s loop re-fetches once; the landed build clears the caption.
+			await act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 2_300));
+			});
+			expect(card?.textContent).not.toContain("Refreshing…");
+			expect(card?.textContent).toContain("9");
+			expect(reportCalls).toBe(2);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a failed refresh keeps the stale report and shows the alert", async () => {
+		const totals = {
+			totalRequests: 0,
+			successfulRequests: 0,
+			failedRequests: 0,
+			errorRate: 0,
+			totalInputTokens: 0,
+			totalOutputTokens: 0,
+			totalCacheReadTokens: 0,
+			totalCacheWriteTokens: 0,
+			cacheRate: 0,
+			cacheSavings: 0,
+			totalCost: 0,
+			unpricedRequests: 0,
+			totalPremiumRequests: 0,
+			avgDuration: 0,
+			avgTtft: 0,
+			avgTokensPerSecond: 0,
+			firstTimestamp: null,
+			lastTimestamp: null,
+		};
+		let reportCalls = 0;
+		const fetchMock = (async (input: RequestInfo | URL): Promise<Response> => {
+			if (String(input).endsWith("/api/settings/omp-stats/dashboard"))
+				return new Response(JSON.stringify({ port: 3848, error: null }));
+			reportCalls += 1;
+			return reportCalls === 1
+				? new Response(
+						JSON.stringify({
+							at: Date.now(),
+							sources: [],
+							overall: totals,
+							byModel: [],
+							refreshing: true,
+						}),
+					)
+				: new Response(JSON.stringify({ error: "boom" }), { status: 500 });
+		}) as unknown as typeof fetch;
+		const { container, unmount } = await mountOmpStats(fetchMock);
+		try {
+			await act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 2_300));
+			});
+			// The refresh's failure surfaces, but the last report stays on the card,
+			// and the stopped loop takes the refreshing mark with it.
+			const alert = container.querySelector('p[role="alert"]');
+			expect(alert?.textContent).toContain("omp usage could not be loaded.");
+			expect(container.textContent).toContain("$0.00");
+			expect(container.textContent).not.toContain("Refreshing…");
+			expect(reportCalls).toBe(2);
+		} finally {
+			await unmount();
+		}
+	});
+
 	/** Report fetch fails; the dashboard info answers `info`. */
 	const dashboardFetch = (info: unknown): typeof fetch =>
 		(async (input: RequestInfo | URL): Promise<Response> =>

@@ -22041,8 +22041,20 @@ describe(
 		};
 
 		/** One fresh app + server with a counting scan stub: board store 7, project 3. */
-		async function boot(opts: { projectAnswer?: OmpStatsAnswer } = {}) {
+		async function boot(
+			opts: { projectAnswer?: OmpStatsAnswer; scanMs?: number } = {},
+		) {
 			let scans = 0;
+			const answerFor = (dir: string): OmpStatsAnswer => {
+				if (dir === entry.store.sessionsDir)
+					return opts.projectAnswer ?? { stats: projectStats(), error: null };
+				if (dir === join(boardOmpHome(), ".omp", "agent", "sessions"))
+					return { stats: boardStats(), error: null };
+				return {
+					stats: { overall: { ...BASE_STATS }, byModel: [] },
+					error: null,
+				};
+			};
 			const ompApp = await createTestApp({
 				gstore,
 				defaultDir: root,
@@ -22068,14 +22080,13 @@ describe(
 				serverRef: { current: undefined },
 				scanSessionUsage: (dir: string) => {
 					scans++;
-					if (dir === entry.store.sessionsDir)
-						return opts.projectAnswer ?? { stats: projectStats(), error: null };
-					if (dir === join(boardOmpHome(), ".omp", "agent", "sessions"))
-						return { stats: boardStats(), error: null };
-					return {
-						stats: { overall: { ...BASE_STATS }, byModel: [] },
-						error: null,
-					};
+					const answer = answerFor(dir);
+					if (opts.scanMs === undefined) return answer;
+					// Real timers on purpose: the slow-build test asserts wall-clock
+					// behavior, so fake timers cannot drive it.
+					const { promise, resolve } = Promise.withResolvers<OmpStatsAnswer>();
+					setTimeout(() => resolve(answer), opts.scanMs);
+					return promise;
 				},
 			});
 			const srv = Bun.serve({ port: 0, ...ompApp.serveOptions });
@@ -22085,11 +22096,21 @@ describe(
 				fetch(new URL("/api/settings/omp-stats", srv.url), {
 					headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
 				});
-			return { get, scans: () => scans };
+			const call = (path: string) =>
+				fetch(new URL(path, srv.url), {
+					headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
+				});
+			return {
+				get,
+				call,
+				scans: () => scans,
+				ageCache: () => ompApp.ompStatsAgeCache(),
+			};
 		}
 
 		type Body = {
 			at: number;
+			refreshing: boolean;
 			sources: {
 				name: string;
 				answer: {
@@ -22142,6 +22163,49 @@ describe(
 				expect(project?.answer.stats).toBeNull();
 				expect(project?.answer.error).toBe("boom in sessions dir");
 				expect(body.overall.totalRequests).toBe(7);
+			});
+
+			test("a slow build never blocks another route", async () => {
+				// Real timers on purpose: the test asserts wall-clock non-blocking
+				// across a live server and fetch, so fake timers cannot drive it.
+				const b = await boot({ scanMs: 300 });
+				// First build: no cache exists, so the GET waits out the whole scan.
+				const t0 = Date.now();
+				const first = await b.get();
+				expect(Date.now() - t0).toBeGreaterThanOrEqual(300);
+				expect(first.status).toBe(200);
+				const one = (await first.json()) as Body;
+				expect(one.refreshing).toBe(false);
+				const stores = one.sources.length;
+				// Age the report cache past its TTL: the next GET serves the stale
+				// report at once while the slow rebuild holds the single flight.
+				b.ageCache();
+				const t1 = Date.now();
+				const second = await b.get();
+				expect(Date.now() - t1).toBeLessThan(100);
+				const two = (await second.json()) as Body;
+				expect(two.refreshing).toBe(true);
+				expect(two.at).toBe(one.at);
+				expect(two.overall).toEqual(one.overall);
+				// Another route answers while the rebuild runs; the dashboard info
+				// endpoint is a different handler that never touches the scan.
+				const t2 = Date.now();
+				const dash = await b.call("/api/settings/omp-stats/dashboard");
+				expect(Date.now() - t2).toBeLessThan(100);
+				expect(dash.status).toBe(200);
+				// While the rebuild runs a GET answers the stale report; once it
+				// lands, the fresh report answers with refreshing:false and no store
+				// scans a third round.
+				let end: Body;
+				do {
+					// Poll the real signal (the refreshing flag), never a fixed wait.
+					const { promise, resolve } = Promise.withResolvers<void>();
+					setTimeout(resolve, 10);
+					await promise;
+					end = (await (await b.get()).json()) as Body;
+				} while (end.refreshing);
+				expect(b.scans()).toBe(2 * stores);
+				expect(end.overall).toEqual(one.overall);
 			});
 		};
 	})(),

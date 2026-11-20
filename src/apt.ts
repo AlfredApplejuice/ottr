@@ -5,6 +5,7 @@
 // request only (docs/specs/worker-list-isolation.md); the container that runs a turn installs
 // what it still lacks.
 import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,6 +25,23 @@ export function workerProjects(home = homedir()): string[] {
 	return readdirSync(dir)
 		.sort()
 		.filter((p) => PROJECT.test(p));
+}
+
+/** The async twin, for request paths that must not hold the event loop on a shared
+ *  volume (OTTR-1088): the sync walk of a workers home on the mounted home is the slow
+ *  part of Settings -> Env. */
+export async function workerProjectsAsync(home = homedir()): Promise<string[]> {
+	const dir = join(home, ".ottr", "workers");
+	let names: string[];
+	try {
+		names = await readdir(dir);
+	} catch (err) {
+		// Only a dir that does not exist means "no provisioned projects yet".
+		if (err instanceof Error && "code" in err && err.code === "ENOENT")
+			return [];
+		throw err;
+	}
+	return names.sort().filter((p) => PROJECT.test(p));
 }
 
 /** Where alate provisions a project's package list, resolved for a read: under the home's

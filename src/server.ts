@@ -912,14 +912,14 @@ const loop = createTurnLoop(projects, {
 	// merge turn must not read a worker-plantable apt.txt from there
 	// (docs/specs/worker-list-isolation.md).
 	ensurePackages: (project) => ensureProjectPackages(project, turnListHome()),
-	turnEnv: (project, model, opts) =>
-		turnEnv(
+	turnEnv: async (project, model, opts) =>
+		await turnEnv(
 			project,
 			model,
 			envValuesByKind(
 				shared.envValues,
 				shared.envPlain,
-				listedEnvNames(workersHome),
+				await listedEnvNames(workersHome),
 			),
 			{
 				home: workersHome,
@@ -1139,6 +1139,9 @@ const app = await createApp({
 	ompStats: { info: ompStatsInfo, dashboard: ompStatsDashboard },
 });
 appRef = app;
+// OTTR-1088: warm the transcript usage scan once at boot, so the first Settings
+// visit answers from the report cache or the single-flight build, never a cold walk.
+app.ompStatsWarm();
 
 // Boot recovery is the loop's job now: a restart resurfaces running/preparing
 // turns through one code path, so a cancelled card can never be requeued twice.

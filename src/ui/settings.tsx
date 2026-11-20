@@ -1977,24 +1977,52 @@ export function dashboardLink(
 	return { href: `http://${hostname}:${info.port}/` };
 }
 
+/** The re-fetch wait while the server marks the report `refreshing` (a background scan
+ *  still builds): long enough to stay quiet, short enough to land the fresh totals
+ *  while the user reads the card. */
+const OMP_STATS_REFRESH_MS = 2_000;
+
 /** Settings -> omp usage: turn usage summed from the board's session transcripts,
- *  fetched when the Settings page opens, plus a link to omp's own stats dashboard
- *  (started on demand behind a board proxy). The two fetches fail independently. */
+ *  fetched when the Settings page opens, re-fetched while the server still marks the
+ *  report `refreshing`, plus a link to omp's own stats dashboard (started on demand
+ *  behind a board proxy). The two fetches fail independently. */
 export function OmpStatsSection() {
 	const [report, setReport] = useState<OmpStatsReport | null>(null);
 	const [loadFailed, setLoadFailed] = useState(false);
+	const [refreshing, setRefreshing] = useState(false);
 	const [info, setInfo] = useState<OmpStatsDashboardInfo | null>(null);
 	const [infoFailed, setInfoFailed] = useState(false);
-	const load = useCallback(async (): Promise<void> => {
-		const r = await unwrap<OmpStatsReport>(
-			await fetch("/api/settings/omp-stats"),
-		);
-		setLoadFailed(false);
-		setReport(r);
-	}, []);
 	useEffect(() => {
-		load().catch(() => setLoadFailed(true));
-	}, [load]);
+		let alive = true;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		// The route answers the last finished report and marks it `refreshing` while
+		// a background scan still builds, so the loop re-fetches until the mark clears.
+		const load = async (): Promise<void> => {
+			try {
+				const r = await unwrap<OmpStatsReport & { refreshing: boolean }>(
+					await fetch("/api/settings/omp-stats"),
+				);
+				if (!alive) return;
+				setLoadFailed(false);
+				setReport(r);
+				const busy = r.refreshing === true;
+				setRefreshing(busy);
+				if (busy) timer = setTimeout(() => void load(), OMP_STATS_REFRESH_MS);
+			} catch {
+				// a failed refresh keeps the stale report; only the first load hides it
+				// (the loop stops here, so the refreshing mark drops with it)
+				if (alive) {
+					setLoadFailed(true);
+					setRefreshing(false);
+				}
+			}
+		};
+		void load();
+		return () => {
+			alive = false;
+			clearTimeout(timer);
+		};
+	}, []);
 	useEffect(() => {
 		(async () =>
 			setInfo(
@@ -2031,10 +2059,10 @@ export function OmpStatsSection() {
 				<p className="hint" role="alert">
 					omp usage could not be loaded.
 				</p>
-			) : report === null ? (
-				<Skeleton shape="stats" rows={3} label="Loading omp usage" />
-			) : (
+			) : null}
+			{report !== null ? (
 				<>
+					{refreshing && <p className="caption">Refreshing…</p>}
 					<div className="setup-facts">
 						<div>
 							<b>{fmtCount(report.overall.totalRequests)}</b>
@@ -2123,6 +2151,9 @@ export function OmpStatsSection() {
 						</tbody>
 					</table>
 				</>
+			) : null}
+			{report === null && !loadFailed && (
+				<Skeleton shape="stats" rows={3} label="Loading omp usage" />
 			)}
 		</SettingsCard>
 	);

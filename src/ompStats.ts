@@ -4,7 +4,14 @@
 // the CLI sees almost none of the fleet's usage. The board scans every project dir it
 // mounts plus the default stores and aggregates the same per-message records omp's rollups
 // use: assistant messages carrying usage (input/output/cacheRead/cacheWrite/cost/model).
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import {
+	type Dirent,
+	readdirSync,
+	readFileSync,
+	type Stats,
+	statSync,
+} from "node:fs";
+import { readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 /** One omp usage total block: the rollup fields the Settings card shows. Rates and
@@ -381,4 +388,156 @@ export function scanSessionUsage(sessionsDir: string): OmpStatsAnswer {
 		records.push(...read);
 	}
 	return { stats: aggregate(records), error: null };
+}
+
+/** Per-file scan state; `stats` holds the usage totals of the file's complete lines. */
+export interface SessionUsageCache {
+	files: Map<string, { size: number; mtimeMs: number; stats: OmpStats }>;
+	/** Cumulative bytes actually read from disk for parsing — the tests' parsed-bytes count. */
+	parsedBytes: number;
+}
+
+export function newSessionUsageCache(): SessionUsageCache {
+	return { files: new Map(), parsedBytes: 0 };
+}
+
+/** The message a failed walk, stat, or read answers with. */
+const ioReason = (err: unknown): string =>
+	err instanceof Error ? err.message : String(err);
+
+/** Folds per-file stats blocks with mergeOmpStats. The merge recomputes errorRate as
+ *  failed/total, but these blocks come from aggregate, which keeps errorRate null
+ *  because transcripts cannot prove failures — so the fold restores that null instead
+ *  of a fabricated 0. */
+function foldStats(stats: OmpStats[]): OmpStats {
+	const calm = <T extends OmpUsageTotals>(r: T): T =>
+		r.failedRequests === 0 && r.errorRate !== null
+			? { ...r, errorRate: null }
+			: r;
+	const merged = mergeOmpStats(stats);
+	return {
+		overall: calm(merged.overall),
+		byModel: merged.byModel.map((m) => calm(m)),
+	};
+}
+
+/** Every transcript file under a sessions dir, listed without blocking the event loop:
+ *  the async twin of walkJsonl. */
+async function walkJsonlAsync(dir: string): Promise<string[]> {
+	const out: string[] = [];
+	let names: Dirent[];
+	try {
+		names = await readdir(dir, { withFileTypes: true });
+	} catch (err) {
+		// Only a dir that does not exist means "no sessions yet" (a fresh project).
+		const absent =
+			err instanceof Error && "code" in err && err.code === "ENOENT";
+		if (absent) return out;
+		throw err;
+	}
+	for (const entry of names) {
+		const path = join(dir, entry.name);
+		if (entry.isDirectory()) {
+			out.push(...(await walkJsonlAsync(path)));
+			continue;
+		}
+		if (entry.name.endsWith(".jsonl")) out.push(path);
+	}
+	return out;
+}
+
+/** Scans one store's sessions dir without blocking the event loop, resuming from the
+ *  cache: a file whose size and mtime are unchanged reuses its stored totals and reads
+ *  0 bytes, an append parses only the new tail, and anything else (first sight, a
+ *  shrink, an mtime moved back) is re-read in full. Only complete lines are ever
+ *  parsed: a trailing line without a newline is skipped this scan and parsed once its
+ *  newline lands — the sync scan's full read would have voided a transcript caught
+ *  mid-write. Per file the cache keeps one aggregate, so an append folds the tail's
+ *  records into the stored stats instead of keeping raw records around. A missing dir
+ *  answers the zero totals (a fresh project); an unreadable dir or file, or a malformed
+ *  record in one, answers { stats: null, error } naming the cause — a partial sum would
+ *  under-report. Files the walk no longer lists leave the totals and the cache. */
+export async function scanSessionUsageIncremental(
+	sessionsDir: string,
+	cache: SessionUsageCache,
+): Promise<OmpStatsAnswer> {
+	let files: string[];
+	try {
+		files = await walkJsonlAsync(sessionsDir);
+	} catch (err) {
+		return { stats: null, error: `${sessionsDir}: ${ioReason(err)}` };
+	}
+	const seen = new Set<string>();
+	const perFile: OmpStats[] = [];
+	for (const file of files) {
+		// One yield per file: the sync scan starves the event loop for the whole store.
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		let st: Stats;
+		try {
+			st = await stat(file);
+		} catch (err) {
+			return { stats: null, error: `${file}: ${ioReason(err)}` };
+		}
+		const prev = cache.files.get(file);
+		if (prev && prev.size === st.size && prev.mtimeMs === st.mtimeMs) {
+			seen.add(file);
+			perFile.push(prev.stats);
+			continue;
+		}
+		if (prev && st.size >= prev.size && st.mtimeMs >= prev.mtimeMs) {
+			// Append: everything new lives past the consumed prefix.
+			let tail: string;
+			try {
+				tail = await Bun.file(file).slice(prev.size).text();
+			} catch (err) {
+				return { stats: null, error: `${file}: ${ioReason(err)}` };
+			}
+			cache.parsedBytes += Buffer.byteLength(tail, "utf8");
+			const cut = tail.lastIndexOf("\n");
+			if (cut === -1) {
+				// No newline landed yet: the tail is a partial line, keep waiting for it.
+				seen.add(file);
+				perFile.push(prev.stats);
+				continue;
+			}
+			const consumed = tail.slice(0, cut + 1);
+			const records = readUsageRecords(consumed);
+			if (records === null)
+				return { stats: null, error: `${file}: a record is not a JSON object` };
+			const stats = foldStats([prev.stats, aggregate(records)]);
+			cache.files.set(file, {
+				size: prev.size + Buffer.byteLength(consumed, "utf8"),
+				mtimeMs: st.mtimeMs,
+				stats,
+			});
+			seen.add(file);
+			perFile.push(stats);
+			continue;
+		}
+		// First sight, a shrink, or an mtime moved back: only a full read tells the truth.
+		let text: string;
+		try {
+			text = await Bun.file(file).text();
+		} catch (err) {
+			return { stats: null, error: `${file}: ${ioReason(err)}` };
+		}
+		cache.parsedBytes += Buffer.byteLength(text, "utf8");
+		const cut = text.lastIndexOf("\n");
+		const complete = cut === -1 ? "" : text.slice(0, cut + 1);
+		const records = readUsageRecords(complete);
+		if (records === null)
+			return { stats: null, error: `${file}: a record is not a JSON object` };
+		const stats = aggregate(records);
+		cache.files.set(file, {
+			size: Buffer.byteLength(complete, "utf8"),
+			mtimeMs: st.mtimeMs,
+			stats,
+		});
+		seen.add(file);
+		perFile.push(stats);
+	}
+	// A file the walk no longer lists is gone; drop it so its totals leave too.
+	for (const path of cache.files.keys())
+		if (!seen.has(path)) cache.files.delete(path);
+	return { stats: foldStats(perFile), error: null };
 }

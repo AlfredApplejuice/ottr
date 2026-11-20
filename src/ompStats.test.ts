@@ -1,16 +1,26 @@
 // ompStats contract tests: transcript scanning, record strictness, merge, report build.
 // Fixtures are synthetic transcript files in the shape tracker turns write.
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	statSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	buildOmpStatsReport,
 	mergeOmpStats,
+	newSessionUsageCache,
 	type OmpStats,
 	type OmpStatsSource,
 	type OmpUsageTotals,
 	scanSessionUsage,
+	scanSessionUsageIncremental,
 } from "./ompStats.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "ottr-omp-stats-"));
@@ -155,6 +165,209 @@ describe("scanSessionUsage", () => {
 		const answer = scanSessionUsage(sessions);
 		expect(answer.stats?.byModel[0]?.model).toBe("unknown");
 		expect(answer.stats?.overall.unpricedRequests).toBe(1);
+	});
+});
+
+describe("scanSessionUsageIncremental", () => {
+	test("parses only the appended tail when a transcript grows", async () => {
+		const root = join(dir, "inc-append");
+		const sessions = join(root, "sessions");
+		mkdirSync(sessions, { recursive: true });
+		const file = join(sessions, "1_sess.jsonl");
+		writeFileSync(
+			file,
+			[
+				usageLine({ input: 10, output: 5, cost: 0.25 }),
+				usageLine({ input: 20, output: 6, cost: 0.5 }),
+				"",
+			].join("\n"),
+		);
+		const cache = newSessionUsageCache();
+		const first = await scanSessionUsageIncremental(sessions, cache);
+		expect(first.error).toBeNull();
+		expect(first.stats?.overall.totalRequests).toBe(2);
+		const appended = `${usageLine({ input: 30, output: 7, cost: 0.25 })}\n`;
+		appendFileSync(file, appended);
+		const before = cache.parsedBytes;
+		const second = await scanSessionUsageIncremental(sessions, cache);
+		expect(second.error).toBeNull();
+		expect(cache.parsedBytes - before).toBe(Buffer.byteLength(appended));
+		expect(second.stats?.overall.totalRequests).toBe(3);
+		expect(second.stats?.overall.totalInputTokens).toBe(60);
+		expect(second.stats?.overall.totalCost).toBe(1);
+		expect(cache.files.get(file)?.size).toBe(statSync(file).size);
+	});
+
+	test("a warm rescan of an unchanged dir reads zero bytes", async () => {
+		const root = join(dir, "inc-unchanged");
+		const sessions = join(root, "sessions");
+		mkdirSync(sessions, { recursive: true });
+		writeFileSync(
+			join(sessions, "1_a.jsonl"),
+			`${usageLine({ input: 10, cost: 0.25 })}\n`,
+		);
+		const cache = newSessionUsageCache();
+		const first = await scanSessionUsageIncremental(sessions, cache);
+		expect(first.error).toBeNull();
+		const before = cache.parsedBytes;
+		const second = await scanSessionUsageIncremental(sessions, cache);
+		expect(second.error).toBeNull();
+		expect(cache.parsedBytes - before).toBe(0);
+		expect(second.stats).toEqual(first.stats);
+	});
+
+	test("a truncated file is re-read in full", async () => {
+		const root = join(dir, "inc-truncated");
+		const sessions = join(root, "sessions");
+		mkdirSync(sessions, { recursive: true });
+		const file = join(sessions, "1_a.jsonl");
+		writeFileSync(
+			file,
+			[
+				usageLine({ input: 10, cost: 0.25 }),
+				usageLine({ input: 20, cost: 0.5 }),
+				"",
+			].join("\n"),
+		);
+		const cache = newSessionUsageCache();
+		const first = await scanSessionUsageIncremental(sessions, cache);
+		expect(first.stats?.overall.totalRequests).toBe(2);
+		writeFileSync(file, `${usageLine({ input: 10, cost: 0.5 })}\n`);
+		const before = cache.parsedBytes;
+		const second = await scanSessionUsageIncremental(sessions, cache);
+		expect(second.error).toBeNull();
+		expect(cache.parsedBytes - before).toBe(statSync(file).size);
+		expect(second.stats?.overall.totalRequests).toBe(1);
+		expect(second.stats?.overall.totalCost).toBe(0.5);
+	});
+
+	test("an mtime moved back forces a full re-read", async () => {
+		const root = join(dir, "inc-mtime");
+		const sessions = join(root, "sessions");
+		mkdirSync(sessions, { recursive: true });
+		const file = join(sessions, "1_a.jsonl");
+		writeFileSync(file, `${usageLine({ cost: 0.25 })}\n`);
+		const cache = newSessionUsageCache();
+		const first = await scanSessionUsageIncremental(sessions, cache);
+		expect(first.stats?.overall.totalRequests).toBe(1);
+		const older = new Date(Date.now() - 60_000);
+		utimesSync(file, older, older);
+		const before = cache.parsedBytes;
+		const second = await scanSessionUsageIncremental(sessions, cache);
+		expect(second.error).toBeNull();
+		expect(cache.parsedBytes - before).toBe(statSync(file).size);
+		expect(second.stats?.overall.totalRequests).toBe(1);
+	});
+
+	test("a removed file leaves the totals and the cache", async () => {
+		const root = join(dir, "inc-removed");
+		const sessions = join(root, "sessions");
+		mkdirSync(sessions, { recursive: true });
+		const a = join(sessions, "1_a.jsonl");
+		const b = join(sessions, "1_b.jsonl");
+		writeFileSync(a, `${usageLine({ model: "model-a", cost: 0.25 })}\n`);
+		writeFileSync(b, `${usageLine({ model: "model-b", cost: 0.75 })}\n`);
+		const cache = newSessionUsageCache();
+		const first = await scanSessionUsageIncremental(sessions, cache);
+		expect(first.stats?.overall.totalRequests).toBe(2);
+		rmSync(b);
+		const second = await scanSessionUsageIncremental(sessions, cache);
+		expect(second.error).toBeNull();
+		expect(second.stats?.overall.totalRequests).toBe(1);
+		expect(second.stats?.byModel.map((m) => m.model)).toEqual(["model-a"]);
+		expect(cache.files.has(b)).toBe(false);
+		expect(cache.files.has(a)).toBe(true);
+	});
+
+	test("matches the sync scan on a main plus subagent layout", async () => {
+		const root = join(dir, "inc-parity");
+		const sessions = join(root, "sessions");
+		const sub = join(sessions, "1_sess-1");
+		mkdirSync(sub, { recursive: true });
+		// Binary-exact costs so float summation order cannot differ.
+		writeFileSync(
+			join(sessions, "1_sess-1.jsonl"),
+			[
+				usageLine({ input: 10, output: 5, cost: 0.25 }),
+				'{"type":"session"}',
+				"",
+			].join("\n"),
+		);
+		writeFileSync(
+			join(sub, "sub-1.jsonl"),
+			`${usageLine({ model: "claude-opus-5-5", input: 99, output: 9, cost: 0.75 })}\n`,
+		);
+		const answer = await scanSessionUsageIncremental(
+			sessions,
+			newSessionUsageCache(),
+		);
+		expect(answer.error).toBeNull();
+		expect(answer.stats).toEqual(scanSessionUsage(sessions).stats);
+	});
+
+	test("a malformed complete line voids the store with the sync wording", async () => {
+		const root = join(dir, "inc-bad");
+		const sessions = join(root, "sessions");
+		mkdirSync(sessions, { recursive: true });
+		const file = join(sessions, "1_bad.jsonl");
+		writeFileSync(file, `${usageLine({ cost: 9 })}\n{broken\n`);
+		const answer = await scanSessionUsageIncremental(
+			sessions,
+			newSessionUsageCache(),
+		);
+		expect(answer.stats).toBeNull();
+		expect(answer.error).toBe(`${file}: a record is not a JSON object`);
+	});
+
+	test("a trailing partial line waits for its newline", async () => {
+		const root = join(dir, "inc-partial");
+		const sessions = join(root, "sessions");
+		mkdirSync(sessions, { recursive: true });
+		const file = join(sessions, "1_a.jsonl");
+		writeFileSync(file, usageLine({ input: 10, cost: 0.25 }));
+		const cache = newSessionUsageCache();
+		const first = await scanSessionUsageIncremental(sessions, cache);
+		expect(first.error).toBeNull();
+		expect(first.stats?.overall.totalRequests).toBe(0);
+		expect(cache.files.get(file)?.size).toBe(0);
+		appendFileSync(file, "\n");
+		const second = await scanSessionUsageIncremental(sessions, cache);
+		expect(second.error).toBeNull();
+		expect(second.stats).toEqual(scanSessionUsage(sessions).stats);
+	});
+
+	test("a large scan yields to the event loop instead of blocking it", async () => {
+		const root = join(dir, "inc-yield");
+		const sessions = join(root, "sessions");
+		mkdirSync(sessions, { recursive: true });
+		for (let i = 0; i < 200; i++)
+			writeFileSync(
+				join(sessions, `${String(i).padStart(3, "0")}_s.jsonl`),
+				`${usageLine({ cost: 0.25 })}\n`,
+			);
+		const cache = newSessionUsageCache();
+		const pending = scanSessionUsageIncremental(sessions, cache);
+		let maxGap = 0;
+		let last = Date.now();
+		// Real wall-clock sampling: fake timers cannot measure true event-loop gaps.
+		const sampler = setInterval(() => {
+			const now = Date.now();
+			if (now - last > maxGap) maxGap = now - last;
+			last = now;
+		}, 1);
+		const answer = await pending.finally(() => clearInterval(sampler));
+		expect(answer.error).toBeNull();
+		expect(answer.stats?.overall.totalRequests).toBe(200);
+		expect(maxGap).toBeLessThan(100);
+	});
+
+	test("a missing dir answers the zero totals as a fresh project", async () => {
+		const answer = await scanSessionUsageIncremental(
+			join(dir, "no-such-inc", "sessions"),
+			newSessionUsageCache(),
+		);
+		expect(answer.error).toBeNull();
+		expect(answer.stats).toEqual({ overall: BASE, byModel: [] });
 	});
 });
 

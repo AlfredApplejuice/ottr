@@ -219,10 +219,12 @@ import {
 } from "./notifications.ts";
 import {
 	buildOmpStatsReport,
+	newSessionUsageCache,
 	type OmpStatsAnswer,
 	type OmpStatsReport,
 	type OmpStatsSource,
-	scanSessionUsage,
+	type SessionUsageCache,
+	scanSessionUsageIncremental,
 } from "./ompStats.ts";
 import {
 	forwardToDashboard,
@@ -712,8 +714,11 @@ interface AppDeps {
 	 * urls' GET /signins for the worker sign-in warnings. Null, absent or empty = no workers to probe. */
 	workerTarget?: WorkerTarget | null;
 	/** Only for tests: the transcript usage scan GET /api/settings/omp-stats runs instead of
-	 * scanSessionUsage, so a test can count reads and serve fixture stores. */
-	scanSessionUsage?: (sessionsDir: string) => OmpStatsAnswer;
+	 * the incremental scanner, so a test can count scans and serve fixture stores. The
+	 * answer may be sync or a promise; the report build awaits it either way. */
+	scanSessionUsage?: (
+		sessionsDir: string,
+	) => OmpStatsAnswer | Promise<OmpStatsAnswer>;
 	/**
 	 * Settings -> omp usage -> Launch omp stats dashboard (docs/specs/omp-stats-dashboard.md):
 	 * the proxy listener's port (null + error when disabled) and the on-demand dashboard that
@@ -6921,19 +6926,40 @@ export async function createApp(deps: AppDeps) {
 	// session store, while tracker turns write their transcripts to each project's
 	// sessions dir (--session-dir) — on the shared volume the server mounts — so the
 	// board sums the transcripts itself: every project's dir plus both default stores.
+	// OTTR-1088: the scan is the async incremental scanner, one cache per store dir —
+	// a scan prunes the entries its walk did not list, so stores cannot share one.
+	// A removed project's dir stops being scanned; its cache entry lingers, bounded
+	// by the project count.
+	const ompStatsScanCaches = new Map<string, SessionUsageCache>();
 	let ompStatsCache: { at: number; report: OmpStatsReport } | null = null;
 	let ompStatsRead: Promise<OmpStatsReport> | null = null;
 	/** One report on demand. The 30 s cache + single-flight keep concurrent Settings
-	 *  tabs from re-walking every transcript at once. */
-	async function ompStatsReportNow(): Promise<OmpStatsReport> {
-		if (ompStatsRead !== null) return ompStatsRead;
-		if (ompStatsCache !== null && Date.now() - ompStatsCache.at < 30_000)
-			return ompStatsCache.report;
+	 *  tabs from re-walking every transcript at once. A build in flight answers the
+	 *  cached report at once with refreshing:true; with no cache it awaits the build. */
+	async function ompStatsReportNow(): Promise<
+		OmpStatsReport & { refreshing: boolean }
+	> {
+		const cached = ompStatsCache;
+		if (ompStatsRead !== null)
+			return cached === null
+				? { ...(await ompStatsRead), refreshing: false }
+				: { ...cached.report, refreshing: true };
+		if (cached !== null && Date.now() - cached.at < 30_000)
+			return { ...cached.report, refreshing: false };
 		const build = (async () => {
-			const scan = deps.scanSessionUsage ?? scanSessionUsage;
-			const sources: OmpStatsSource[] = ompSessionStores(deps.projects).map(
-				(s) => ({ name: s.name, answer: scan(s.dir) }),
-			);
+			const scan =
+				deps.scanSessionUsage ??
+				((dir: string) => {
+					let cache = ompStatsScanCaches.get(dir);
+					if (cache === undefined) {
+						cache = newSessionUsageCache();
+						ompStatsScanCaches.set(dir, cache);
+					}
+					return scanSessionUsageIncremental(dir, cache);
+				});
+			const sources: OmpStatsSource[] = [];
+			for (const s of ompSessionStores(deps.projects))
+				sources.push({ name: s.name, answer: await scan(s.dir) });
 			const report = buildOmpStatsReport(sources, Date.now());
 			ompStatsCache = { at: report.at, report };
 			return report;
@@ -6942,7 +6968,8 @@ export async function createApp(deps: AppDeps) {
 			ompStatsRead = null;
 		});
 		ompStatsRead = pendingReport;
-		return pendingReport;
+		if (cached !== null) return { ...cached.report, refreshing: true };
+		return { ...(await pendingReport), refreshing: false };
 	}
 
 	// Settings -> omp usage -> Launch omp stats dashboard (docs/specs/omp-stats-dashboard.md).
@@ -9858,7 +9885,9 @@ export async function createApp(deps: AppDeps) {
 		const name = r.body.name;
 		const value = r.body.value;
 		// Listed names already passed parseEnvTxt's ENV_NAME check.
-		const row = listedEnvNames(workersHome).find((row) => row.name === name);
+		const row = (await listedEnvNames(workersHome)).find(
+			(row) => row.name === name,
+		);
 		if (
 			typeof name !== "string" ||
 			row === undefined ||
@@ -13792,7 +13821,7 @@ export async function createApp(deps: AppDeps) {
 			GET: async (req) =>
 				await api(req, async () =>
 					json({
-						names: listedEnvNames(workersHome).map((row) =>
+						names: (await listedEnvNames(workersHome)).map((row) =>
 							row.plain
 								? {
 										...row,
@@ -14848,6 +14877,18 @@ export async function createApp(deps: AppDeps) {
 			backgroundTick("trending scan", () => trendingScanner.tick()),
 		memoryHealthTick: () => backgroundTick("memory health", memoryHealthTick),
 		workerSignInTick: () => backgroundTick("worker sign-ins", workerSignInTick),
+		// OTTR-1088: boot warmup of the transcript usage scan. Fire-and-forget: a request
+		// during the warmup awaits the same single-flight build or reads the last report.
+		ompStatsWarm: (): void => {
+			void ompStatsReportNow().catch((err) =>
+				console.error(`omp usage warmup failed: ${errmsg(err)}`),
+			);
+		},
+		// Only for tests: age the report cache past its 30 s TTL, so a test can watch a
+		// stale report serve with refreshing:true while the next scan runs.
+		ompStatsAgeCache: (): void => {
+			if (ompStatsCache !== null) ompStatsCache.at -= 60_000;
+		},
 		refreshUpdates: () => backgroundTick("updates refresh", refreshUpdates),
 		tokenReminderTick: () =>
 			backgroundTick("token reminder", tokenReminderTick),
