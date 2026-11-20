@@ -446,6 +446,46 @@ validation card anywhere in the project answers 409. The route calls
 cancelled-decline skip, so the user can restart a declined review's
 validation.
 
+##### Validate blocked leads again (OTTR-1129)
+
+The same route takes an optional JSON body. Absent bytes, a JSON `null`, or
+`{}` keep the plain start above byte for byte. The body
+`{ again: "blocked", before: "<ISO timestamp>" }` asks for a re-run over the
+leads whose earlier result came from the broken sandbox: `before` is the
+cutoff instant, and only leads validated before it re-enter a batch. The
+exported parser `parseValidateAgainBody` (src/app.ts) judges the body: any
+other `again` value than the exact string `"blocked"`, or a missing,
+non-string, or unparseable `before`, answers `400 {"error": <reason>}` and
+never reaches the filing seam. Unknown extra keys are ignored.
+
+The reset shares `filePendingValidationRun`'s store transaction and runs
+right after its open-run 409, before any other return: past it every failure
+throws, so a failed filing rolls the reset back and the lead keeps its old
+validated state. With no matching lead the reset is a no-op and the plain
+409s still apply. The reset's candidates are direct backlog lead children
+of the review (prompt `Needs validation`, not cancelled, a sandbox blocker)
+whose `validatedAt` is set and older than `before`. Of those, only leads
+whose newest recorded outcome is `blocked` reset: the scan reads the
+review's validation cards newest first (createdAt desc, ties by id) and
+takes the first parsed result per lead from each card's stored findings; a
+lead whose newest outcome is `confirmed`, `refuted`, or `deployment` keeps
+its validation. Each reset lead loses the settle's newest marker segment
+from its details — from the last
+`\nValidated by validation run #<run id>` through the next
+`\nValidated by ` occurrence or the end of the string, trimmed, `null` when
+nothing remains; no marker leaves the details unchanged — and logs exactly
+one line naming the old result:
+`- validation result cleared for re-validation: was "still blocked"
+(validation run #<run id>)`. The re-listed tasks then feed the batchable
+gate, so a reset lead enters the batch like a never-validated lead.
+
+The response wraps the new validation card's task view with `reset`: the
+ids of the cleared leads in reset order, `[]` without the again flag.
+
+Operator note: after deploy, run OTTR-969 once with
+`before: 2026-11-17T00:00Z` so the leads the broken sandbox marked blocked
+re-validate.
+
 ##### Settings
 
 `ProjectSettings` gains `validationBatchSize: number`, default 10

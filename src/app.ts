@@ -625,7 +625,10 @@ interface AppDeps {
 		e: Entry,
 		reviewId: string,
 		strictReview?: boolean,
-	): Promise<{ id: string } | { error: string; status: number }>;
+		again?: { before: number },
+	): Promise<
+		{ id: string; reset: string[] } | { error: string; status: number }
+	>;
 	stopTurn(e: Entry, id: string): Promise<StopOutcome>;
 	finishKept(
 		e: Entry,
@@ -1811,6 +1814,25 @@ function parseTendChurnGlobs(
 	}
 	patch.tendChurnGlobs = globs;
 	return null;
+}
+
+/** OTTR-1129: the validate route's optional body. The again flag must be exactly
+ *  the string "blocked" and `before` an ISO timestamp that Date.parse reads as a
+ *  finite epoch ms; anything else (a non-object body included) is an error result.
+ *  Pure: never throws, and unknown extra keys are ignored. */
+export function parseValidateAgainBody(
+	body: unknown,
+): { before: number } | { error: string } {
+	if (typeof body !== "object" || body === null)
+		return { error: "body must be a JSON object" };
+	const { again, before } = body as Record<string, unknown>;
+	if (again !== "blocked") return { error: `again must be "blocked"` };
+	if (typeof before !== "string")
+		return { error: "before must be an ISO timestamp string" };
+	const at = Date.parse(before);
+	if (!Number.isFinite(at))
+		return { error: "before must be a timestamp Date.parse reads" };
+	return { before: at };
 }
 
 const settingParsers: FieldParser[] = [
@@ -10833,7 +10855,9 @@ export async function createApp(deps: AppDeps) {
 
 	/** OTTR-1047: the manual start of a done review's batch validation run. The card
 	 * itself is filed by the turn loop (deps.validateLeads, filePendingValidationRun);
-	 * the route only gates the input and schedules after the filing. */
+	 * the route only gates the input and schedules after the filing. OTTR-1129: an
+	 * optional body adds validate-again — `{ again: "blocked", before: <ISO> }` — and
+	 * the response wraps the card's view with the reset list. */
 	async function handlePOSTProjectsTasksValidateByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/validate">,
 	): Promise<Response> {
@@ -10849,13 +10873,46 @@ export async function createApp(deps: AppDeps) {
 				{ error: "only a done review can start a validation run" },
 				409,
 			);
+		// The optional body. Absent bytes, a JSON null, or {} keep the body-less
+		// behavior byte-for-byte; readJson refuses a null body, so this route reads
+		// its own bytes. The transport errors mirror readJson's.
+		let body: Record<string, unknown> = {};
+		if (
+			(req.headers.get("content-type") ?? "").startsWith("application/json")
+		) {
+			const read = await readBytes(req, MAX_BODY_BYTES);
+			if ("error" in read) return read.error;
+			if (read.bytes.length > 0) {
+				let parsed: unknown;
+				try {
+					parsed = JSON.parse(new TextDecoder().decode(read.bytes));
+				} catch {
+					return json({ error: "invalid JSON body" }, 400);
+				}
+				if (parsed !== null) {
+					if (typeof parsed !== "object" || Array.isArray(parsed))
+						return json({ error: "body must be a JSON object" }, 400);
+					body = parsed as Record<string, unknown>;
+				}
+			}
+		}
+		let again: { before: number } | undefined;
+		if (body.again !== undefined) {
+			const parsed = parseValidateAgainBody(body);
+			if ("error" in parsed) return json({ error: parsed.error }, 400);
+			again = parsed;
+		}
 		const fileRun = deps.validateLeads;
 		if (fileRun === undefined)
 			return json({ error: "validation filing is not wired" }, 500);
-		const filed = await fileRun(e, task.id, true);
+		const filed = await fileRun(e, task.id, true, again);
 		if ("error" in filed) return json({ error: filed.error }, filed.status);
 		await deps.schedule();
-		return await taskResponse(e, filed.id);
+		// OTTR-1129: the response adds the reset list — the ids whose validatedAt
+		// the call cleared, [] without the again flag — around the card's view.
+		const t = await e.store.getTask(filed.id);
+		if (t === null) return json({ error: "unknown task" }, 404);
+		return json({ ...(await taskView(e, t)), reset: filed.reset });
 	}
 
 	/** The steering refusal for a card not in flight; null lets the steer queue. */

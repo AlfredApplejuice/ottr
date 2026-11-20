@@ -38,6 +38,7 @@ import {
 	boardWarnings,
 	dependabotHeadPrefix,
 	type Entry,
+	parseValidateAgainBody,
 	pickEncoding,
 	reconcileLayerUse,
 	storedProjectPaths,
@@ -379,7 +380,10 @@ let validateLeadsImpl:
 			e: Entry,
 			reviewId: string,
 			strictReview?: boolean,
-	  ) => Promise<{ id: string } | { error: string; status: number }>)
+			again?: { before: number },
+	  ) => Promise<
+			{ id: string; reset: string[] } | { error: string; status: number }
+	  >)
 	| null = null;
 const loopStubs = () => ({
 	cancel: (e: Entry, id: string, force: boolean) => cancelImpl(e, id, force),
@@ -387,10 +391,15 @@ const loopStubs = () => ({
 		finishKeptImpl(e, id, choices),
 	stopTurn: (e: Entry, id: string) => stopTurnImpl(e, id),
 	claimedPids: () => new Set<number>(),
-	validateLeads: (e: Entry, reviewId: string, strictReview?: boolean) => {
+	validateLeads: (
+		e: Entry,
+		reviewId: string,
+		strictReview?: boolean,
+		again?: { before: number },
+	) => {
 		if (!validateLeadsImpl)
 			return Promise.reject(new Error("validateLeads not stubbed"));
-		return validateLeadsImpl(e, reviewId, strictReview);
+		return validateLeadsImpl(e, reviewId, strictReview, again);
 	},
 });
 // Deepen seam: the route tests swap deepenImpl per test; unstubbed calls fail loudly.
@@ -10524,9 +10533,10 @@ describe("manual validation start route (OTTR-1047)", () => {
 			e: Entry;
 			reviewId: string;
 			strictReview?: boolean;
+			again?: { before: number };
 		}> = [];
-		validateLeadsImpl = async (e, reviewId, strictReview) => {
-			seen.push({ e, reviewId, strictReview });
+		validateLeadsImpl = async (e, reviewId, strictReview, again) => {
+			seen.push({ e, reviewId, strictReview, again });
 			// The seam mimics the loop's filing: createTask lands the card queued.
 			const card = await e.store.createTask(
 				"Batch validation of 1 lead(s) of review.",
@@ -10537,7 +10547,7 @@ describe("manual validation start route (OTTR-1047)", () => {
 				followUpOf: reviewId,
 				promptAuthor: "board",
 			});
-			return { id: card.id };
+			return { id: card.id, reset: [] };
 		};
 		const before = calls;
 		try {
@@ -10553,6 +10563,8 @@ describe("manual validation start route (OTTR-1047)", () => {
 			// The start is strict: it files for this review only and must never
 			// accept a fallback to another candidate review.
 			expect(seen[0]!.strictReview).toBe(true);
+			// OTTR-1129: an empty body keeps the plain start — the seam sees no again.
+			expect(seen[0]!.again).toBeUndefined();
 			const card = (await store.listTasks()).find((t) => t.id === b.id)!;
 			expect(card.kind).toBe("validation");
 			expect(card.followUpOf).toBe(review.id);
@@ -10575,7 +10587,7 @@ describe("manual validation start route (OTTR-1047)", () => {
 		let filed = 0;
 		validateLeadsImpl = async () => {
 			filed++;
-			return { id: "nope" };
+			return { id: "nope", reset: [] };
 		};
 		try {
 			const res = await post(
@@ -10596,7 +10608,7 @@ describe("manual validation start route (OTTR-1047)", () => {
 	test("a non-review card is refused", async () => {
 		const work = await store.createTask("plain work for validation route");
 		await store.updateTask(work.id, { stage: "done", state: "idle" });
-		validateLeadsImpl = async () => ({ id: "nope" });
+		validateLeadsImpl = async () => ({ id: "nope", reset: [] });
 		try {
 			const res = await post(`/api/projects/p1/tasks/${work.id}/validate`, {});
 			expect(res.status).toBe(409);
@@ -10610,7 +10622,7 @@ describe("manual validation start route (OTTR-1047)", () => {
 	test("a cancelled review is refused", async () => {
 		const { review } = await doneReviewWithLead();
 		await store.updateTask(review.id, { cancelledAt: Date.now() });
-		validateLeadsImpl = async () => ({ id: "nope" });
+		validateLeadsImpl = async () => ({ id: "nope", reset: [] });
 		try {
 			const res = await post(
 				`/api/projects/p1/tasks/${review.id}/validate`,
@@ -10644,6 +10656,96 @@ describe("manual validation start route (OTTR-1047)", () => {
 			await store.updateTask(review.id, { cancelledAt: Date.now() });
 			await store.updateTask(lead.id, { cancelledAt: Date.now() });
 		}
+	});
+
+	// OTTR-1129: validate-again. The again body reaches the seam parsed, and the
+	// response wraps the card's view with the seam's reset list.
+	test("the again body reaches the seam and the reset list lands in the response (OTTR-1129)", async () => {
+		const { review, lead } = await doneReviewWithLead();
+		const seen: Array<{ again?: { before: number } }> = [];
+		validateLeadsImpl = async (e, reviewId, _strictReview, again) => {
+			seen.push({ again });
+			const card = await e.store.createTask(
+				"Batch validation of 1 lead(s) of review.",
+				null,
+				"validation",
+			);
+			await e.store.updateTask(card.id, {
+				followUpOf: reviewId,
+				promptAuthor: "board",
+			});
+			return { id: card.id, reset: ["lead-7", "lead-9"] };
+		};
+		try {
+			const res = await post(`/api/projects/p1/tasks/${review.id}/validate`, {
+				again: "blocked",
+				before: "2026-11-17T00:00:00.000Z",
+			});
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as { id: string; reset: string[] };
+			expect(seen).toHaveLength(1);
+			expect(seen[0]!.again).toEqual({
+				before: Date.parse("2026-11-17T00:00:00.000Z"),
+			});
+			// The response carries the seam-provided reset list verbatim.
+			expect(b.reset).toEqual(["lead-7", "lead-9"]);
+			const card = (await store.listTasks()).find((t) => t.id === b.id)!;
+			expect(card.kind).toBe("validation");
+			expect(card.followUpOf).toBe(review.id);
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
+	test("a malformed again body is refused before the filing (OTTR-1129)", async () => {
+		const { review, lead } = await doneReviewWithLead();
+		let filed = 0;
+		validateLeadsImpl = async () => {
+			filed++;
+			return { id: "nope", reset: [] };
+		};
+		try {
+			for (const body of [
+				{ again: "blocked" },
+				{ again: "later", before: "2026-11-17T00:00:00.000Z" },
+				{ again: "blocked", before: "not-a-date" },
+				// A non-string before is refused too.
+				{ again: "blocked", before: 42 },
+			]) {
+				const res = await post(
+					`/api/projects/p1/tasks/${review.id}/validate`,
+					body,
+				);
+				expect(res.status).toBe(400);
+				expect(await errorOf(res)).not.toBe("");
+				// The filing seam never runs for a refused body.
+				expect(filed).toBe(0);
+			}
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
+	// OTTR-1129: the parser's contract, property-checked. Exactly the string
+	// "blocked" with a before Date.parse reads as a finite number wins; every
+	// other shape is an error result, and the parser never throws.
+	test("parseValidateAgainBody accepts only blocked with a parseable before (OTTR-1129)", () => {
+		const props = fc.property(
+			fc.string({ maxLength: 40 }),
+			fc.string({ maxLength: 40 }),
+			(again, before) => {
+				const r = parseValidateAgainBody({ again, before });
+				const at = Date.parse(before);
+				if (again === "blocked" && Number.isFinite(at))
+					expect(r).toEqual({ before: at });
+				else expect("error" in r && r.error.length > 0).toBe(true);
+			},
+		);
+		fc.assert(props);
 	});
 });
 

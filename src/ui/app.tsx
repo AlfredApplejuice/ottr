@@ -12599,6 +12599,12 @@ function DrawerActions(p: {
 	runRefile: () => Promise<boolean>;
 	refileError: string | null;
 	rerunDone: boolean;
+	/** OTTR-1129: the done-review re-validation group (datetime + button) and its inline lines. */
+	validateAgainBefore: string;
+	setValidateAgainBefore: (v: string) => void;
+	runValidateAgain: () => Promise<boolean>;
+	validateAgainError: string | null;
+	validateAgainDone: boolean;
 	runCancel: () => Promise<boolean>;
 	/** A proposal's decision card carries Cancel task in its footer; the row drops it. */
 	cancelInPanel: boolean;
@@ -12623,6 +12629,11 @@ function DrawerActions(p: {
 		runRefile,
 		refileError,
 		rerunDone,
+		validateAgainBefore,
+		setValidateAgainBefore,
+		runValidateAgain,
+		validateAgainError,
+		validateAgainDone,
 		runCancel,
 		cancelInPanel,
 	} = p;
@@ -12735,6 +12746,52 @@ function DrawerActions(p: {
 					</BusyButton>
 				)}
 			</div>
+			{/* OTTR-1129: a done review card can clear the blocked results its leads
+			    got before a chosen time and file a fresh validation run. The datetime
+			    starts empty and stays required: the board tracks no sandbox-fix time
+			    to preset it with (a future preset would fill the input from a known
+			    sandbox-fix time). Like the re-run lines below, the group and its
+			    inline lines render full width under the actions row. */}
+			{task.kind === "review" && task.stage === "done" && !cancelled && (
+				<div className="reply-form">
+					<label htmlFor="validate-again-before">
+						Validate blocked leads again
+					</label>
+					<input
+						id="validate-again-before"
+						type="datetime-local"
+						required
+						value={validateAgainBefore}
+						onChange={(e) => setValidateAgainBefore(e.target.value)}
+					/>
+					<div className="reply-actions">
+						<BusyButton
+							title="Clears the blocked results this review's leads got before the chosen time and files a fresh validation run for them"
+							disabled={validateAgainBefore.trim().length === 0}
+							run={runValidateAgain}
+						>
+							Validate blocked leads again
+						</BusyButton>
+					</div>
+				</div>
+			)}
+			{task.kind === "review" &&
+				task.stage === "done" &&
+				!cancelled &&
+				validateAgainError !== null && (
+					<p className="auth-error" role="alert">
+						{validateAgainError}
+					</p>
+				)}
+			{task.kind === "review" &&
+				task.stage === "done" &&
+				!cancelled &&
+				validateAgainDone &&
+				validateAgainError === null && (
+					<p className="hint" role="status">
+						Validation run filed.
+					</p>
+				)}
 			{/* OTTR-604: the re-run error and confirmation render as full-width
 					    lines below the actions row, not as flex items inside it, so they
 					    align with the drawer's content margin and keep their spacing. */}
@@ -13692,6 +13749,39 @@ export function Drawer({
 			return false;
 		}
 	};
+	// OTTR-1129: a done review card can clear the blocked results its leads got
+	// before a chosen time and file a fresh validation run for them. The datetime
+	// starts empty and stays required: the board tracks no sandbox-fix time to
+	// preset it with (a future preset would fill the input from a known
+	// sandbox-fix time). A new card's drawer starts without the last card's
+	// input, error or confirmation.
+	const [validateAgainBefore, setValidateAgainBefore] = useState("");
+	const [validateAgainError, setValidateAgainError] = useState<string | null>(
+		null,
+	);
+	const [validateAgainDone, setValidateAgainDone] = useState(false);
+	useEffect(() => {
+		setValidateAgainBefore("");
+		setValidateAgainError(null);
+		setValidateAgainDone(false);
+	}, [rerunTaskId]);
+	const runValidateAgain = async (): Promise<boolean> => {
+		setValidateAgainError(null);
+		try {
+			await post(
+				`/api/projects/${encodeURIComponent(task.project)}/tasks/${encodeURIComponent(task.id)}/validate`,
+				{
+					again: "blocked",
+					before: new Date(validateAgainBefore).toISOString(),
+				},
+			);
+			setValidateAgainDone(true);
+			return true;
+		} catch (e) {
+			setValidateAgainError(e instanceof Error ? e.message : String(e));
+			return false;
+		}
+	};
 	// The rank strip leads: the picked segment presses at once, the triage POST
 	// follows, a failure rolls the strip back and lands in the inline alert
 	// (onError).
@@ -14353,6 +14443,11 @@ export function Drawer({
 						runRefile={runRefile}
 						refileError={refileError}
 						rerunDone={rerunDone}
+						validateAgainBefore={validateAgainBefore}
+						setValidateAgainBefore={setValidateAgainBefore}
+						runValidateAgain={runValidateAgain}
+						validateAgainError={validateAgainError}
+						validateAgainDone={validateAgainDone}
 						runCancel={runCancel}
 						cancelInPanel={proposal && task.state === "needs_you"}
 					/>

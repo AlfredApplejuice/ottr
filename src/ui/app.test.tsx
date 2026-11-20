@@ -13292,6 +13292,318 @@ describe("Drawer re-run failed jobs action", () => {
 	});
 });
 
+describe("Drawer validate blocked leads again action", () => {
+	// OTTR-1129: a done review card's drawer offers "Validate blocked leads again"
+	// — a required datetime and a busy button that POSTs to the validate route.
+	const project = {
+		name: "proj",
+		github: null,
+		hasRules: true,
+		sessionsDir: "/tmp/proj/.tasks/sessions",
+		settings: {},
+	} as unknown as ProjectView;
+	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	} as unknown as Partial<TaskCard>;
+	const base = {
+		task: null as never,
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		projects: [],
+		read: true,
+		onMarkUnread: () => {},
+		onMarkSeen: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+	// React interaction needs browser globals; the same happy-dom swap as the
+	// re-run describe above: installed after app.tsx's import, removed after
+	// this describe's tests, so later test files in the same process see no DOM.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	// happy-dom's dispatched clicks never reach React's event plugin (same
+	// upstream gap as settings.test.tsx's onChangeOf): call the production
+	// onClick React rendered onto the node instead.
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+
+	// A React onChange picks up programmatic edits only through the native value
+	// setter, and happy-dom's dispatched input event never reaches React's
+	// ChangeEventPlugin: set the value natively, then call the production onChange.
+	const typeInto = (el: HTMLInputElement, value: string): void => {
+		const setter = Object.getOwnPropertyDescriptor(
+			window.HTMLInputElement.prototype,
+			"value",
+		)?.set;
+		if (setter === undefined) throw new Error("value setter missing");
+		setter.call(el, value);
+		onChangeOf(el)({ target: el, currentTarget: el });
+	};
+
+	// Same happy-dom gap as onClickOf above, for onChange handlers.
+	const onChangeOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onChange?: (e: unknown) => void;
+		};
+		if (props.onChange === undefined) throw new Error("node has no onChange");
+		return props.onChange;
+	};
+
+	const doneReviewCard = (): TaskCard =>
+		cardFixture({
+			...drawerFields,
+			kind: "review",
+			stage: "done",
+			state: "idle",
+			prompt: "Review the quota changes",
+		}) as TaskCard;
+
+	/** Renders a drawer for `card` under a fetch stub; the stub records the
+	 * validate POSTs and answers them with `respond`, everything else with 404. */
+	const withRoot = async (
+		card: TaskCard,
+		respond: { status: number; body: unknown },
+		run: (args: {
+			posts: { url: string; body: unknown }[];
+			container: HTMLDivElement;
+		}) => Promise<void>,
+	): Promise<void> => {
+		const posts: { url: string; body: unknown }[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+			const u = String(url);
+			if (u.endsWith("/validate")) {
+				posts.push({
+					url: u,
+					body: JSON.parse(String(init?.body)) as unknown,
+				});
+				return new Response(JSON.stringify(respond.body), {
+					status: respond.status,
+				});
+			}
+			// The detail fetch fills the drawer body (OTTR-965): serve the row back
+			// loaded, so the sections render from the fixture's fields.
+			if (u.endsWith(`/tasks/${card.id}`)) {
+				return new Response(JSON.stringify({ ...card, turns: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} task={card} />);
+			});
+			// One more act lets the detail fetch land before the run callback queries.
+			await act(async () => {});
+			await run({ posts, container });
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	};
+
+	const validateInput = (container: HTMLDivElement): HTMLInputElement => {
+		const node = container.querySelector(
+			'input[type="datetime-local"]#validate-again-before',
+		);
+		if (node === null) throw new Error("no validate-again datetime input");
+		return node as unknown as HTMLInputElement;
+	};
+
+	const validateButton = (container: HTMLDivElement): Element => {
+		for (const node of container.querySelectorAll("button"))
+			if (node.textContent?.includes("Validate blocked leads again"))
+				return node;
+		throw new Error("no Validate blocked leads again button");
+	};
+
+	test("a done review card renders the datetime and the button, disabled while the input is empty", async () => {
+		await withRoot(
+			doneReviewCard(),
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ container }) => {
+				const input = validateInput(container);
+				const button = validateButton(container);
+				const label = container.querySelector(
+					'label[for="validate-again-before"]',
+				);
+				expect(label?.textContent).toContain("Validate blocked leads again");
+				expect(input.getAttribute("required")).not.toBeNull();
+				expect((button as HTMLButtonElement).disabled).toBe(true);
+			},
+		);
+	});
+
+	test("a non-done or cancelled review card renders no validate control", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			kind: "review",
+			stage: "in_progress",
+			state: "running",
+			prompt: "Review the quota changes",
+		}) as TaskCard;
+		await withRoot(
+			card,
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ container }) => {
+				expect(container.textContent).not.toContain(
+					"Validate blocked leads again",
+				);
+			},
+		);
+	});
+
+	test("setting a datetime enables the button; clicking POSTs again:blocked with the chosen instant", async () => {
+		await withRoot(
+			doneReviewCard(),
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ posts, container }) => {
+				const input = validateInput(container);
+				const button = validateButton(container);
+				expect((button as HTMLButtonElement).disabled).toBe(true);
+				await act(async () => {
+					typeInto(input, "2026-11-05T09:30");
+				});
+				expect((validateButton(container) as HTMLButtonElement).disabled).toBe(
+					false,
+				);
+				await act(async () => {
+					onClickOf(validateButton(container))({});
+				});
+				await act(async () => {});
+				const post = posts.at(-1);
+				expect(post?.url.endsWith("/tasks/t1/validate")).toBe(true);
+				expect(post?.body).toEqual({
+					again: "blocked",
+					before: new Date("2026-11-05T09:30").toISOString(),
+				});
+			},
+		);
+	});
+
+	test("a failed validate POST surfaces the message as an inline alert", async () => {
+		await withRoot(
+			doneReviewCard(),
+			{
+				status: 409,
+				body: { error: "a validation run is already in flight" },
+			},
+			async ({ posts, container }) => {
+				await act(async () => {
+					typeInto(validateInput(container), "2026-11-05T09:30");
+				});
+				await act(async () => {
+					onClickOf(validateButton(container))({});
+				});
+				await act(async () => {});
+				expect(posts).toHaveLength(1);
+				const alerts = [...container.querySelectorAll('p[role="alert"]')];
+				expect(
+					alerts.some((a) =>
+						a.textContent?.includes("a validation run is already in flight"),
+					),
+				).toBe(true);
+				expect(container.textContent).not.toContain("Validation run filed.");
+			},
+		);
+	});
+
+	test("an ok response surfaces the Validation run filed status line", async () => {
+		await withRoot(
+			doneReviewCard(),
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ container }) => {
+				await act(async () => {
+					typeInto(validateInput(container), "2026-11-05T09:30");
+				});
+				await act(async () => {
+					onClickOf(validateButton(container))({});
+				});
+				await act(async () => {});
+				const statuses = [...container.querySelectorAll('p[role="status"]')];
+				expect(
+					statuses.some((s) =>
+						s.textContent?.includes("Validation run filed."),
+					),
+				).toBe(true);
+				expect(container.textContent).not.toContain(
+					"a validation run is already in flight",
+				);
+			},
+		);
+	});
+});
+
 describe("AddProjectModal Git URL field error", () => {
 	// React interaction needs browser globals; the same happy-dom swap as the
 	// board-GitHub-token describe above: installed after app.tsx's import,

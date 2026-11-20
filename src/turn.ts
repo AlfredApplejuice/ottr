@@ -1587,16 +1587,22 @@ export interface TurnLoop {
 	scheduleTick(): Promise<void>;
 	runTurn(name: string, id: string): Promise<void>;
 	cancel(e: TurnProject, id: string, force: boolean): Promise<CancelOutcome>;
-	/** OTTR-1047: files at most one batch validation card ({ id }), or { error, status }
+	/** OTTR-1047: files at most one batch validation card ({ id, reset }), or { error, status }
 	 * when nothing files. The manual start route passes the review's id (it overrides a
 	 * cancelled-decline skip) with `strictReview`: it files for that review only and
 	 * refuses when the review has no batchable leads; the done-review and chain triggers
-	 * call it without one and fall back to the next candidate. */
+	 * call it without one and fall back to the next candidate. With `again` (OTTR-1129
+	 * validate-again) the call first clears the stale validatedAt of the review's
+	 * blocked-before-`again.before` sandbox leads inside the same transaction and returns
+	 * their ids in `reset` ([] without the flag). */
 	filePendingValidationRun(
 		e: TurnProject,
 		reviewId?: string,
 		strictReview?: boolean,
-	): Promise<{ id: string } | { error: string; status: number }>;
+		again?: { before: number },
+	): Promise<
+		{ id: string; reset: string[] } | { error: string; status: number }
+	>;
 	/** OTTR-1139: the periodic catch-up sweep, on the supervisor tick's cadence.
 	 * Calls filePendingValidationRun(e) for every project, so a done review whose
 	 * settle event never fired (a deploy gap, a crash between the done write and
@@ -9166,6 +9172,80 @@ export function createTurnLoop(
 		return next;
 	}
 
+	/** OTTR-1129 validate-again: clears validatedAt on the review's sandbox leads whose
+	 * newest recorded outcome was "blocked" and whose validatedAt predates `before` (the
+	 * broken-sandbox window). Newest run wins: the review's validation cards newest
+	 * first (createdAt desc, ties by id — the declined helper's comparison), and the
+	 * first parsed result per lead inside a card, like the settle's first-result rule.
+	 * Each reset lead loses the settle's newest marker segment from its details and logs
+	 * one line naming the old result. Runs inside the filing transaction and returns the
+	 * reset lead ids in reset order. */
+	async function resetValidatedLeads(
+		store: ProjectStore,
+		reviewId: string,
+		before: number,
+	): Promise<string[]> {
+		const tasks = await store.listTasks();
+		const newest = new Map<string, { outcome: string; runId: string }>();
+		const cards = tasks
+			.filter((t) => t.followUpOf === reviewId && t.kind === "validation")
+			.sort((a, b) =>
+				a.createdAt !== b.createdAt
+					? a.createdAt > b.createdAt
+						? -1
+						: 1
+					: a.id > b.id
+						? -1
+						: 1,
+			);
+		for (const card of cards)
+			for (const finding of await store.listReviewFindings(card.id)) {
+				const r = validationResult(finding.prompt);
+				if (r !== null && !newest.has(r.leadId))
+					newest.set(r.leadId, { outcome: r.outcome, runId: card.id });
+			}
+		const reset: string[] = [];
+		for (const lead of tasks) {
+			if (
+				lead.followUpOf !== reviewId ||
+				!lead.prompt.startsWith("Needs validation") ||
+				lead.stage !== "backlog" ||
+				lead.cancelledAt !== null ||
+				lead.validatedAt === null ||
+				lead.validatedAt >= before ||
+				leadBlocker(lead.prompt).kind !== "sandbox"
+			)
+				continue;
+			const last = newest.get(lead.id);
+			if (last === undefined || last.outcome !== "blocked") continue;
+			const full = await store.getTask(lead.id);
+			if (full === null) continue;
+			// The settle's marker segment for the cleared run: from its last occurrence
+			// through the next `Validated by ` marker, or the end of the string. No
+			// marker leaves the details unchanged; an empty remainder stores null.
+			const text = full.details ?? "";
+			const start = text.lastIndexOf(
+				`\nValidated by validation run #${last.runId}`,
+			);
+			const patch: TaskPatch = { validatedAt: null };
+			if (start !== -1) {
+				const next = text.indexOf("\nValidated by ", start + 1);
+				const cleared = (
+					text.slice(0, start) + (next === -1 ? "" : text.slice(next))
+				).trim();
+				patch.details = cleared === "" ? null : cleared;
+			}
+			await store.updateTask(lead.id, patch);
+			await appendLog(
+				store,
+				lead.id,
+				`- validation result cleared for re-validation: was "still blocked" (validation run #${last.runId})`,
+			);
+			reset.push(lead.id);
+		}
+		return reset;
+	}
+
 	/** OTTR-1047: files at most one batch validation card per call, in one store
 	 * transaction. The manual start route, the done-review triggers, and the chain of a
 	 * done validation run share this one implementation. Candidate reviews: `isReview`,
@@ -9180,14 +9260,21 @@ export function createTurnLoop(
 	 * when it has no batchable leads, instead of falling back to another candidate. The
 	 * batch is the review's batchable leads in severity order — ascending rank from the
 	 * review's stored findings by exact prompt (missing rank last, ties by card id) —
-	 * capped at `validationBatchSize` (below 1 behaves as 1). */
+	 * capped at `validationBatchSize` (below 1 behaves as 1). With `again` (OTTR-1129
+	 * validate-again) the call first clears the validatedAt of the review's sandbox
+	 * leads whose newest recorded outcome was blocked and whose validatedAt predates
+	 * `again.before`, inside this transaction, and the response carries the cleared
+	 * ids in `reset`. */
 	async function filePendingValidationRun(
 		e: TurnProject,
 		reviewId?: string,
 		strictReview?: boolean,
-	): Promise<{ id: string } | { error: string; status: number }> {
+		again?: { before: number },
+	): Promise<
+		{ id: string; reset: string[] } | { error: string; status: number }
+	> {
 		return await e.store.transaction(async () => {
-			const tasks = await e.store.listTasks();
+			let tasks = await e.store.listTasks();
 			// One open validation run per project: the manual route's 409 and the
 			// triggers' quiet no-op come from this single check.
 			if (
@@ -9199,6 +9286,19 @@ export function createTurnLoop(
 				)
 			)
 				return { error: "a validation run is already open", status: 409 };
+			// OTTR-1129: validate-again clears the stale validatedAt inside this
+			// transaction, after the open-run 409 and before any other return: past
+			// this point every failure throws, so the rollback keeps the old validated
+			// state; with no matching lead the reset is a no-op and the plain 409s
+			// below still apply.
+			const reset =
+				again !== undefined && reviewId !== undefined
+					? await resetValidatedLeads(e.store, reviewId, again.before)
+					: [];
+			if (reset.length > 0)
+				// The batchable gate reads the fresh list: a reset lead counts like a
+				// never-validated lead.
+				tasks = await e.store.listTasks();
 			const batchableOf = (review: ListedTask): ListedTask[] =>
 				tasks.filter(
 					(t) =>
@@ -9290,7 +9390,7 @@ export function createTurnLoop(
 				promptAuthor: "board",
 				details: `Batch validation of ${batch.length} lead(s) of review ${review.id}.`,
 			});
-			return { id: card.id };
+			return { id: card.id, reset };
 		});
 	}
 

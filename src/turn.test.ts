@@ -28341,6 +28341,255 @@ describe("stored review findings", () => {
 		expect(card.followUpOf).toBe(b.id);
 		expect(card.prompt).toContain(`#${bLead.id}`);
 	});
+
+	// ---- OTTR-1129: validate blocked leads again ----
+
+	test("validate-again resets the stale blocked lead and refiles only it (OTTR-1129)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop, batches } = await validationCase(record);
+		const review = await doneReview(store, "again");
+		const a = mkFinding(
+			"Needs validation: lead A\nBlocker: sandbox run: ca",
+			1,
+		);
+		const b = mkFinding(
+			"Needs validation: lead B\nBlocker: sandbox run: cb",
+			2,
+		);
+		const c = mkFinding(
+			"Needs validation: lead C\nBlocker: sandbox run: cc",
+			3,
+		);
+		for (const f of [a, b, c]) await store.appendReviewFinding(review.id, f);
+		const la = await leadCard(store, review.id, a.prompt);
+		const lb = await leadCard(store, review.id, b.prompt);
+		const lc = await leadCard(store, review.id, c.prompt);
+
+		// Run 1 lands A "blocked" and C "deployment"; the chain files the
+		// remainder and run 2 lands B "blocked" later.
+		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
+		expect("id" in v1).toBe(true);
+		if (!("id" in v1)) throw new Error("no validation run filed");
+		batches.push([
+			mkFinding(`Validation: #${la.id} blocked\nthe sandbox lacks the control`),
+			mkFinding(
+				`Validation: #${lc.id} deployment\nWhich proxy terminates TLS?`,
+			),
+		]);
+		await loop.runTurn(store.name, v1.id);
+		await settled(store, v1.id);
+		// The chain queued run 2 for the still-unvalidated B. Cancel it: its
+		// scheduler start could race the batch push below, and an auto-started
+		// run with an empty batch settles needs_you and stays open.
+		const chained = (await store.listTasks()).find(
+			(t) =>
+				t.kind === "validation" &&
+				t.id !== v1.id &&
+				t.cancelledAt === null &&
+				t.stage !== "done",
+		);
+		expect(chained).toBeDefined();
+		await store.updateTask(chained!.id, { cancelledAt: Date.now() });
+		// A real 2 ms gap: the settle stamps validatedAt with the real clock and
+		// fake timers cannot drive it, and the cutoff below must sit strictly
+		// between the two settles' stamps.
+		await Bun.sleep(2);
+		batches.push([mkFinding(`Validation: #${lb.id} blocked\nstill lacks it`)]);
+		// File run 2 explicitly: the strict start overrides the cancelled card's
+		// decline and batches exactly B.
+		const v2 = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+		);
+		expect("id" in v2).toBe(true);
+		if (!("id" in v2)) throw new Error("no second validation run filed");
+		await loop.runTurn(store.name, v2.id);
+		await settled(store, v2.id);
+
+		const validatedB = (await store.getTask(lb.id))!.validatedAt!;
+		// The cutoff sits between the two runs: only A validated before it.
+		const cutoff =
+			((await store.getTask(la.id))!.validatedAt! + validatedB) / 2;
+
+		const again = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+			{ before: cutoff },
+		);
+		expect("id" in again).toBe(true);
+		if (!("id" in again)) throw new Error("no validation run filed");
+		expect(again.reset).toEqual([la.id]);
+
+		// A lost its validatedAt and its settle marker (the marker was the
+		// details' only line, so the cleared remainder stores null); B and C
+		// keep theirs.
+		const fullA = (await store.getTask(la.id))!;
+		expect(fullA.validatedAt).toBeNull();
+		expect(fullA.details).toBeNull();
+		const fullB = (await store.getTask(lb.id))!;
+		expect(fullB.validatedAt).toBe(validatedB);
+		expect(fullB.details).toContain(`Validated by validation run #${v2!.id}`);
+		const fullC = (await store.getTask(lc.id))!;
+		expect(fullC.validatedAt).not.toBeNull();
+		expect(fullC.details).toContain(`Validated by validation run #${v1.id}`);
+
+		// Exactly one new validation card, and its batch names A only. The
+		// cancelled chain card stays on the board, so the lookup skips it; the
+		// three live cards are run 1, run 2, and the again filing.
+		const cards = (await store.listTasks()).filter(
+			(t) => t.kind === "validation" && t.cancelledAt === null,
+		);
+		expect(cards).toHaveLength(3);
+		const fresh = cards.find((t) => t.id !== v1.id && t.id !== v2.id)!;
+		expect(fresh.prompt).toContain(`#${la.id}`);
+		expect(fresh.prompt).not.toContain(`#${lb.id}`);
+		expect(fresh.prompt).not.toContain(`#${lc.id}`);
+
+		// A's log names the old result and its run; B never gained a log file
+		// (only the reset writes one), and a present B log stays clean.
+		expect(await logText(store, la.id)).toContain(
+			`validation result cleared for re-validation: was "still blocked" (validation run #${v1.id})`,
+		);
+		const bLog = existsSync(await store.logPath(lb.id))
+			? await logText(store, lb.id)
+			: "";
+		expect(bLog).not.toContain("validation result cleared");
+	});
+
+	test("without the again flag nothing resets and the plain start refuses (OTTR-1129)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop, batches } = await validationCase(record);
+		const review = await doneReview(store, "plain start");
+		const a = mkFinding(
+			"Needs validation: lead A\nBlocker: sandbox run: ca",
+			1,
+		);
+		await store.appendReviewFinding(review.id, a);
+		const la = await leadCard(store, review.id, a.prompt);
+		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
+		expect("id" in v1).toBe(true);
+		if (!("id" in v1)) throw new Error("no validation run filed");
+		batches.push([mkFinding(`Validation: #${la.id} blocked\nstill fails`)]);
+		await loop.runTurn(store.name, v1.id);
+		await settled(store, v1.id);
+		const validated = (await store.getTask(la.id))!.validatedAt;
+		expect(validated).not.toBeNull();
+
+		// The same call without the again arg is today's behavior: the validated
+		// lead is not batchable, so the strict start refuses and nothing resets.
+		const plain = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+		);
+		expect(plain).toEqual({
+			error: `no batchable leads for review ${review.id}`,
+			status: 409,
+		});
+		expect((await store.getTask(la.id))!.validatedAt).toBe(validated);
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "validation"),
+		).toHaveLength(1);
+	});
+
+	test("validate-again keeps the newest recorded outcome per lead (OTTR-1129)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop, batches } = await validationCase(record);
+		const review = await doneReview(store, "newest wins");
+		const df = mkFinding(
+			"Needs validation: lead D\nBlocker: sandbox run: cd",
+			1,
+		);
+		const ef = mkFinding(
+			"Needs validation: lead E\nBlocker: sandbox run: ce",
+			2,
+		);
+		const gf = mkFinding(
+			"Needs validation: filler G\nBlocker: sandbox run: cg",
+			3,
+		);
+		for (const f of [df, ef, gf]) await store.appendReviewFinding(review.id, f);
+		const ld = await leadCard(store, review.id, df.prompt);
+		const le = await leadCard(store, review.id, ef.prompt);
+		const lg = await leadCard(store, review.id, gf.prompt);
+
+		// Run 1 lands D "blocked" and E "deployment"; the chain files the
+		// remainder and run 2 confirms G and re-records both leads: D flips to
+		// "deployment", E flips to "blocked". Both runs land before the cutoff.
+		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
+		expect("id" in v1).toBe(true);
+		if (!("id" in v1)) throw new Error("no validation run filed");
+		batches.push([
+			mkFinding(`Validation: #${ld.id} blocked\nno control in the sandbox`),
+			mkFinding(
+				`Validation: #${le.id} deployment\nWhich proxy terminates TLS?`,
+			),
+		]);
+		await loop.runTurn(store.name, v1.id);
+		await settled(store, v1.id);
+		// The chain queued run 2 with the untouched filler G in its batch.
+		// Cancel it so its scheduler start cannot race the batch push below.
+		const chained = (await store.listTasks()).find(
+			(t) =>
+				t.kind === "validation" &&
+				t.id !== v1.id &&
+				t.cancelledAt === null &&
+				t.stage !== "done",
+		);
+		expect(chained).toBeDefined();
+		await store.updateTask(chained!.id, { cancelledAt: Date.now() });
+		// A real 2 ms gap, same reason as the split test above: the settle
+		// stamps validatedAt with the real clock fake timers cannot drive.
+		await Bun.sleep(2);
+		batches.push([
+			mkFinding(`Validation: #${lg.id} confirmed\nthe job reproduces it`),
+			mkFinding(`Validation: #${ld.id} deployment\nflipped later`),
+			mkFinding(`Validation: #${le.id} blocked\nstill fails`),
+		]);
+		// File run 2 explicitly: the strict start overrides the cancelled
+		// card's decline and batches exactly the unvalidated filler G.
+		const v2 = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+		);
+		expect("id" in v2).toBe(true);
+		if (!("id" in v2)) throw new Error("no second validation run filed");
+		await loop.runTurn(store.name, v2.id);
+		await settled(store, v2.id);
+		const validatedAt = (await store.getTask(ld.id))!.validatedAt;
+		expect(validatedAt).not.toBeNull();
+		if (validatedAt === null) throw new Error("run 2 stamped nothing");
+
+		// Any cutoff above the two runs puts both leads in the reset window.
+		const again = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+			{ before: validatedAt + 1 },
+		);
+		expect("id" in again).toBe(true);
+		if (!("id" in again)) throw new Error("no validation run filed");
+		// The newest outcome wins: D's newest record is deployment, so only E resets.
+		expect(again.reset).toEqual([le.id]);
+		const fullD = (await store.getTask(ld.id))!;
+		expect(fullD.validatedAt).toBe(validatedAt);
+		const fullE = (await store.getTask(le.id))!;
+		expect(fullE.validatedAt).toBeNull();
+		// The reset removes the newest (run 2, blocked) marker only: the older
+		// run 1 deployment note stays as history.
+		expect(fullE.details).not.toContain(
+			`Validated by validation run #${v2.id}`,
+		);
+		expect(fullE.details).toContain(`Validated by validation run #${v1.id}`);
+		// The refiled batch names E only.
+		const fresh = (await store.getTask(again.id))!;
+		expect(fresh.prompt).toContain(`#${le.id}`);
+		expect(fresh.prompt).not.toContain(`#${ld.id}`);
+		expect(fresh.prompt).not.toContain(`#${lg.id}`);
+	});
 });
 
 describe("prompt gate", () => {
