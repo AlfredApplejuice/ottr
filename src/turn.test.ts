@@ -12663,6 +12663,80 @@ describe("turn cross-project merge hold", () => {
 		expect(after.needsReason).toBeNull();
 		expect(record.removeWorktree).toHaveLength(1);
 	});
+
+	/** The validation scenario: fork-research R on the foreign board, a held child H
+	 * beside it, and H's child filed into the own project. A distinct taskIdPrefix
+	 * keeps the foreign ids off the own board's id sequence. */
+	async function foreignForkChainCase() {
+		const s = await setup({ commitsAhead: async () => 0 });
+		const foreign = await freshStore();
+		await foreign.setSettings({ taskIdPrefix: "AD" });
+		s.projects.set(foreign.name, fakeProject(foreign));
+		const research = await foreign.createTask("fork research: weekly digest");
+		await foreign.updateTask(research.id, {
+			topic: "fork research",
+			research: true,
+			stage: "done",
+			state: "idle",
+		});
+		const held = await foreign.createTask("adopt fork idea");
+		await foreign.updateTask(held.id, { followUpOf: research.id });
+		const task = await s.store.createTask("split-off fork work");
+		await s.store.updateTask(task.id, {
+			followUpOf: held.id,
+			followUpOfProject: foreign.name,
+		});
+		return { ...s, foreign, research, held, task };
+	}
+
+	test("the walk finds a fork-research ancestor two hops up on the foreign board", async () => {
+		const { store, record, loop, task } = await foreignForkChainCase();
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.needsReason).toBe(FORK_HOLD_REASON);
+		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	/** A grandchild whose own link is local: its parent crossed the border, and the
+	 * foreign board's holdUpdateMerges must reach it through the chain. */
+	async function foreignUpdateChainCase(foreignOn: boolean) {
+		const s = await setup({ commitsAhead: async () => 0 });
+		const foreign = await freshStore();
+		await foreign.setSettings({ taskIdPrefix: "AD" });
+		if (foreignOn) await foreign.setSettings({ holdUpdateMerges: true });
+		s.projects.set(foreign.name, fakeProject(foreign));
+		const parent = await foreign.createTask("update pins");
+		await foreign.updateTask(parent.id, { updateIds: ["a@1"] });
+		const child = await s.store.createTask("cross-border update child");
+		await s.store.updateTask(child.id, {
+			followUpOf: parent.id,
+			followUpOfProject: foreign.name,
+			updateIds: ["a@1"],
+		});
+		const task = await s.store.createTask("grandchild update work");
+		await s.store.updateTask(task.id, {
+			followUpOf: child.id,
+			updateIds: ["a@1"],
+		});
+		return { ...s, foreign, parent, child, task };
+	}
+
+	test("a grandchild of a foreign update card holds when only that board holds update merges", async () => {
+		const { store, loop, task } = await foreignUpdateChainCase(true);
+		await loop.runTurn(store.name, task.id);
+		expect((await store.getTask(task.id))!.needsReason).toBe(
+			UPDATE_HOLD_REASON,
+		);
+	});
+
+	test("with the whole chain's holdUpdateMerges off the grandchild merges like any work card", async () => {
+		const { store, record, loop, task } = await foreignUpdateChainCase(false);
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.needsReason).toBeNull();
+		expect(record.removeWorktree).toHaveLength(1);
+	});
 });
 
 describe("fork-born work check before the hold", () => {

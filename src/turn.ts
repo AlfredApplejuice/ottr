@@ -9701,16 +9701,19 @@ export function createTurnLoop(
 	async function isForkBorn(st: TurnSettle): Promise<boolean> {
 		const seen = new Set<string>([st.task.id]);
 		let up = st.task.followUpOf;
-		// The board that holds the card `up` names: followUpOfProject names the foreign
-		// board of a border-crossing link, and every ancestor names its own parent's board.
-		let upProject = st.task.followUpOfProject;
+		// The board that holds the card `up` names: followUpOfProject names a foreign
+		// board, and null means the parent sits on the same board as the card that
+		// holds the link (the settle's own board for the first hop).
+		let upBoard = st.task.followUpOfProject ?? st.store.name;
 		let forkBorn = false;
 		while (up !== null && !seen.has(up) && !forkBorn) {
 			seen.add(up);
-			const anc = await ancestorTask(st, up, upProject);
+			const anc = await ancestorTask(st, up, upBoard);
 			forkBorn = anc?.topic === "fork research";
 			up = anc?.followUpOf ?? null;
-			upProject = anc?.followUpOfProject ?? null;
+			// A null followUpOfProject keeps the parent on the board the ancestor
+			// itself was read from, never the destination board.
+			upBoard = anc?.followUpOfProject ?? upBoard;
 		}
 		return forkBorn;
 	}
@@ -9721,30 +9724,40 @@ export function createTurnLoop(
 	async function ancestorTask(
 		st: TurnSettle,
 		id: string,
-		project: string | null,
+		board: string | null,
 	): Promise<Task | null> {
-		if (project === null || project === st.store.name)
+		if (board === null || board === st.store.name)
 			return await st.store.getTask(id);
 		return (
 			(await projects
-				.get(project)
+				.get(board)
 				?.store.getTask(id)
 				.catch(() => null)) ?? null
 		);
 	}
 
-	/** U7 across a project border: a card whose parent lives on another board also holds
-	 * when that board holds update merges — the hold the parent's split-off work lived
-	 * under must not vanish at the border. A vanished project reads as off; a sick
-	 * foreign store falls back to defaults (getSettingsLogged) instead of failing the
-	 * settle. */
+	/** U7 across project borders: the chain behind an update-work card may cross boards,
+	 * and every copied-updateIds link keeps marking the card below it, so each board
+	 * along the followUpOf chain counts: the hold the parent's split-off work lived
+	 * under must not vanish at a border or one hop below it. The own board's setting is
+	 * checked by the caller; a vanished project reads as off, and getSettingsLogged
+	 * keeps a sick foreign store from failing the settle. */
 	async function borderHoldsUpdates(st: TurnSettle): Promise<boolean> {
-		const tp =
-			st.task.followUpOfProject === null
-				? undefined
-				: projects.get(st.task.followUpOfProject);
-		if (tp === undefined) return false;
-		return (await getSettingsLogged(tp)).holdUpdateMerges;
+		const seen = new Set<string>([st.task.id]);
+		let up = st.task.followUpOf;
+		let board = st.task.followUpOfProject ?? st.store.name;
+		while (up !== null && !seen.has(up)) {
+			seen.add(up);
+			if (board !== st.store.name) {
+				const tp = projects.get(board);
+				if (tp !== undefined && (await getSettingsLogged(tp)).holdUpdateMerges)
+					return true;
+			}
+			const anc = await ancestorTask(st, up, board);
+			up = anc?.followUpOf ?? null;
+			board = anc?.followUpOfProject ?? board;
+		}
+		return false;
 	}
 
 	/** U7: an update card on a hold-update-merges project parks for a human approval; the reply
