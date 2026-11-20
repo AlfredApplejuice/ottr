@@ -13,9 +13,11 @@ import {
 	readFileSync,
 	readlinkSync,
 	realpathSync,
+	renameSync,
 	rmSync,
 	statSync,
 	symlinkSync,
+	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -30,6 +32,7 @@ import {
 	readRegular,
 	removeBelow,
 	renameBelow,
+	renameProven,
 	touchBelow,
 	trustedAnchor,
 	unlinkBelow,
@@ -182,6 +185,60 @@ describe("renameBelow", () => {
 		);
 		expect(readFileSync(from, "utf8")).toBe("data");
 		expect(readdirSync(outside)).toEqual([]);
+	});
+});
+
+describe("renameProven", () => {
+	test("renames inside the held dir; a parent swapped for a symlink after the walk receives nothing", () => {
+		const { root, anchor } = fixture();
+		const held = join(anchor, "held");
+		mkdirSync(held);
+		const from = join(held, "from");
+		writeFileSync(from, "data");
+		const server = join(root, "server");
+		mkdirSync(server);
+		writeFileSync(join(server, "tasks.db"), "keep");
+		const fd = openSync(from, constants.O_RDONLY);
+		const d = openDir(anchor, held, {});
+		try {
+			// A worker renames the walked dir away and plants a symlink at its name.
+			renameSync(held, join(anchor, "held.moved"));
+			symlinkSync(server, join(anchor, "held"));
+			renameProven(d, "from", "to", fd);
+			// The rename landed in the held dir (now "held.moved"), never through the link.
+			expect(readFileSync(join(anchor, "held.moved", "to"), "utf8")).toBe(
+				"data",
+			);
+			expect(existsSync(join(server, "to"))).toBe(false);
+			expect(readFileSync(join(server, "tasks.db"), "utf8")).toBe("keep");
+		} finally {
+			closeSync(fd);
+			d.close();
+		}
+	});
+
+	test("an entry swapped for a symlink fails the proof and is never followed", () => {
+		const { anchor, outside } = fixture();
+		writeFileSync(join(outside, "keep"), "keep");
+		const held = join(anchor, "held");
+		mkdirSync(held);
+		const fd = openSync(
+			join(held, "from"),
+			constants.O_CREAT | constants.O_WRONLY,
+		);
+		const d = openDir(anchor, held, {});
+		try {
+			// A worker unlinks the entry and plants a symlink to a sentinel under its name.
+			unlinkSync(join(held, "from"));
+			symlinkSync(join(outside, "keep"), join(held, "from"));
+			expect(() => renameProven(d, "from", "to", fd)).toThrow(/refusing/);
+			expect(readFileSync(join(outside, "keep"), "utf8")).toBe("keep");
+			expect(lstatSync(join(held, "from")).isSymbolicLink()).toBe(true);
+			expect(existsSync(join(held, "to"))).toBe(false);
+		} finally {
+			closeSync(fd);
+			d.close();
+		}
 	});
 });
 

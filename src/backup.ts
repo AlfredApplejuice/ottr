@@ -483,9 +483,11 @@ function moveAsideIn(
 	if (taken !== undefined)
 		throw new Error(`${d.path}/${taken.aside} exists already`);
 	for (const m of moves) {
-		// Real paths of the held dir: rename(2) refuses a /proc/self/fd path. A rename moves
-		// the entry itself, so a planted symlink at `from` is renamed aside, not followed.
-		renameSync(join(d.path, m.from), join(d.path, m.aside));
+		// Through the held dir (d.at): the rename resolves no parent again, so a parent dir
+		// that a worker swapped for a symlink after the walk receives nothing, and the aside
+		// name is taken only in the held dir. A rename moves the entry itself, so a planted
+		// symlink at `from` is renamed aside, not followed.
+		renameSync(d.at(m.from), d.at(m.aside));
 		movedAside.push(`${d.path}/${m.aside}`);
 	}
 }

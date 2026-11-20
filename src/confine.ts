@@ -320,10 +320,10 @@ export function openExclusive(d: Dir, name: string, perm = 0o666): number {
 
 /**
  * Renames entry `from` to `to` inside the held dir `d` and proves the installed entry is
- * still the file `fd` holds: rename(2) refuses a /proc/self/fd path (EXDEV), so the rename
- * runs on the real paths of `d` and re-resolves the names. A worker who swaps an entry in
- * between is caught by the ino checks (the held fd pins our inode, so it cannot be
- * recycled), and an entry that is not ours is removed, never followed.
+ * the file `fd` holds. The rename runs through the held dir (d.at), so it resolves no
+ * parent again: a parent dir that a worker swapped for a symlink after the walk receives
+ * nothing. The ino checks catch a swap of the entry names (the held fd pins our inode,
+ * so it cannot be recycled), and an entry that is not ours is removed, never followed.
  */
 export function renameProven(
 	d: Dir,
@@ -331,12 +331,12 @@ export function renameProven(
 	to: string,
 	fd: number,
 ): void {
-	const dst = join(d.path, to);
+	const label = `${d.path}/${to}`;
 	const mine = fstatSync(fd).ino;
 	const pre = lstatSync(d.at(from), { throwIfNoEntry: false });
 	if (pre === undefined || pre.ino !== mine)
-		throw new Error(`refusing ${dst}: the entry changed before the rename`);
-	renameSync(join(d.path, from), dst);
+		throw new Error(`refusing ${label}: the entry changed before the rename`);
+	renameSync(d.at(from), d.at(to));
 	const post = lstatSync(d.at(to), { throwIfNoEntry: false });
 	if (post === undefined || post.ino !== mine) {
 		try {
@@ -344,7 +344,7 @@ export function renameProven(
 		} catch {
 			// the proof failed: report it, and leave no entry of theirs behind when it unlinks
 		}
-		throw new Error(`refusing ${dst}: the entry changed during the rename`);
+		throw new Error(`refusing ${label}: the entry changed during the rename`);
 	}
 }
 
