@@ -125,12 +125,19 @@ layers and `.ottr` lists prove the volume reaches every runner.
   `current` link at a temp name and renames it over the old one — one atomic rename.
   Every runner resolves `current` at spawn time, so the flip switches the server and all
   runners at their next spawn, and a running turn keeps the binary it already started.
-- Resolution: the server's turn launcher (`src/runner.ts` `launch("omp", …)`) and the
-  board-side omp calls (`src/login.ts`, `src/models.ts`, `src/ompStats.ts`) prepend
-  `~/.ottr/omp/current/bin` to PATH. The worker and microVM guest spawn points
-  (`src/workers.ts`, `src/vmGuest.ts`) already take `opts.ompPath`; they receive the
-  resolved `current/bin/omp`. Each runner kind must resolve the volume; a runner that
-  cannot see it (no volume mount) keeps the image omp through the fallback.
+- Resolution: one shared resolver, `boardOmpEnv` (`src/login.ts`), prepends
+  `~/.ottr/omp/current/bin` to PATH, and every board-side omp spawn goes through it:
+  the turn launcher (`src/runner.ts`), `omp models --json` (`src/models.ts`),
+  `omp usage --json` (`src/quota.ts`, env passed from its `boardOmpEnv()` callers),
+  `omp login` (`src/login.ts`), `omp token` (`src/tokens.ts`), the fork-analysis
+  gateway (`src/forkAnalysis.ts`) and the omp stats dashboard
+  (`src/ompStatsDashboard.ts`, env from `server.ts`). One resolver is the point: a
+  flip switches every board-side call at once, and a spawn site that skips
+  `boardOmpEnv` would run the image omp beside the layer omp. The worker and microVM
+  guest spawn points (`src/workers.ts`, `src/vmGuest.ts`) already take `opts.ompPath`;
+  they receive the resolved `current/bin/omp`. Each runner kind must resolve the
+  volume; a runner that cannot see it (no volume mount) keeps the image omp through
+  the fallback.
 - Floor and fallback: the board never installs a version at or below the image pin
   (read from the deployment's `Dockerfile.worker` when the repo is present, else from
   `omp --version` of the image binary). When `current` is missing, broken or points at a
@@ -146,7 +153,7 @@ the production parser — and a bun gap can only surface by running on that bun.
 1. `<candidate> --version` prints the candidate version.
 2. `omp models --json` parses and carries the fields `src/models.ts` reads; at least one
    model.
-3. `omp usage --json` parses and carries the fields `src/ompStats.ts` sums.
+3. `omp usage --json` parses and carries the fields `src/quota.ts` `parseUsage` reads.
 4. The tracker extension loads: the turn of check 5 runs with
    `--extension extension/tracker.ts --config run.yml` (the `buildOmpArgs` argv shape)
    and its tool events include tracker tools.
@@ -328,6 +335,10 @@ fixed-seed property tests (100–200 runs) for every parser it adds.
 - A failed install leaves the flip untouched and removes its partial dir.
 - Each runner kind resolves the layer: the server PATH prepend, the `ompPath` argument
   for workers and microVM guests (pinned argv in tests).
+- Every board-side spawn site runs the layer binary after a flip: the turn launcher,
+  `omp models`, `omp usage`, `omp login`, `omp token`, the fork-analysis gateway and
+  the stats dashboard each resolve through `boardOmpEnv` (pinned env tests); a site
+  that builds its own omp PATH or skips the resolver fails the check.
 
 ### B3 — smoke suite (`src/ompSmoke.ts`, `src/ompSmoke.test.ts`)
 
