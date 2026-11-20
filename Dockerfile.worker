@@ -12,16 +12,16 @@ LABEL ottr.image=worker
 # Debian trixie git version (the 1.4.4-debian base is trixie); a wrong pin fails the build loudly (D1).
 ARG GIT_VERSION=1:2.47.3-0+deb13u1
 # rtk (Rust Token Killer) — pix-optimizer rewrites known bash commands through it only
-# when the binary is on PATH; without it every command runs raw. Host /usr/local/bin runs 1.0.1.
+# when the binary is on PATH; without it every command runs raw. Host /usr/local/bin runs 1.1.0.
 # Static musl build, no glibc deps. A wrong pin 404s the download (fails the build loudly).
-ARG RTK_VERSION=1.1.0
+ARG RTK_VERSION=1.2.0
 # sha256 of rtk-x86_64-unknown-linux-musl.tar.gz from the release's checksums.txt.
-ARG RTK_SHA256=9454ad1b9489daa57ab0a9f4ebe2faaf4dc82b8a0f26c9e5135151abd7c9378d
+ARG RTK_SHA256=70fee7b4a548c43dde94c77e2335550981b0bc2fb013691d8c8109b5bd0eda37
 # ripwire (redhat-et) — call-graph CLI for structure questions before shared-code edits
 # (map, --impact, --affected). A wrong pin 404s the download (fails the build loudly).
-ARG RIPWIRE_VERSION=0.6.8
+ARG RIPWIRE_VERSION=0.6.10
 # sha256 of ripwire-${RIPWIRE_VERSION}-linux-x64.tar.gz, the release asset's GitHub digest.
-ARG RIPWIRE_SHA256=aa09e8c43acd2104db91a80f2824a36c314ea4a72fd565cd2e579e043e09b03b
+ARG RIPWIRE_SHA256=84346e9d487d94c1021810ecb3169ae125bc15529d1662a3463070e851f3be87
 # gitleaks secret scanner: review gates that name it (e.g. ottr-cloud's AGENTS.md) run
 # `gitleaks git .` on workers. Keep the version and checksum equal to the CI pin in
 # .github/workflows/ci.yml ("Install gitleaks 8.30.1"). A bump changes both places.
