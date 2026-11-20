@@ -1,0 +1,38 @@
+name: Accessibility report
+description: Tell us about a barrier in the board or the documentation
+labels: ["accessibility"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Thank you for the report. This form sets the accessibility label
+        itself, so you need no label permission. A security problem goes
+        through [private vulnerability reporting](https://github.com/ottr-ai/ottr/security/advisories/new).
+        See [SECURITY.md](https://github.com/ottr-ai/ottr/blob/main/SECURITY.md).
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where is the barrier?
+      options:
+        - The board (user interface)
+        - The documentation
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: barrier
+    attributes:
+      label: The barrier
+      description: Tell us the page, what you did, what you expected, and what happened.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >
+        Your operating system, the browser, the output of `bun --version`,
+        and the install path (Docker Compose, Podman, or bare metal).
+        Name your assistive technology too, for example a screen reader.
+    validations:
+      required: true

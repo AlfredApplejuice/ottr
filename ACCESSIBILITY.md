@@ -26,4 +26,4 @@ Ottr is a web board. It runs on your machine, and you open it in a current deskt
 
 ## Report a barrier
 
-When something in the board blocks you, open an issue with the [bug report form](https://github.com/ottr-ai/ottr/issues/new?template=bug_report.yml) and add the `accessibility` label. Tell us the page, what you did, what you expected, and what happened.
+When something in the board blocks you, open an issue with the [accessibility report form](https://github.com/ottr-ai/ottr/issues/new?template=accessibility_report.yml). The form sets the `accessibility` label itself, so you need no label permission. Tell us the page, what you did, what you expected, and what happened.
