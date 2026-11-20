@@ -12,6 +12,7 @@ import {
 	chmodSync,
 	closeSync,
 	constants,
+	type Dirent,
 	existsSync,
 	futimesSync,
 	lstatSync,
@@ -33,6 +34,8 @@ import { hostname } from "node:os";
 import { dirname, isAbsolute, join, posix, relative } from "node:path";
 import { childDatabaseEnv } from "./childEnv.ts";
 import { type Dir, openDir, withDir } from "./confine.ts";
+import { readCgroup } from "./systemStats.ts";
+import type { SystemVm, VmStateDisk } from "./types.ts";
 import {
 	type BoardAddr,
 	boardPort,
@@ -1134,6 +1137,12 @@ export interface VmRunnerOptions {
 	bootTimeoutMs?: number;
 	/** Expiry of /detached entries; 24 h. */
 	detachedTtlMs?: number;
+	/** Only for tests: the cgroup root GET /stats reads instead of /sys/fs/cgroup. */
+	cgroupRoot?: string;
+	/** Only for tests: the mutation lock file GET /stats reads instead of tmpdir()/ott-stryker.lock. */
+	lockPath?: string;
+	/** Only for tests: the /proc tree GET /stats reads the runs' usage from instead of the real one. */
+	statsProcRoot?: string;
 }
 
 /** Null when this host can run VMs, else the one-line reason /healthz answers. */
@@ -1155,6 +1164,26 @@ interface VmRun extends DetachedRun {
 	closeStream(): void;
 	/** Stops the run: kills the current VM (bake or run), skips every later step. */
 	stop(): void;
+}
+
+/** One accepted run or validate job while it holds a slot: the /stats vms row's source.
+ *  The endpoint registers the entry before its first await, so /stats can never miss
+ *  an accepted run, and every finish path deletes it. */
+interface VmLive {
+	id: string;
+	project: string;
+	/** The card the dispatch named (VmSpec.taskId / ValidateRequest.taskId); null when none. */
+	cardId: string | null;
+	mode: "turn" | "validate";
+	vcpus: number;
+	memMiB: number;
+	/** Epoch ms the runner accepted the run. */
+	startedAt: number;
+	/** The live VM's host pid; null until its first boot (bake or run). */
+	pid: number | null;
+	running: boolean;
+	/** The run's scratch disk path; null until the runner created it. */
+	scratchPath: string | null;
 }
 
 interface GuestDone {
@@ -1236,6 +1265,54 @@ function removeRunDir(runDir: string): void {
 	}
 }
 
+/** Allocated bytes (st_blocks × 512) of the regular files under `dir`: du's semantics,
+ *  so a sparse disk counts what the volume actually holds, never its apparent size.
+ *  Links are lstat'd, never followed; 0 when the dir is missing or unreadable. */
+function dirAllocated(dir: string): number {
+	let entries: Dirent[];
+	try {
+		entries = readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return 0; // a missing or unreadable part sums nothing
+	}
+	let total = 0;
+	for (const e of entries) {
+		const path = join(dir, e.name);
+		if (e.isDirectory()) {
+			total += dirAllocated(path);
+			continue;
+		}
+		// lstat: the entry itself, so a link adds nothing and its target stays unread.
+		try {
+			const st = lstatSync(path);
+			if (st.isFile()) total += st.blocks * 512;
+		} catch {
+			// vanished or unreadable mid-walk: adds nothing
+		}
+	}
+	return total;
+}
+
+/** The vm-state volume's allocated bytes per part: GET /stats disk field, the board's
+ *  System view reads it as the vm-runner row's real disk use. Never throws. */
+export function vmStateDiskUsage(stateDir: string): VmStateDisk {
+	return {
+		base: dirAllocated(join(stateDir, "base")),
+		layers: dirAllocated(join(stateDir, "layers")),
+		runs: dirAllocated(join(stateDir, "runs")),
+	};
+}
+
+/** Allocated bytes (st_blocks × 512) of one scratch disk; null while the runner has
+ *  not created it (sparseFile plus mkfs run later in the job). */
+function scratchAllocated(path: string): number | null {
+	try {
+		return lstatSync(path).blocks * 512;
+	} catch {
+		return null;
+	}
+}
+
 export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 	const exec = opts.exec ?? defaultExec;
 	const guestFetch = opts.fetch ?? fetch;
@@ -1250,6 +1327,9 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 	const slots = new Set<number>();
 	const active = new Map<string, VmRun>();
 	const detached = new Map<string, VmRun>();
+	// One entry per live VM (turn run or validate job) holding a slot: GET /stats
+	// lists it, the way serveWorker's stats lists its live runs.
+	const liveVms = new Map<string, VmLive>();
 	// Ids the sweep removed after the guest was reaped, with the removal time: a
 	// late kill answers 410 with the expiry instead of a bare not-found.
 	const reaped = new Map<string, number>();
@@ -1399,6 +1479,10 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 			});
 			current = vm;
 			entry.pid = vm.pid;
+			// /stats keeps the live row's pid current as boots replace each other
+			// (the bake VM first, then the run VM).
+			const live = liveVms.get(entry.id);
+			if (live) live.pid = vm.pid;
 			// A stop that raced the launch: the VM must not outlive it.
 			if (stopper.signal.aborted) vm.kill();
 			return vm;
@@ -1671,6 +1755,10 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 			// the install's error.
 			if (!layer.ok) return { exitCode: 1, stderrTail: layer.stderrTail };
 			const scratch = await newScratch();
+			// The run's scratch, not the bake's status disk: /stats reports its
+			// allocated size while the VM lives.
+			const live = liveVms.get(entry.id);
+			if (live) live.scratchPath = scratch;
 			const runStart = now();
 			const token = randomBytes(16).toString("hex");
 			const vm = await boot(
@@ -1739,6 +1827,8 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 			removeRunDir(runDir);
 			slots.delete(index);
 			if (active.get(entry.id) === entry) active.delete(entry.id);
+			// Every finish path unregisters: a run that errored before its boot too.
+			liveVms.delete(entry.id);
 			entry.running = false;
 			if (entry.detached) {
 				settleDetached(done);
@@ -1822,6 +1912,20 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 		if (request.signal.aborted) stop();
 		mkdirSync(runDir, { recursive: true });
 		const startedAt = now();
+		// Registered before the first await: /stats sees the job from the moment
+		// its slot is taken, like a turn run.
+		liveVms.set(body.id, {
+			id: body.id,
+			project: body.project,
+			cardId: body.taskId ?? null,
+			mode: "validate",
+			vcpus: VM_VALIDATE.vcpus,
+			memMiB: VM_VALIDATE.memMiB,
+			startedAt,
+			pid: null,
+			running: true,
+			scratchPath: null,
+		});
 
 		/** The response for `result`; `error` says why it is absent or what was refused. */
 		const answer = (
@@ -1849,6 +1953,8 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 			if (upBoard) await slotDown(exec, slot, upBoard);
 			removeRunDir(runDir);
 			slots.delete(index);
+			// Every finish path unregisters, the failed setups included.
+			liveVms.delete(body.id);
 			return Response.json(response);
 		};
 
@@ -1856,6 +1962,10 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 		const boot = async (spec: VmLaunchSpec): Promise<VmHandle> => {
 			const vm = await opts.launcher(spec);
 			current = vm;
+			// /stats keeps the live row's pid current across the bake and the
+			// validate boot, as the run path does.
+			const live = liveVms.get(body.id);
+			if (live) live.pid = vm.pid;
 			if (stopper.signal.aborted) vm.kill();
 			return vm;
 		};
@@ -1944,6 +2054,8 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 			writeJobStaging(scratchStaging, body);
 			const scratch = join(runDir, "scratch.ext4");
 			sparseFile(scratch, VM_VALIDATE.diskBytes);
+			const live = liveVms.get(body.id);
+			if (live) live.scratchPath = scratch;
 			const scratchErr = await mkfsPopulate("scratch", scratchStaging, scratch);
 			if (scratchErr !== null) return finish(answer(null, scratchErr));
 			const resultImg = join(runDir, "result.img");
@@ -2193,6 +2305,20 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 				headers: { "x-ottr-busy": "1" },
 			});
 		slots.add(index);
+		// Registered before any await: /stats sees the run from the moment its slot
+		// is taken, so it can never miss an accepted one.
+		liveVms.set(body.id, {
+			id: body.id,
+			project: spec.project,
+			cardId: spec.taskId,
+			mode: "turn",
+			vcpus: opts.vcpus,
+			memMiB: opts.memMiB,
+			startedAt: now(),
+			pid: null,
+			running: true,
+			scratchPath: null,
+		});
 		const response = startRun(body, spec, index);
 		request.signal.addEventListener("abort", () => {
 			const e = active.get(body.id);
@@ -2247,6 +2373,42 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 				return reason === null
 					? new Response("ok", { headers })
 					: new Response(reason, { status: 503, headers });
+			}
+			// Mirrors serveWorker GET /stats (src/workers.ts) so the board's System
+			// sampler reads vm-runner like a worker; vms and disk carry what the
+			// container's cgroup cannot say about the VM fleet and the vm-state volume.
+			if (request.method === "GET" && url.pathname === "/stats") {
+				if (!authorized(request))
+					return new Response("unauthorized", { status: 401 });
+				const runs = [...liveVms.values()].flatMap((e) =>
+					e.running && e.pid !== null ? [{ id: e.id, pid: e.pid }] : [],
+				);
+				const vms: SystemVm[] = [];
+				for (const e of liveVms.values()) {
+					if (!e.running) continue;
+					vms.push({
+						id: e.id,
+						project: e.project,
+						cardId: e.cardId,
+						mode: e.mode,
+						vcpus: e.vcpus,
+						memMiB: e.memMiB,
+						startedAt: e.startedAt,
+						scratchBytes:
+							e.scratchPath === null ? null : scratchAllocated(e.scratchPath),
+					});
+				}
+				return Response.json({
+					...readCgroup({
+						root: opts.cgroupRoot,
+						lockPath: opts.lockPath,
+						runs,
+						procRoot: opts.statsProcRoot,
+					}),
+					vms,
+					max: opts.max,
+					disk: vmStateDiskUsage(opts.stateDir),
+				});
 			}
 			const answered = await handleDetach(request, url);
 			if (answered !== null) return answered;

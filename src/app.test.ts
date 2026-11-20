@@ -610,6 +610,8 @@ async function mount(
 		slowApiMs?: Parameters<typeof createApp>[0]["slowApiMs"];
 		/** Live-run seam for the system sampler (OTTR-793); tests inject to force a sample failure. */
 		liveRuns?: Parameters<typeof createApp>[0]["liveRuns"];
+		/** OTTR-1151: the microVM runner the system sampler polls like a worker row. */
+		vmTarget?: Parameters<typeof createApp>[0]["vmTarget"];
 		/** Test seam (OTTR-866 send-back): awaited at each state build's start; passed
 		 * through to createApp so a test can park builds across a guaranteed window. */
 		stateBuildGate?: Parameters<typeof createApp>[0]["stateBuildGate"];
@@ -680,6 +682,7 @@ async function mount(
 		githubTokenExpirySleep: input.githubTokenExpirySleep,
 		slowApiMs: input.slowApiMs,
 		liveRuns: input.liveRuns,
+		vmTarget: input.vmTarget,
 		stateBuildGate: input.stateBuildGate,
 		runnerTurns: input.runnerTurns,
 		runners: input.runners,
@@ -24208,6 +24211,132 @@ describe("failed system sampler logging (OTTR-793)", () => {
 		} finally {
 			console.error = origError;
 		}
+	});
+});
+
+describe("system sampler vm-runner row (OTTR-1151)", () => {
+	/** A valid vm-runner GET /stats body: the worker shape plus one live VM. */
+	const statsBody = () => ({
+		at: Date.now(),
+		cpuUsageUsec: 1_000,
+		cpuMax: "max",
+		memoryCurrent: 2_000,
+		memoryMax: 4_000,
+		memoryEvents: { max: 0, oom: 0, oomKill: 0 },
+		lock: { exists: false, pid: null, alive: false },
+		runs: [],
+		vms: [
+			{
+				id: "r-1",
+				project: "proj",
+				cardId: "T-9",
+				mode: "turn",
+				vcpus: 2,
+				memMiB: 2048,
+				startedAt: Date.now(),
+				scratchBytes: null,
+			},
+		],
+		max: 4,
+		disk: { base: 100, layers: 200, runs: 300 },
+	});
+
+	/** The vm-runner test server: token-checked /healthz "ok" and /stats. */
+	const vmRunnerServer = (body: unknown) =>
+		Bun.serve({
+			port: 0,
+			fetch: (req) => {
+				if (req.headers.get("x-otwr-token") !== "tok")
+					return new Response("unauthorized", { status: 401 });
+				if (new URL(req.url).pathname === "/healthz") return new Response("ok");
+				return Response.json(body);
+			},
+		});
+
+	const getSystem = async (srv: Server<undefined>) =>
+		(await fetch(new URL("/api/system", srv.url), {
+			headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
+		}).then((r) => r.json())) as Promise<{
+			containers: {
+				name: string;
+				reachable: boolean;
+				unreachableSince: number | null;
+				vm?: {
+					health: { ok: boolean; reason: string | null };
+					max: number | null;
+					vms: {
+						id: string;
+						project: string;
+						cardId: string | null;
+						mode: string;
+						vcpus: number;
+						memMiB: number;
+						startedAt: number;
+						scratchBytes: number | null;
+					}[];
+					disk: { base: number; layers: number; runs: number } | null;
+					busy: { project: string; id: string }[];
+				};
+			}[];
+		}>;
+
+	test("a reachable vm-runner shows its row with the fleet, the disk and the busy cards", async () => {
+		const server = vmRunnerServer(statsBody());
+		const savedHealth = vmState.health;
+		const savedBusy = vmState.busy;
+		vmState.health = { configured: true, ok: true, reason: null };
+		vmState.busy = new Set(["proj/T-9"]);
+		try {
+			const m = await mount({
+				vmTarget: { urls: [`http://127.0.0.1:${server.port}`], token: "tok" },
+			});
+			// sampleStats resolves only once measureSystem and the snapshot landed.
+			await m.app.sampleStats();
+			const system = await getSystem(m.server);
+			// The row is named by the url's hostname, like a worker's.
+			const row = system.containers.find((c) => c.name === "127.0.0.1");
+			expect(row?.reachable).toBe(true);
+			expect(row?.vm?.health).toEqual({ ok: true, reason: null });
+			expect(row?.vm?.max).toBe(4);
+			expect(row?.vm?.vms).toEqual([
+				{
+					id: "r-1",
+					project: "proj",
+					cardId: "T-9",
+					mode: "turn",
+					vcpus: 2,
+					memMiB: 2048,
+					startedAt: expect.any(Number),
+					scratchBytes: null,
+				},
+			]);
+			expect(row?.vm?.disk).toEqual({ base: 100, layers: 200, runs: 300 });
+			// The board's busy set lands on the row, split at the first "/".
+			expect(row?.vm?.busy).toEqual([{ project: "proj", id: "T-9" }]);
+		} finally {
+			vmState.health = savedHealth;
+			vmState.busy = savedBusy;
+			void server.stop(true);
+		}
+	});
+
+	test("an unreachable vm-runner leaves the row unreachable and the request unharmed", async () => {
+		const server = Bun.serve({ port: 0, fetch: () => new Response("ok") });
+		const port = server.port;
+		void server.stop(true); // A port nothing answers: the fetch must fail.
+		const m = await mount({ vmTarget: { urls: [`http://127.0.0.1:${port}`] } });
+		await m.app.sampleStats();
+		const system = await getSystem(m.server);
+		const row = system.containers.find((c) => c.name === "127.0.0.1");
+		expect(row?.reachable).toBe(false);
+		expect(row?.unreachableSince).toBeTypeOf("number");
+	});
+
+	test("no vmTarget means no vm-runner row", async () => {
+		const m = await mount({});
+		await m.app.sampleStats();
+		const system = await getSystem(m.server);
+		expect(system.containers.map((c) => c.name)).toEqual(["server"]);
 	});
 });
 

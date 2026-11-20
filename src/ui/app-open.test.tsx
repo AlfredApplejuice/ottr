@@ -1390,6 +1390,261 @@ test("the System view's Turns cell shows each worker turn's memory and CPU", asy
 	}
 });
 
+test("the System view's vm-runner row shows health, fleet, disk, VM facts, and busy cards", async () => {
+	const vmRunner: ContainerRow = {
+		name: "vm-runner",
+		reachable: true,
+		unreachableSince: null,
+		cpuPct: 12,
+		cpuShare: 4,
+		memUsed: 1024 ** 3,
+		memLimit: 8 * 1024 ** 3,
+		memMaxHits: 0,
+		oomKills: 0,
+		memMaxHitsHour: null,
+		oomKillsHour: null,
+		history: [],
+		cards: [
+			{
+				project: "alpha",
+				id: "V-1",
+				usage: {
+					mem: 0.5 * 1024 ** 3,
+					memPeak: 0.6 * 1024 ** 3,
+					cpuPct: 40,
+					cpuSec: 30,
+				},
+			},
+			// The validate run the runner has not weighed yet: the VM facts alone.
+			{ project: "beta", id: "V-2", usage: null },
+		],
+		lock: { holderPid: null, holderCard: null, waiters: [] },
+		warnings: [],
+		vm: {
+			health: { ok: true, reason: null },
+			max: 10,
+			vms: [
+				{
+					id: "run-1",
+					project: "alpha",
+					cardId: "V-1",
+					mode: "turn",
+					vcpus: 2,
+					memMiB: 512,
+					startedAt: 1000,
+					scratchBytes: 2 * 1024 ** 3,
+				},
+				{
+					id: "val-1",
+					project: "beta",
+					cardId: "V-2",
+					mode: "validate",
+					vcpus: 1,
+					memMiB: 1024,
+					startedAt: 1000,
+					scratchBytes: null,
+				},
+			],
+			disk: { base: 1024 ** 3, layers: 2 * 1024 ** 3, runs: 0.5 * 1024 ** 3 },
+			busy: [{ project: "alpha", id: "V-3" }],
+		},
+	};
+	const realFetch = host.fetch;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) !== "/api/system")
+			return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+				input,
+			);
+		const base = (await (
+			await (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+				input,
+			)
+		).json()) as SystemSnapshot;
+		return new Response(JSON.stringify({ ...base, containers: [vmRunner] }), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}) as typeof fetch;
+	window.history.replaceState(null, "", "/system");
+	container = window.document.createElement("div") as unknown as HTMLDivElement;
+	window.document.body.appendChild(container as unknown as HappyNode);
+	root = createRoot(container);
+	try {
+		await act(async () => {
+			root?.render(<App />);
+		});
+		await waitFor(() => document.querySelector("ul.sys-turns") !== null);
+		const text = document.body.textContent!;
+		expect(text).toContain("vm-runner ok");
+		expect(text).toContain("2 / 10 VMs");
+		expect(text).toContain(
+			"vm-state 3.5 GiB allocated (base 1.0 · layers 2.0 · runs 0.5)",
+		);
+		const items = [...document.querySelectorAll("ul.sys-turns > li")];
+		expect(items.map((li) => li.querySelector("a")?.textContent)).toEqual([
+			"V-1",
+			"V-2",
+		]);
+		// Second sub-line of the first item: the VM facts under the usage line.
+		expect(items[0]?.querySelectorAll(".sys-sub")[1]?.textContent).toContain(
+			"turn · 2 vCPU · 512 MiB guest · scratch 2.0 GiB allocated · since",
+		);
+		// No usage on the validate run, so its only sub-line is the VM facts —
+		// and with no scratch disk yet, the scratch part is gone.
+		expect(items[1]?.querySelector(".sys-sub")?.textContent).toContain(
+			"validate · 1 vCPU · 1024 MiB guest · since",
+		);
+		expect(items[1]?.querySelector(".sys-sub")?.textContent).not.toContain(
+			"scratch",
+		);
+		expect(text).toContain("waiting for a free VM:");
+		expect(
+			[...document.querySelectorAll("a")].some((a) => a.textContent === "V-3"),
+		).toBe(true);
+	} finally {
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
+test("an unreachable vm-runner row keeps the gap cell, the health reason, and busy cards", async () => {
+	const down: ContainerRow = {
+		name: "vm-runner",
+		reachable: false,
+		unreachableSince: 1000,
+		cpuPct: null,
+		cpuShare: null,
+		memUsed: null,
+		memLimit: null,
+		memMaxHits: null,
+		oomKills: null,
+		memMaxHitsHour: null,
+		oomKillsHour: null,
+		history: [],
+		cards: [{ project: "alpha", id: "V-4", usage: null }],
+		lock: { holderPid: null, holderCard: null, waiters: [] },
+		warnings: [],
+		vm: {
+			health: { ok: false, reason: "no answer from http://vm-runner:8399" },
+			max: null,
+			vms: [],
+			disk: null,
+			busy: [{ project: "alpha", id: "V-5" }],
+		},
+	};
+	const realFetch = host.fetch;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) !== "/api/system")
+			return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+				input,
+			);
+		const base = (await (
+			await (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+				input,
+			)
+		).json()) as SystemSnapshot;
+		return new Response(JSON.stringify({ ...base, containers: [down] }), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}) as typeof fetch;
+	window.history.replaceState(null, "", "/system");
+	container = window.document.createElement("div") as unknown as HTMLDivElement;
+	window.document.body.appendChild(container as unknown as HappyNode);
+	root = createRoot(container);
+	try {
+		await act(async () => {
+			root?.render(<App />);
+		});
+		await waitFor(() => document.querySelector("td.sys-gap") !== null);
+		expect(document.querySelector("td.sys-gap")!.textContent).toContain(
+			"not reachable since",
+		);
+		const text = document.body.textContent!;
+		expect(text).toContain("no answer from http://vm-runner:8399");
+		// No reachable reading: no fleet count and no disk line at all.
+		expect(text).not.toContain("VMs");
+		expect(text).not.toContain("allocated");
+		expect(text).toContain("waiting for a free VM:");
+		expect(
+			[...document.querySelectorAll("a")].some((a) => a.textContent === "V-5"),
+		).toBe(true);
+		// The listed card has no usage and no live VM behind it: the bare link.
+		const items = [...document.querySelectorAll("ul.sys-turns > li")];
+		expect(items[0]?.querySelector("a")?.textContent).toBe("V-4");
+		expect(items[0]?.querySelector(".sys-sub")).toBeNull();
+	} finally {
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
+test("a board without a vm-runner row renders containers as before", async () => {
+	const server: ContainerRow = {
+		name: "server",
+		reachable: true,
+		unreachableSince: null,
+		cpuPct: 5,
+		cpuShare: 4,
+		memUsed: 1024 ** 3,
+		memLimit: 8 * 1024 ** 3,
+		memMaxHits: 0,
+		oomKills: 0,
+		memMaxHitsHour: null,
+		oomKillsHour: null,
+		history: [],
+		cards: [
+			{
+				project: "alpha",
+				id: "AL-1",
+				usage: {
+					mem: 2.5 * 1024 ** 3,
+					memPeak: 3 * 1024 ** 3,
+					cpuPct: 87.4,
+					cpuSec: 150,
+				},
+			},
+		],
+		lock: { holderPid: null, holderCard: null, waiters: [] },
+		warnings: [],
+	};
+	const realFetch = host.fetch;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) !== "/api/system")
+			return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+				input,
+			);
+		const base = (await (
+			await (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+				input,
+			)
+		).json()) as SystemSnapshot;
+		return new Response(JSON.stringify({ ...base, containers: [server] }), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}) as typeof fetch;
+	window.history.replaceState(null, "", "/system");
+	container = window.document.createElement("div") as unknown as HTMLDivElement;
+	window.document.body.appendChild(container as unknown as HappyNode);
+	root = createRoot(container);
+	try {
+		await act(async () => {
+			root?.render(<App />);
+		});
+		await waitFor(() => document.querySelector("ul.sys-turns") !== null);
+		expect(document.body.textContent!.includes("vm-runner")).toBe(false);
+		const items = [...document.querySelectorAll("ul.sys-turns > li")];
+		expect(items[0]?.querySelector("a")?.textContent).toBe("AL-1");
+		expect(items[0]?.querySelector(".sys-sub")?.textContent).toBe(
+			"2.5 GiB · peak 3.0 GiB · 87 % CPU · 3 min CPU time",
+		);
+	} finally {
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
 test("open PR chips render per PR when three or fewer open PRs exist", async () => {
 	const saved = state.projects;
 	state.projects = [

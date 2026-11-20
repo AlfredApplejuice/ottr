@@ -347,11 +347,13 @@ import { prFeedbackReason } from "./supervisor.ts";
 import { createSystemSampleLog } from "./systemSampleLog.ts";
 import {
 	createSystemSampler,
+	fetchVmRunnerStats,
 	fetchWorkerStats,
 	type LiveRun,
 	type RunnerReading,
 	readCgroup,
 	readVm,
+	type VmRunnerView,
 } from "./systemStats.ts";
 import { formatBytes, type TmpDiskSpace, tmpDiskSpace } from "./tmpsweep.ts";
 import {
@@ -713,6 +715,10 @@ interface AppDeps {
 	/** OTTR-548: the worker dispatch target parsed from OTTR_WORKER_URLS; workerSignInTick probes its
 	 * urls' GET /signins for the worker sign-in warnings. Null, absent or empty = no workers to probe. */
 	workerTarget?: WorkerTarget | null;
+	/** OTTR-1151: the microVM runner target parsed from OTTR_VM_RUNNER_URL; the /system view polls
+	 * its GET /stats like a worker's and joins the VM fleet onto that row. Null, absent or empty
+	 * = no vm-runner row. */
+	vmTarget?: WorkerTarget | null;
 	/** Only for tests: the transcript usage scan GET /api/settings/omp-stats runs instead of
 	 * the incremental scanner, so a test can count scans and serve fixture stores. The
 	 * answer may be sync or a promise; the report build awaits it either way. */
@@ -6904,6 +6910,26 @@ export async function createApp(deps: AppDeps) {
 	async function measureSystem(): Promise<void> {
 		const reading = readCgroup();
 		const target = deps.workerTarget;
+		// OTTR-1151: the vm-runner polls beside the workers, one row like a worker's plus
+		// the VM fleet the cgroup numbers cannot say. A failed fetch still names the row,
+		// so an outage shows as unreachable instead of a vanishing row.
+		const vmTarget = deps.vmTarget;
+		const vmRow = (async (): Promise<RunnerReading[]> => {
+			const url = vmTarget?.urls[0];
+			if (url === undefined) return [];
+			let name: string;
+			try {
+				name = new URL(url).hostname;
+			} catch {
+				return []; // A malformed url names no row.
+			}
+			const stats = await fetchVmRunnerStats(url, vmTarget?.token);
+			return [
+				stats === null
+					? { name, reading: null }
+					: { name, reading: stats.reading, vm: stats.extras },
+			];
+		})();
 		const workers = await Promise.all(
 			(target?.urls ?? []).flatMap((url) => {
 				let name: string;
@@ -6919,7 +6945,33 @@ export async function createApp(deps: AppDeps) {
 				];
 			}),
 		);
-		system.record([{ name: "server", reading }, ...workers], readVm());
+		system.record(
+			[{ name: "server", reading }, ...workers, ...(await vmRow)],
+			readVm(),
+		);
+	}
+
+	/** The vm-runner overlay for the snapshot's containers (OTTR-1151): null without a
+	 *  configured url, else the row's name plus the board's /healthz probe and busy set
+	 *  (src/vmState.ts); the sampler joins it onto the vm-runner's row. */
+	function vmRunnerView(): VmRunnerView | null {
+		const url = deps.vmTarget?.urls[0];
+		if (url === undefined) return null;
+		let name: string;
+		try {
+			name = new URL(url).hostname;
+		} catch {
+			return null; // A malformed url names no row.
+		}
+		return {
+			name,
+			health: { ok: vmState.health.ok, reason: vmState.health.reason },
+			// vmState.busy holds "project/id" entries (src/vmState.ts).
+			busy: [...vmState.busy].map((entry) => {
+				const slash = entry.indexOf("/");
+				return { project: entry.slice(0, slash), id: entry.slice(slash + 1) };
+			}),
+		};
 	}
 
 	// The Settings -> omp usage report. omp's own `stats` command only syncs the default
@@ -7519,6 +7571,7 @@ export async function createApp(deps: AppDeps) {
 						deps.liveRuns?.() ?? [],
 						await systemHolds(now),
 						now,
+						vmRunnerView(),
 					);
 					const msg = { type: "system", system: snap } satisfies ServerMessage;
 					lastSystemJson = JSON.stringify(msg);
@@ -9576,7 +9629,12 @@ export async function createApp(deps: AppDeps) {
 	async function handleGETSystem(): Promise<Response> {
 		const now = Date.now();
 		return json(
-			system.snapshot(deps.liveRuns?.() ?? [], await systemHolds(now), now),
+			system.snapshot(
+				deps.liveRuns?.() ?? [],
+				await systemHolds(now),
+				now,
+				vmRunnerView(),
+			),
 		);
 	}
 
@@ -12446,6 +12504,8 @@ export async function createApp(deps: AppDeps) {
 		const out = await runSandboxJob({
 			project: b.project,
 			checkout: target.path,
+			// The calling run's card: the validate VM names it on the System view.
+			taskId: b.taskId,
 			argv: b.argv,
 			...(b.ref !== undefined ? { ref: b.ref } : {}),
 			...(b.cwd !== undefined ? { cwd: b.cwd } : {}),

@@ -7,18 +7,22 @@ import {
 	counterGrowth,
 	cpuPercent,
 	createSystemSampler,
+	fetchVmRunnerStats,
 	fetchWorkerStats,
 	HOUR_MS,
 	keepWindow,
 	type LiveRun,
 	MUTATION_LOCK_PATH,
 	parseCgroupReading,
+	parseVmRunnerStats,
 	pushRing,
 	readCgroup,
 	readRunUsage,
 	readVm,
 	rowWarnings,
 	type VmReading,
+	type VmRunnerExtras,
+	type VmRunnerView,
 	vmCpuPercent,
 } from "./systemStats.ts";
 import type {
@@ -26,6 +30,7 @@ import type {
 	RunUsage,
 	SystemHolds,
 	SystemPoint,
+	SystemVm,
 } from "./types.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "ottr-system-"));
@@ -97,6 +102,29 @@ const vmAt = (at: number, over: Partial<VmReading> = {}): VmReading => ({
 	memAvailable: null,
 	memTotal: null,
 	cpus: 4,
+	...over,
+});
+
+const vm = (over: Partial<SystemVm> = {}): SystemVm => ({
+	id: "r-1",
+	project: "p",
+	cardId: "T-1",
+	mode: "turn",
+	vcpus: 2,
+	memMiB: 2048,
+	startedAt: 0,
+	scratchBytes: null,
+	...over,
+});
+
+/** A valid vm-runner /stats body: the worker shape plus vms, max and disk. */
+const vmBody = (
+	over: Partial<CgroupReading> = {},
+): CgroupReading & VmRunnerExtras => ({
+	...reading({ at: 3, cpuUsageUsec: 8 }),
+	vms: [vm()],
+	max: 4,
+	disk: { base: 100, layers: 200, runs: 300 },
 	...over,
 });
 
@@ -376,6 +404,67 @@ describe("fetchWorkerStats", () => {
 		const url = `http://127.0.0.1:${server.port}`;
 		expect(await fetchWorkerStats(url, "tok")).toEqual(body);
 		expect(await fetchWorkerStats(url, "nope")).toBeNull();
+	});
+});
+
+describe("parseVmRunnerStats", () => {
+	test("accepts the combined body and rejects a wrong shape", () => {
+		expect(parseVmRunnerStats(JSON.parse(JSON.stringify(vmBody())))).toEqual(
+			vmBody(),
+		);
+		expect(parseVmRunnerStats(null)).toBeNull();
+		// A valid worker body without the extras part is not a vm-runner body.
+		expect(parseVmRunnerStats(reading({ at: 3, cpuUsageUsec: 8 }))).toBeNull();
+		expect(
+			parseVmRunnerStats({ ...vmBody(), vms: [{ id: "r-1" }] }),
+		).toBeNull();
+		expect(parseVmRunnerStats({ ...vmBody(), disk: { base: 1 } })).toBeNull();
+		expect(
+			parseVmRunnerStats({ ...vmBody(), vms: [{ ...vm(), mode: "job" }] }),
+		).toBeNull();
+		expect(
+			parseVmRunnerStats({
+				...vmBody(),
+				vms: [{ ...vm(), scratchBytes: "5" }],
+			}),
+		).toBeNull();
+		expect(parseVmRunnerStats({ ...vmBody(), max: "4" })).toBeNull();
+	});
+});
+
+describe("fetchVmRunnerStats", () => {
+	test("splits the body into reading and extras; a refused token gives null", async () => {
+		const body = vmBody();
+		const server = Bun.serve({
+			port: 0,
+			fetch: (req) =>
+				req.headers.get("x-otwr-token") === "tok"
+					? Response.json(body)
+					: new Response("unauthorized", { status: 401 }),
+		});
+		stops.push(() => {
+			void server.stop(true);
+		});
+		const url = `http://127.0.0.1:${server.port}`;
+		const { vms, max, disk, ...r } = body;
+		expect(await fetchVmRunnerStats(url, "tok")).toEqual({
+			reading: r,
+			extras: { vms, max, disk },
+		});
+		expect(await fetchVmRunnerStats(url, "nope")).toBeNull();
+	});
+
+	test("a non-200 answer gives null", async () => {
+		const server = Bun.serve({
+			port: 0,
+			fetch: () => new Response("gone", { status: 404 }),
+		});
+		stops.push(() => {
+			void server.stop(true);
+		});
+		expect(
+			await fetchVmRunnerStats(`http://127.0.0.1:${server.port}`, undefined),
+		).toBeNull();
 	});
 });
 
@@ -766,6 +855,83 @@ describe("createSystemSampler", () => {
 		[row] = sampler.snapshot([], HOLDS, 3 * TICK).containers;
 		expect(row!.reachable).toBe(true);
 		expect(row!.unreachableSince).toBeNull();
+	});
+
+	test("the vm-runner row carries the vm overlay from the reading and the view", () => {
+		const sampler = createSystemSampler();
+		const { vms, max, disk, ...r } = vmBody({ at: 0, cpuUsageUsec: 0 });
+		sampler.record(
+			[
+				{ name: "worker-a", reading: reading({ at: 0 }) },
+				{ name: "vm-runner", reading: r, vm: { vms, max, disk } },
+			],
+			vmAt(0),
+		);
+		const view: VmRunnerView = {
+			name: "vm-runner",
+			health: { ok: true, reason: null },
+			busy: [{ project: "p", id: "T-1" }],
+		};
+		const rows = sampler.snapshot([], HOLDS, 0, view).containers;
+		expect(rows.map((row) => row.name)).toEqual(["worker-a", "vm-runner"]);
+		// max/vms/disk come from the reading's extras, health/busy from the view.
+		expect(rows[1]!.vm).toEqual({
+			health: { ok: true, reason: null },
+			busy: [{ project: "p", id: "T-1" }],
+			max: 4,
+			vms: [vm()],
+			disk: { base: 100, layers: 200, runs: 300 },
+		});
+		// A worker row has no vm field, and without the view none appears anywhere.
+		expect("vm" in rows[0]!).toBe(false);
+		expect(
+			sampler.snapshot([], HOLDS, 0).containers.every((row) => !("vm" in row)),
+		).toBe(true);
+	});
+
+	test("a reachable vm-runner reading without extras still gets health and busy", () => {
+		const sampler = createSystemSampler();
+		const view: VmRunnerView = {
+			name: "vm-runner",
+			health: { ok: true, reason: null },
+			busy: [],
+		};
+		sampler.record(
+			[{ name: "vm-runner", reading: reading({ at: 0 }) }],
+			vmAt(0),
+		);
+		const [row] = sampler.snapshot([], HOLDS, 0, view).containers;
+		expect(row!.reachable).toBe(true);
+		expect(row!.vm).toEqual({
+			health: view.health,
+			busy: [],
+			max: null,
+			vms: [],
+			disk: null,
+		});
+	});
+
+	test("an unreachable vm-runner keeps the overlay with nulls, never a crash", () => {
+		const sampler = createSystemSampler();
+		sampler.record([{ name: "vm-runner", reading: null }], vmAt(0));
+		const view: VmRunnerView = {
+			name: "vm-runner",
+			health: { ok: false, reason: "healthz answered 502" },
+			busy: [],
+		};
+		const [row] = sampler.snapshot([], HOLDS, 0, view).containers;
+		expect(row).toMatchObject({
+			name: "vm-runner",
+			reachable: false,
+			unreachableSince: 0,
+		});
+		expect(row!.vm).toEqual({
+			health: { ok: false, reason: "healthz answered 502" },
+			busy: [],
+			max: null,
+			vms: [],
+			disk: null,
+		});
 	});
 
 	test("lock holder and waiters come from the live runs on that runner", () => {

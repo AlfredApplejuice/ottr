@@ -15,8 +15,10 @@ import type {
 	SystemPoint,
 	SystemSnapshot,
 	SystemTurn,
+	SystemVm,
 	TurnUsage,
 	VmRow,
+	VmStateDisk,
 } from "./types.ts";
 
 /** join(os.tmpdir(), "ott-stryker.lock") — the same file scripts/stryker-load.mjs creates. */
@@ -417,12 +419,86 @@ export function parseCgroupReading(body: unknown): CgroupReading | null {
 	};
 }
 
-/** GET `${url}/stats` with x-otwr-token, redirect "manual", AbortSignal.timeout(timeoutMs default 5000). null on any failure (network, non-200, 401, bad body). */
-export async function fetchWorkerStats(
+/** The vm-runner GET /stats body's additions to the worker shape: the live VM fleet,
+ *  OTTR_VM_MAX and the vm-state volume's allocated bytes (src/vmRunner.ts). */
+export interface VmRunnerExtras {
+	vms: SystemVm[];
+	max: number | null;
+	disk: VmStateDisk | null;
+}
+
+/** The board's overlay for the vm-runner's System row: the row name to join on, the
+ *  last /healthz probe (src/vmState.ts) and the cards a dispatch refused as busy. */
+export interface VmRunnerView {
+	name: string;
+	health: { ok: boolean; reason: string | null };
+	busy: SystemCard[];
+}
+
+/** The vms array of a vm-runner /stats body; null when the shape is wrong. */
+function parseVmsField(v: unknown): SystemVm[] | null {
+	if (!Array.isArray(v)) return null;
+	const vms: SystemVm[] = [];
+	for (const entry of v) {
+		if (typeof entry !== "object" || entry === null) return null;
+		const u = entry as Unchecked<SystemVm>;
+		if (
+			typeof u.id !== "string" ||
+			typeof u.project !== "string" ||
+			!(u.cardId === null || typeof u.cardId === "string") ||
+			!(u.mode === "turn" || u.mode === "validate") ||
+			!isCount(u.vcpus) ||
+			!isCount(u.memMiB) ||
+			!isCount(u.startedAt) ||
+			!isCountOrNull(u.scratchBytes)
+		)
+			return null;
+		vms.push({
+			id: u.id,
+			project: u.project,
+			cardId: u.cardId,
+			mode: u.mode,
+			vcpus: u.vcpus,
+			memMiB: u.memMiB,
+			startedAt: u.startedAt,
+			scratchBytes: u.scratchBytes,
+		});
+	}
+	return vms;
+}
+
+/** The disk part of a vm-runner /stats body; null when the shape is wrong. */
+function parseVmDiskField(v: unknown): VmStateDisk | null {
+	if (typeof v !== "object" || v === null) return null;
+	const d = v as Unchecked<VmStateDisk>;
+	if (!isCount(d.base) || !isCount(d.layers) || !isCount(d.runs)) return null;
+	return { base: d.base, layers: d.layers, runs: d.runs };
+}
+
+/** Validates a vm-runner's GET /stats JSON body: the worker shape plus VmRunnerExtras;
+ *  null when either part has a wrong shape. */
+export function parseVmRunnerStats(
+	body: unknown,
+): (CgroupReading & VmRunnerExtras) | null {
+	const r = parseCgroupReading(body);
+	if (r === null) return null;
+	const b = body as Unchecked<CgroupReading & VmRunnerExtras>;
+	const vms = parseVmsField(b.vms);
+	if (vms === null) return null;
+	if (!isCountOrNull(b.max)) return null;
+	const disk = parseVmDiskField(b.disk);
+	if (disk === null) return null;
+	return { ...r, vms, max: b.max, disk };
+}
+
+/** GET `${url}/stats` with x-otwr-token, redirect "manual", AbortSignal.timeout(timeoutMs);
+ *  the body goes through `parse`. null on any failure (network, non-200, 401, bad body). */
+async function fetchStats<T>(
 	url: string,
 	token: string | undefined,
-	timeoutMs = 5000,
-): Promise<CgroupReading | null> {
+	timeoutMs: number,
+	parse: (body: unknown) => T | null,
+): Promise<T | null> {
 	try {
 		const res = await fetch(`${url}/stats`, {
 			headers: token ? { "x-otwr-token": token } : {},
@@ -431,16 +507,39 @@ export async function fetchWorkerStats(
 			signal: AbortSignal.timeout(timeoutMs),
 		});
 		if (res.status !== 200) return null;
-		return parseCgroupReading(await res.json());
+		return parse(await res.json());
 	} catch {
 		return null;
 	}
+}
+
+/** GET `${url}/stats` with x-otwr-token, redirect "manual", AbortSignal.timeout(timeoutMs default 5000). null on any failure (network, non-200, 401, bad body). */
+export async function fetchWorkerStats(
+	url: string,
+	token: string | undefined,
+	timeoutMs = 5000,
+): Promise<CgroupReading | null> {
+	return fetchStats(url, token, timeoutMs, parseCgroupReading);
+}
+
+/** The vm-runner's GET /stats, the same fetch rules as a worker's; null on any failure. */
+export async function fetchVmRunnerStats(
+	url: string,
+	token: string | undefined,
+	timeoutMs = 5000,
+): Promise<{ reading: CgroupReading; extras: VmRunnerExtras } | null> {
+	const body = await fetchStats(url, token, timeoutMs, parseVmRunnerStats);
+	if (body === null) return null;
+	const { vms, max, disk, ...reading } = body;
+	return { reading, extras: { vms, max, disk } };
 }
 
 /** reading null = unreachable this tick. name = "server" or the worker hostname. */
 export interface RunnerReading {
 	name: string;
 	reading: CgroupReading | null;
+	/** The vm-runner's /stats additions, set only on the vm-runner's reading. */
+	vm?: VmRunnerExtras;
 }
 
 /** A live run of the board. runner = "server" (local/merge turn) or the worker hostname. progress = the run's Stryker progress text (RunEntry.progress), null when none. */
@@ -457,8 +556,14 @@ export interface LiveRun {
 export interface SystemSampler {
 	/** One 30 s tick: rows follow `runners` order; keeps a 1 h / 120-point ring per row and for the VM. */
 	record(runners: RunnerReading[], vm: VmReading): void;
-	/** Builds the snapshot; before any record() → containers [] and a VM row of nulls (cpus from os). */
-	snapshot(runs: LiveRun[], holds: SystemHolds, now: number): SystemSnapshot;
+	/** Builds the snapshot; before any record() → containers [] and a VM row of nulls (cpus from os).
+	 *  `vmRunner` joins the board's health and busy overlay onto the vm-runner's row. */
+	snapshot(
+		runs: LiveRun[],
+		holds: SystemHolds,
+		now: number,
+		vmRunner?: VmRunnerView | null,
+	): SystemSnapshot;
 }
 
 /** CPU in percent of one CPU between two readings: Δusage_usec / Δwall_usec × 100. null without
@@ -585,6 +690,9 @@ function cpuShareOf(r: CgroupReading, vmCpus: number): number | null {
 interface RunnerState {
 	/** The latest reading; null while unreachable. */
 	latest: CgroupReading | null;
+	/** The vm-runner's /stats additions of the latest reachable reading; null while
+	 *  unreachable or when the reading carried none. */
+	extras: VmRunnerExtras | null;
 	cpuPct: number | null;
 	/** The VM CPU count of the latest tick: the share of a container without a CPU quota. */
 	vmCpus: number;
@@ -659,6 +767,7 @@ export function createSystemSampler(): SystemSampler {
 	const recordRunner = (
 		prev: RunnerState | undefined,
 		reading: CgroupReading | null,
+		extras: VmRunnerExtras | null,
 		vm: VmReading,
 	): RunnerState => {
 		const tick = vm.at;
@@ -669,6 +778,7 @@ export function createSystemSampler(): SystemSampler {
 			// a turn's peak survives the outage.
 			return {
 				latest: null,
+				extras: null,
 				cpuPct: null,
 				vmCpus: vm.cpus,
 				unreachableSince: prev?.unreachableSince ?? tick,
@@ -690,6 +800,7 @@ export function createSystemSampler(): SystemSampler {
 			});
 		return {
 			latest: reading,
+			extras,
 			cpuPct,
 			vmCpus: vm.cpus,
 			unreachableSince: null,
@@ -776,9 +887,9 @@ export function createSystemSampler(): SystemSampler {
 		record(readings, vm) {
 			const prev = new Map(runners.map((r) => [r.name, r.state]));
 			// Rebuilt from this tick's list: a runner no longer polled loses its row.
-			runners = readings.map(({ name, reading }) => ({
+			runners = readings.map(({ name, reading, vm: extras }) => ({
 				name,
-				state: recordRunner(prev.get(name), reading, vm),
+				state: recordRunner(prev.get(name), reading, extras ?? null, vm),
 			}));
 			vmCpuPct = vmCpuPercent(vmLatest?.cpuTicks ?? null, vm.cpuTicks);
 			vmLatest = vm;
@@ -791,7 +902,7 @@ export function createSystemSampler(): SystemSampler {
 						: null,
 			});
 		},
-		snapshot(runs, holds, now) {
+		snapshot(runs, holds, now, vmRunner) {
 			const vm: VmRow = {
 				cpuPct: vmCpuPct,
 				cpus: vmLatest?.cpus ?? availableParallelism(),
@@ -802,9 +913,23 @@ export function createSystemSampler(): SystemSampler {
 			};
 			return {
 				at: now,
-				containers: runners.map(({ name, state }) =>
-					row(name, state, runs, now),
-				),
+				containers: runners.map(({ name, state }) => {
+					const r = row(name, state, runs, now);
+					if (vmRunner != null && name === vmRunner.name)
+						// The board's overlay: health and busy come from the view, the fleet
+						// and the disk only from a reachable reading with extras.
+						return {
+							...r,
+							vm: {
+								health: vmRunner.health,
+								busy: vmRunner.busy,
+								max: state.extras?.max ?? null,
+								vms: state.extras?.vms ?? [],
+								disk: state.extras?.disk ?? null,
+							},
+						};
+					return r;
+				}),
 				vm,
 				holds,
 			};

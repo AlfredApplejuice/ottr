@@ -56,6 +56,9 @@ export const newJobId = (): string =>
 export interface SandboxJobOptions {
 	/** Must pass PROJECT_NAME; names the run dir and the /data record. */
 	project: string;
+	/** The calling run's card id, carried on the ValidateRequest (its taskId) so the
+	 *  runner names the card on the System view; optional. */
+	taskId?: string;
 	/** Git ref to archive; default HEAD. */
 	ref?: string;
 	/** The job's command; a non-empty list of strings. */
@@ -199,6 +202,7 @@ export async function runSandboxJob(
 	const request: ValidateRequest = {
 		id,
 		project,
+		...(o.taskId ? { taskId: o.taskId } : {}),
 		targetTar,
 		// The validate bake reads the dispatch's trusted texts, never the shared
 		// home (docs/specs/vm-list-isolation.md).

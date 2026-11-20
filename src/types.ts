@@ -1744,6 +1744,32 @@ export interface SystemTurn extends SystemCard {
 	usage: TurnUsage | null;
 }
 
+/** One live VM in the vm-runner's GET /stats body (src/vmRunner.ts) and on the System view. */
+export interface SystemVm {
+	/** The turn's run id (WorkerRequest.id) or the validate job id. */
+	id: string;
+	project: string;
+	/** The card the dispatch named (VmSpec.taskId, the sandbox job's taskId); null when it carried none. */
+	cardId: string | null;
+	/** "turn" for a card run, "validate" for a sandbox validation job. */
+	mode: "turn" | "validate";
+	vcpus: number;
+	/** Guest memory in MiB. */
+	memMiB: number;
+	/** Epoch ms the runner accepted the run. */
+	startedAt: number;
+	/** Allocated bytes of the run's scratch disk (st_blocks × 512, du semantics — never the
+	 *  sparse file's apparent size); null while the runner has not created the disk. */
+	scratchBytes: number | null;
+}
+
+/** Allocated bytes (st_blocks × 512, du semantics) of the vm-state volume's parts. */
+export interface VmStateDisk {
+	base: number;
+	layers: number;
+	runs: number;
+}
+
 /** One container in the System view: the server, then each OTTR_WORKER_URLS worker. */
 export interface ContainerRow {
 	/** "server", or the worker url's hostname (e.g. "worker-a"). */
@@ -1781,6 +1807,20 @@ export interface ContainerRow {
 	/** Warning reasons in plain text ("memory 93 %", "OOM kill in the last hour",
 	 *  "CPU at 90 % of its share for 5 min"); empty = ok. */
 	warnings: string[];
+	/** Set only on the vm-runner row (OTTR_VM_RUNNER_URL set): what the container's
+	 *  cgroup numbers cannot say — health, the VM fleet, the vm-state volume's real use. */
+	vm?: {
+		/** The board's last /healthz probe (src/vmState.ts); ok false carries the reason. */
+		health: { ok: boolean; reason: string | null };
+		/** OTTR_VM_MAX, as the runner's /stats reported it; null without a reachable reading. */
+		max: number | null;
+		/** One entry per live VM, the runner's /stats vms list. */
+		vms: SystemVm[];
+		/** The vm-state volume's allocated bytes per part; null without a reachable reading. */
+		disk: VmStateDisk | null;
+		/** Cards whose last dispatch vm-runner refused as busy (src/vmState.ts). */
+		busy: SystemCard[];
+	};
 }
 
 /** The Docker VM as the server's /proc sees it. Never warns. */

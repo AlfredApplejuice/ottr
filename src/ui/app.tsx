@@ -77,6 +77,7 @@ import {
 	type SystemCard,
 	type SystemPoint,
 	type SystemSnapshot,
+	type SystemVm,
 	type TaskCard,
 	type TaskView,
 	type TurnUsage,
@@ -1658,16 +1659,18 @@ function containerRow(
 						: `not reachable since ${clockTime(c.unreachableSince)}`}
 				</td>
 			)}
-			{containerTurns(c, tasks, openTask)}
+			{containerTurns(c, tasks, openTask, links)}
 			{containerLock(c, links)}
 		</tr>
 	);
 }
 
-/** A container row's first cell: name, warning mark, and the warning reasons in text —
- *  amber alone never carries a warning. */
+/** A container row's first cell: name, warning mark, the warning reasons, and on the
+ *  vm-runner row the runner health, VM fleet, and vm-state disk facts as plain text —
+ *  amber alone never carries a warning, and no fact rides on color only. */
 function containerWarnHead(c: SystemSnapshot["containers"][number]): ReactNode {
 	const warn = c.warnings.length > 0;
+	const vm = c.vm;
 	return (
 		<th scope="row">
 			<span className="sys-name">
@@ -1679,6 +1682,29 @@ function containerWarnHead(c: SystemSnapshot["containers"][number]): ReactNode {
 					{c.warnings.map((w) => (
 						<li key={w}>{w}</li>
 					))}
+				</ul>
+			)}
+			{vm && (
+				<ul className="sys-warns">
+					<li className="sys-sub">
+						{vm.health.ok
+							? "vm-runner ok"
+							: (vm.health.reason ?? "runner not reachable")}
+					</li>
+					{c.reachable && (
+						<>
+							<li className="sys-sub">
+								{vm.max === null
+									? `${vm.vms.length} VMs`
+									: `${vm.vms.length} / ${vm.max} VMs`}
+							</li>
+							{vm.disk !== null && (
+								<li className="sys-sub">
+									{`vm-state ${gib(vm.disk.base + vm.disk.layers + vm.disk.runs)} GiB allocated (base ${gib(vm.disk.base)} · layers ${gib(vm.disk.layers)} · runs ${gib(vm.disk.runs)})`}
+								</li>
+							)}
+						</>
+					)}
 				</ul>
 			)}
 		</th>
@@ -1740,16 +1766,60 @@ function containerMetrics(
 	);
 }
 
-/** A container's live-turns cell: none, or the turn list with each turn's usage figures. */
+/** One vm-runner turn's VM facts: mode, vCPUs, guest memory, scratch allocated, start
+ *  time — the scratch part drops while the runner has not created the disk yet. */
+function vmTurnFacts(v: SystemVm): ReactNode {
+	return (
+		<span className="sys-sub">
+			{[
+				v.mode,
+				`${v.vcpus} vCPU`,
+				`${v.memMiB} MiB guest`,
+				v.scratchBytes === null
+					? null
+					: `scratch ${gib(v.scratchBytes)} GiB allocated`,
+				`since ${clockTime(v.startedAt)}`,
+			]
+				.filter((part): part is string => part !== null)
+				.map((part, i) => (
+					<Fragment key={part}>
+						{i > 0 && " · "}
+						<span>{part}</span>
+					</Fragment>
+				))}
+		</span>
+	);
+}
+
+/** The vm-runner's refused-as-busy cards under the turns, mirrored on the lock cell's
+ *  waiter style: a text lead, then the card links. */
+function vmBusyWaiters(
+	busy: SystemCard[],
+	links: (cards: SystemCard[]) => ReactNode,
+): ReactNode {
+	if (busy.length === 0) return null;
+	return (
+		<span className="sys-cards">
+			<span className="sys-sub">waiting for a free VM:</span>
+			{links(busy)}
+		</span>
+	);
+}
+
+/** A container's live-turns cell: none, or the turn list with each turn's usage figures;
+ *  on the vm-runner row each turn also gains its VM facts and the busy cards follow. */
 function containerTurns(
 	c: SystemSnapshot["containers"][number],
 	tasks: TaskCard[],
 	openTask: (id: string) => void,
+	links: (cards: SystemCard[]) => ReactNode,
 ): ReactNode {
+	const busy = c.vm?.busy ?? [];
 	if (c.cards.length === 0) {
 		return (
 			<td data-label="Turns">
 				<span className="sys-sub">none</span>
+				{vmBusyWaiters(busy, links)}
 			</td>
 		);
 	}
@@ -1758,22 +1828,29 @@ function containerTurns(
 			{/* Largest memory first (the server's order): the turn to look at
 			    when the container runs full leads the list. */}
 			<ul className="sys-turns">
-				{c.cards.map((t) => (
-					<li key={`${t.project}/${t.id}`}>
-						<SystemCardLink card={t} tasks={tasks} openTask={openTask} />
-						{t.usage !== null && (
-							<span className="sys-sub">
-								{turnUsageParts(t.usage).map((part, i) => (
-									<Fragment key={part}>
-										{i > 0 && " · "}
-										<span>{part}</span>
-									</Fragment>
-								))}
-							</span>
-						)}
-					</li>
-				))}
+				{c.cards.map((t) => {
+					const v = c.vm?.vms.find(
+						(x) => x.project === t.project && x.cardId === t.id,
+					);
+					return (
+						<li key={`${t.project}/${t.id}`}>
+							<SystemCardLink card={t} tasks={tasks} openTask={openTask} />
+							{t.usage !== null && (
+								<span className="sys-sub">
+									{turnUsageParts(t.usage).map((part, i) => (
+										<Fragment key={part}>
+											{i > 0 && " · "}
+											<span>{part}</span>
+										</Fragment>
+									))}
+								</span>
+							)}
+							{v && vmTurnFacts(v)}
+						</li>
+					);
+				})}
 			</ul>
+			{vmBusyWaiters(busy, links)}
 		</td>
 	);
 }
@@ -1857,7 +1934,7 @@ function SystemView({
 								<caption className="sr">
 									Containers: CPU and memory now and over the last hour, memory
 									limit hits, OOM kills, live turns with each turn's memory and
-									CPU, and the mutation lock
+									CPU, cards waiting for a free VM, and the mutation lock
 								</caption>
 								<thead>
 									<tr>

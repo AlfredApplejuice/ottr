@@ -1086,6 +1086,9 @@ const app = await createApp({
 	],
 	// OTTR-548: the /signins tick probes the same urls the loop dispatches work turns to.
 	workerTarget,
+	// OTTR-1151: the /system view polls the vm-runner's /stats like a worker's and shows
+	// the VM fleet on that row.
+	vmTarget,
 	runnerTurns: () => loop.runnerTurns(),
 	// OTTR-1071: the Settings watches row shows when the next regular PR poll runs.
 	prPollNextAt: () => prPollGrid.nextAt,
