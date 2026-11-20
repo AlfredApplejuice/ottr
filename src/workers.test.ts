@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -15,6 +16,7 @@ import { dirname, join } from "node:path";
 import { readLayerUse, rebuildLayerUse } from "./layers.ts";
 import { signIns } from "./login.ts";
 import { createRunSink, type RunSink } from "./runner.ts";
+import { projectTurnUid } from "./turnUid.ts";
 import {
 	detachedRuns,
 	killDetached,
@@ -2767,4 +2769,171 @@ setTimeout(() => process.exit(0), 60000);`,
 			await settle(releases, readers, [url]);
 		}
 	}, 60_000);
+});
+
+// Per-project turn identity through the daemon (OTTR-994): root-only, because the
+// feature drops the child to a non-root uid and chowns fixtures.
+describe("serveWorker turn identity", () => {
+	const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+	const rootTest = isRoot ? test : test.skip;
+
+	const post = async (
+		url: string,
+		body: Record<string, unknown>,
+	): Promise<Response> =>
+		fetch(`${url}/run`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+
+	rootTest(
+		"each project drops to its own uid and home; the layer copy retargets caches",
+		async () => {
+			const workerHome = freshWorkerHome();
+			const homesRoot = freshWorkerHome();
+			// A real workspace: each project dir holds a git repo, the daemon's
+			// structural git-dir derivation and per-run chown run against it.
+			const ws = freshWorkerHome();
+			const mkRepo = (name: string): string => {
+				const repo = join(ws, name);
+				mkdirSync(repo, { recursive: true });
+				Bun.spawnSync(["git", "-C", repo, "init", "-b", "main"], {
+					stdout: "ignore",
+					stderr: "ignore",
+				});
+				return repo;
+			};
+			const cwdA = mkRepo("proj-a");
+			const cwdB = mkRepo("proj-b");
+			// Identity stub: prints the child's uid and the env values the boundary
+			// protects. Executable (0755) and reachable: the stub dir gets a plain
+			// world-readable mode, because mkdtemp dirs are 0700 root-only and the
+			// real omp binary lives in the image's world-executable PATH instead.
+			const identPath = join(workerHome, "ident-omp.js");
+			writeFileSync(
+				identPath,
+				`#!${process.execPath}\nprocess.stdout.write(JSON.stringify({ uid: process.getuid(), HOME: process.env.HOME, PI: process.env.PI_CODING_AGENT_DIR, SECRET: process.env.DUMMY_SECRET }) + "\\n");`,
+			);
+			chmodSync(identPath, 0o755);
+			chmodSync(workerHome, 0o755);
+			// One pinned layer in the shared home, with the pin's absolute state links.
+			const layerDir = join(workerHome, ".alate", "layers", "l1");
+			mkdirSync(join(layerDir, ".omp", "agent"), { recursive: true });
+			mkdirSync(join(workerHome, ".omp", "agent"), { recursive: true });
+			mkdirSync(join(workerHome, ".cache"), { recursive: true });
+			const dbTarget = join(workerHome, ".omp", "agent", "agent.db");
+			symlinkSync(dbTarget, join(layerDir, ".omp", "agent", "agent.db"));
+			symlinkSync(join(workerHome, ".cache"), join(layerDir, ".cache"));
+
+			const url = start({
+				ompPath: identPath,
+				home: workerHome,
+				turnUid: { homesRoot, workerHome, dataRoots: [], workspaceRoot: ws },
+			});
+			const run = async (
+				project: string,
+				repo: string,
+				extra?: { bodyProject?: boolean; flatHome?: boolean },
+			): Promise<string[]> => {
+				const res = await post(url, {
+					id: `ti-${project}`,
+					argv: ["-p"],
+					cwd: repo,
+					stdin: "",
+					...(extra?.bodyProject ? { project } : {}),
+					env: {
+						...(extra?.bodyProject ? {} : { OTTR_PROJECT: project }),
+						...(extra?.flatHome ? {} : { HOME: layerDir }),
+						...(extra?.flatHome
+							? {}
+							: { PI_CODING_AGENT_DIR: join(layerDir, ".omp", "agent") }),
+						DUMMY_SECRET: `s3cret-${project}`,
+					},
+				});
+				expect(res.status).toBe(200);
+				return readLines(res);
+			};
+
+			const linesA = await run("proj-a", cwdA);
+			const dumpedA = JSON.parse(linesA[0]!) as {
+				uid: number;
+				HOME: string;
+				PI: string;
+				SECRET: string;
+			};
+			const idsA = projectTurnUid("proj-a");
+			expect(dumpedA.uid).toBe(idsA.uid);
+			const homeA = join(homesRoot, "proj-a", "layers", "l1");
+			expect(dumpedA.HOME).toBe(homeA);
+			expect(dumpedA.PI).toBe(join(homeA, ".omp", "agent"));
+			expect(dumpedA.SECRET).toBe("s3cret-proj-a");
+			// The cache link inside the copy points into the project's writable home;
+			// the cache dir itself the turn creates through the link.
+			expect(readlinkSync(join(homeA, ".cache"))).toBe(
+				join(homesRoot, "proj-a", "home", ".cache"),
+			);
+			expect(existsSync(join(homesRoot, "proj-a", "home", ".cache"))).toBe(
+				false,
+			);
+			// The state link keeps its flat shared-home target.
+			expect(readlinkSync(join(homeA, ".omp", "agent", "agent.db"))).toBe(
+				dbTarget,
+			);
+			const sentinelA = JSON.parse(linesA[1]!) as {
+				[WORKER_DONE]: { exitCode: number };
+			};
+			expect(sentinelA[WORKER_DONE].exitCode).toBe(0);
+
+			// A second project lands on a different uid and its own home.
+			const linesB = await run("proj-b", cwdB);
+			const dumpedB = JSON.parse(linesB[0]!) as { uid: number; HOME: string };
+			expect(dumpedB.uid).toBe(projectTurnUid("proj-b").uid);
+			expect(dumpedB.uid).not.toBe(idsA.uid);
+			expect(dumpedB.HOME).toBe(join(homesRoot, "proj-b", "layers", "l1"));
+
+			// A stripBoard run (retro, proposal) carries no OTTR_PROJECT in its env;
+			// the request's project field keeps its identity.
+			const linesC = await run("proj-a", cwdA, { bodyProject: true });
+			const dumpedC = JSON.parse(linesC[0]!) as { uid: number };
+			expect(dumpedC.uid).toBe(idsA.uid);
+
+			// An unpinned run gets the turn home's writable home with the flat
+			// identity link instead of the layer copy.
+			const linesD = await run("proj-a", cwdA, { flatHome: true });
+			const dumpedD = JSON.parse(linesD[0]!) as { HOME: string };
+			expect(dumpedD.HOME).toBe(join(homesRoot, "proj-a", "home"));
+			expect(readlinkSync(join(dumpedD.HOME, ".omp"))).toBe(
+				join(workerHome, ".omp"),
+			);
+		},
+		30_000,
+	);
+
+	rootTest(
+		"a vanished pinned layer fails the run closed",
+		async () => {
+			const workerHome = freshWorkerHome();
+			const homesRoot = freshWorkerHome();
+			const ws = freshWorkerHome();
+			const url = start({
+				ompPath: process.execPath,
+				home: workerHome,
+				turnUid: { homesRoot, workerHome, dataRoots: [], workspaceRoot: ws },
+			});
+			const res = await post(url, {
+				id: "ti-gone",
+				argv: ["-p"],
+				cwd: ws,
+				stdin: "",
+				env: {
+					OTTR_PROJECT: "gone-proj",
+					HOME: join(workerHome, ".alate", "layers", "gone"),
+				},
+			});
+			expect(res.status).toBe(500);
+			expect(await res.text()).toContain("vanished");
+		},
+		30_000,
+	);
 });

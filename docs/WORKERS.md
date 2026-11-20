@@ -564,17 +564,19 @@ folder and compares the two trees. A changed, added or removed file stops the tu
 and the error names the folder to remove. A kept copy that fails the hash is
 downloaded again, so an install from before this check costs one download.
 A reused link folder must hold exactly the turn's links. A planted or changed
-entry stops the turn too. The reason: a turn can write the shared home, so an
-installed tool must never run from a planted file (OTTR-953).
+entry stops the turn too. The reason: the link folder is worker-side writable
+state (each project's turn home since OTTR-994, the shared home on a legacy
+non-root daemon), so an installed tool must never run from a planted file
+(OTTR-953).
 
 A turn that runs in the server (a merge turn, or a work turn with no worker) does
 not use the shared home volume for tools. The server reads `tools.json` and
 installs the tools under its own home (`OTTR_BOARD_OMP_HOME`, `/etc/ottr/home` on
 compose). The seed installs the lists into the board home's layers
 ([The agent layers](#the-agent-layers)), and the board reads them from the current
-layer at read time. The reason is R5-1: a
-worker turn can write the shared home, so a binary there must never run in the
-server. Until a seed runs, server-side turns get no tools. The VM bake path
+layer at read time. The reason is R5-1: worker-side writable state must never
+serve a binary that runs in the server (a project's turn home today, the
+shared home on a legacy non-root daemon). Until a seed runs, server-side turns get no tools. The VM bake path
 follows the same rule: the board puts the project's lists on the vm dispatch
 from its own home, and the bake installs from those texts only, never from the
 shared home. The pinned agent layer copy (`vm.layerDir`) still reads the shared
@@ -592,8 +594,9 @@ keep it. When one listing of a name lacks `plain`, the name stays a secret. Spec
 A listed name with no value does not stop the turn; the card log names it.
 The board reads these lists only from its own home (`OTTR_BOARD_OMP_HOME`,
 `/etc/ottr/home` on compose), never from the shared home volume. The reason is
-R5-1: a turn can write the shared home, and a list there could give the secrets
-of project A to project B. The seed installs the lists into the board home's
+R5-1: a list in worker-side writable state could give the secrets of project A
+to project B — the shared home before OTTR-994, a project's own turn home
+today — so the board carries the lists on the request instead. The seed installs the lists into the board home's
 layers ([The agent layers](#the-agent-layers)); the hourly deploy runs it when
 it seeds the board ("Seed the board
 config"). The 5-minute board seed schedule above runs the same seed sooner when the
@@ -756,6 +759,66 @@ keep the profile off on a Podman host. On a host with `/dev/kvm`, the upgrade
 path is [podman inside the Firecracker VM](#microvm-workers), where a VM owns a
 real podman.
 
+## Turn identity (per-project uid and home)
+
+On the classic pool, every turn of every project used to run as the worker
+daemon's own root uid with one shared home. A turn of project A could read
+the process env of a running turn of project B — its Settings env values and
+the lent provider token — and plant files into the shared home that a later
+turn of project B loads (R5-1). Since OTTR-994 the worker daemon drops each
+turn to its project's own uid. The uid comes from the project name
+(`projectTurnUid` in `src/turnUid.ts`), so every worker of the pool and every
+restart computes the same identity. The project rides the run request as
+`project`, so retro and proposal runs keep their identity even when the turn
+env strips `OTTR_PROJECT`.
+
+Each project gets a turn home, `<OTTR_TURN_HOMES>/<project>` (compose: the
+`turn-homes` volume). Its layout keeps root and the turn uid out of each
+other's way: `home/` is the project uid's writable HOME (mode `0700`),
+`layers/` holds the project's own copies of the pinned agent layer, and
+`ottr/` holds what provisioning installs (tools, python venv, PATH link
+dirs, root-owned, readable by the turn). A turn's HOME is `home/` — with the
+flat identity linked in (`.omp`, git, gh, ssh, claude state) when the stack
+runs without a layer pin — or the project's own layer copy. The copy keeps
+the shared-state links of the pin (`agent.db`, `sessions`, `oauth`, `logs`)
+pointed at the flat shared home and moves the cache links (`.cache`, `.npm`,
+`.bun`, `.local`) into `home/`; the turn creates the cache dirs itself
+through those links, so one project's caches are not another project's
+write surface. Everything root touches in the turn home lives under the
+root-owned shell dirs, and every recursive chown pins its entries with
+`O_PATH|O_NOFOLLOW` file descriptors (`fchownSync`), so a turn cannot
+redirect a root chown by renaming or planting symlinks mid-walk.
+
+The daemon also closes the project's dirs on the shared volumes: the project
+dir under `/workspace` and the whole `/data/<project>` tree get the project
+uid and mode `0700`, and the run's cwd plus the project's git dir
+(`<workspace>/<project>/.git`, never the worktree's planted `.git` pointer)
+become uid-owned, so the turn's git can write. A turn can no longer read
+another project's process env, traverse another project's checkout or task
+data, or plant anything a different project's turn later loads.
+
+What stays shared, on purpose: the credential store (`agent.db`), the pinned
+agent layer tree that alate provisions, and the sticky `.omp/agent`,
+`sessions` and `logs` dirs the pin links back to the flat home (`1733`:
+write-only for others, each uid keeps its own entries private). One stack,
+one store — the spec's residuals list what that leaves open, including the
+mounted-store case: when `agent.db` is a host bind mount, the boot skips its
+mode change and a turn-side store write degrades to the cause omp reports.
+When the build profile is on, the boot also gives the BuildKit client key and
+certs a turn-readable mode, which the root-only image previously withheld. A
+project's own turns share one uid and one home: one project is one trust
+domain. A daemon that does not run as root keeps the legacy identity and
+logs one `turn-uid: off` line at boot. Any identity step that fails fails
+the run, so a run never falls back to a root turn.
+
+The server's own git (merge, release, review) runs as root inside the
+uid-owned worktrees, so the board gitconfig that the entry script seeds
+carries `[safe] directory = *`, added idempotently on every boot. Host-side
+tools see the turn uid numbers on the volume files; backups run on the
+server as root and stay unaffected.
+
+Spec: [docs/specs/worker-turn-uid-isolation.md](specs/worker-turn-uid-isolation.md).
+
 ## Env settings
 
 - Server: `OTTR_WORKER_URLS` (comma-separated, e.g.
@@ -792,6 +855,11 @@ real podman.
   value from the host shell or the compose env file and passes it to the
   server only; workers never use it. Refer to the "GitHub host" row in
   [docs/configuration.md](configuration.md).
+- Worker: `OTTR_TURN_HOMES` (default `/turn-homes`) is the root of the
+  per-project turn homes ("Turn identity" above). Compose mounts the
+  `turn-homes` volume there, so the per-project tool, venv and cache installs
+  survive a worker recreation; the daemon creates the dir itself when no
+  volume is mounted.
 - Unset `OTTR_WORKER_URLS` = local spawn on the server host (the default;
   `runner.startRun` stays the reference implementation). When the variable is
   set, a work turn never runs on the server: if a worker is down or answers

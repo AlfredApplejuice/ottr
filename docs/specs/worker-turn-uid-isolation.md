@@ -1,0 +1,260 @@
+# Worker turn uid isolation: one project, one uid, one turn home
+
+Status: accepted (OTTR-994).
+
+## Problem
+
+On the classic compose pool every turn of every project ran as the worker
+daemon's own root uid. All turns shared the container, the pid namespace, the
+shared home volume (`home:/root`), `/workspace` and `/data`. `runChildEnv`
+gives each turn its project's Settings env values and, for lent providers,
+the provider access token. Round-robin dispatch mixes projects in one
+container.
+
+A turn of project A could therefore read `/proc/<pid>/environ` and reopen
+`/proc/<pid>/fd/1` of a running turn of project B, and could plant files into
+the shared home that a later turn of project B loads. The plant vector via
+tools link dirs is closed (OTTR-953); the same-uid process and shared-home
+surface stayed open. ADR 0009 records the sharing as the classic-pool
+limitation that microVM mode removes; this spec shrinks it for deployments
+that stay on the classic pool.
+
+## Design
+
+The worker daemon drops each classic turn to a per-project identity. Project
+names map to uid/gid pairs deterministically, so every worker of the pool and
+every restart computes the same identity for a project. Round-robin dispatch
+stays unchanged.
+
+### Identity
+
+- `projectTurnUid(name)`: first 8 bytes of the SHA-256 of the name, mapped
+  into `[65536, 65536 + 2^24)`. `gid` equals `uid` (user-private group
+  convention). The range starts above `nobody` (65534) so no fixed account
+  collides; files on the volumes show these numbers on the host.
+- The daemon keeps a name-to-uid map for the container's lifetime. When two
+  different names map to one uid, the run logs an error line: those two
+  projects share a trust boundary until one is renamed. The 2^24 space makes
+  a collision unlikely (about 0.003% at 100 projects).
+
+### Soundness rule: root never touches a uid-mutable path
+
+Everything the daemon (root) does below the turn homes stays out of reach of
+the turn uid by construction:
+
+- The project level `<root>/<project>` is a root-owned shell holding three
+  fixed dirs: `home/` (the only uid-owned, uid-writable subtree, mode 0700),
+  `layers/` (root-owned per-project layer copies) and `ottr/` (root-owned
+  provisioning target for tools, venv and PATH link dirs). The uid can never
+  create, rename or symlink-swap an entry the daemon then chowns, copies or
+  follows: a rename would need write permission on the root-owned parent.
+- Recursive chowns pin every entry with an `O_PATH|O_NOFOLLOW` fd and chown
+  the inode through it (`fchownSync`, the fchownat equivalent), so a
+  same-uid rename during the walk cannot redirect the chown outside the
+  tree. A symlink entry is lchowned (the link itself), never its target, and
+  the walk never descends through it.
+- The daemon creates no file below the uid-owned `home` after handoff. The
+  per-project cache dirs the layer copy's links name (`<home>/.cache` and
+  friends) the turn creates itself, through the link, as its own uid.
+- The pinned layer copy is materialized into a root-owned temp dir beside
+  the final name and moved in with one atomic rename, so a half-written or
+  attacker-shaped copy can never appear under the final path. The final dir
+  is uid-writable in content but its directory entry stays root-owned.
+
+### Per-project turn home
+
+- Root of the turn homes: `OTTR_TURN_HOMES`, default `/turn-homes`. Compose
+  mounts the new `turn-homes` volume there so per-project caches survive a
+  worker recreation; the daemon creates the dir itself when the volume is
+  absent, so the feature works without a mount.
+- Provisioning installs into `<root>/<project>/ottr`: tools, the python venv
+  and the PATH link dirs. They stay root-owned and world-readable; a turn
+  reads and executes them and never writes them (its ad-hoc installs go to
+  its own home). Apt packages stay global (root-only install).
+- When the request env carries no agent-layer pin, the spawn's `HOME` is
+  `<root>/<project>/home`, and the daemon links the flat identity into it:
+  `.omp` (config, agent dir, store, plugins, logs) always, plus
+  `.gitconfig`, `.config`, `.ssh` and `.claude` when the flat home has them.
+  Root creates a link only when the entry is missing; an entry a turn
+  planted stays, and a planted link only redirects the turn's own reads.
+
+### Pinned agent layer
+
+The pin (`src/layers.ts`) resolves the shared home's `current` layer and puts
+`HOME=<layer dir>` into the request env. One layer serves every project of
+the stack, so the layer dir itself cannot be owned by one project's uid.
+Instead the daemon materializes a per-project copy:
+
+- At `/run`, when the request env's `HOME` resolves to
+  `<shared home>/.alate/layers/<id>` (same shape check as `pinTarget`), the
+  daemon copies the layer to `<turn home>/layers/<id>` as above. The copy
+  keeps the shared-state links of the pin (`agent.db`, `sessions`, `oauth`,
+  `logs`) pointed at their flat shared-home targets.
+- The per-project cache links (`.cache`, `.npm`, `.bun`, `.local`) are
+  retargeted into `<turn home>/home/<name>` when they exist as links into
+  the shared home. Caches therefore stop being a cross-project plant and
+  write surface, and the turn's ad-hoc `pip --user` flow (target
+  `$HOME/.local`) keeps working under the project uid.
+- The copy is chowned recursively to the project uid (fd-pinned, symlinks
+  via lchown) and gets mode `0700` on its top dir. The request env's `HOME`
+  and `PI_CODING_AGENT_DIR` are rewritten to the copy.
+- A pinned layer that vanished between dispatch and `/run` fails the run
+  with a clear error. A `HOME` that does not resolve inside the layers tree
+  is treated as unpinned (planted-pointer refuse, as `pinTarget` does).
+- Copies whose source layer alate deleted, and temp dirs older than a day,
+  are pruned on the next copy for that project; the currently pinned id is
+  never pruned.
+
+### Project on the request
+
+The run's project rides the `/run` request as `project`, set by the board on
+every dispatch from the run's project store. The turn env strips
+`OTTR_PROJECT` for retro and proposal runs; the request field keeps their
+per-project identity. A request with neither `project` nor `OTTR_PROJECT`
+(the direct-API case) keeps the legacy identity and is a documented
+exposure, not a silent downgrade of a board dispatch.
+
+### Workspace and task data
+
+- Before the spawn, the daemon chowns the run's cwd tree and the project's
+  git dir (`<workspaceRoot>/<project>/.git`, the board's own layout) to the
+  project uid, so git writes (index, objects, worktree files) work under the
+  uid. The project dir under the workspace root gets the project uid and
+  mode `0700`, so a turn of another project cannot traverse into this
+  project's checkout or worktrees. The daemon never follows the worktree's
+  planted `.git` pointer for the chown: it derives the git dir from the
+  board layout, and a cwd outside the workspace root, or a project without a
+  git dir, fails the run (fail closed).
+- At boot, the daemon walks `/workspace` and `/data` (the compose mount
+  points) and gives every project dir the project uid and mode `0700`. Per
+  run, `/data/<project>` is chowned as a whole tree, so the turn's session
+  writes (`/data/<project>/sessions`) succeed beside the files the server
+  wrote as root. The server keeps its root access to both volumes.
+
+### Shared home
+
+The flat shared home stays the stack's credential store and layer tree. The
+daemon prepares it once per boot, root-only:
+
+- `chmod 0711` on the shared home: turn uids can traverse to the flat link
+  targets but cannot list or create entries there.
+- `.omp/agent` becomes sticky `1777` (sqlite creates its journal and wal
+  beside the store), and `.omp/agent/sessions` plus `.omp/logs` become
+  sticky `1733`: every uid can create its entries, no uid can list or read
+  another uid's entries by path, and a sticky dir keeps each uid to its own
+  files.
+- `.omp/agent/agent.db` gets `a+rw`, but only when it is not a mount point
+  (the daemon reads `/proc/self/mountinfo`). The compose store is a host
+  bind mount, and a chmod through it would change the host file's mode; the
+  boot logs a note instead and leaves the mode to the host. The residual:
+  a turn-side store write (a credential refresh of a non-lent provider)
+  fails on such a deployment with the cause omp reports; lent providers and
+  env keys are unaffected.
+- BuildKit client material (`/certs/buildkit/client/*`, the CA) is root-only
+  `0400` in the image ("workers run as root"); the boot gives the turn uids
+  a read (`0644`), because a build turn needs the client key when the build
+  profile is on. The key authorizes image builds, which every turn of the
+  pool could run before; the container-internal exposure class is unchanged.
+
+### Spawn
+
+`startRun` spawns omp with `uid` and `gid` of the project and the rewritten
+env. The feature is active only when the daemon runs as root; otherwise the
+daemon keeps today's behavior (dev setups). Any identity step that fails
+fails the run with the cause (fail closed): no silent fall-back to a root
+turn.
+
+### Server side
+
+Server-side turns (merge, release, review) run git as root inside worktrees
+that the workers now own by project uid. Git refuses a repo owned by another
+user ("dubious ownership"). The entry script's board gitconfig
+(`GIT_CONFIG_GLOBAL`, server-only env) gains `[safe] directory = *`,
+idempotently: `git config --file` adds the line on every boot, so existing
+deployments get it on their next recreate. The server already reads
+worker-writable trees; this restores its own git access. Worker turns match
+their repo's owner and need nothing.
+
+## Error cases
+
+- Daemon not root: identity steps are skipped, one boot log line says so, and
+  turns run exactly as today.
+- Turn-home root not creatable or not writable: the run fails with the cause.
+- Layer copy source missing: the run fails with the layer id in the message.
+- Chown or copy failure: the run fails with the cause; the temp copy is
+  removed on the next run's stale sweep.
+- A run cwd outside the workspace root, or a project dir without a git dir:
+  the run fails with the cause.
+- Uid collision between two project names: logged per run; both projects
+  share a trust boundary until one is renamed.
+
+## Acceptance checks
+
+- `projectTurnUid` is deterministic and in range; `gid === uid`; distinct
+  names hash to distinct values for a fixed example set.
+- The env rewrite swaps `HOME`/`PI_CODING_AGENT_DIR` to the per-project
+  layer copy, retargets the cache links without creating the cache dirs, and
+  sets `HOME` to the turn home (with the flat `.omp` link) when no pin is
+  present. Property test: for arbitrary names and homes the mapping is in
+  range and deterministic; the rewrite is a no-op on an env without a pinned
+  `HOME`.
+- A spawn under the feature runs with the project uid (observable with `id
+  -u`), and a process of project A's uid cannot read `/proc/<pid>/environ` of
+  a process of project B's uid (live smoke).
+- After `prepareRunWorkspace`, the cwd, the project git dir and the project
+  top dir are owned by the project uid with mode `0700`; a symlink planted
+  in the tree is lchowned and its target is untouched; a cwd outside the
+  workspace root fails the run.
+- The turn home shell is root-owned; the layer copy reuses an existing final
+  dir and prunes copies of deleted layers.
+- `bun run check` and `bun test` pass.
+
+## Alternatives considered
+
+- One container per turn (the microVM or a per-turn compose service): the
+  ADR 0009 route, strongest isolation, needs KVM or a second orchestrator.
+  Out of scope here; this spec only shrinks the classic pool's surface.
+- Per-project mount namespace via `unshare -m`: needs `CAP_SYS_ADMIN`, which
+  the compose worker deliberately does not hold.
+- Group-based separation (per-project gid, shared root uid): leaves the
+  same-uid procfs read open, which is the claimed vector.
+- chmod hardening of the shared home without uids: root turns read and write
+  everything regardless of file modes; no boundary.
+- A path-based recursive chown (`chownSync` after `lstat`, or `chown -R`):
+  a same-uid rename or symlink swap between the walk's read and the chown
+  could redirect a root chown to a file outside the tree. Rejected for the
+  fd-pinned walk above.
+
+## Risks
+
+- `chownTree` is one `open`/`fchown`/`close` per file, and the copy, chown
+  and provision steps run synchronously in the daemon's fetch handler: a
+  large checkout or a fresh layer copy blocks the other live streams for
+  seconds. Bounded, per run, and visible on the card's dispatch time; an
+  async refactor is future work.
+- Host-side tooling sees uid numbers on volume files; backups run as root on
+  the server and are unaffected.
+- The credential store stays one shared file per stack; a turn can still
+  read (and, where the store is not a host mount, also write) `agent.db`.
+  This matches today's exposure for root turns and is the documented
+  classic-pool residual until microVM mode.
+- The oauth dir is a read-only host mount; host file modes may deny reads to
+  non-root uids. Provider auth in turns rides lent tokens, store rows or
+  Settings env keys; a provider that needs the oauth cache mid-turn would
+  fail with a clear provider error.
+- A same-uid turn of the SAME project can still read its sibling's env: one
+  project is one trust domain, by definition here.
+- `/tmp` stays shared (sticky); scratch files keep their creator's uid.
+- The cache dirs inside a turn home are created by the turn through the
+  layer copy's links; a tool that writes a cache file without creating the
+  dir first would need the dir seeded (none is known today).
+
+## Non-goals
+
+- No network isolation between turns (separate card).
+- No change to the VM runner path: the guest already drops to `nobody`.
+- No per-turn containers, no KVM requirement, no new orchestrator.
+- No change to the board home (`board-config`) boundary or to the lists
+  isolation of OTTR-953.
+- No credential store split per project.
+- No async (off-event-loop) form of the identity steps.

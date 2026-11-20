@@ -49,11 +49,19 @@ x-worker: &worker
     # rename (docs/specs/agent-layer-switch.md). A turn pins the layer it started with:
     # its HOME and agent dir resolve once at spawn and stay there for the run's life.
     # Shared state (agent.db, oauth, logs, caches, git/gh config) stays at its flat path
-    # and is linked into each layer. The home is shared with the board's home, so it is
-    # worker-plantable by design; the board pins its git/gh config and its own omp agent
-    # dir to the server-only board-config volume instead (R5-1, see the server service
-    # env) and never copies from this home.
+    # and is linked into each layer. Since OTTR-994 a turn no longer runs as root with
+    # this home as HOME: it runs as its project's own uid with HOME at
+    # /turn-homes/<project> or that project's copy of the pinned layer, so a project's
+    # turn can plant only what its own project's turns later load (R5-1, see the server
+    # env). The board pins its git/gh config and its own omp agent dir to the
+    # server-only board-config volume and never copies from this home.
     - home:/root
+    # OTTR-994 per-project turn homes: a turn runs as its project's own uid with
+    # HOME at /turn-homes/<project> (or its per-project layer copy under it), and
+    # the daemon provisions the project's tools, venv and caches there
+    # (docs/specs/worker-turn-uid-isolation.md). One dir per project, owned by the
+    # project's turn uid.
+    - turn-homes:/turn-homes
     # Credentials stay on the host; the named home volume holds writable
     # state and the oauth dir is mounted read-only over it.
     - ${OTTR_OAUTH_DIR:?set OTTR_OAUTH_DIR to the host omp oauth dir}:/root/.omp/oauth:ro
@@ -607,6 +615,10 @@ networks:
 volumes:
   workspace:
   home:
+  # Per-project turn homes (OTTR-994): one dir per project, owned by the project's
+  # turn uid. Persists the per-project tool, venv and cache installs across worker
+  # recreations; the daemon creates the dir itself when the mount is absent.
+  turn-homes:
   ottr-state:
   ottr-backup:
   ottr-data:

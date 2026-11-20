@@ -6097,6 +6097,8 @@ export function createTurnLoop(
 			},
 			stripBoard: idn.retroCard,
 			stripGithubToken: idn.scout,
+			// OTTR-994: the identity key survives stripBoard on the worker request.
+			project: store.name,
 			...turnRunTools(idn),
 			dataRoot: store.dataRoot,
 			logPath: await store.logPath(id),
@@ -10540,6 +10542,8 @@ export function createTurnLoop(
 			config: join(dirname(ops.extensionPath), "check.yml"),
 			maxTime: "1800",
 			dataRoot: st.store.dataRoot,
+			// OTTR-994: the check run keeps its project's turn identity on a worker.
+			project: st.store.name,
 			// The check's transcript lands in the card's log, next to the run it checks.
 			logPath: await st.store.logPath(st.id),
 			onLog: () => ops.notifyLog(st.name, st.id),

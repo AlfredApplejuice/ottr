@@ -1715,6 +1715,10 @@ interface StartOptions {
 	sessionName?: string | null;
 	/** Set: the run's session can file cards via its create_task tool; injected as OTTR_BOARD_URL/OTTR_BOARD_TOKEN/OTTR_PROJECT/OTTR_TASK_ID. */
 	board?: BoardEnv | null;
+	/** The run's project name (OTTR-994): rides the worker request even when
+	 * `stripBoard` removes OTTR_PROJECT from the env, so retro and proposal
+	 * runs keep their per-project turn identity on the worker. */
+	project?: string | null;
 	logPath: string;
 	/** Anchor for the log write (src/confine.ts). */
 	dataRoot: string;
@@ -2393,6 +2397,13 @@ function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
 			cwd: o.cwd,
 			stdin: o.prompt,
 			env,
+			// OTTR-994: the identity key rides the request itself, so a stripBoard
+			// run (retro, proposal) keeps its project's turn uid and turn home.
+			project:
+				o.project ??
+				(o.board === null || o.board === undefined
+					? undefined
+					: o.board.project),
 			githubReadEnv: withoutDatabaseUrl(o.githubReadEnv),
 			...(project === undefined ? {} : { lists: workerTurnLists(project) }),
 		},

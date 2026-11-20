@@ -30,6 +30,16 @@ import {
 	parseToolsJson,
 	type ToolEntry,
 } from "./tools.ts";
+import {
+	applyTurnHomeEnv,
+	closeProjectDir,
+	prepareRunWorkspace,
+	prepareTurnHome,
+	projectTurnUid,
+	type TurnHome,
+	type TurnIdentity,
+	uidCollisionNote,
+} from "./turnUid.ts";
 import type { RunResult } from "./types.ts";
 import { stripGitAuthEnv, stripProxyCredentials } from "./worktree.ts";
 
@@ -55,6 +65,10 @@ export interface WorkerRequest {
 	cwd: string;
 	stdin: string;
 	env: Record<string, string>;
+	/** The run's project, set by the board on every dispatch (OTTR-994): the turn
+	 * identity key. Present even when the turn env strips OTTR_PROJECT (retro and
+	 * proposal runs), so a project-less run can only be a direct API caller. */
+	project?: string;
 	/** The board's confirmed read-only GitHub token env (docs/specs/turn-read-token.md),
 	 * applied after the strips — the only GitHub token names a turn may hold. */
 	githubReadEnv?: Record<string, string>;
@@ -202,6 +216,18 @@ export function serveWorker(opts: {
 	sweepKill?: typeof process.kill;
 	/** Only for tests: the expiry of /detached entries instead of 24 h. */
 	detachedTtlMs?: number;
+	/** Per-project turn identity (OTTR-994, docs/specs/worker-turn-uid-isolation.md): when set
+	 * (src/worker.ts, root daemons only), every turn with a project drops to its project's
+	 * uid, provisions into its turn home, and runs with a per-project HOME. Tests and
+	 * non-root daemons omit it (or pass null) and keep the legacy identity. */
+	turnUid?: {
+		homesRoot: string;
+		workerHome: string;
+		/** Shared roots whose per-project dir is closed for other projects per run. */
+		dataRoots: readonly string[];
+		/** The workspace mount root: run cwds must live under it (fail closed). */
+		workspaceRoot: string;
+	} | null;
 	/** Only for tests: the sign-ins GET /signins reports instead of reading the worker's own store. */
 	readSignIns?: () => SignIn[];
 	/** Only for tests: the cgroup v2 directory GET /stats and the runs' OOM snapshots
@@ -356,13 +382,16 @@ export function serveWorker(opts: {
 			return handleDetachKill(request);
 		return new Response("not found", { status: 404 });
 	};
-	// The daemon provisions into its own home (the test's when opts.home is set). The
-	// request lists are texts, so no read path can reach for the shared home.
+	// The daemon provisions into the run's turn home (the test's when opts.home is set,
+	// the per-project turn home when turn identity is on). The request lists are texts,
+	// so no read path can reach for the shared home.
 	const workerHome = opts.home ?? homedir();
+	const turnUid = opts.turnUid ?? null;
 	// A failed install or a broken request list ends the run with the error as its stderr
 	// tail (the sentinel), so the client sees the provisioner's failure and no run spawns.
 	const provisionResponse = async (
 		body: WorkerRequest,
+		home: string,
 	): Promise<{ notes: string; pathDir: string } | Response> => {
 		try {
 			return await provisionRun(
@@ -371,7 +400,7 @@ export function serveWorker(opts: {
 				opts.ensurePython ?? buildPythonVenv,
 				opts.buildPath ?? buildToolsPath,
 				parseTurnLists(body.lists),
-				workerHome,
+				home,
 			);
 		} catch (err) {
 			const stderrTail = `${err instanceof Error ? err.message : String(err)}\n`;
@@ -401,11 +430,26 @@ export function serveWorker(opts: {
 		request: Request,
 		body: WorkerRequest,
 	): Promise<{ notes: string; pathDir: string } | Response> => {
-		const project = body.env?.OTTR_PROJECT;
+		const project = body.project ?? body.env?.OTTR_PROJECT;
 		if (typeof project !== "string" || project === "")
 			// No project: no provisioning, and the lists stay ignored (nothing to provision for).
 			return { notes: "", pathDir: "" };
-		const provided = await provisionResponse(body);
+		let turnHome: TurnHome | null = null;
+		if (turnUid) {
+			try {
+				turnHome = prepareTurnHome(
+					turnUid.homesRoot,
+					project,
+					projectTurnUid(project),
+				);
+			} catch (err) {
+				return new Response(`turn-uid: ${String(err)}`, { status: 500 });
+			}
+		}
+		const provided = await provisionResponse(
+			body,
+			turnHome === null ? workerHome : turnHome.provision,
+		);
 		if (provided instanceof Response) return provided;
 		// The client gave up during the install: spawning now would orphan the run.
 		if (request.signal.aborted) return new Response("aborted", { status: 499 });
@@ -429,6 +473,34 @@ export function serveWorker(opts: {
 		pathDir: string,
 	): Promise<Response> => {
 		const env = runChildEnv(body.env, body.githubReadEnv, pathDir);
+		// Per-project turn identity (OTTR-994): the run drops to its project's uid, its
+		// HOME moves to the per-project turn home or layer copy, its project dirs under
+		// the shared roots close for other projects, and its cwd plus git common dir
+		// become writable by the uid. Any failure here fails the run: never a silent
+		// fall-back to a root turn.
+		let ids: TurnIdentity | null = null;
+		let runNotes = notes;
+		if (turnUid) {
+			const project = body.project ?? body.env?.OTTR_PROJECT;
+			if (typeof project === "string" && project !== "") {
+				try {
+					ids = projectTurnUid(project);
+					const collision = uidCollisionNote(project, ids);
+					if (collision !== null) runNotes += `${collision}\n`;
+					const turnHome = prepareTurnHome(turnUid.homesRoot, project, ids);
+					applyTurnHomeEnv(env, {
+						workerHome: turnUid.workerHome,
+						turnHome,
+						ids,
+					});
+					for (const root of turnUid.dataRoots)
+						closeProjectDir(join(root, project), ids);
+					prepareRunWorkspace(body.cwd, ids, turnUid.workspaceRoot);
+				} catch (err) {
+					return new Response(`turn-uid: ${String(err)}`, { status: 500 });
+				}
+			}
+		}
 		// The provision guard's untracked scan compares against the rules dir as it
 		// stood before omp started (docs/specs/turn-provision-guard.md).
 		const rulesAtStart = opts.rulesAtStart ? opts.rulesAtStart() : undefined;
@@ -454,6 +526,7 @@ export function serveWorker(opts: {
 				env,
 				stdio: ["pipe", "pipe", "pipe"],
 				windowsHide: true,
+				...(ids ? { uid: ids.uid, gid: ids.gid } : {}),
 			});
 		} catch (err) {
 			release();
@@ -513,7 +586,7 @@ export function serveWorker(opts: {
 		const stream = openRunStream({
 			child,
 			entry,
-			notes,
+			notes: runNotes,
 			stdin: body.stdin,
 			state,
 			killTree,

@@ -77,12 +77,21 @@ fi
 # Ottr identity (the one src/app.ts commits with). gh starts empty: its config can name
 # commands (browser, pager). The omp agent dir only gets content from the trusted seed,
 # the Alate one-off service `board-seed` (docs/WORKERS.md).
-if [ -n "$GIT_CONFIG_GLOBAL" ] && [ ! -e "$GIT_CONFIG_GLOBAL" ]; then
-	mkdir -p "$(dirname "$GIT_CONFIG_GLOBAL")"
-	printf '[user]\n\tname = Ottr\n\temail = ottr@localhost\n' > "$GIT_CONFIG_GLOBAL"
-	if [ -f "$HOME/.gitconfig" ]; then
-		echo "ottr-entry: R5-1: refused to seed $GIT_CONFIG_GLOBAL from $HOME/.gitconfig (the shared home is worker-writable); wrote the fixed Ottr identity" >&2
+if [ -n "$GIT_CONFIG_GLOBAL" ]; then
+	if [ ! -e "$GIT_CONFIG_GLOBAL" ]; then
+		mkdir -p "$(dirname "$GIT_CONFIG_GLOBAL")"
+		printf '[user]\n\tname = Ottr\n\temail = ottr@localhost\n' > "$GIT_CONFIG_GLOBAL"
+		if [ -f "$HOME/.gitconfig" ]; then
+			echo "ottr-entry: R5-1: refused to seed $GIT_CONFIG_GLOBAL from $HOME/.gitconfig (the shared home is worker-writable); wrote the fixed Ottr identity" >&2
+		fi
 	fi
+	# OTTR-994: worker turns own their project's checkout and worktrees by the
+	# project's turn uid, and the server's own git runs as root inside them, so
+	# the board gitconfig allows git to operate on other-uid repos. Idempotent:
+	# a gitconfig from an earlier boot gets the line on this boot too. The
+	# workers strip this pointer from their turns; a worker turn's repo matches
+	# its own uid and needs nothing.
+	git config --file "$GIT_CONFIG_GLOBAL" safe.directory '*'
 fi
 if [ -n "$GH_CONFIG_DIR" ]; then
 	mkdir -p "$GH_CONFIG_DIR"

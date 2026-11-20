@@ -22,7 +22,11 @@ oauth dir, mnemopi store) and `/data` (sessions, logs, handoffs). The R5-1
 comments in `docker-compose.yml` and docs/WORKERS.md, Residuals, list what that
 leaves open: a turn can write a main checkout's `.git/config`, plant files in the
 shared home that later turns load, read the provider credentials of the shared
-home, and see every other project's checkout. A worker keeps its state between
+home, and see every other project's checkout. Since OTTR-994 the classic pool
+drops each turn to its project's own uid with its own turn home
+(docs/specs/worker-turn-uid-isolation.md): the cross-project env read and the
+cross-project plant are closed, and the shared credential store stays the
+accepted residual that this ADR's VM mode removes. A worker keeps its state between
 turns, and the pool size is the number of compose blocks. CPU and RAM limits are
 per container, not per turn; disk has no limit.
 
