@@ -181,12 +181,33 @@ const state = {
 	deadSignIns: [],
 } as unknown as StateResponse;
 
+// --- per-test overrides -------------------------------------------------------
+// The shared answers above stay fixed; a test swaps the frame the poll reads or
+// serves its own fetch answers (older Done pages, the single-card route, failures).
+// Every test clears what it set in its finally block.
+let stateOverride: StateResponse | null = null;
+let fetchTest: ((url: string) => Response | Promise<Response> | null) | null =
+	null;
+const setFrame = (s: StateResponse | null): void => {
+	stateOverride = s;
+};
+const setFetch = (
+	fn: ((url: string) => Response | Promise<Response> | null) | null,
+): void => {
+	fetchTest = fn;
+};
+
 const fetchMock = (async (input: RequestInfo | URL) => {
 	const url = String(input);
+	// A test's answers win; null falls through to the shared answers.
+	if (fetchTest !== null) {
+		const served = fetchTest(url);
+		if (served !== null) return served;
+	}
 	let body: unknown = {};
 	if (url === "/api/boot")
 		body = { onboarding: false, version: "vtest", live: false };
-	else if (url === "/api/state") body = state;
+	else if (url === "/api/state") body = stateOverride ?? state;
 	else if (url === "/api/update") body = { behind: 0, commits: [] };
 	else if (url === "/api/provisioning")
 		body = {
@@ -1916,5 +1937,242 @@ test("five card references clamp to three links and expand in place", async () =
 	} finally {
 		restore();
 		await unmountApp();
+	}
+});
+
+// --- OTTR-1136: cards outside the state frame ---------------------------------
+
+/** One JSON answer for the per-test fetch override. */
+const jsonRes = (body: unknown, status = 200): Response =>
+	new Response(JSON.stringify(body), {
+		status,
+		headers: { "Content-Type": "application/json" },
+	});
+
+/** The wide TaskView shape the drawer's detail fetch reads, built over a slim row. */
+const wideOf = (row: TaskCard): unknown => ({
+	...row,
+	prompt: "work",
+	summary: null,
+	gate: null,
+	workCheckReport: null,
+	turns: [],
+	details: null,
+	report: null,
+	diffFiles: null,
+	worktreeFiles: [],
+	workCheckLog: [],
+});
+
+/** A Done window the state frame carries (the newest DONE_PAGE cards) with a
+ * doneTotal that names five more, so the lane offers "Show more". */
+const doneWindow = (): {
+	win: StateResponse;
+	alpha: ProjectView;
+} => {
+	const alpha = { ...projects[0], doneTotal: 25 } as ProjectView;
+	const held = Array.from({ length: 20 }, (_, j) =>
+		card({
+			id: `D-${j}`,
+			title: `Held ${j}`,
+			sessionTitle: `Held ${j}`,
+			stage: "done",
+			state: "idle",
+			doneAt: 2000 - j,
+			revision: 1,
+		}),
+	);
+	const win = {
+		...state,
+		projects: [alpha, projects[1]],
+		tasks: held,
+	} as unknown as StateResponse;
+	return { win, alpha };
+};
+
+/** A fetched Done page card that sits outside the state frame. */
+const oldCard = (over: Partial<TaskCard>): TaskCard =>
+	card({
+		title: "Older nine",
+		sessionTitle: "Older nine",
+		id: "OLD-9",
+		project: "alpha",
+		stage: "done",
+		state: "idle",
+		doneAt: 90,
+		revision: 1,
+		...over,
+	});
+
+test("a Show more card outside the state window opens in the drawer", async () => {
+	const { win } = doneWindow();
+	const page2 = [oldCard({})];
+	setFetch((url) => {
+		if (url === "/api/projects/alpha/done?page=2")
+			return jsonRes({ tasks: page2, total: 21 });
+		if (url === "/api/projects/alpha/tasks/OLD-9")
+			return jsonRes(wideOf(page2[0]!));
+		return null;
+	});
+	setFrame(win);
+	await mountAt("/projects/alpha");
+	try {
+		const more = document.querySelector<HTMLButtonElement>("button.lane-more");
+		expect(more).not.toBeNull();
+		await click(more!);
+		await waitFor(() => cardEl("OLD-9") !== null);
+		const link = cardEl("OLD-9")!.querySelector("a.card-open");
+		expect(link).not.toBeNull();
+		await click(link!);
+		await waitFor(drawerOpen);
+		expect(drawer()?.querySelector("h2")?.textContent).toBe("Older nine");
+	} finally {
+		await unmountApp();
+		setFetch(null);
+		setFrame(null);
+	}
+});
+
+test("a deep link to a done card outside the window opens it after the fetch", async () => {
+	const deep = oldCard({
+		id: "DEEP-1",
+		title: "Deep old card",
+		sessionTitle: "Deep old card",
+		doneAt: 5,
+	});
+	let gated = false;
+	const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+	setFetch((url) => {
+		if (url === "/api/projects/alpha/tasks/DEEP-1") {
+			// The first fetch waits, so the drawer's loading state renders.
+			if (gated) return jsonRes(wideOf(deep));
+			gated = true;
+			return gate.then(() => jsonRes(wideOf(deep)));
+		}
+		return null;
+	});
+	await mountAt("/projects/alpha/tasks/DEEP-1");
+	try {
+		await waitFor(drawerOpen);
+		expect(
+			drawer()?.querySelector('[aria-label="Loading the card"]'),
+		).not.toBeNull();
+		release();
+		await waitFor(
+			() => drawer()?.querySelector("h2")?.textContent === "Deep old card",
+		);
+		expect(drawerOpen()).toBe(true);
+	} finally {
+		release();
+		await unmountApp();
+		setFetch(null);
+	}
+});
+
+test("an unknown id shows not-found and a failed fetch offers Retry", async () => {
+	let brokenCalls = 0;
+	const healed = oldCard({
+		id: "BROKEN-7",
+		title: "Broken card",
+		sessionTitle: "Broken card",
+	});
+	setFetch((url) => {
+		if (url === "/api/projects/alpha/tasks/GONE-1")
+			return jsonRes({ error: "unknown task" }, 404);
+		if (url === "/api/projects/alpha/tasks/BROKEN-7") {
+			brokenCalls++;
+			return brokenCalls === 1
+				? jsonRes({ error: "no" }, 500)
+				: jsonRes(wideOf(healed));
+		}
+		return null;
+	});
+	await mountAt("/projects/alpha/tasks/GONE-1");
+	try {
+		await waitFor(
+			() =>
+				document.body.textContent?.includes("Card not found: GONE-1") === true,
+		);
+		const close = [...document.querySelectorAll("dialog.drawer button")].find(
+			(b) => b.textContent?.trim() === "Close",
+		);
+		expect(close).toBeDefined();
+		await click(close!);
+		await waitFor(() => !drawerOpen());
+
+		// A failed fetch shows the retry shell; the retry then opens the card.
+		await unmountApp();
+		await mountAt("/projects/alpha/tasks/BROKEN-7");
+		await waitFor(
+			() =>
+				document.body.textContent?.includes("Loading the card failed.") ===
+				true,
+		);
+		const retry = [...document.querySelectorAll("dialog.drawer button")].find(
+			(b) => b.textContent?.trim() === "Retry",
+		);
+		expect(retry).toBeDefined();
+		await click(retry!);
+		await waitFor(
+			() => drawer()?.querySelector("h2")?.textContent === "Broken card",
+		);
+		expect(drawerOpen()).toBe(true);
+		expect(brokenCalls).toBe(2);
+	} finally {
+		await unmountApp();
+		setFetch(null);
+	}
+});
+
+test("an open older card stays open across frames and follows changes", async () => {
+	const { win } = doneWindow();
+	const v1 = oldCard({});
+	const v2 = oldCard({
+		title: "Older nine, revised",
+		sessionTitle: "Older nine, revised",
+		revision: 2,
+	});
+	let frame2 = false;
+	setFetch((url) => {
+		if (url === "/api/projects/alpha/done?page=2")
+			return jsonRes({ tasks: [v1], total: 21 });
+		if (url === "/api/projects/alpha/tasks/OLD-9")
+			return jsonRes(wideOf(frame2 ? v2 : v1));
+		return null;
+	});
+	setFrame(win);
+	await mountAt("/projects/alpha");
+	try {
+		const more = document.querySelector<HTMLButtonElement>("button.lane-more");
+		await click(more!);
+		await waitFor(() => cardEl("OLD-9") !== null);
+		const link = cardEl("OLD-9")!.querySelector("a.card-open");
+		await click(link!);
+		await waitFor(
+			() => drawer()?.querySelector("h2")?.textContent === "Older nine",
+		);
+		// A new frame that still lacks the card must not close the drawer.
+		frame2 = true;
+		const moved = { ...win.tasks[0]!, title: "Held 0 v2" };
+		setFrame({
+			...win,
+			tasks: [moved, ...win.tasks.slice(1)],
+		} as unknown as StateResponse);
+		refreshState();
+		await waitFor(
+			() => document.body.textContent?.includes("Held 0 v2") === true,
+		);
+		// The frame still lacks the card, but the drawer stays open.
+		expect(drawerOpen()).toBe(true);
+		// The frame refetch of the open row carries the revision bump into the drawer.
+		await waitFor(
+			() =>
+				drawer()?.querySelector("h2")?.textContent === "Older nine, revised",
+		);
+		expect(drawerOpen()).toBe(true);
+	} finally {
+		await unmountApp();
+		setFetch(null);
+		setFrame(null);
 	}
 });

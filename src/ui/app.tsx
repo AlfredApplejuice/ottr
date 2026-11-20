@@ -15638,6 +15638,13 @@ function taskCardFromDetail(detail: TaskView): TaskCard {
 	return { ...card, answered: answeredCard(turns) };
 }
 
+/** The drawer shell's state while the selection resolves outside the frame (OTTR-1136):
+ * the fetch runs, the server has no such card, or the fetch failed. */
+type PendingDrawerState = {
+	id: string;
+	status: "loading" | "missing" | "error";
+};
+
 /** Server-frame notice fields the board's inbox and banner read; defaults while the
  * first frame is still loading. */
 function appServerNotices(state: StateResponse | null): {
@@ -16835,6 +16842,10 @@ function AppDrawer(p: {
 	selected: TaskCard | null;
 	selectedProject: ProjectView | null;
 	sheet: { task: TaskCard; project: ProjectView } | null;
+	/** OTTR-1136: the drawer shell state while the selection resolves outside the frame. */
+	pendingDrawer: PendingDrawerState | null;
+	/** Re-arms the pending card fetch (the Retry button). */
+	retryPending: () => void;
 	state: StateResponse | null;
 	projects: ProjectView[];
 	tasks: TaskCard[];
@@ -16855,6 +16866,7 @@ function AppDrawer(p: {
 		selected,
 		selectedProject,
 		sheet,
+		pendingDrawer,
 		state,
 		projects,
 		tasks,
@@ -16869,12 +16881,26 @@ function AppDrawer(p: {
 		markUnread,
 		closeDrawer,
 		seenDoneSince,
+		retryPending,
 	} = p;
 	// While open, the drawer renders the live selection; on a close (X, Esc, backdrop,
 	// Back, mark-unread) it freezes into `sheet` so the dialog can animate out mounted.
 	const drawerTask = selected ?? sheet?.task ?? null;
 	const drawerProject = selectedProject ?? sheet?.project ?? null;
-	if (drawerTask === null || drawerProject === null) return null;
+	if (drawerTask === null) {
+		// OTTR-1136: a selection the frame lacks shows its fetch state, so a click on
+		// a Show-more card or a pasted URL never lands on nothing.
+		if (pendingDrawer !== null)
+			return (
+				<DrawerPending
+					pending={pendingDrawer}
+					onRetry={retryPending}
+					onClose={closeDrawer}
+				/>
+			);
+		return null;
+	}
+	if (drawerProject === null) return null;
 	// The drawer's context: the project's cards plus the cross-project links the
 	// lineage rail resolves (OTTR-787) — the drawer card's foreign parent, that
 	// parent's own source (a retro's source card), the drawer card's foreign
@@ -16952,6 +16978,51 @@ function AppDrawer(p: {
 				closeDrawer(); // close the drawer so the board shows the follow-up fly in
 			}}
 		/>
+	);
+}
+
+/** OTTR-1136: the drawer shell while its row resolves outside the state frame — the
+ * loading skeleton, a not-found line with Close, or a failed fetch with Retry. The
+ * same `dialog.drawer` the row drawer renders, so the shell opens and closes alike. */
+function DrawerPending(p: {
+	pending: PendingDrawerState;
+	onRetry: () => void;
+	onClose: () => void;
+}) {
+	return (
+		<Modal open onClose={p.onClose} label="Card" className="drawer">
+			<div className="drawer-body drawer-body-pending">
+				{p.pending.status === "loading" ? (
+					<Skeleton shape="list" rows={3} label="Loading the card" />
+				) : p.pending.status === "missing" ? (
+					<div className="drawer-pending" role="status">
+						<p>Card not found: {p.pending.id}</p>
+						<button type="button" className="ghost" onClick={p.onClose}>
+							Close
+						</button>
+					</div>
+				) : (
+					<div className="drawer-pending" role="alert">
+						<p>
+							<Mark kind="crit" /> Loading the card failed.
+						</p>
+						<div className="drawer-pending-actions">
+							<BusyButton
+								run={async () => {
+									p.onRetry();
+									return true;
+								}}
+							>
+								Retry
+							</BusyButton>
+							<button type="button" className="ghost" onClick={p.onClose}>
+								Close
+							</button>
+						</div>
+					</div>
+				)}
+			</div>
+		</Modal>
 	);
 }
 
@@ -17136,6 +17207,11 @@ export function App() {
 		"state" | "detail" | null
 	>(null);
 	const [fallbackAttempt, setFallbackAttempt] = useState(0);
+	// OTTR-1136: the drawer shell's state for an off-frame selection while the
+	// fallback fetch runs, after a not-found, or after a failed fetch.
+	const [fallbackStatus, setFallbackStatus] = useState<
+		"idle" | "loading" | "missing" | "error"
+	>("idle");
 	const [error, setError] = useState<string | null>(null);
 	/** Cards with something to read (answers, PR reviews) that the user has opened; the unread badge on done cards reads its absence. Starts empty; the server owns the set. */
 	const [seenAnswers, setSeenAnswers] = useState(() => new Set<string>());
@@ -17646,6 +17722,7 @@ export function App() {
 		if (selectedId === null) {
 			setFallbackTask(null);
 			setFallbackTaskSource(null);
+			setFallbackStatus("idle");
 		} else if (selectedStateTask !== undefined) {
 			setFallbackTask(selectedStateTask);
 			setFallbackTaskSource("state");
@@ -17679,6 +17756,8 @@ export function App() {
 		if (requestSelection === null) return;
 		const requestRevision = requestSelection.revision;
 		const url = `/api/projects/${encodeURIComponent(lookupProject)}/tasks/${encodeURIComponent(selectedId)}`;
+		// OTTR-1136: the shell shows the fetch, not nothing.
+		setFallbackStatus("loading");
 		void readDetail(url)
 			.then((detail) => {
 				if (!alive) return;
@@ -17693,10 +17772,14 @@ export function App() {
 					return;
 				setFallbackTask(taskCardFromDetail(detail));
 				setFallbackTaskSource("detail");
+				setFallbackStatus("idle");
 			})
 			.catch((e: unknown) => {
 				if (!alive) return;
 				const reason = e instanceof Error ? e.message : String(e);
+				// A 404 names no such card: the shell shows its not-found line.
+				// Any other answer is a failed fetch: the shell offers Retry.
+				setFallbackStatus(reason === "404" ? "missing" : "error");
 				setError(`Task ${selectedId} could not be loaded: ${reason}`);
 			});
 		return () => {
@@ -17711,6 +17794,44 @@ export function App() {
 		fallbackTaskSource,
 		fallbackAttempt,
 	]);
+	// OTTR-1136: the frame cannot carry an off-frame card's changes, so each new
+	// frame refetches the row the drawer holds: a reply or a stage change still
+	// reaches the open drawer. A failure keeps the held row and the next frame
+	// tries again; an identical revision swaps nothing.
+	const refreshInFlight = useRef(false);
+	useEffect(() => {
+		if (selectedId === null || state === null) return;
+		if (lookupProject === null || !fallbackMatches) return;
+		if (fallbackTaskSource !== "detail") return; // the fetch above owns the row
+		if (refreshInFlight.current) return;
+		refreshInFlight.current = true;
+		const requestRevision = latestTaskSelection.current?.revision ?? 0;
+		const url = `/api/projects/${encodeURIComponent(lookupProject)}/tasks/${encodeURIComponent(selectedId)}`;
+		void readDetail(url)
+			.then((detail) => {
+				refreshInFlight.current = false;
+				const currentSelection = latestTaskSelection.current;
+				if (
+					currentSelection === null ||
+					currentSelection.id !== selectedId ||
+					currentSelection.project !== lookupProject ||
+					currentSelection.revision !== requestRevision
+				)
+					return;
+				const next = taskCardFromDetail(detail);
+				setFallbackTask((prev) =>
+					prev !== null && prev.revision === next.revision ? prev : next,
+				);
+			})
+			.catch(() => {
+				// A failed refresh keeps the held row; the next frame tries again.
+				refreshInFlight.current = false;
+			});
+	}, [state, selectedId, lookupProject, fallbackMatches, fallbackTaskSource]);
+	/** OTTR-1136: the shell's Retry re-arms the fallback fetch. */
+	const retryPendingDrawer = useCallback(() => {
+		setFallbackAttempt((attempt) => attempt + 1);
+	}, []);
 
 	// ponytail: a dev tool for the board that develops Ottr itself, so it shows only where a
 	// project tracks ottr-ai/ottr (that project holds the check card). Put it behind a release
@@ -17757,6 +17878,16 @@ export function App() {
 		task: TaskCard;
 		project: ProjectView;
 	} | null>(null);
+	// OTTR-1136: the shell state for a selection the frame lacks: the fallback fetch
+	// runs, the server has no such card, or the fetch failed. The exit sheet wins,
+	// so a closing drawer never flips to a shell mid-animation.
+	const pendingDrawer: PendingDrawerState | null =
+		selectedId !== null &&
+		selected === null &&
+		sheet === null &&
+		fallbackStatus !== "idle"
+			? { id: selectedId, status: fallbackStatus }
+			: null;
 	// While open, the drawer renders the live selection; on a close (X, Esc, backdrop,
 	// Back, mark-unread) it freezes into `sheet` so the dialog can animate out mounted.
 	useEffect(() => {
@@ -18261,6 +18392,8 @@ export function App() {
 				selected={selected}
 				selectedProject={selectedProject}
 				sheet={sheet}
+				pendingDrawer={pendingDrawer}
+				retryPending={retryPendingDrawer}
 				state={state}
 				projects={projects}
 				tasks={drawerContextTasks}
