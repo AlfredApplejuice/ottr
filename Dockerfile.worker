@@ -32,9 +32,9 @@ ARG GITLEAKS_VERSION=8.30.1
 ARG GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
 # GitHub CLI: the board publishes releases and creates repos with it, server-side, with its
 # GitHub token (D6). Host runs 2.103.3. A wrong pin 404s the download (fails the build loudly).
-ARG GH_VERSION=2.103.3
+ARG GH_VERSION=2.104.0
 # sha256 of gh_${GH_VERSION}_linux_amd64.tar.gz from the release's checksums.txt.
-ARG GH_SHA256=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
+ARG GH_SHA256=98cb101ad87dbbd3f6b2f2bfcbd43197ccd07643140121d8a9cfaa91eadbc24e
 # Node.js: npx starts the agent layer's MCP servers (chrome-devtools), and projects run
 # their Node tooling with it (some need >= 24.21.0). Without it, `node` is bun's fallback and
 # npx is missing. A wrong pin 404s the download (fails the build loudly).
@@ -174,7 +174,7 @@ RUN bun install -g --ignore-scripts --minimum-release-age 604800 "agent-browser@
 # TypeScript 7's tsc serves TS/JS (`tsc --lsp`), typescript-language-server serves projects whose
 # own TypeScript is older, pyright serves Python. A wrong pin fails the build loudly.
 ARG TYPESCRIPT_VERSION=7.0.2
-ARG TS_LANGUAGE_SERVER_VERSION=6.0.2
+ARG TS_LANGUAGE_SERVER_VERSION=6.1.0
 ARG PYRIGHT_VERSION=1.1.414
 RUN bun install -g "typescript@${TYPESCRIPT_VERSION}" \
       "typescript-language-server@${TS_LANGUAGE_SERVER_VERSION}" \
