@@ -26,6 +26,7 @@ import {
 	parseForkPage,
 	rangeCommits,
 } from "./forks.ts";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { ProjectStore } from "./store.ts";
 import type { ForkAnalysisResult } from "./types.ts";
 import { git, gitExe, spawnPiped } from "./worktree.ts";
@@ -54,7 +55,7 @@ function run(allArgs: string[], cwd: string, env?: Record<string, string>) {
 	const args =
 		allArgs[allArgs.length - 1] === cwd ? allArgs.slice(0, -1) : allArgs;
 	// spawnPiped (not git()) so fixtures can pin GIT_COMMITTER_DATE for rewrites.
-	const fullEnv: Record<string, string | undefined> = { ...process.env };
+	const fullEnv: Record<string, string | undefined> = { ...fixtureGitEnv() };
 	if (env?.date) fullEnv.GIT_COMMITTER_DATE = env.date;
 	return spawnPiped(
 		[gitExe(), "-c", "user.email=t@t", "-c", "user.name=t", ...args],

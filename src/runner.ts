@@ -24,6 +24,7 @@ import {
 	type IdentProbeEnv,
 	probeGitIdent,
 } from "./gitIdentity.ts";
+import { stripRepoRelocatingEnv } from "./gitRepoEnv.ts";
 import type { TokenUsage } from "./hosted.ts";
 import {
 	acquireLayerUse,
@@ -1595,6 +1596,11 @@ function withoutGitAuth(
 	const out = { ...env };
 	for (const k of Object.keys(out))
 		if (GIT_AUTH_ENV_NAME.test(k)) delete out[k];
+	// OTTR-1162: a session env carrying GIT_DIR (a process launched from a git hook) once
+	// redirected a turn's test run into the board's own repository. A turn's git names its
+	// repos with path arguments; the ambient repo-relocating vars never help and only
+	// redirect. Guests strip the same set (vmGuest toolEnv).
+	stripRepoRelocatingEnv(out);
 	return out;
 }
 
@@ -2064,7 +2070,7 @@ function startLocalRun(s: RunStart): RunHandle {
 	// this server process at session start. Park them out of discovery for the run and
 	// restore them at settle; a park error throws before the spawn (fail-closed), after
 	// unwinding the dirs that did park, so the worktree keeps its committed content.
-	let parked: ParkedDir[] = [];
+	const parked: ParkedDir[] = [];
 	try {
 		parkCustomToolDirs(o.cwd, parked);
 	} catch (err) {

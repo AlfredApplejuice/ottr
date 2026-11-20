@@ -7,6 +7,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import {
 	AGE_MS,
 	CAP_MS,
@@ -338,6 +339,7 @@ describe("fetchReleases", () => {
 function must(cwd: string, ...args: string[]): void {
 	const r = Bun.spawnSync(["git", ...args], {
 		cwd,
+		env: fixtureGitEnv(),
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",

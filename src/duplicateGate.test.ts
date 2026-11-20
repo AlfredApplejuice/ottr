@@ -18,6 +18,7 @@ import {
 	staleDupMatches,
 } from "./duplicateGate.ts";
 import type { SpawnFn } from "./forkAnalysis.ts";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { DUPLICATE_REASON } from "./prompts.ts";
 import { ProjectStore } from "./store.ts";
 import fc from "./test/properties.ts";
@@ -492,7 +493,7 @@ let repo: string;
 
 /** The fixture's own git runner: the fixture never goes through the code under test. */
 const sh = (cwd: string, ...args: string[]): string => {
-	const r = Bun.spawnSync(["git", ...args], { cwd });
+	const r = Bun.spawnSync(["git", ...args], { cwd, env: fixtureGitEnv() });
 	if (r.exitCode !== 0) throw new Error(r.stderr.toString());
 	return r.stdout.toString().trim();
 };

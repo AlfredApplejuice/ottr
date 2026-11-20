@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fixtureGitEnv, GIT_REPO_ENV } from "./gitRepoEnv.ts";
 import {
 	computeRelease,
 	highestTag,
@@ -548,6 +549,7 @@ function must(cwd: string, ...args: string[]): string {
 	];
 	const r = Bun.spawnSync([gitExe(), ...id, ...args], {
 		cwd,
+		env: fixtureGitEnv(),
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -1279,7 +1281,10 @@ const [mode, record] = process.argv.slice(2);
 const { OTTR_RELEASE_VERSION: v, OTTR_RELEASE_COMMIT: c, OTTR_RELEASE_NOTES_FILE: n, OTTR_ARCH_REVIEW: a } = process.env;
 const git = (...args) => {
   const id = ["-c", "user.name=ott", "-c", "user.email=ott@example.invalid", "-c", "commit.gpgsign=false"];
-  const r = spawnSync(process.env.OTT_GIT_EXE || "git", [...id, ...args], { encoding: "utf8" });
+  // Separate process, so no fixtureGitEnv import: copy process.env minus the repo-relocating vars.
+  const env = { ...process.env };
+  for (const k of ${JSON.stringify(GIT_REPO_ENV)}) delete env[k];
+  const r = spawnSync(process.env.OTT_GIT_EXE || "git", [...id, ...args], { encoding: "utf8", env });
   if (r.status !== 0) { console.error(r.stderr); process.exit(9); }
   return r.stdout.trim();
 };

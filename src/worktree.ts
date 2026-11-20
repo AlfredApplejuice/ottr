@@ -28,6 +28,7 @@ import {
 } from "./confine.ts";
 import { githubHost, hostMatcher } from "./githubHost.ts";
 import { type CommitIdentity, identityArgs } from "./gitIdentity.ts";
+import { stripRepoRelocatingEnv } from "./gitRepoEnv.ts";
 import { HOSTED_SECRET_ENV } from "./hosted.ts";
 import { platform } from "./platform/index.ts";
 import type { DiffFileStat, KeptChoice } from "./types.ts";
@@ -234,6 +235,11 @@ export function gitEnv(
 	auth: Record<string, string> = {},
 ): Record<string, string | undefined> {
 	const env = { ...process.env };
+	// The board's git always names its repo through the cwd argument and path arguments, never
+	// through ambient env: a server or test process that inherited GIT_DIR (a git hook launch)
+	// would otherwise redirect every `git -C <project>` call to that gitdir (OTTR-1162). Calls
+	// that need them pass them as the explicit env below, which merges after this strip.
+	stripRepoRelocatingEnv(env);
 	let sub = "";
 	let isNetwork = false;
 	for (let i = 0; i < args.length; i++) {

@@ -9,6 +9,7 @@ import {
 	pushRefusal,
 	syncWorktreeTo,
 } from "./gitHttp.ts";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { VmTokens } from "./vmTokens.ts";
 import { gitExe } from "./worktree.ts";
 
@@ -47,6 +48,7 @@ async function run(
 		{
 			cwd,
 			env: {
+				...fixtureGitEnv(),
 				PATH: process.env.PATH ?? "",
 				GIT_CONFIG_GLOBAL: "/dev/null",
 				HOME: tmpdir(),

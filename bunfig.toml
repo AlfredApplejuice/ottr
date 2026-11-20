@@ -10,3 +10,7 @@ minimumReleaseAge = 604800
 # ceiling stays an order of magnitude below the suite's own slow-seed tests,
 # which set 20 s explicitly, so a genuinely hung test still fails fast.
 timeout = 20000
+# OTTR-1162: the suite must never write the board's own repository. The preload routes every
+# git exec through a shim that refuses writes resolving into the enclosing repo (see
+# src/test/boardRepoGuard.ts). Active only under bun test.
+preload = ["./src/test/boardRepoGuard.ts"]

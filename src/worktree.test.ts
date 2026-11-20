@@ -20,6 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { GIT_AUTH_ENV_RE, gitAuthEnv } from "./gitHosts.ts";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { platform } from "./platform/index.ts";
 import { archReviewDue } from "./scheduler.ts";
 import fc from "./test/properties.ts";
@@ -202,6 +203,7 @@ describe("serverMergePush", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -284,8 +286,10 @@ describe("serverMergePush", () => {
 				run(f.main, "rev-parse", "refs/heads/main"),
 			);
 			expect(
-				Bun.spawnSync(["git", "rev-parse", "--verify", "main"], { cwd: up })
-					.exitCode,
+				Bun.spawnSync(["git", "rev-parse", "--verify", "main"], {
+					cwd: up,
+					env: fixtureGitEnv(),
+				}).exitCode,
 			).not.toBe(0);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
@@ -518,7 +522,12 @@ describe("serverMergePush", () => {
 			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(before);
 			const rebaseDir = Bun.spawnSync(
 				["git", "rev-parse", "--git-path", "rebase-merge"],
-				{ cwd: f.main, stdout: "pipe", stderr: "pipe" },
+				{
+					cwd: f.main,
+					env: fixtureGitEnv(),
+					stdout: "pipe",
+					stderr: "pipe",
+				},
 			);
 			expect(existsSync(join(f.main, rebaseDir.stdout.toString().trim()))).toBe(
 				false,
@@ -844,6 +853,7 @@ describe("mergeHoldMismatch", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -1147,6 +1157,7 @@ describe("mergeHoldLanded (VELV-89)", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -1232,6 +1243,7 @@ describe("pinned origin URL (OTTR-348)", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -1591,6 +1603,7 @@ describe("branchUnpushed", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -1652,6 +1665,7 @@ describe("checkedOutBranch (OTTR-531)", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -1689,6 +1703,7 @@ describe("resetBranchTo", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -1969,6 +1984,7 @@ async function must(cwd: string, ...args: string[]): Promise<string> {
 	];
 	const r = Bun.spawnSync([gitExe(), ...id, ...args], {
 		cwd,
+		env: fixtureGitEnv(),
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -2752,7 +2768,7 @@ describe("archReviewDelta", () => {
 				stderr: "pipe",
 				windowsHide: true,
 				env: {
-					...process.env,
+					...fixtureGitEnv(),
 					GIT_AUTHOR_DATE: `@${at} +0000`,
 					GIT_COMMITTER_DATE: `@${at} +0000`,
 				},
@@ -3450,14 +3466,28 @@ describe("unlinked worktree guards", () => {
 		// A transient git failure inside the dir (an index lock, dubious ownership): the .git
 		// file's gitdir is alive, so the worktree is not a husk (OTTR-349 — a husk verdict
 		// here let the pre-dispatch guard settle a zero-commit card done on a vacuous proof).
-		const previous = process.env.GIT_DIR;
-		process.env.GIT_DIR = join(main, "no-such-gitdir");
+		// The failure injection flips the repo's format version directly in the config file:
+		// git refuses the repo while the gitdir stays alive. Ambient GIT_DIR can no longer
+		// play this role (OTTR-1162: every git spawn strips repo-relocating env).
+		const cfg = join(main, ".git", "config");
+		writeFileSync(
+			cfg,
+			readFileSync(cfg, "utf8").replace(
+				"repositoryformatversion = 0",
+				"repositoryformatversion = 99",
+			),
+		);
 		try {
 			expect(await worktreeLinked(wt)).toBe(false);
 			expect(await worktreeHusk(wt)).toBe(false);
 		} finally {
-			if (previous === undefined) delete process.env.GIT_DIR;
-			else process.env.GIT_DIR = previous;
+			writeFileSync(
+				cfg,
+				readFileSync(cfg, "utf8").replace(
+					"repositoryformatversion = 99",
+					"repositoryformatversion = 0",
+				),
+			);
 		}
 		expect(await worktreeHusk(wt)).toBe(false);
 		// The deregistered shape keeps its husk verdict: the gitdir is gone.
@@ -4018,6 +4048,7 @@ describe("git", () => {
 		// transport. The fetch itself fails (the fake proxy speaks no git protocol).
 		Bun.spawnSync([gitExe(), "fetch", "--quiet", "origin"], {
 			cwd: main,
+			env: fixtureGitEnv(),
 			stdin: "ignore",
 			stdout: "ignore",
 			stderr: "ignore",
@@ -4086,7 +4117,10 @@ describe("git", () => {
 		await must(main, "status", "--porcelain");
 		expect(existsSync(marker("filter"))).toBe(true);
 		rmSync(marker("filter"));
-		Bun.spawnSync(["git", "commit", "--allow-empty", "-m", "c"], { cwd: main });
+		Bun.spawnSync(["git", "commit", "--allow-empty", "-m", "c"], {
+			cwd: main,
+			env: fixtureGitEnv(),
+		});
 		expect(existsSync(marker("gpg"))).toBe(true);
 		// The control commit may also re-run the planted clean filter: clear every marker.
 		for (const kind of ["filter", "merge", "gpg"])
@@ -4318,7 +4352,7 @@ describe("git", () => {
 		process.env.PATH = `${bin}:${prevPath ?? ""}`;
 		try {
 			// Control: without the pin, plain git runs the planted sshCommand.
-			const plain = { ...process.env } as Record<string, string>;
+			const plain = { ...fixtureGitEnv() } as Record<string, string>;
 			delete plain.GIT_SSH_COMMAND;
 			const ctl = Bun.spawnSync(
 				[gitExe(), "ls-remote", `ssh://ottr-fixture.invalid/${up}`],
@@ -4395,6 +4429,7 @@ describe("git", () => {
 		const plain = (...a: string[]) =>
 			Bun.spawnSync([gitExe(), ...a], {
 				cwd: main,
+				env: fixtureGitEnv(),
 				stdin: "ignore",
 				stdout: "ignore",
 				stderr: "ignore",
@@ -4469,6 +4504,7 @@ describe("git", () => {
 				[gitExe(), "-c", "core.hooksPath=/dev/null", ...(a as string[])],
 				{
 					cwd: main,
+					env: fixtureGitEnv(),
 					stdin: "ignore",
 					stdout: "ignore",
 					stderr: "ignore",
@@ -4784,6 +4820,7 @@ describe("fetchPrHead (OTTR-755)", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -4992,6 +5029,7 @@ describe("pushBranch destination ref (OTTR-760)", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -5102,6 +5140,7 @@ describe("deleteRemoteBranch (OTTR-800)", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -5228,6 +5267,7 @@ describe("commitMeta (OTTR-763)", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -5427,6 +5467,7 @@ function saveFixture(): { wt: string; saveDir: string; dataRoot: string } {
 	const mustGit = (...args: string[]): void => {
 		const r = Bun.spawnSync([gitExe(), ...id, ...args], {
 			cwd: wt,
+			env: fixtureGitEnv(),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -5511,6 +5552,7 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		mkdirSync(join(wt, "clone"));
 		const init = Bun.spawnSync([gitExe(), "init", "-q", "clone"], {
 			cwd: wt,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -5550,6 +5592,7 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		const git = (cwd: string, args: string[]): void => {
 			const run = Bun.spawnSync([gitExe(), ...id, ...args], {
 				cwd,
+				env: fixtureGitEnv(),
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -5580,7 +5623,12 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		// Precondition: without the " M sub" row this test exercises nothing.
 		const st = Bun.spawnSync(
 			[gitExe(), "status", "--porcelain", "-z", "--untracked-files=no"],
-			{ cwd: wt, stdout: "pipe", stderr: "pipe" },
+			{
+				cwd: wt,
+				env: fixtureGitEnv(),
+				stdout: "pipe",
+				stderr: "pipe",
+			},
 		);
 		expect(st.exitCode).toBe(0);
 		expect(
@@ -5609,6 +5657,7 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		const id = ["-c", "user.name=ott", "-c", "user.email=ott@example.invalid"];
 		const add = Bun.spawnSync([gitExe(), ...id, "add", "gone.txt"], {
 			cwd: wt,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -5637,6 +5686,7 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		const config = (...args: string[]): void => {
 			const run = Bun.spawnSync([gitExe(), ...args], {
 				cwd: wt,
+				env: fixtureGitEnv(),
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -5676,6 +5726,7 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		const config = (...args: string[]): void => {
 			const run = Bun.spawnSync([gitExe(), ...args], {
 				cwd: wt,
+				env: fixtureGitEnv(),
 				stdout: "pipe",
 				stderr: "pipe",
 			});

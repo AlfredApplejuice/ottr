@@ -31,6 +31,7 @@ import { PassThrough } from "node:stream";
 import { deflateSync } from "node:zlib";
 
 import { createApp } from "./app.ts";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { GlobalStore } from "./globalStore.ts";
 import {
 	type GateCheck,
@@ -1966,7 +1967,7 @@ test("no agent run carries git host auth, merge turns included (D6)", async () =
 // origin" button — the real resolveTarget runs against real git here.
 test("a merge turn on an origin without the target branch parks naming Push to origin", async () => {
 	const run = (cwd: string, ...args: string[]): void => {
-		execSync(`git ${args.join(" ")}`, { cwd, stdio: "ignore" });
+		execSync(`git ${args.join(" ")}`, { cwd, stdio: "ignore", env: fixtureGitEnv() });
 	};
 	const { store, loop } = await setup({ resolveTarget: realResolveTarget });
 	// The main checkout holds a commit; origin is an empty bare repo.
@@ -3251,9 +3252,9 @@ describe("turn sessions, steering and images", () => {
 		writeFileSync(join(wt, "shots", "committed.png"), png);
 		// Distinct bytes: byte-identical shots are deduped as one screenshot.
 		writeFileSync(join(wt, "shots", "fresh.png"), Uint8Array.from([...png, 1]));
-		execSync("git init -q -b main", { cwd: wt });
-		execSync("git add shots/committed.png", { cwd: wt });
-		execSync("git -c user.name=t -c user.email=t@t commit -qm c", { cwd: wt });
+		execSync("git init -q -b main", { cwd: wt, env: fixtureGitEnv() });
+		execSync("git add shots/committed.png", { cwd: wt, env: fixtureGitEnv() });
+		execSync("git -c user.name=t -c user.email=t@t commit -qm c", { cwd: wt, env: fixtureGitEnv() });
 		await loop.runTurn(store.name, task.id);
 		const after = (await store.getTask(task.id))!;
 		expect(after.shots).toEqual(["1.png"]); // the tracked shot never arrives
@@ -3305,9 +3306,9 @@ describe("turn sessions, steering and images", () => {
 			join(wt, "shots", "settings-kept-days.png"),
 			Uint8Array.from([...png, 1]),
 		);
-		execSync("git init -q -b main", { cwd: wt });
-		execSync("git add .", { cwd: wt });
-		execSync("git -c user.name=t -c user.email=t@t commit -qm c", { cwd: wt });
+		execSync("git init -q -b main", { cwd: wt, env: fixtureGitEnv() });
+		execSync("git add .", { cwd: wt, env: fixtureGitEnv() });
+		execSync("git -c user.name=t -c user.email=t@t commit -qm c", { cwd: wt, env: fixtureGitEnv() });
 		await loop.runTurn(store.name, task.id);
 
 		const after = (await store.getTask(task.id))!;
@@ -7364,7 +7365,7 @@ describe("turn research cards", () => {
 					wtPath = o.worktreePath;
 					mkdirSync(o.worktreePath, { recursive: true });
 					// The real saveDoneFiles runs git ls-files/status: a repo, not a plain dir.
-					execSync(`git init -q "${o.worktreePath}"`, { stdio: "ignore" });
+					execSync(`git init -q "${o.worktreePath}"`, { stdio: "ignore", env: fixtureGitEnv() });
 					writeFileSync(
 						join(o.worktreePath, RESEARCH_REPORT),
 						"# findings\n\nthe body",
@@ -9851,6 +9852,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 				cwd,
 				stdout: "pipe",
 				stderr: "pipe",
+				env: fixtureGitEnv(),
 			});
 			if (r.exitCode !== 0)
 				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
@@ -9936,7 +9938,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 				targetSha: async (mainPath: string, ref: string) => {
 					const r = Bun.spawnSync(
 						["git", "rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
-						{ cwd: mainPath, stdout: "pipe", stderr: "pipe" },
+						{ cwd: mainPath, stdout: "pipe", stderr: "pipe", env: fixtureGitEnv() },
 					);
 					return r.exitCode === 0 ? r.stdout.toString().trim() : null;
 				},
@@ -10096,7 +10098,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 	test("cancel keeps a real dirty worktree under the Cancel prefix (R5-2)", async () => {
 		const repoDir = mkdtempSync(join(tmpdir(), "turn-cancel-repo-"));
 		dirs.push(repoDir);
-		const run = (cmd: string) => execSync(cmd, { stdio: "ignore" });
+		const run = (cmd: string) => execSync(cmd, { stdio: "ignore", env: fixtureGitEnv() });
 		run(`git init -q ${repoDir}`);
 		run(`git -C ${repoDir} config user.email t@t`);
 		run(`git -C ${repoDir} config user.name t`);
@@ -10104,6 +10106,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		run(`git -C ${repoDir} add seed.txt`);
 		run(`git -C ${repoDir} commit -qm seed`);
 		const base = execSync("git rev-parse HEAD", {
+			env: fixtureGitEnv(),
 			cwd: repoDir,
 			encoding: "utf8",
 		}).trim();
@@ -15776,7 +15779,7 @@ describe("turn release line hold (dependabot gate park)", () => {
 		// Base commit: the unbumped lock, so origin/main:bun.lock is the scan's
 		// base. No remote: the ref alone answers rev-parse and cat-file.
 		const git = (...args: string[]): void => {
-			execSync(`git ${args.join(" ")}`, { cwd: wt, stdio: "ignore" });
+			execSync(`git ${args.join(" ")}`, { cwd: wt, stdio: "ignore", env: fixtureGitEnv() });
 		};
 		writeFileSync(join(wt, "bun.lock"), realLock);
 		writeFileSync(
@@ -23860,6 +23863,7 @@ describe("turn PR-mode merge settle", () => {
 					cwd,
 					stdout: "pipe",
 					stderr: "pipe",
+					env: fixtureGitEnv(),
 				});
 				if (r.exitCode !== 0)
 					throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
@@ -23949,7 +23953,7 @@ describe("turn PR-mode merge settle", () => {
 					targetSha: async (_m: string, ref: string) => {
 						const r = Bun.spawnSync(
 							["git", "rev-parse", "--verify", "--quiet", ref],
-							{ cwd: main },
+							{ cwd: main, env: fixtureGitEnv() },
 						);
 						return r.exitCode === 0 ? r.stdout.toString().trim() : null;
 					},
@@ -24051,6 +24055,7 @@ describe("turn PR-mode merge settle", () => {
 				cwd,
 				stdout: "pipe",
 				stderr: "pipe",
+				env: fixtureGitEnv(),
 			});
 			if (r.exitCode !== 0)
 				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
@@ -24091,7 +24096,7 @@ describe("turn PR-mode merge settle", () => {
 				targetSha: async (_m: string, ref: string) => {
 					const r = Bun.spawnSync(
 						["git", "rev-parse", "--verify", "--quiet", ref],
-						{ cwd: main },
+						{ cwd: main, env: fixtureGitEnv() },
 					);
 					return r.exitCode === 0 ? r.stdout.toString().trim() : null;
 				},
@@ -24606,6 +24611,7 @@ describe("turn PR-mode merge settle", () => {
 					cwd,
 					stdout: "pipe",
 					stderr: "pipe",
+					env: fixtureGitEnv(),
 				});
 				if (r.exitCode !== 0)
 					throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
@@ -26756,6 +26762,7 @@ describe("turn checkout guard (other projects)", () => {
 				cwd,
 				stdout: "pipe",
 				stderr: "pipe",
+				env: fixtureGitEnv(),
 			});
 			if (r.exitCode !== 0)
 				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
@@ -26824,7 +26831,7 @@ describe("turn checkout guard (other projects)", () => {
 						cwd: repo,
 						stdout: "pipe",
 						stderr: "pipe",
-						env: env === undefined ? process.env : { ...process.env, ...env },
+						env: env === undefined ? fixtureGitEnv() : { ...fixtureGitEnv(), ...env },
 					});
 					if (r.exitCode !== 0)
 						throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
@@ -26890,6 +26897,7 @@ describe("turn checkout guard (other projects)", () => {
 				cwd,
 				stdout: "pipe",
 				stderr: "pipe",
+				env: fixtureGitEnv(),
 			});
 			if (r.exitCode !== 0)
 				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);

@@ -59,6 +59,7 @@ import type { SpawnFn } from "./forkAnalysis.ts";
 import type { GhFn } from "./forks.ts";
 import { defaultSshDir, GIT_URL_ERROR, type Keyscan } from "./gitHosts.ts";
 import { DEFAULT_COMMIT_EMAIL, DEFAULT_COMMIT_NAME } from "./gitIdentity.ts";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { GlobalStore } from "./globalStore.ts";
 import { MAX_IMAGE_BYTES } from "./images.ts";
 import { acquireLayerUse } from "./layers.ts";
@@ -276,7 +277,8 @@ process.env.GIT_CONFIG_GLOBAL = gitConfigGlobal;
 const makeFixture = (name: string, empty = false) => {
 	const p = join(fixtureRepos, name);
 	mkdirSync(p, { recursive: true });
-	const run = (cmd: string) => execSync(cmd, { cwd: p, stdio: "ignore" });
+	const run = (cmd: string) =>
+		execSync(cmd, { cwd: p, stdio: "ignore", env: fixtureGitEnv() });
 	run("git init -q -b main");
 	if (!empty) {
 		run("git config user.email t@t && git config user.name t");
@@ -1017,7 +1019,7 @@ describe("task routes", () => {
 		// statusFiles only reports for a linked git worktree, so build a real one.
 		const repo = join(root, "wt-repo");
 		const run = (cmd: string, cwd: string) =>
-			execSync(cmd, { cwd, stdio: "ignore" });
+			execSync(cmd, { cwd, stdio: "ignore", env: fixtureGitEnv() });
 		mkdirSync(repo, { recursive: true });
 		run("git init -q", repo);
 		run("git config user.email t@t && git config user.name t", repo);
@@ -1223,13 +1225,15 @@ describe("task routes", () => {
 
 	test("an open card reads its diff live from the branch", async () => {
 		const repo = join(root, "diff-repo");
-		const run = (cmd: string) => execSync(cmd, { cwd: repo, stdio: "ignore" });
+		const run = (cmd: string) =>
+			execSync(cmd, { cwd: repo, stdio: "ignore", env: fixtureGitEnv() });
 		mkdirSync(repo, { recursive: true });
 		run("git init -q -b main");
 		run("git config user.email t@t && git config user.name t");
 		writeFileSync(join(repo, "seed.txt"), "s");
 		run("git add seed.txt && git commit -qm seed");
 		const seed = execSync("git rev-parse HEAD", {
+			env: fixtureGitEnv(),
 			cwd: repo,
 		})
 			.toString()
@@ -1238,6 +1242,7 @@ describe("task routes", () => {
 		run(`git worktree add -q "${wt}" -b card`);
 		writeFileSync(join(wt, "a.txt"), "added\n");
 		execSync('git add a.txt && git commit -qm "card work"', {
+			env: fixtureGitEnv(),
 			cwd: wt,
 			stdio: "ignore",
 		});
@@ -3092,6 +3097,7 @@ describe("settings routes", () => {
 				});
 				expect(add.status).toBe(200);
 				return execSync("git log -1 --format=%an%n%ae", {
+					env: fixtureGitEnv(),
 					cwd: join(dir, `identity-proj-${o.label}`),
 				})
 					.toString()
@@ -3187,7 +3193,10 @@ describe("settings routes", () => {
 					const dir = join(root, `identity-proj-${Date.now()}-pw`);
 					mkdirSync(dir, { recursive: true });
 					expect(
-						execSync("git var GIT_AUTHOR_IDENT", { cwd: dir }).toString(),
+						execSync("git var GIT_AUTHOR_IDENT", {
+							cwd: dir,
+							env: fixtureGitEnv(),
+						}).toString(),
 					).toContain("<root@passwd.invalid>");
 					const m = await mount({ projects: new Map(), defaultDir: dir });
 					if (source === "Settings") {
@@ -3200,6 +3209,7 @@ describe("settings routes", () => {
 					const add = await m.call("/api/projects", { name: "identity-proj" });
 					expect(add.status).toBe(200);
 					const log = execSync("git log -1 --format=%an%n%ae", {
+						env: fixtureGitEnv(),
 						cwd: join(dir, "identity-proj"),
 					})
 						.toString()
@@ -3392,6 +3402,7 @@ describe("settings routes", () => {
 		writeFileSync(join(fixtureRepos, "persist-me", "AGENTS.md"), "rules");
 		// Clones carry committed files only: the rules file must be in the fixture's commit.
 		execSync("git add AGENTS.md && git commit -qm rules", {
+			env: fixtureGitEnv(),
 			cwd: join(fixtureRepos, "persist-me"),
 			stdio: "ignore",
 		});
@@ -3455,6 +3466,7 @@ describe("settings routes", () => {
 			),
 		).toBe(false);
 		const head = execSync("git rev-parse HEAD", {
+			env: fixtureGitEnv(),
 			cwd: dir,
 			encoding: "utf8",
 		}).trim();
@@ -3532,6 +3544,7 @@ describe("settings routes", () => {
 		expect(init.status).toBe(200);
 		// The init commit itself is the watermark: reviewed from birth, delta 0.
 		const base = execSync("git rev-parse HEAD", {
+			env: fixtureGitEnv(),
 			cwd: dir,
 			encoding: "utf8",
 		}).trim();
@@ -3542,13 +3555,14 @@ describe("settings routes", () => {
 		});
 		// The rules interview's AGENTS.md commit is the first commit toward the cap: not due.
 		execSync("git config user.email t@t && git config user.name t", {
+			env: fixtureGitEnv(),
 			cwd: dir,
 			stdio: "ignore",
 		});
 		writeFileSync(join(dir, "AGENTS.md"), "rules");
 		execSync(
 			"git add AGENTS.md && git commit -qm 'docs(rules): add AGENTS.md'",
-			{ cwd: dir, stdio: "ignore" },
+			{ cwd: dir, stdio: "ignore", env: fixtureGitEnv() },
 		);
 		const d = await archReviewDelta(dir, "main", null);
 		expect(d).toEqual({ delta: 1, reviewed: true, anchor: base });
@@ -3572,6 +3586,7 @@ describe("settings routes", () => {
 		const p = makeFixture("imported-proj");
 		writeFileSync(join(p, "AGENTS.md"), "rules");
 		execSync("git add AGENTS.md && git commit -qm rules", {
+			env: fixtureGitEnv(),
 			cwd: p,
 			stdio: "ignore",
 		});
@@ -3601,6 +3616,7 @@ describe("settings routes", () => {
 		expect(projects.get("fresh")?.path).toBe(dest);
 		// The handler initialized a repo with a commit, even without a global git identity.
 		const head = execSync("git rev-parse HEAD", {
+			env: fixtureGitEnv(),
 			cwd: dest,
 			encoding: "utf8",
 		}).trim();
@@ -6607,10 +6623,12 @@ describe("idle auto review tick", () => {
 		e.target = "main";
 		const dir = join(root, name);
 		execSync("git config user.email t@t && git config user.name t", {
+			env: fixtureGitEnv(),
 			cwd: dir,
 			stdio: "ignore",
 		});
 		execSync("git commit -q --allow-empty -m work", {
+			env: fixtureGitEnv(),
 			cwd: dir,
 			stdio: "ignore",
 		});
@@ -6640,7 +6658,12 @@ describe("idle auto review tick", () => {
 		expect(cards).toHaveLength(1);
 		expect(cards[0]?.kind).toBe("review");
 		// The review freezes the target head, like a release card.
-		const head = execSync("git rev-parse HEAD", { cwd: dir }).toString().trim();
+		const head = execSync("git rev-parse HEAD", {
+			cwd: dir,
+			env: fixtureGitEnv(),
+		})
+			.toString()
+			.trim();
 		expect(cards[0]?.base).toBe(head);
 		expect(scheduled).toBeGreaterThan(0);
 	});
@@ -8886,7 +8909,9 @@ describe("release-summary route", () => {
 	// The route plans a real release, so the project needs a git repo; each test builds its
 	// own checkout under root and removes it afterwards (same pattern as the drawer tests).
 	const run = (dir: string, cmd: string): string =>
-		execSync(cmd, { cwd: dir, stdio: "pipe" }).toString().trim();
+		execSync(cmd, { cwd: dir, stdio: "pipe", env: fixtureGitEnv() })
+			.toString()
+			.trim();
 	const commit = (dir: string, file: string, msg: string): string => {
 		writeFileSync(join(dir, file), "x");
 		run(dir, `git add ${file} && git commit -qm '${msg}'`);
@@ -9347,7 +9372,9 @@ describe("release-summary route", () => {
 
 describe("drawer late commits route", () => {
 	const run = (cmd: string): string =>
-		execSync(cmd, { cwd: projectDir, stdio: "pipe" }).toString().trim();
+		execSync(cmd, { cwd: projectDir, stdio: "pipe", env: fixtureGitEnv() })
+			.toString()
+			.trim();
 	const commit = (file: string, msg: string): string => {
 		writeFileSync(join(projectDir, file), "x");
 		run(`git add ${file} && git commit -qm '${msg}'`);
@@ -9357,7 +9384,11 @@ describe("drawer late commits route", () => {
 	test("a waiting release card lists the commits past its base, finding merges marked", async () => {
 		// The route reads the target head without a fetch, so a local branch without upstream
 		// resolves to itself; the repo lives only for this test and is removed afterwards.
-		execSync("git init -q -b main", { cwd: projectDir, stdio: "ignore" });
+		execSync("git init -q -b main", {
+			cwd: projectDir,
+			stdio: "ignore",
+			env: fixtureGitEnv(),
+		});
 		try {
 			run("git config user.email t@t && git config user.name t");
 			commit("seed.txt", "seed");
@@ -10229,13 +10260,19 @@ describe("sandbox endpoint", () => {
 	// git archive -- HEAD needs a commit: seed the registered checkout and remove the
 	// repo in the test's finally (the checkout dir is shared with other describes).
 	const seedCommit = () => {
-		execSync("git init -q -b main", { cwd: projectDir, stdio: "ignore" });
+		execSync("git init -q -b main", {
+			cwd: projectDir,
+			stdio: "ignore",
+			env: fixtureGitEnv(),
+		});
 		execSync("git config user.email t@t && git config user.name t", {
+			env: fixtureGitEnv(),
 			cwd: projectDir,
 			stdio: "ignore",
 		});
 		writeFileSync(join(projectDir, "seed.txt"), "s");
 		execSync("git add seed.txt && git commit -qm seed", {
+			env: fixtureGitEnv(),
 			cwd: projectDir,
 			stdio: "ignore",
 		});
@@ -10315,13 +10352,19 @@ describe("sandbox endpoint", () => {
 		});
 		// Seed p2's own checkout: the tar bytes and the runner request must both
 		// name p2, never the calling run's p1.
-		execSync("git init -q -b main", { cwd: projectDir2, stdio: "ignore" });
+		execSync("git init -q -b main", {
+			cwd: projectDir2,
+			stdio: "ignore",
+			env: fixtureGitEnv(),
+		});
 		execSync("git config user.email t@t && git config user.name t", {
+			env: fixtureGitEnv(),
 			cwd: projectDir2,
 			stdio: "ignore",
 		});
 		writeFileSync(join(projectDir2, "seed2.txt"), "s2");
 		execSync("git add seed2.txt && git commit -qm seed2", {
+			env: fixtureGitEnv(),
 			cwd: projectDir2,
 			stdio: "ignore",
 		});
@@ -11410,7 +11453,10 @@ describe("project settings validation", () => {
 		const add = await post("/api/projects", { name: "target-shape-proj" });
 		expect(add.status).toBe(200);
 		const pe = projects.get("target-shape-proj")!;
-		execSync("git update-ref refs/remotes/origin/develop HEAD", { cwd: dir });
+		execSync("git update-ref refs/remotes/origin/develop HEAD", {
+			cwd: dir,
+			env: fixtureGitEnv(),
+		});
 		const ok = await post("/api/projects/target-shape-proj/settings", {
 			targetBranch: "  develop  ",
 		});
@@ -11435,17 +11481,21 @@ describe("project settings validation", () => {
 		const e = projects.get("target-save-proj")!;
 		// A second branch on origin, different from the checked-out head: only a
 		// targetBranch-aware resolution can land on it.
-		const tree = execSync("git rev-parse HEAD^{tree}", { cwd: dir })
+		const tree = execSync("git rev-parse HEAD^{tree}", {
+			cwd: dir,
+			env: fixtureGitEnv(),
+		})
 			.toString()
 			.trim();
 		const other = execSync(
 			"git -c user.name=ott -c user.email=ott@example.invalid commit-tree " +
 				`${tree} -m feature`,
-			{ cwd: dir },
+			{ cwd: dir, env: fixtureGitEnv() },
 		)
 			.toString()
 			.trim();
 		execSync(`git update-ref refs/remotes/origin/feature ${other}`, {
+			env: fixtureGitEnv(),
 			cwd: dir,
 		});
 		e.target = "origin/main";
@@ -11469,7 +11519,10 @@ describe("project settings validation", () => {
 		const add = await post("/api/projects", { name: "watch-target-proj" });
 		expect(add.status).toBe(200);
 		const e = projects.get("watch-target-proj")!;
-		execSync("git update-ref refs/remotes/origin/feature HEAD", { cwd: dir });
+		execSync("git update-ref refs/remotes/origin/feature HEAD", {
+			cwd: dir,
+			env: fixtureGitEnv(),
+		});
 		const start = Date.parse("2026-03-01T00:00:00Z");
 		const later = start + 60_000;
 		// The clock moves while the route awaits its targetBranch git check: an issue opened
@@ -11517,7 +11570,10 @@ describe("project settings validation", () => {
 		expect((await e.store.getSettings()).targetBranch).toBeNull();
 		expect(e.target).toBe("origin/main");
 		// A resolvable branch still saves normally afterwards.
-		execSync("git update-ref refs/remotes/origin/feature HEAD", { cwd: dir });
+		execSync("git update-ref refs/remotes/origin/feature HEAD", {
+			cwd: dir,
+			env: fixtureGitEnv(),
+		});
 		const ok = await post("/api/projects/target-bad-proj/settings", {
 			targetBranch: "feature",
 		});
@@ -11532,7 +11588,9 @@ describe("push-main route (OTTR-531)", () => {
 	// Real repos: a bare origin plus a clone whose main is one commit ahead. execSync
 	// fixtures only, like the release-summary and behindMain describes.
 	const run = (dir: string, cmd: string): string =>
-		execSync(cmd, { cwd: dir, stdio: "pipe" }).toString().trim();
+		execSync(cmd, { cwd: dir, stdio: "pipe", env: fixtureGitEnv() })
+			.toString()
+			.trim();
 
 	const setup = async (
 		name: string,
@@ -11633,7 +11691,9 @@ describe("push-main route (OTTR-531)", () => {
 // must create the branch (and set the upstream), and the merge hold must lift after.
 describe("push-main on an empty origin (OTTR-605)", () => {
 	const run = (dir: string, cmd: string): string =>
-		execSync(cmd, { cwd: dir, stdio: "pipe" }).toString().trim();
+		execSync(cmd, { cwd: dir, stdio: "pipe", env: fixtureGitEnv() })
+			.toString()
+			.trim();
 
 	const setup = async (name: string) => {
 		const origin = join(root, `${name}-origin`);
@@ -11985,7 +12045,7 @@ describe(
 		mkdirSync(rulesDir, { recursive: true });
 		const rulesStore = await ProjectStore.open(rulesDir);
 		const sh = (cmd: string) =>
-			execSync(cmd, { cwd: rulesDir, stdio: "ignore" });
+			execSync(cmd, { cwd: rulesDir, stdio: "ignore", env: fixtureGitEnv() });
 		// git-init the dir offline exactly like the shared fixture repos: one seed commit,
 		// a github.com origin, and a planted origin/main ref, so refreshRemote resolves the
 		// target with no network.
@@ -12426,7 +12486,12 @@ describe("arch-review duplicate guard (R1-8)", () => {
 		);
 		expect(live).toHaveLength(1);
 		// The review freezes the target head, like a release card, and reviews it read-only.
-		const head = execSync("git rev-parse HEAD", { cwd: dir }).toString().trim();
+		const head = execSync("git rev-parse HEAD", {
+			cwd: dir,
+			env: fixtureGitEnv(),
+		})
+			.toString()
+			.trim();
 		expect(live[0]?.base).toBe(head);
 		projects.delete("arch-proj");
 		await closeTestStore(e.store);
@@ -12439,17 +12504,21 @@ describe("arch-review duplicate guard (R1-8)", () => {
 		const e = projects.get("target-branch-proj")!;
 		// A second branch on origin, different from the checked-out head: only the
 		// configured target resolves to it.
-		const tree = execSync("git rev-parse HEAD^{tree}", { cwd: dir })
+		const tree = execSync("git rev-parse HEAD^{tree}", {
+			cwd: dir,
+			env: fixtureGitEnv(),
+		})
 			.toString()
 			.trim();
 		const other = execSync(
 			"git -c user.name=ott -c user.email=ott@example.invalid commit-tree " +
 				`${tree} -m feature`,
-			{ cwd: dir },
+			{ cwd: dir, env: fixtureGitEnv() },
 		)
 			.toString()
 			.trim();
 		execSync(`git update-ref refs/remotes/origin/feature ${other}`, {
+			env: fixtureGitEnv(),
 			cwd: dir,
 		});
 		await e.store.setSettings({ targetBranch: "feature" });
@@ -12560,7 +12629,9 @@ describe("review and release cards carry the board's GitHub alerts", () => {
 		);
 		mkdirSync(dir, { recursive: true });
 		const run = (cmd: string): string =>
-			execSync(cmd, { cwd: dir, stdio: "pipe" }).toString().trim();
+			execSync(cmd, { cwd: dir, stdio: "pipe", env: fixtureGitEnv() })
+				.toString()
+				.trim();
 		run("git init -q -b main");
 		run("git config user.email t@t && git config user.name t");
 		writeFileSync(join(dir, "seed.txt"), "x");
@@ -12666,7 +12737,7 @@ describe("how-it-works route", () => {
 		writeFileSync(join(e.path, "docs/how-it-works.md"), "committed");
 		execSync(
 			"git add docs && git -c user.name=t -c user.email=t@t commit -qm d",
-			{ cwd: e.path },
+			{ cwd: e.path, env: fixtureGitEnv() },
 		);
 		// An uncommitted edit stays out: the board shows the target's version.
 		writeFileSync(join(e.path, "docs/how-it-works.md"), "draft");
@@ -18331,6 +18402,7 @@ describe(
 					"rules\n",
 				);
 				execSync("git add AGENTS.md && git commit -qm rules", {
+					env: fixtureGitEnv(),
 					cwd: join(fixtureRepos, "appcheck-recheck"),
 					stdio: "ignore",
 				});
@@ -18344,6 +18416,7 @@ describe(
 				// re-reads it and boardRepos() gains the repo.
 				execSync(
 					`git -C ${join(root, "appcheck-recheck")} remote set-url origin https://github.com/other/appcheck-recheck`,
+					{ env: fixtureGitEnv() },
 				);
 				const saved = await m.call("/api/projects/appcheck-recheck/settings", {
 					targetBranch: "main",
@@ -22859,7 +22932,7 @@ describe(
 describe("behindMain", () => {
 	// Fixtures come from execSync here, never from the code under test.
 	const run = (cmd: string, cwd: string) =>
-		execSync(cmd, { cwd, stdio: "ignore" });
+		execSync(cmd, { cwd, stdio: "ignore", env: fixtureGitEnv() });
 	const setup = () => {
 		const origin = makeFixture(`behind-${Math.random().toString(36).slice(2)}`);
 		const clone = mkdtempSync(join(tmpdir(), "ottr-behind-"));

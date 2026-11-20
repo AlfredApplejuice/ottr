@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { hostedGh, publishRelease, runReleaseCommand } from "./release.ts";
 import { setHostedGitAuth } from "./worktree.ts";
 
@@ -23,7 +24,7 @@ let bin: string;
 let record: string;
 
 const sh = (cwd: string, ...args: string[]) => {
-	const r = Bun.spawnSync(["git", ...args], { cwd });
+	const r = Bun.spawnSync(["git", ...args], { cwd, env: fixtureGitEnv() });
 	if (r.exitCode !== 0) throw new Error(r.stderr.toString());
 	return r.stdout.toString().trim();
 };

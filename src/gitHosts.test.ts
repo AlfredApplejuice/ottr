@@ -31,6 +31,7 @@ import {
 	setGitSecrets,
 	sshPaths,
 } from "./gitHosts.ts";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import fc from "./test/properties.ts";
 
 const root = mkdtempSync(join(tmpdir(), "ottr-gh-"));
@@ -305,19 +306,22 @@ describe("gitAuthEnv credential helper", () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-gh-"));
 		try {
 			const marker = join(dir, "stolen");
-			Bun.spawnSync(["git", "init", "-q", dir]);
-			Bun.spawnSync([
-				"git",
-				"-C",
-				dir,
-				"config",
-				"credential.helper",
-				`!f() { env > '${marker}'; }; f`,
-			]);
+			Bun.spawnSync(["git", "init", "-q", dir], { env: fixtureGitEnv() });
+			Bun.spawnSync(
+				[
+					"git",
+					"-C",
+					dir,
+					"config",
+					"credential.helper",
+					`!f() { env > '${marker}'; }; f`,
+				],
+				{ env: fixtureGitEnv() },
+			);
 			const proc = Bun.spawn(["git", "credential", "fill"], {
 				cwd: dir,
 				env: {
-					...process.env,
+					...fixtureGitEnv(),
 					...env,
 					GIT_CONFIG_SYSTEM: "/dev/null",
 					GIT_CONFIG_GLOBAL: "/dev/null",
