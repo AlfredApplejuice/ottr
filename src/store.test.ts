@@ -287,6 +287,56 @@ describe("moveInQueue", () => {
 		}
 	});
 
+	test("a same-key card created before the anchor stays above the moved card", async () => {
+		const store = await open(join(root, "move-twin-above"));
+		try {
+			// Pinned createdAt: x ties with b on queuedAt and sorts above b.
+			setSystemTime(new Date(1000));
+			const p = await store.createTask("p");
+			setSystemTime(new Date(2000));
+			const x = await store.createTask("x");
+			setSystemTime(new Date(3000));
+			const b = await store.createTask("b");
+			setSystemTime(new Date(4000));
+			const m = await store.createTask("m");
+			await store.updateTask(p.id, { queuedAt: 1 });
+			await store.updateTask(x.id, { queuedAt: 10 });
+			await store.updateTask(b.id, { queuedAt: 10 });
+			await store.updateTask(m.id, { queuedAt: 20 });
+			expect(await store.queueIds()).toEqual([p.id, x.id, b.id, m.id]);
+			// A free integer slot exists below the anchor (between 1 and 10), but a
+			// write there would land m above x; m must go between x and b.
+			expect(await store.moveInQueue(m.id, b.id)).toBe(true);
+			expect(await store.queueIds()).toEqual([p.id, x.id, m.id, b.id]);
+			await store.close();
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	test("a same-key twin forces the renumber on a top insert too", async () => {
+		const store = await open(join(root, "move-twin-top"));
+		try {
+			setSystemTime(new Date(1000));
+			const x = await store.createTask("x");
+			setSystemTime(new Date(2000));
+			const b = await store.createTask("b");
+			setSystemTime(new Date(3000));
+			const m = await store.createTask("m");
+			await store.updateTask(x.id, { queuedAt: 10 });
+			await store.updateTask(b.id, { queuedAt: 10 });
+			await store.updateTask(m.id, { queuedAt: 20 });
+			expect(await store.queueIds()).toEqual([x.id, b.id, m.id]);
+			// Nothing queues below the anchor, but x (same key, earlier createdAt)
+			// sorts above b, so the top-insert slot below the anchor is wrong too.
+			expect(await store.moveInQueue(m.id, b.id)).toBe(true);
+			expect(await store.queueIds()).toEqual([x.id, m.id, b.id]);
+			await store.close();
+		} finally {
+			setSystemTime();
+		}
+	});
+
 	test("adjacent queuedAt leaves no slot, so the queue renumbers", async () => {
 		const store = await open(join(root, "move-renumber"));
 		const a = await store.createTask("a");

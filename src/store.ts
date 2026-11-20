@@ -4609,13 +4609,21 @@ export class ProjectStore {
 					? null
 					: (anchorRow.queuedAt ?? anchorRow.createdAt);
 			const others = queue.filter((t) => t.id !== id);
-			// The queued card right above the anchor point: its queuedAt bounds the free slot.
+			// The sort key of the queued card directly above the anchor point: the
+			// largest key strictly below it, or — when a card ties on the key but was
+			// created earlier than `before` — the anchor key itself. That card sorts
+			// above `before`, and no integer slot below the anchor lands the moved
+			// card above it, so the tie collapses the gap to 0 and forces the
+			// renumber path below.
 			const prev =
 				anchor === null
 					? null
 					: others.reduce<number | null>(
 							(top, t) =>
-								key(t) < anchor && (top === null || key(t) > top)
+								(key(t) < anchor ||
+									(key(t) === anchor &&
+										t.createdAt < (anchorRow?.createdAt ?? 0))) &&
+								(top === null || key(t) > top)
 									? key(t)
 									: top,
 							null,
