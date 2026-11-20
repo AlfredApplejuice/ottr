@@ -151,6 +151,7 @@ import {
 	REVIEW_FOOTER,
 	type Task,
 } from "./types.ts";
+import { shortNoticeText } from "./ui/notice.ts";
 import { isUnread } from "./ui/queue.ts";
 import {
 	UPDATE_HOST_LEASE_MS,
@@ -23269,12 +23270,18 @@ describe("worker /tmp full warnings (OTTR-754)", () => {
 		]);
 	});
 
-	test("the tmp advisory texts lead with words, never a path token", () => {
-		// OTTR-1097: a text that starts with a path loses its subject in the bell's
-		// collapsed line (stripNoticeTokens drops path tokens). The old texts led
-		// with "/tmp", so the short line started with "of". The path survives only
-		// as bracketed detail behind a worded subject.
+	test("the tmp advisories keep their subject and host in the bell's short line", () => {
+		// OTTR-1097: the bell's collapsed line strips path tokens, so an advisory
+		// that leads with a path loses its subject (the old texts collapsed to
+		// "of <host> is full"). The assertions run against tmpFullNotice's real
+		// output, not a copied literal: a path-led rewording fails here again.
 		const runners = ["worker-a", "127.0.0.1", "local"];
+		for (const runner of runners) {
+			const short = shortNoticeText(tmpFullNotice(runner, 512 * 1024 * 1024));
+			expect(short.startsWith("The temp disk")).toBe(true);
+			expect(short).toContain(runner);
+		}
+		// Both templates lead with words; a leading path token would strip away.
 		const texts = [
 			...runners.map((r) => tmpFullNotice(r, 512 * 1024 * 1024)),
 			...runners.map((r) => tmpSpaceNotice(r, 512 * 1024 * 1024)),

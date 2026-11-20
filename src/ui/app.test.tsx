@@ -2166,18 +2166,6 @@ describe("card links in bell text", () => {
 		).toBe("cards ottr#OTTR-1071, alate#ALAT-180 were running");
 	});
 
-	test("shortNoticeText keeps the tmp advisories' subject and host", () => {
-		// OTTR-1097: the server's tmp-full texts must lead with words, because the
-		// collapsed bell line strips path tokens: a leading "/tmp" left the short
-		// line as "of <host> is full", which named no disk.
-		for (const host of ["worker-a", "127.0.0.1", "local"]) {
-			const text = `The temp disk (/tmp) of ${host} is full (512 MiB free)`;
-			const short = shortNoticeText(text);
-			expect(short.startsWith("The temp disk")).toBe(true);
-			expect(short).toContain(host);
-		}
-	});
-
 	test("shortNoticeText keeps a removed path's period and drops its connector", () => {
 		expect(
 			shortNoticeText(
