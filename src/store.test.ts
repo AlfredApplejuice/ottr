@@ -200,9 +200,9 @@ describe("old-driver file compatibility", () => {
 	});
 });
 
-describe("reorderQueue", () => {
-	test("exact permutation moves a task to the front as queueIds reports", async () => {
-		const store = await open(join(root, "reorder"));
+describe("moveInQueue", () => {
+	test("a move lands while another card leaves and another enters the queue", async () => {
+		const store = await open(join(root, "move-race"));
 		const a = await store.createTask("a");
 		const b = await store.createTask("b");
 		const c = await store.createTask("c");
@@ -210,24 +210,113 @@ describe("reorderQueue", () => {
 		await store.updateTask(a.id, { queuedAt: 1 });
 		await store.updateTask(b.id, { queuedAt: 2 });
 		await store.updateTask(c.id, { queuedAt: 3 });
-		expect(await store.queueIds()).toEqual([a.id, b.id, c.id]);
-		expect(await store.reorderQueue([c.id, a.id, b.id])).toBe(true);
-		expect(await store.queueIds()).toEqual([c.id, a.id, b.id]);
+		// The board's stale /api/state view says [a, b, c]; then b starts a turn (leaves
+		// the queue) and d enters before the move's write lands.
+		await store.updateTask(b.id, { state: "preparing" });
+		const d = await store.createTask("d");
+		expect(await store.moveInQueue(c.id, a.id)).toBe(true);
+		// The named move lands; every other card keeps its order.
+		expect(await store.queueIds()).toEqual([c.id, a.id, d.id]);
 		await store.close();
 	});
 
-	test("wrong length, duplicate id, and unknown id each return false without writing", async () => {
-		const store = await open(join(root, "reorder-bad"));
+	test("before null moves to the end, before the first card moves to the top", async () => {
+		const store = await open(join(root, "move-ends"));
+		const a = await store.createTask("a");
+		const b = await store.createTask("b");
+		const c = await store.createTask("c");
+		await store.updateTask(a.id, { queuedAt: 1 });
+		await store.updateTask(b.id, { queuedAt: 2 });
+		await store.updateTask(c.id, { queuedAt: 3 });
+		expect(await store.moveInQueue(a.id, null)).toBe(true);
+		expect(await store.queueIds()).toEqual([b.id, c.id, a.id]);
+		expect(await store.moveInQueue(c.id, b.id)).toBe(true);
+		expect(await store.queueIds()).toEqual([c.id, b.id, a.id]);
+		await store.close();
+	});
+
+	test("a before that left the queue still anchors by its stored queuedAt", async () => {
+		const store = await open(join(root, "move-anchor"));
+		const a = await store.createTask("a");
+		const gone = await store.createTask("gone");
+		const b = await store.createTask("b");
+		await store.updateTask(a.id, { queuedAt: 1 });
+		await store.updateTask(gone.id, { queuedAt: 10 });
+		await store.updateTask(b.id, { queuedAt: 20 });
+		// gone started a turn, so it left the queue; the drag names it as before anyway.
+		await store.updateTask(gone.id, { state: "preparing" });
+		expect(await store.moveInQueue(b.id, gone.id)).toBe(true);
+		// b lands between a and gone's old slot, in a one-row write.
+		expect(await store.queueIds()).toEqual([a.id, b.id]);
+		expect((await store.getTask(b.id))!.queuedAt).toBe(5);
+		expect((await store.getTask(a.id))!.queuedAt).toBe(1);
+		await store.close();
+	});
+
+	test("adjacent queuedAt leaves no slot, so the queue renumbers", async () => {
+		const store = await open(join(root, "move-renumber"));
+		const a = await store.createTask("a");
+		const b = await store.createTask("b");
+		const c = await store.createTask("c");
+		await store.updateTask(a.id, { queuedAt: 1 });
+		await store.updateTask(b.id, { queuedAt: 2 });
+		await store.updateTask(c.id, { queuedAt: 3 });
+		expect(await store.moveInQueue(c.id, b.id)).toBe(true);
+		expect(await store.queueIds()).toEqual([a.id, c.id, b.id]);
+		const keys = await Promise.all(
+			[a.id, c.id, b.id].map(async (id) => (await store.getTask(id))!.queuedAt),
+		);
+		expect(keys[0]!).toBeLessThan(keys[1]!);
+		expect(keys[1]!).toBeLessThan(keys[2]!);
+		await store.close();
+	});
+
+	test("a card that is not queued, and an unknown id, are refused without writing", async () => {
+		const store = await open(join(root, "move-refuse"));
 		const a = await store.createTask("a");
 		const b = await store.createTask("b");
 		await store.updateTask(a.id, { queuedAt: 1 });
 		await store.updateTask(b.id, { queuedAt: 2 });
+		await store.updateTask(b.id, { state: "preparing" });
 		const before = await store.queueIds();
-		expect(await store.reorderQueue([a.id])).toBe(false);
-		expect(await store.reorderQueue([a.id, a.id])).toBe(false);
-		expect(await store.reorderQueue([a.id, "nope"])).toBe(false);
+		expect(await store.moveInQueue(b.id, a.id)).toBe(false);
+		expect(await store.moveInQueue("nope", null)).toBe(false);
 		expect(await store.queueIds()).toEqual(before);
-		expect(await store.reorderQueue([a.id, b.id])).toBe(true);
+		await store.close();
+	});
+
+	test("a before that names no card behaves like null: end of the queue", async () => {
+		const store = await open(join(root, "move-unknown-before"));
+		const a = await store.createTask("a");
+		const b = await store.createTask("b");
+		await store.updateTask(a.id, { queuedAt: 1 });
+		await store.updateTask(b.id, { queuedAt: 2 });
+		expect(await store.moveInQueue(a.id, "nope")).toBe(true);
+		expect(await store.queueIds()).toEqual([b.id, a.id]);
+		await store.close();
+	});
+
+	test("a within-lane move leaves other lanes' relative order alone", async () => {
+		const store = await open(join(root, "move-lane"));
+		const t1 = await store.createTask("t1");
+		const t2 = await store.createTask("t2");
+		const t3 = await store.createTask("t3");
+		const m = await store.createTask("m");
+		await store.updateTask(t1.id, { queuedAt: 1 });
+		await store.updateTask(t2.id, { queuedAt: 2 });
+		await store.updateTask(t3.id, { queuedAt: 3 });
+		await store.updateTask(m.id, { stage: "merging", queuedAt: 4 });
+		// The board drags t3 above t1 inside the todo lane; the server orders globally.
+		expect(await store.moveInQueue(t3.id, t1.id)).toBe(true);
+		expect(await store.queueIds()).toEqual([t3.id, t1.id, t2.id, m.id]);
+		// The lane's own queued order matches the lane-local splice the UI computes, and
+		// the merging card keeps its queuedAt (one-row write).
+		expect((await store.queueIds()).filter((id) => id !== m.id)).toEqual([
+			t3.id,
+			t1.id,
+			t2.id,
+		]);
+		expect((await store.getTask(m.id))!.queuedAt).toBe(4);
 		await store.close();
 	});
 });
@@ -7028,31 +7117,35 @@ describe("async store serial operations", () => {
 		expect(await store.events()).toHaveLength(2);
 	});
 
-	test("concurrent queue permutations expose only complete orders", async () => {
+	test("concurrent queue moves expose only complete orders", async () => {
 		const store = await open(join(root, "async-queue"));
 		const cards = await Promise.all(
 			["a", "b", "c"].map((p) => store.createTask(p)),
 		);
 		const [a, b, c] = cards.map((card) => card.id) as [string, string, string];
+		await store.updateTask(a, { queuedAt: 1 });
+		await store.updateTask(b, { queuedAt: 2 });
+		await store.updateTask(c, { queuedAt: 3 });
 		const events = await store.events();
 		const [first, firstOrder, second, secondOrder, invalid, lastOrder] =
 			await Promise.all([
-				store.reorderQueue([c, a, b]),
+				store.moveInQueue(c, a),
 				store.queueIds(),
-				store.reorderQueue([b, c, a]),
+				store.moveInQueue(b, a),
 				store.queueIds(),
-				store.reorderQueue([a, a, c]),
+				store.moveInQueue("nope", null),
 				store.queueIds(),
 			]);
 		expect(first).toBe(true);
 		expect(firstOrder).toEqual([c, a, b]);
 		expect(second).toBe(true);
-		expect(secondOrder).toEqual([b, c, a]);
+		expect(secondOrder).toEqual([c, b, a]);
 		expect(invalid).toBe(false);
-		expect(lastOrder).toEqual([b, c, a]);
-		for (const card of cards) {
-			expect((await store.getTask(card.id))?.revision).toBe(card.revision + 2);
-		}
+		expect(lastOrder).toEqual([c, b, a]);
+		// The plain move rewrote one row; the move with no free slot renumbered the queue.
+		expect((await store.getTask(c))!.revision).toBe(cards[2]!.revision + 3);
+		expect((await store.getTask(b))!.revision).toBe(cards[1]!.revision + 2);
+		expect((await store.getTask(a))!.revision).toBe(cards[0]!.revision + 2);
 		expect(await store.events()).toEqual(events);
 	});
 

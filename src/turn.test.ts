@@ -14981,7 +14981,7 @@ describe("work card check", () => {
 		expect(await ids(resetsAt + 1)).toContain(task.id);
 		// A queue reorder rewrites queuedAt; the hold must survive it.
 		const other = await store.createTask("another");
-		expect(await store.reorderQueue([task.id, other.id])).toBe(true);
+		expect(await store.moveInQueue(task.id, other.id)).toBe(true);
 		expect((await store.getTask(task.id))!.holdUntil).toBe(resetsAt);
 		expect(await ids()).not.toContain(task.id);
 		await store.updateTask(other.id, { state: "idle" });

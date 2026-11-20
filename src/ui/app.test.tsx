@@ -13013,6 +13013,89 @@ describe("Optimistic taps (client)", () => {
 		}
 	});
 
+	test("a queue reorder posts the moved card and its anchor, not the full order", async () => {
+		const realFetch = globalThis.fetch;
+		const bodies: unknown[] = [];
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			if (url.endsWith("/queue") && (init?.method ?? "GET") === "POST") {
+				bodies.push(JSON.parse(String(init?.body)));
+				return new Response(JSON.stringify({ ok: true }), { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const tasks = [
+			cardFixture({ id: "a", stage: "todo", state: "queued" }),
+			cardFixture({ id: "b", stage: "todo", state: "queued" }),
+			cardFixture({ id: "c", stage: "todo", state: "idle" }),
+		];
+		const project = {
+			name: "proj",
+			hasRules: true,
+			github: null,
+			gitless: false,
+			dirty: false,
+			archReview: null,
+			latestRelease: null,
+			latestImage: null,
+			doneTotal: 0,
+			settings: { setupChecklist: false },
+			sessionsDir: "/tmp/s",
+		} as unknown as ProjectView;
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectBoard
+						project={project}
+						tasks={tasks}
+						deltas={new Map()}
+						open={() => {}}
+						seenAnswers={new Set()}
+						seenDoneSince={0}
+						compose={() => {}}
+						composeDraft={() => {}}
+						act={async (fn: () => Promise<void>) => {
+							await fn();
+							return true;
+						}}
+						onNotice={() => {}}
+						draining={false}
+					/>,
+				);
+			});
+			const b = container.querySelector('.card[data-task-id="b"]')!;
+			// Keyboard reorder (the pointer-free path): Alt+ArrowUp moves b above a.
+			// The lanes all render a .stage-cards; the todo lane is the one b queues in.
+			await act(async () => {
+				propHandler(
+					container.querySelector('[data-stage="todo"] .stage-cards')!,
+					"onKeyDown",
+				)({
+					altKey: true,
+					key: "ArrowUp",
+					target: b,
+					preventDefault: () => {},
+				} as unknown);
+			});
+			// The request names the moved card and the card below it only.
+			expect(bodies).toEqual([{ id: "b", before: "a" }]);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
 	const steerTask = () =>
 		cardFixture({
 			...drawerFields,

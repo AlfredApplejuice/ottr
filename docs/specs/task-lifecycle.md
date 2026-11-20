@@ -61,7 +61,7 @@ Related references provide design context, not proof of transition enforcement. 
 | Same builder, lines 3424-3428 | Records stage/state events only when a successful patch changes the respective value. There is no cancellation event in this path. |
 | [`editTask`, `store.ts:3297-3316`](../../src/store.ts#L3297-L3316) | Changes prompt/title and clears hold columns. It changes none of the three lifecycle fields. Its optional revision guard does not add a lifecycle rule. |
 | [`claimPromptHold` and `releasePromptHold`, `store.ts:3351-3378`](../../src/store.ts#L3351-L3378) | Change hold columns through the same builder with no revision increment. Claim can compare a supplied revision. Release does not. Both still update `updatedAt`. Neither changes lifecycle fields. |
-| [`reorderQueue`, `store.ts:3432-3447`](../../src/store.ts#L3432-L3447) | Requires an exact permutation of current queue IDs. It changes `queuedAt` only. |
+| [`moveInQueue`, `store.ts:4589-4650`](../../src/store.ts#L4589-L4650) | Requires `id` to name a queued card; the drop names the card below it (or null for the end). It changes `queuedAt` only. |
 
 `queuedAt` is caller-managed. `state: "queued"` alone does not stamp it. Writers below explicitly show where a queue timestamp changes. The builder's revision rules do not cover every direct SQL metadata repair listed later.
 
@@ -484,7 +484,7 @@ These writers do not change `stage`, `state`, or `cancelledAt`, except where a b
 | Supervisor PR metadata | [`prRebaseAnswer`, `supervisor.ts:2065-2091`](../../src/supervisor.ts#L2065-L2091), line 2082, changes only reason after a matching bot comment and `wentStale`. The caller requires the carry-park marker. [`settleFollowUpPr`, `supervisor.ts:2113-2138`](../../src/supervisor.ts#L2113-L2138), line 2118, clears only follow-up PR fields under the guard above. |
 | Other production modules | omp watch title/topic at [`ompWatch.ts:469-483`](../../src/ompWatch.ts#L469-L483) and [`528-537`](../../src/ompWatch.ts#L528-L537). Trending title/topic at [`trending.ts:453-470`](../../src/trending.ts#L453-L470). Boot release repair at [`server.ts:466-489`](../../src/server.ts#L466-L489), writes 484/488, selects done/null-base/null-latch snapshots and stamps or clears only release version. |
 | Store import metadata | Jira todo branch line 2936 and existing PR-draft branch line 3167. Sources and dynamic spreads appear above. |
-| Store queue/prompt methods | [`editTask`, `store.ts:3297-3316`](../../src/store.ts#L3297-L3316), prompt-hold methods at [`3351-3378`](../../src/store.ts#L3351-L3378), and queue reorder write at [`3437-3447`](../../src/store.ts#L3437-L3447). |
+| Store queue/prompt methods | [`editTask`, `store.ts:3297-3316`](../../src/store.ts#L3297-L3316), prompt-hold methods at [`3351-3378`](../../src/store.ts#L3351-L3378), and the queue move write at [`4589-4650`](../../src/store.ts#L4589-L4650). |
 
 ### Direct SQL that does not introduce production transitions
 

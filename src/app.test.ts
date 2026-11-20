@@ -856,6 +856,59 @@ describe(
 	})(),
 );
 
+describe("queue route", () => {
+	test("moves one card by { id, before } while another card leaves the queue", async () => {
+		const a = await store.createTask("a");
+		const b = await store.createTask("b");
+		const c = await store.createTask("c");
+		await store.updateTask(a.id, { queuedAt: 1 });
+		await store.updateTask(b.id, { queuedAt: 2 });
+		await store.updateTask(c.id, { queuedAt: 3 });
+		const mine = async (...ids: string[]) =>
+			(await store.queueIds()).filter((id) => ids.includes(id));
+		const res = await post("/api/projects/p1/queue", {
+			id: c.id,
+			before: a.id,
+		});
+		expect(res.status).toBe(200);
+		expect(await mine(a.id, b.id, c.id)).toEqual([c.id, a.id, b.id]);
+		// A stale move whose named cards still queue lands even after b left the queue.
+		await store.updateTask(b.id, { state: "preparing" });
+		const again = await post("/api/projects/p1/queue", {
+			id: a.id,
+			before: c.id,
+		});
+		expect(again.status).toBe(200);
+		expect(await mine(a.id, c.id)).toEqual([a.id, c.id]);
+	});
+
+	test("a bad body shape is 400 and a not-queued card is 409", async () => {
+		const a = await store.createTask("a");
+		// The old full-order body is now a bad shape.
+		const full = await post("/api/projects/p1/queue", { order: [a.id] });
+		expect(full.status).toBe(400);
+		const missing = await post("/api/projects/p1/queue", { id: a.id });
+		expect(missing.status).toBe(400);
+		const wrongType = await post("/api/projects/p1/queue", {
+			id: a.id,
+			before: 5,
+		});
+		expect(wrongType.status).toBe(400);
+		const unknown = await post("/api/projects/p1/queue", {
+			id: "nope",
+			before: null,
+		});
+		expect(unknown.status).toBe(409);
+		expect(await errorOf(unknown)).toContain("not queued");
+		await store.updateTask(a.id, { state: "preparing" });
+		const notQueued = await post("/api/projects/p1/queue", {
+			id: a.id,
+			before: null,
+		});
+		expect(notQueued.status).toBe(409);
+	});
+});
+
 describe("task routes", () => {
 	test("create returns a queued task with a PREFIX-n id and kicks the scheduler", async () => {
 		const before = calls;

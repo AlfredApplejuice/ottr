@@ -4586,20 +4586,65 @@ export class ProjectStore {
 		});
 	}
 
-	/** True iff `order` is an exact permutation of the current queue; then moves each task by writing future queuedAt. */
-	async reorderQueue(order: string[]): Promise<boolean> {
+	/** OTTR-1148: moves one queued card to sit right above `before` (null: to the end of
+	 * the queue) without a full-order round trip, so a drag still lands when cards enter
+	 * or leave the queue while the board reads /api/state. A `before` that has left the
+	 * queue (its turn started, it is done or cancelled) still anchors: the move positions
+	 * by its stored queuedAt, where the card used to sit. An unknown `before` id behaves
+	 * like null (end of the queue). The write touches one row — a queuedAt strictly
+	 * between the neighbours — and renumbers the queue only when no integer slot is free.
+	 * Returns false only when `id` is not a queued, non-cancelled card of the project. */
+	async moveInQueue(id: string, before: string | null): Promise<boolean> {
 		return this.queue.transaction(async () => {
-			const current = await this.queueIds();
-			if (
-				order.length !== current.length ||
-				new Set(order).size !== order.length
-			)
-				return false;
-			const currentSet = new Set(current);
-			if (order.some((id) => !currentSet.has(id))) return false;
+			const tasks = await this.listTasks();
+			const queue = queueOrder(tasks);
+			if (!queue.some((t) => t.id === id)) return false;
+			const key = (t: (typeof queue)[number]): number =>
+				t.queuedAt ?? t.createdAt;
+			const anchorRow =
+				before === null ? undefined : tasks.find((t) => t.id === before);
+			// null anchor: append after the last queued card.
+			const anchor =
+				anchorRow === undefined
+					? null
+					: (anchorRow.queuedAt ?? anchorRow.createdAt);
+			const others = queue.filter((t) => t.id !== id);
+			// The queued card right above the anchor point: its queuedAt bounds the free slot.
+			const prev =
+				anchor === null
+					? null
+					: others.reduce<number | null>(
+							(top, t) =>
+								key(t) < anchor && (top === null || key(t) > top)
+									? key(t)
+									: top,
+							null,
+						);
+			if (anchor === null || prev === null || anchor - prev >= 2) {
+				// A free integer slot exists: write only the moved row.
+				const target =
+					anchor === null
+						? others.length === 0
+							? Date.now()
+							: Math.max(...others.map(key)) + 1
+						: prev === null
+							? // Top of the queue: nothing queued sits below the anchor point.
+								anchor - 1
+							: Math.floor((prev + anchor) / 2);
+				await this.updateTask(id, { queuedAt: target });
+				return true;
+			}
+			// No integer slot between the neighbours: renumber the whole queue in the
+			// desired order (the others keep their relative order).
+			const at = others.filter((t) => key(t) < anchor).length;
+			const next = [
+				...others.slice(0, at),
+				queue.find((t) => t.id === id)!,
+				...others.slice(at),
+			];
 			const now = Date.now();
-			for (const [i, id] of order.entries())
-				await this.updateTask(id, { queuedAt: now + i });
+			for (const [i, t] of next.entries())
+				await this.updateTask(t.id, { queuedAt: now + i });
 			return true;
 		});
 	}

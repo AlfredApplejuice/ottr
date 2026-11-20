@@ -4917,15 +4917,13 @@ export function ProjectBoard({
 					const onReorder = (
 						dragId: string,
 						beforeId: string | null,
-					): Promise<boolean> => {
-						const order = reorderIds(tasks, c.key, dragId, beforeId);
-						if (order === null) return Promise.resolve(true);
-						return act(() =>
+					): Promise<boolean> =>
+						act(() =>
 							post(`/api/projects/${encodeURIComponent(project.name)}/queue`, {
-								order,
+								id: dragId,
+								before: beforeId,
 							}).then(() => undefined),
 						);
-					};
 					return (
 						<section
 							key={c.key}
@@ -6549,10 +6547,13 @@ export function LaneCol({
 	// overwrite the first on the server (last write wins). Every reorder path routes through here.
 	const sendReorder = (id: string, before: string | null): void => {
 		// `tasks` is this column's laneOrder-ed list; reorderIds over it yields the column's
-		// queued-id order, which the server's queuedAt rewrite reproduces exactly.
+		// queued-id order after the drop. A drop that changes nothing sends no request —
+		// the server moves only the named card, so a no-op body would still rewrite queuedAt.
 		const next = reorderIds(tasks, stage, id, before);
+		const current = queued.map((t) => t.id);
+		if (next === null || next.join(" ") === current.join(" ")) return;
 		setPending({ id, before });
-		if (next !== null) setLocalOrder(next);
+		setLocalOrder(next);
 		void onReorder(id, before)
 			.then((ok) => {
 				if (!ok) setLocalOrder(null);

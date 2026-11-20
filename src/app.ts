@@ -8714,12 +8714,17 @@ export async function createApp(deps: AppDeps) {
 		const e = deps.projects.get(req.params.project);
 		if (!e) return json({ error: "unknown project" }, 404);
 		if (e.gitless) return json({ error: "init a git repository first" }, 409);
-		const order = r.body.order;
-		if (!Array.isArray(order) || !order.every((id) => typeof id === "string")) {
-			return json({ error: "order must be an array of task ids" }, 400);
-		}
-		if (!(await e.store.reorderQueue(order)))
-			return json({ error: "order does not match the current queue" }, 409);
+		// OTTR-1148: the request names the moved card and the card it lands above, not the
+		// full queue order — a move must survive cards entering or leaving the queue while
+		// the board reads /api/state (the exact permutation check answered 409 on every drag).
+		const { id, before } = r.body;
+		if (
+			typeof id !== "string" ||
+			!(before === null || typeof before === "string")
+		)
+			return json({ error: "body must be { id, before: string | null }" }, 400);
+		if (!(await e.store.moveInQueue(id, before)))
+			return json({ error: "card is not queued" }, 409);
 		await deps.schedule();
 		return json({ ok: true });
 	}
