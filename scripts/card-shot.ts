@@ -69,7 +69,7 @@ interface Planted {
 	doneId: string;
 }
 
-const VIEWS = ["card", "done", "board"];
+const VIEWS = ["card", "done", "board", "settings-hindsight"];
 
 function parseView(raw: string | undefined, usage: string, views: string[]) {
 	if (raw === undefined || !VIEWS.includes(raw)) fail("card-shot", usage);
@@ -78,7 +78,7 @@ function parseView(raw: string | undefined, usage: string, views: string[]) {
 
 function parseArgs(argv: string[]): { pr: number | null; views: string[] } {
 	const usage =
-		"usage: bun scripts/card-shot.ts --pr <number> [--view card|done|board]...";
+		"usage: bun scripts/card-shot.ts --pr <number> [--view card|done|board|settings-hindsight]...";
 	let pr: number | null = null;
 	const views: string[] = [];
 	for (let i = 0; i < argv.length; i++) {
@@ -176,6 +176,8 @@ function plantCards(root: string, pr: number): Planted {
 /** The board URL path each view name shoots; card and done open the card's drawer. */
 function viewPath(name: string, planted: Planted | null): string {
 	if (name === "board") return `/projects/${PROJECT}`;
+	// Settings opens on its own path; the shot drives the scroll to the section.
+	if (name === "settings-hindsight") return "/settings";
 	if (planted === null) throw new Error(`the ${name} view needs --pr`);
 	return `/projects/${PROJECT}/tasks/${name === "card" ? planted.prId : planted.doneId}`;
 }
@@ -217,12 +219,28 @@ if (planted !== null) {
 	);
 }
 
+const hostEnv = { ...process.env };
+// The host's VM runner env must not reach the demo board: a runner URL without its
+// token refuses the boot (src/runner.ts), and a shot board runs no agents anyway.
+delete hostEnv.OTTR_VM_RUNNER_URL;
+delete hostEnv.OTTR_VM_RUNNER_TOKEN;
+delete hostEnv.OTTR_WORKER_TOKEN;
+// The settings-hindsight shot shows the no-memory warning line, which renders only
+// when the memory probe fails. Strip the host's Hindsight endpoint (its probe would
+// pass against it, so the line never renders) and pin the mnemopi store probe to the
+// read-only /proc: the line renders deterministically, with no network dependency.
+if (views.includes("settings-hindsight")) {
+	delete hostEnv.HINDSIGHT_API_URL;
+	delete hostEnv.HINDSIGHT_API_TOKEN;
+	hostEnv.OTTR_BOARD_OMP_HOME = "/proc/nonexistent";
+}
+
 // Demo board only, production asset mode: the dev-mode HMR server stalls the first
 // request while it bundles the app. OTTR_DEMO blocks every agent run.
 const board = Bun.spawn(["bun", "src/server.ts"], {
 	cwd: REPO,
 	env: {
-		...process.env,
+		...hostEnv,
 		PORT: String(port),
 		NODE_ENV: "production",
 		OTTR_DEMO: "1",
@@ -355,6 +373,34 @@ async function capture(): Promise<void> {
 		await withTimeout(load, 30_000, `the ${name} view load`);
 		// Card entrance animations run about 2 s; let them finish before the shot.
 		await Bun.sleep(SETTLE_MS);
+		if (name === "settings-hindsight") {
+			// The warning line sits at the top of the Hindsight card; scroll the card
+			// under the page header, then refuse the shot when the line is missing.
+			const probe = await withTimeout(
+				client.send(
+					"Runtime.evaluate",
+					{
+						returnByValue: true,
+						expression:
+							"document.getElementById('hindsight-section')?.scrollIntoView({ block: 'start' }); scrollBy(0, -90); (document.querySelector('#hindsight-section p[role=alert]')?.textContent ?? 'MISSING').trim()",
+					},
+					sessionId,
+				),
+				10_000,
+				"the Hindsight section probe",
+			);
+			const result = probe?.result;
+			const value =
+				result && typeof result === "object" && "value" in result
+					? result.value
+					: undefined;
+			if (typeof value !== "string" || !value.includes("no memory"))
+				fail(
+					"card-shot",
+					`the Hindsight section shows no memory warning (${String(value)})`,
+				);
+			await Bun.sleep(500);
+		}
 		const shot = await withTimeout(
 			client.send("Page.captureScreenshot", { format: "png" }, sessionId),
 			30_000,
