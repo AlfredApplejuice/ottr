@@ -228,8 +228,10 @@ function modelSelector(
 
 /** The largest transcript file the board reads whole; larger files stay unread. */
 export const TRANSCRIPT_MAX_BYTES = 64 * 1024 * 1024;
-/** The most subagent transcripts read for one session; beyond it the rest stay unread. */
-export const TRANSCRIPT_MAX_SUB_FILES = 32;
+/** The most subagent transcripts read for one session; beyond it the rest stay unread.
+ *  Generous on purpose: legit fan-out spans many waves, and the byte budget below stays
+ *  the memory bound. */
+export const TRANSCRIPT_MAX_SUB_FILES = 200;
 /** The total byte budget for one session's subagent transcripts. */
 export const TRANSCRIPT_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
 
