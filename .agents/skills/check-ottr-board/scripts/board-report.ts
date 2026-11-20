@@ -49,6 +49,9 @@ export type Facts = {
 	depsOpen: string[];
 	drain: boolean;
 	capFull: boolean;
+	/** The board's cards. The queued merge scans them for a merge turn of the same
+	 * project that runs or prepares: the scheduler runs one merge per project. */
+	cards: Card[];
 };
 
 const IDLE_LIMIT_S = 20 * 60; // skill step 3: a run is stuck when its log does not grow for 20 minutes
@@ -134,6 +137,19 @@ export function verdict(c: Card, f: Facts): { verdict: string; note: string } {
 	}
 	if (c.state === "queued") {
 		const hu = c.holdUntil;
+		// The scheduler runs one merge per project (mergeSlot returns null while a
+		// merge turn runs), so a queued merge waits for it by design.
+		const runsMerge =
+			c.stage === "merging"
+				? f.cards.find(
+						(t) =>
+							t.id !== c.id &&
+							t.cancelledAt === null &&
+							t.project === c.project &&
+							t.stage === "merging" &&
+							(t.state === "running" || t.state === "preparing"),
+					)
+				: undefined;
 		const holds = [
 			f.drain && "drain",
 			f.capFull && "cap full",
@@ -143,6 +159,7 @@ export function verdict(c: Card, f: Facts): { verdict: string; note: string } {
 				hu > f.now &&
 				`holdUntil ${new Date(hu).toISOString()}`,
 			f.hold,
+			runsMerge && `a merge runs: ${runsMerge.id}`,
 		].filter(Boolean);
 		return holds.length > 0
 			? { verdict: "OK", note: holds.join("; ") }
@@ -264,6 +281,7 @@ export async function report(s: BoardState, now: number): Promise<string> {
 				depsOpen,
 				drain,
 				capFull: s.maxTotal !== null && running >= s.maxTotal,
+				cards: s.tasks,
 			});
 			if (v.verdict === "question")
 				questions.push(

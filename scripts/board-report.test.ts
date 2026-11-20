@@ -18,6 +18,7 @@ const F: Facts = {
 	depsOpen: [],
 	drain: false,
 	capFull: false,
+	cards: [],
 };
 
 const card = (x: Partial<Card>): Card => ({
@@ -233,6 +234,56 @@ describe("verdict", () => {
 		expect(v.note).toContain("waiting for the review's findings");
 	});
 
+	test("a queued merge behind a running merge of the same project holds on it", () => {
+		const v = verdict(card({ stage: "merging", state: "queued" }), {
+			...F,
+			cards: [
+				card({ stage: "merging", state: "queued" }),
+				card({ id: "T-8", stage: "merging", state: "running" }),
+			],
+		});
+		expect(v.verdict).toBe("OK");
+		expect(v.note).toBe("a merge runs: T-8");
+	});
+
+	test("a queued merge behind a preparing merge of the same project holds on it", () => {
+		const v = verdict(card({ stage: "merging", state: "queued" }), {
+			...F,
+			cards: [card({ id: "T-8", stage: "merging", state: "preparing" })],
+		});
+		expect(v.verdict).toBe("OK");
+		expect(v.note).toBe("a merge runs: T-8");
+	});
+
+	test("a queued merge with the running merge in another project still needs a check", () => {
+		const v = verdict(card({ stage: "merging", state: "queued" }), {
+			...F,
+			cards: [
+				card({ stage: "merging", state: "queued" }),
+				card({
+					id: "T-8",
+					stage: "merging",
+					state: "running",
+					project: "velvarr",
+				}),
+			],
+		});
+		expect(v.verdict).toBe("check");
+		expect(v.note).toBe("queued with no hold found");
+	});
+
+	test("a cancelled merging card of the same project holds nothing", () => {
+		const v = verdict(card({ stage: "merging", state: "queued" }), {
+			...F,
+			cards: [
+				card({ stage: "merging", state: "queued" }),
+				card({ id: "T-8", stage: "merging", state: "running", cancelledAt: 5 }),
+			],
+		});
+		expect(v.verdict).toBe("check");
+		expect(v.note).toBe("queued with no hold found");
+	});
+
 	test("merging idle waiting for the review's findings is OK", () => {
 		const v = verdict(card({ stage: "merging", state: "idle" }), {
 			...F,
@@ -407,6 +458,14 @@ describe("report", () => {
 				kind: "review",
 				releaseVersion: null,
 			}),
+			card({
+				id: "T-11",
+				stage: "merging",
+				state: "running",
+				project: "br-fixt-a1",
+				kind: "task",
+				releaseVersion: null,
+			}),
 			card({ id: "T-7", stage: "in_progress", state: "idle" }),
 			card({ id: "T-8", stage: "done", state: "idle" }),
 			card({ id: "T-10", stage: "in_progress", state: "idle", cancelledAt: 5 }),
@@ -461,18 +520,19 @@ describe("report", () => {
 
 	test("renders the table, the questions and the checkouts over a real-state shape", async () => {
 		const out = await report(s, F.now);
-		// Header with the open count (7 open: T-8 done and T-10 cancelled drop out).
+		// Header with the open count (8 open: T-8 done and T-10 cancelled drop out).
 		expect(out).toContain(
-			"Board at 2025-10-09T08:53:20.000Z: 7 open, 1 running, maxTotal 3, drain none.",
+			"Board at 2025-10-09T08:53:20.000Z: 8 open, 2 running, maxTotal 3, drain none.",
 		);
 		// No warning: mergeHold resolved through the real scheduler.
 		expect(out).not.toContain("WARNING:");
 		// Stuck rows sort first; the question row follows the stuck one.
 		expect(out.indexOf("p/T-7")).toBeLessThan(out.indexOf("p/T-1"));
 		// T-5 is a queued merge behind the review parked at merging: the real
-		// mergeHold names the findings hold in its note.
+		// mergeHold names the findings hold in its note, and T-11's merge turn
+		// of the same project adds the merge-slot hold.
 		expect(out).toContain(
-			"| br-fixt-a1/T-5 T | merging/queued | OK | waiting for the review's findings to be implemented |  |",
+			"| br-fixt-a1/T-5 T | merging/queued | OK | waiting for the review's findings to be implemented; a merge runs: T-11 |  |",
 		);
 		expect(out).toContain(
 			"| br-fixt-a1/T-6 T | merging/idle | OK | release waits for its findings | waiting for the review's findings",
