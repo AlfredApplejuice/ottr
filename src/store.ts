@@ -384,6 +384,7 @@ interface TaskRow {
 	source_pr_cross_repo: number;
 	source_pr_dependabot: number;
 	source_pr_superseded: number;
+	source_issue: string | null;
 	follow_up_pr_number: number | null;
 	follow_up_pr_url: string | null;
 	topic: string | null;
@@ -682,6 +683,7 @@ function toListedTask(
 		sourcePrCrossRepo: r.source_pr_cross_repo === 1,
 		sourcePrDependabot: r.source_pr_dependabot === 1,
 		sourcePrSuperseded: r.source_pr_superseded === 1,
+		sourceIssue: r.source_issue,
 		followUpPrNumber: r.follow_up_pr_number,
 		followUpPrUrl: r.follow_up_pr_url,
 		topic: r.topic,
@@ -1044,6 +1046,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	sourcePrCrossRepo: "source_pr_cross_repo",
 	sourcePrDependabot: "source_pr_dependabot",
 	sourcePrSuperseded: "source_pr_superseded",
+	sourceIssue: "source_issue",
 	followUpPrNumber: "follow_up_pr_number",
 	followUpPrUrl: "follow_up_pr_url",
 	topic: "topic",
@@ -1834,6 +1837,32 @@ export class ProjectStore {
 		});
 	}
 
+	/** Stamps source_issue on the issue-watch and Jira cards filed before the column
+	 * existed (OTTR-996), so the duplicate gate's outside-text exclusion covers every
+	 * outside-text card, not only cards filed after the upgrade. Only NULL rows match,
+	 * so the pass stays idempotent on every open. */
+	private static async convergeSourceIssues(
+		db: SQLiteDatabase,
+		queue: StoreQueue,
+	): Promise<void> {
+		await queue.transaction(async () => {
+			await db.run(
+				`UPDATE tasks SET source_issue = (
+					SELECT CAST(w.number AS TEXT) FROM issue_watch w WHERE w.task_id = tasks.id
+				)
+				WHERE source_issue IS NULL
+					AND EXISTS (SELECT 1 FROM issue_watch w WHERE w.task_id = tasks.id)`,
+			);
+			await db.run(
+				`UPDATE tasks SET source_issue = (
+					SELECT j.issue_key FROM jira_imports j WHERE j.task_id = tasks.id
+				)
+				WHERE source_issue IS NULL
+					AND EXISTS (SELECT 1 FROM jira_imports j WHERE j.task_id = tasks.id)`,
+			);
+		});
+	}
+
 	/** Rebuilds pr_review_runs when its stored shape predates the current columns: copies
 	 * rows explicitly, verifies the count, swaps — one transaction, so a failure leaves
 	 * the old table untouched. */
@@ -2618,6 +2647,17 @@ export class ProjectStore {
 					"ci_pr_answered_info",
 					"ALTER TABLE tasks ADD COLUMN ci_pr_answered_info TEXT",
 				);
+				// OTTR-996: the outside issue/ticket a card was filed from (an issue-watch
+				// issue or a Jira ticket). The prompt embeds that author's text, so the
+				// duplicate gate never uses the card as a candidate. ALTER-only after both
+				// CHECK rebuilds, same reason as source_pr_number above.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"source_issue",
+					"ALTER TABLE tasks ADD COLUMN source_issue TEXT",
+				);
+				await ProjectStore.convergeSourceIssues(db, store.queue);
 				await ProjectStore.convergeProposalReasons(db, store.queue);
 				// posted_url landed after the first pr_review release: CREATE TABLE IF NOT EXISTS never
 				// updates a live table, so converge additively like the tasks columns above.
@@ -3597,7 +3637,10 @@ export class ProjectStore {
 				title: o.title,
 				// The prompt embeds the issue's title and body, which a person wrote, so
 				// the card stays user-authored and the prompt gate judges it (OTTR-850).
+				// sourceIssue marks the outside text: the duplicate gate never uses the
+				// card as a candidate (OTTR-996).
 				topic: "github issue",
+				sourceIssue: String(o.number),
 				stage: "backlog",
 				state: "idle",
 				queuedAt: null,
@@ -3655,8 +3698,10 @@ export class ProjectStore {
 					title: item.title,
 					// The prompt embeds the ticket's summary, description and comments,
 					// which people wrote, so the card stays user-authored and the prompt
-					// gate judges it (OTTR-850).
+					// gate judges it (OTTR-850). sourceIssue marks the outside text: the
+					// duplicate gate never uses the card as a candidate (OTTR-996).
 					topic: "jira",
+					sourceIssue: item.key,
 					...(o.stage === "backlog"
 						? { stage: "backlog", state: "idle", queuedAt: null }
 						: {}),

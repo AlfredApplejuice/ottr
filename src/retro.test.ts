@@ -102,6 +102,7 @@ function retroTask(p: Partial<Task> = {}): Task {
 		sourcePrCrossRepo: false,
 		sourcePrDependabot: false,
 		sourcePrSuperseded: false,
+		sourceIssue: null,
 		followUpPrNumber: null,
 		followUpPrUrl: null,
 		pushSha: null,

@@ -1093,6 +1093,7 @@ describe("handoffMarkdown research report", () => {
 		sourcePrCrossRepo: false,
 		sourcePrDependabot: false,
 		sourcePrSuperseded: false,
+		sourceIssue: null,
 		followUpPrNumber: null,
 		followUpPrUrl: null,
 		pushSha: null,

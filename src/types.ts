@@ -566,6 +566,11 @@ export interface Task {
 	sourcePrDependabot: boolean;
 	/** OTTR-1063: true when the ship proved the card branch holds nothing beyond the target (an integrated merge turn rebased it onto a moved target). The card waits only on its source PR and finishes done once that PR closes — merged or closed unmerged; the watch never parks it. */
 	sourcePrSuperseded: boolean;
+	/** OTTR-996: the outside issue or ticket this card was filed from; null for every
+	 * other card. The GitHub issue number as text for issue-watch cards, the Jira issue
+	 * key for Jira imports. The prompt embeds that author's text, so the duplicate gate
+	 * never uses the card as a duplicate candidate. */
+	sourceIssue: string | null;
 	/** OTTR-809: the follow-up pull request the ship step opened for a Dependabot card's
 	 * fixes beyond the source PR's head (base = the Dependabot branch); null otherwise.
 	 * The card waits for this PR and the source PR to merge before it finishes. */

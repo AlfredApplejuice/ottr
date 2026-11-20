@@ -4907,6 +4907,7 @@ describe("issue watch store methods", () => {
 			stage: "backlog",
 			state: "idle",
 			topic: "github issue",
+			sourceIssue: "7",
 			queuedAt: null,
 		});
 		expect(await store.getIssueWatch(7)).toEqual({
@@ -4937,6 +4938,39 @@ describe("issue watch store methods", () => {
 		expect(await store.issueCardsFiledSince(201)).toBe(1);
 		expect(await store.issueCardsFiledSince(0)).toBe(3);
 		expect(await store.issueCardsFiledSince(301)).toBe(0);
+	});
+
+	test("open stamps source_issue on outside-text cards filed before the column existed", async () => {
+		const dir = join(root, "issue-converge");
+		const store = await open(dir);
+		const issue = await store.fileIssueCard({
+			number: 7,
+			title: "a",
+			prompt: "a",
+			now: 1,
+		});
+		const { filed } = await store.fileJiraCards({
+			site: "jira.example.com",
+			stage: "backlog",
+			items: [{ key: "C-1", title: "t", prompt: "p" }],
+			now: 2,
+		});
+		const jira = filed[0];
+		if (jira === undefined) throw new Error("fileJiraCards filed nothing");
+		await store.close();
+		// Rows of cards filed before the column existed: NULL source_issue.
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		db.run("UPDATE tasks SET source_issue = NULL");
+		db.close();
+		const again = await open(dir);
+		expect((await again.getTask(issue.id))?.sourceIssue).toBe("7");
+		expect((await again.getTask(jira.id))?.sourceIssue).toBe("C-1");
+		await again.close();
+		// Idempotent: a second open keeps the values.
+		const third = await open(dir);
+		expect((await third.getTask(issue.id))?.sourceIssue).toBe("7");
+		expect((await third.getTask(jira.id))?.sourceIssue).toBe("C-1");
+		await third.close();
 	});
 
 	test("unlabelledIssues lists ascending until markIssueLabelled", async () => {
@@ -6274,6 +6308,7 @@ describe("jira imports", () => {
 				stage: "backlog",
 				state: "idle",
 				topic: "jira",
+				sourceIssue: `A-${i + 1}`,
 				queuedAt: null,
 				title: `A-${i + 1}: t`,
 				prompt: `prompt A-${i + 1}`,

@@ -56,8 +56,10 @@ function hasFollowUp(id: string, tasks: ListedTask[]): boolean {
  * cancelled, self, the card self continues, a card of another kind than `work` or one
  * filed from an outside pull request, or outside in progress, merging, and done research
  * without a follow-up. PR-review and source-PR cards carry the PR author's title in their
- * text, so an outsider could word one to claim every new card as its duplicate. A child
- * on another board is not in the list, so its parent counts as "without a follow-up". */
+ * text; issue-watch and Jira cards (sourceIssue) carry the issue or ticket author's text
+ * the same way. An outsider could word one to claim every new card as its duplicate. A
+ * child on another board is not in the list, so its parent counts as "without a
+ * follow-up". */
 function candidateStatus(
 	self: ListedTask,
 	t: ListedTask,
@@ -69,7 +71,8 @@ function candidateStatus(
 		t.id === self.id ||
 		t.id === parent ||
 		t.kind !== "work" ||
-		t.sourcePrNumber !== null
+		t.sourcePrNumber !== null ||
+		t.sourceIssue !== null
 	)
 		return null;
 	if (t.stage === "in_progress") return "in progress";
