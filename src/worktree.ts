@@ -2016,12 +2016,35 @@ async function catFileBatch(
 	return err.trim() !== "" ? Buffer.alloc(0) : Buffer.from(bytes);
 }
 
-/** The LFS endpoint git-lfs derives for an http(s) origin URL, pinned on the command
- * line so a planted `lfs.url` cannot move the upload (verified against git-lfs 3.6.1:
- * an empty `-c lfs.url=` fails the push, the derived value overrides the plant). */
+/**
+ * The LFS endpoint git-lfs derives for an http(s) origin URL, plus the lock-check
+ * opt-out, both pinned on the command line so a planted `lfs.url` cannot move the
+ * upload (verified against git-lfs 3.6.1: an empty `-c lfs.url=` fails the push, the
+ * derived value overrides the plant).
+ *
+ * The endpoint mirrors git-lfs's own derivation (lfsapi/endpoint_finder.go
+ * NewEndpointFromCloneURL): `<url>.git/info/lfs` when the URL lacks the `.git`
+ * suffix, `<url>/info/lfs` when it carries it. OTTR-1109: the bare
+ * `<url>/info/lfs` form this pin used before lands on a different server route —
+ * GitHub answers 422 to the locks/verify call and to the batch alike there
+ * (MYST-34) — where git-lfs's own derivation appends `.git`. git-lfs reads the lock
+ * opt-out as `lfs.<endpoint>.locksverify` (commands/lockverifier.go
+ * getVerifyStateFor), so the second pin scopes that same endpoint: the board never
+ * uses LFS locks, and on github hosts git-lfs verifies locks by default, so a 422
+ * from a locking endpoint must not fail an upload whose batch works.
+ */
 function lfsEndpointPin(originUrl: string): readonly string[] {
 	if (!/^https?:\/\//i.test(originUrl)) return [];
-	return ["-c", `lfs.url=${originUrl.replace(/\/+$/, "")}/info/lfs`];
+	const base = originUrl.replace(/\/+$/, "");
+	const endpoint = base.endsWith(".git")
+		? `${base}/info/lfs`
+		: `${base}.git/info/lfs`;
+	return [
+		"-c",
+		`lfs.url=${endpoint}`,
+		"-c",
+		`lfs.${endpoint}.locksverify=false`,
+	];
 }
 
 /**

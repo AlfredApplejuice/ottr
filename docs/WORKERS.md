@@ -1284,8 +1284,8 @@ release tag push therefore run a scan before they push: plain git
 inside the range still shows; `cat-file --batch-check` for sizes; then
 `cat-file --batch` for only the blobs under the 1 KiB pointer ceiling) lists
 the LFS pointer oids, and only when the list is not empty does the server run
-`git lfs push <originUrl> <ref>` for the same ref with the same credential
-plumbing as the push (git() classifies `lfs` as network git). A repo whose
+`git lfs push <originUrl> <ref>` for the same ref with the same
+credential plumbing as the push (git() classifies `lfs` as network git). A repo whose
 pushed range holds no LFS pointers runs no git lfs command, and the scan never
 reads a big blob's bytes, so the read stays bounded on a large history. The
 release tag's scan base is the target's tracking tip when it is an ancestor of
@@ -1293,10 +1293,17 @@ the tag — the release's normal state, the tag riding the tip the merge push
 landed — so a release of any repo scans an empty range and runs no LFS step at
 all; a tag on a commit the origin does not hold scans only what the tag adds.
 The upload runs only for origins whose endpoint can be pinned: an http(s) origin
-gets `-c lfs.url=<originUrl>/info/lfs` on the command line, which outranks a
-planted `lfs.url` (an empty `-c lfs.url=` fails the push, verified against
-git-lfs 3.6.1) and the URL argument means `remote.<name>.lfsurl` is never
-read; a local-path origin becomes a `file://` URL and git-lfs's built-in
+gets `-c lfs.url=<endpoint>` and `-c lfs.<endpoint>.locksverify=false` on the
+command line, where `<endpoint>` mirrors git-lfs's own derivation —
+`<originUrl>.git/info/lfs` when the URL lacks the `.git` suffix,
+`<originUrl>/info/lfs` when it carries one. OTTR-1109: the bare
+`<originUrl>/info/lfs` form lands on a different server route, and GitHub
+answers 422 to the locks/verify call and to the batch alike there (MYST-34).
+The pins outrank a planted `lfs.url` (an empty `-c lfs.url=` fails the push,
+verified against git-lfs 3.6.1), the URL argument means `remote.<name>.lfsurl`
+is never read, and the lock pin turns the locking API off: the board never uses
+LFS locks, and on github hosts git-lfs verifies locks by default, so a locking
+endpoint's error response must not fail an upload whose batch endpoint works; a local-path origin becomes a `file://` URL and git-lfs's built-in
 standalone file transfer ignores endpoint config entirely, storing the objects
 in the bare repo itself. Any other scheme runs no LFS step: for `ssh://` the
 https endpoint git-lfs authenticates over ssh cannot be derived offline, so no
