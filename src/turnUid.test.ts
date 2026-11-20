@@ -1,7 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import {
 	chmodSync,
-	chownSync,
 	closeSync,
 	existsSync,
 	lstatSync,
@@ -426,43 +425,47 @@ rootTest("chownTree leaves symlink targets untouched", () => {
 });
 
 rootTest(
-	"a renamed walked root cannot redirect the walk into an impostor",
+	"renames after the pin cannot redirect the walk into impostors",
 	() => {
 		const ws = freshDir("rename-ws");
 		const ids = projectTurnUid("rename-proj");
 		const root = join(ws, "root");
 		mkdirSync(join(root, "sub"), { recursive: true });
 		writeFileSync(join(root, "sub", "mine.txt"), "x\n");
-		// First pass: the takeover, as a real first turn performs it.
-		chownTree(root, ids);
 
-		// The uid renames the walked dir and plants an impostor at the old path,
-		// holding a plain file that a walk following the path would chown.
-		renameSync(root, `${root}-moved`);
-		mkdirSync(join(root, "steal"), { recursive: true });
-		const stolen = join(root, "steal", "victim.txt");
-		writeFileSync(stolen, "v\n");
-		chmodSync(stolen, 0o644);
-		// Hand the moved tree back to root, so the pinned walk must visibly re-chown it.
-		const rootIds = { uid: 0, gid: 0 };
-		chownTree(`${root}-moved`, rootIds);
-		expect(statSync(join(`${root}-moved`, "sub", "mine.txt")).uid).toBe(0);
-
-		// The daemon pins the root by fd (the open is the race window's entry) and
-		// walks: the rename above stands in for a swap between listing and chown.
-		const fd = openPinned(`${root}-moved`);
+		// The daemon pins the root BEFORE any attacker action: the open is the
+		// race window's entry.
+		const fd = openPinned(root);
 		try {
-			chownSync(`/proc/self/fd/${fd}`, ids.uid, ids.gid);
+			// Mid-walk swaps, after the pin: the uid renames the walked dir twice
+			// and plants an impostor at every path a resolving walk could land on.
+			// A chownTreeFd that resolves the fd back to its path (readlinkSync)
+			// or follows any path under the old root would chown an impostor's
+			// file; the anchored walk must chown the pinned inode's children.
+			renameSync(root, `${root}-a`);
+			mkdirSync(join(root, "steal-a"), { recursive: true });
+			const victimA = join(root, "steal-a", "victim.txt");
+			writeFileSync(victimA, "v\n");
+			chmodSync(victimA, 0o644);
+			renameSync(`${root}-a`, `${root}-b`);
+			mkdirSync(join(`${root}-a`, "steal-b"), { recursive: true });
+			const victimB = join(`${root}-a`, "steal-b", "victim.txt");
+			writeFileSync(victimB, "v\n");
+			chmodSync(victimB, 0o644);
+
 			chownTreeFd(fd, ids);
+
+			// The walk followed the pinned inode (now named root-b): its children
+			// are the uid's, and both impostors stayed root-owned.
+			expect(statSync(join(`${root}-b`, "sub")).uid).toBe(ids.uid);
+			expect(statSync(join(`${root}-b`, "sub", "mine.txt")).uid).toBe(ids.uid);
+			expect(statSync(victimA).uid).not.toBe(ids.uid);
+			expect(statSync(victimB).uid).not.toBe(ids.uid);
+			expect(statSync(join(root, "steal-a")).uid).not.toBe(ids.uid);
+			expect(statSync(join(`${root}-a`, "steal-b")).uid).not.toBe(ids.uid);
 		} finally {
 			closeSync(fd);
 		}
-		// The walk followed the pinned inode: the moved tree is the uid's again, and
-		// the impostor's file was never touched.
-		expect(statSync(join(`${root}-moved`, "sub", "mine.txt")).uid).toBe(
-			ids.uid,
-		);
-		expect(statSync(stolen).uid).not.toBe(ids.uid);
 	},
 );
 

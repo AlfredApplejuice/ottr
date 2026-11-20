@@ -213,10 +213,13 @@ their repo's owner and need nothing.
   top dir are owned by the project uid with mode `0700`; a symlink planted
   in the tree is lchowned and its target is untouched; a cwd outside the
   workspace root fails the run.
-- The rename race has a regression test: the walked root is renamed and an
-  impostor planted at the old path mid-flight; the fd-anchored walk chowns
-  the original tree and never touches the impostor's files, and a symlink
-  as the walked root fails the run.
+- The rename race has a regression test in the blocker's order: the root is
+  pinned by fd first, then renamed twice with an impostor directory planted
+  at each old path before the walk runs; the fd-anchored walk chowns the
+  pinned inode's children and never touches either impostor's files, and a
+  symlink as the walked root fails the run. A path-based walk (the old
+  `readdirSync(path)`/`join` form) fails this test because it chowns the
+  first impostor's files.
 - The turn home shell is root-owned; the layer copy reuses an existing final
   dir and prunes copies of deleted layers.
 - `bun run check` and `bun test` pass.
