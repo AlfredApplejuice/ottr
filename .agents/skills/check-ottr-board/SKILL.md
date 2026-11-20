@@ -1,6 +1,6 @@
 ---
 name: check-ottr-board
-description: "Use to check the Ottr board: list the open cards, find stuck ones and their cause, fix them, file a card when the cause can stop other cards too, and check each project's main checkout for uncommitted files. Runs on the host against the Docker board, or in the board as the card of its Check the board button."
+description: "Use to check the Ottr board: list the open cards, find stuck ones and their cause, fix them, file a card when the cause can stop other cards too, and check each project's main checkout for uncommitted files, or to call the local board API from the host (hold turns, move or start cards). Runs on the host against the Docker board, or in the board as the card of its Check the board button."
 ---
 
 # Check the Ottr board
