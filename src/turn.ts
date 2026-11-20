@@ -9696,19 +9696,55 @@ export function createTurnLoop(
 
 	/** True when a card descends from a fork-research card: the parent existing implies the
 	 * feature ran, so this is independent of the forkResearch toggle. The hold covers every
-	 * descendant: a card an agent files from a fork-born card (create_task) must not merge
-	 * without approval either. */
+	 * descendant, also across a project border: a card an agent files from a fork-born card
+	 * (create_task with another project) must not merge without approval either. */
 	async function isForkBorn(st: TurnSettle): Promise<boolean> {
 		const seen = new Set<string>([st.task.id]);
 		let up = st.task.followUpOf;
+		// The board that holds the card `up` names: followUpOfProject names the foreign
+		// board of a border-crossing link, and every ancestor names its own parent's board.
+		let upProject = st.task.followUpOfProject;
 		let forkBorn = false;
 		while (up !== null && !seen.has(up) && !forkBorn) {
 			seen.add(up);
-			const anc = await st.store.getTask(up);
+			const anc = await ancestorTask(st, up, upProject);
 			forkBorn = anc?.topic === "fork research";
 			up = anc?.followUpOf ?? null;
+			upProject = anc?.followUpOfProject ?? null;
 		}
 		return forkBorn;
+	}
+
+	/** One followUpOf-chain ancestor: the named foreign store when the link crossed a
+	 * project border, the settle's own store otherwise. A vanished project or a missing
+	 * card reads as no ancestor and ends the walk. */
+	async function ancestorTask(
+		st: TurnSettle,
+		id: string,
+		project: string | null,
+	): Promise<Task | null> {
+		if (project === null || project === st.store.name)
+			return await st.store.getTask(id);
+		return (
+			(await projects
+				.get(project)
+				?.store.getTask(id)
+				.catch(() => null)) ?? null
+		);
+	}
+
+	/** U7 across a project border: a card whose parent lives on another board also holds
+	 * when that board holds update merges — the hold the parent's split-off work lived
+	 * under must not vanish at the border. A vanished project reads as off; a sick
+	 * foreign store falls back to defaults (getSettingsLogged) instead of failing the
+	 * settle. */
+	async function borderHoldsUpdates(st: TurnSettle): Promise<boolean> {
+		const tp =
+			st.task.followUpOfProject === null
+				? undefined
+				: projects.get(st.task.followUpOfProject);
+		if (tp === undefined) return false;
+		return (await getSettingsLogged(tp)).holdUpdateMerges;
 	}
 
 	/** U7: an update card on a hold-update-merges project parks for a human approval; the reply
@@ -9726,7 +9762,9 @@ export function createTurnLoop(
 			st.kind === "work" && (next.stage === "done" || next.stage === "merging");
 		const settings = await st.store.getSettings();
 		const updateHold =
-			readyWork && st.task.updateIds.length > 0 && settings.holdUpdateMerges;
+			readyWork &&
+			st.task.updateIds.length > 0 &&
+			(settings.holdUpdateMerges || (await borderHoldsUpdates(st)));
 		const forkHold =
 			readyWork &&
 			(await isForkBorn(st)) &&

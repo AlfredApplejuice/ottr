@@ -11199,6 +11199,9 @@ export async function createApp(deps: AppDeps) {
 		const patch: TaskPatch = {
 			followUpOf: sourceTask.id,
 			followUpOfProject,
+			// A child of an update card inherits its merge hold, the same rule as
+			// create_task's followUpOf (resolveFollowUpOf).
+			updateIds: sourceTask.updateIds,
 			prompt: followUpPrompt({ text: trimmed, title, handoffPath }),
 			images: names,
 			promptAuthor: trimmed === IMPLEMENT_RECOMMENDATIONS ? "board" : "user",
@@ -12557,7 +12560,8 @@ export async function createApp(deps: AppDeps) {
 		// the id shape is valid (resolveTask answers 400 for a bad shape
 		// first). Ids are unique per project, not across projects: exactly
 		// one foreign match links and stores the parent's project, several
-		// are ambiguous, and the merge hold never crosses a project border.
+		// are ambiguous. The merge hold follows the link across the border:
+		// the child inherits the parent's updateIds like a local child.
 		const hits = (
 			await Promise.all(
 				[...deps.projects.values()]
@@ -12581,7 +12585,7 @@ export async function createApp(deps: AppDeps) {
 		return {
 			followUpOf: hit.task.id,
 			followUpOfProject: hit.project,
-			updateIds: [],
+			updateIds: hit.task.updateIds,
 		};
 	}
 

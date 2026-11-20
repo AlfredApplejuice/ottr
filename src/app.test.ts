@@ -1357,8 +1357,8 @@ describe("task routes", () => {
 				(t) => t.followUpOf === parent.id,
 			)!;
 			expect(child.followUpOfProject).toBe("p1");
-			// The merge hold never crosses a project border.
-			expect(child.updateIds).toEqual([]);
+			// The merge hold crosses the border: the child inherits the parent's hold ids.
+			expect(child.updateIds).toEqual(["x@1"]);
 		});
 
 		test("create with a parent on this board keeps the link local", async () => {
@@ -1425,6 +1425,43 @@ describe("task routes", () => {
 				existsSync(join(p2.store.tasksDir, "handoffs", `${kid.id}.md`)),
 			).toBe(true);
 			expect((await store.listTasks()).length).toBe(before);
+		});
+
+		test("a follow-up inherits the source card's merge hold ids", async () => {
+			const parent = await store.createTask("p1 held parent");
+			await store.updateTask(parent.id, {
+				updateIds: ["x@1"],
+				stage: "done",
+				state: "idle",
+			});
+			const cross = await post(
+				`/api/projects/p1/tasks/${parent.id}/follow-up`,
+				{
+					text: "carry on in p2",
+					project: "p2",
+				},
+			);
+			expect(cross.status).toBe(200);
+			const crossKid = (await p2.store.listTasks()).find(
+				(t) => t.followUpOf === parent.id,
+			)!;
+			expect(crossKid.followUpOfProject).toBe("p1");
+			expect(crossKid.updateIds).toEqual(["x@1"]);
+			const localParent = await store.createTask("p1 held parent, local");
+			await store.updateTask(localParent.id, {
+				updateIds: ["x@1"],
+				stage: "done",
+				state: "idle",
+			});
+			const local = await post(
+				`/api/projects/p1/tasks/${localParent.id}/follow-up`,
+				{ text: "carry on here" },
+			);
+			expect(local.status).toBe(200);
+			const localKid = (await store.listTasks()).find(
+				(t) => t.followUpOf === localParent.id,
+			)!;
+			expect(localKid.updateIds).toEqual(["x@1"]);
 		});
 
 		test("follow-up into an unknown project 404s and files nothing", async () => {

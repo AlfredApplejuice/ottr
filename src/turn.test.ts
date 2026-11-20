@@ -12584,6 +12584,87 @@ describe("turn fork-born merge hold", () => {
 	});
 });
 
+describe("turn cross-project merge hold", () => {
+	// Fresh stores share one id sequence, so a filler card keeps the foreign parent's
+	// id off the child's board: the ancestry walk must not mistake a local id twin
+	// for the ancestor.
+	async function foreignForkCase(overrides: FixtureOps = {}) {
+		const s = await setup({ commitsAhead: async () => 0, ...overrides });
+		const foreign = await freshStore();
+		s.projects.set(foreign.name, fakeProject(foreign));
+		await foreign.createTask("filler keeps ids apart");
+		const parent = await foreign.createTask("fork research: weekly digest");
+		await foreign.updateTask(parent.id, {
+			topic: "fork research",
+			research: true,
+			stage: "done",
+			state: "idle",
+		});
+		const task = await s.store.createTask("adopt fork idea");
+		await s.store.updateTask(task.id, {
+			followUpOf: parent.id,
+			followUpOfProject: foreign.name,
+		});
+		return { ...s, foreign, parent, task };
+	}
+
+	/** An update-card parent on another board; the child carries the copied hold ids
+	 * the create_task route stores. `foreignOn` turns on only the foreign board's
+	 * holdUpdateMerges; the own board's stays at its default (off). */
+	async function foreignUpdateCase(foreignOn: boolean) {
+		const s = await setup({ commitsAhead: async () => 0 });
+		const foreign = await freshStore();
+		s.projects.set(foreign.name, fakeProject(foreign));
+		await foreign.createTask("filler keeps ids apart");
+		const parent = await foreign.createTask("update pins");
+		await foreign.updateTask(parent.id, { updateIds: ["a@1"] });
+		const task = await s.store.createTask("split-off update work");
+		await s.store.updateTask(task.id, {
+			followUpOf: parent.id,
+			followUpOfProject: foreign.name,
+			updateIds: ["a@1"],
+		});
+		if (foreignOn) await foreign.setSettings({ holdUpdateMerges: true });
+		return { ...s, foreign, parent, task };
+	}
+
+	test("a card of a fork-research parent on another board parks for merge approval", async () => {
+		const { store, record, loop, task } = await foreignForkCase();
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.needsReason).toBe(FORK_HOLD_REASON);
+		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	test("the walk reads the foreign board, not a local card that shares the id", async () => {
+		const { store, foreign, parent, loop, task } = await foreignForkCase();
+		// Own board's second card gets the foreign parent's id, and it is plain work:
+		// a local-only walk would settle done instead of holding.
+		const decoy = await store.createTask("unrelated local card");
+		expect(decoy.id).toBe(parent.id);
+		expect(foreign.name).not.toBe(store.name);
+		await loop.runTurn(store.name, task.id);
+		expect((await store.getTask(task.id))!.needsReason).toBe(FORK_HOLD_REASON);
+	});
+
+	test("a child of an update card on another board holds when only that board holds update merges", async () => {
+		const { store, loop, task } = await foreignUpdateCase(true);
+		await loop.runTurn(store.name, task.id);
+		expect((await store.getTask(task.id))!.needsReason).toBe(
+			UPDATE_HOLD_REASON,
+		);
+	});
+
+	test("with both boards' holdUpdateMerges off the border child merges like any work card", async () => {
+		const { store, record, loop, task } = await foreignUpdateCase(false);
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.needsReason).toBeNull();
+		expect(record.removeWorktree).toHaveLength(1);
+	});
+});
+
 describe("fork-born work check before the hold", () => {
 	// A fork-born card whose ready report carries commits classifies merging/queued; the
 	// fork hold would park it, and the second-model check must judge the head first
