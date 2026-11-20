@@ -1550,6 +1550,14 @@ describe("AskBlock", () => {
 		options: [{ label: "A", description: "first" }, { label: "B" }],
 		multi: true,
 		recommended: 0,
+		text: false,
+	};
+	const textQ = {
+		question: "Name the branch",
+		options: [],
+		multi: false,
+		recommended: null,
+		text: true,
 	};
 
 	test("a multi question renders checkboxes and a disabled Answer button", () => {
@@ -1647,12 +1655,34 @@ describe("AskBlock", () => {
 					options: [{ label: "Postgres" }],
 					multi: false,
 					recommended: null,
+					text: false,
 				}}
 			/>,
 		);
 		expect(html).toContain('placeholder="Your answer"');
 		// A fixed composer example would read as a suggested answer under a park question.
 		expect(html).not.toContain("Deploy only the API");
+	});
+
+	test("a text question renders a labeled field and no choice controls", () => {
+		const html = renderToStaticMarkup(<AskBlock {...base} q={textQ} />);
+		expect(html).toContain('type="text"');
+		expect(html).not.toContain('type="radio"');
+		expect(html).not.toContain('type="checkbox"');
+		// The field carries the question text as its label.
+		expect(html).toContain('aria-label="Name the branch"');
+		// Nothing typed: the Answer button stays disabled.
+		expect(html).toContain("Answer");
+		expect(html).toContain("disabled");
+	});
+
+	test("a saved text answer seeds the field and shows the answered state", () => {
+		const html = renderToStaticMarkup(
+			<AskBlock {...base} q={textQ} answered selected="release-branch" />,
+		);
+		expect(html).toContain('value="release-branch"');
+		expect(html).toContain("Replace answer");
+		expect(html).toContain('class="ask-q answered"');
 	});
 });
 
@@ -1694,6 +1724,14 @@ describe("AskBlock multi answers", () => {
 		options: [{ label: "A", description: "first" }, { label: "B" }],
 		multi: true,
 		recommended: null,
+		text: false,
+	};
+	const textQ = {
+		question: "Name the branch",
+		options: [],
+		multi: false,
+		recommended: null,
+		text: true,
 	};
 
 	/** The form-submit DOM event; happy-dom's Event class does not match lib.dom's. */
@@ -1838,6 +1876,84 @@ describe("AskBlock multi answers", () => {
 		expect(answers).toEqual(["handwritten note"]);
 		expect(text.value).toBe("handwritten note");
 		expect(other.checked).toBe(true);
+	});
+
+	/** One mounted text AskBlock; every onAnswer text lands in `answers`, every onDraft in `drafts`. */
+	async function mountTextAsk(): Promise<{
+		container: HTMLDivElement;
+		answers: string[];
+		drafts: (string | null)[];
+		form: HTMLFormElement;
+		text: HTMLInputElement;
+		button: HTMLButtonElement;
+	}> {
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const answers: string[] = [];
+		const drafts: (string | null)[] = [];
+		function Block() {
+			return (
+				<AskBlock
+					q={textQ}
+					name="ask-0"
+					answered={false}
+					selected={null}
+					busy={false}
+					changed={[]}
+					onOpenDiff={() => {}}
+					onAnswer={(t: string) => {
+						answers.push(t);
+					}}
+					onDraft={(t: string | null) => {
+						drafts.push(t);
+					}}
+				/>
+			);
+		}
+		await act(async () => {
+			root.render(<Block />);
+		});
+		const text = container.querySelector(
+			'input[type="text"]',
+		) as unknown as HTMLInputElement;
+		const form = container.querySelector("form") as unknown as HTMLFormElement;
+		const button = container.querySelector(
+			"button",
+		) as unknown as HTMLButtonElement;
+		if (text === null || form === null || button === null)
+			throw new Error("text ask block did not render its controls");
+		return { container, answers, drafts, form, text, button };
+	}
+
+	test("a text block drafts as it types and answers the trimmed text on submit", async () => {
+		const { answers, drafts, form, text, button } = await mountTextAsk();
+		// Nothing typed: the button is disabled and a submit answers nothing.
+		expect(button.disabled).toBe(true);
+		await act(async () => {
+			form.dispatchEvent(submitEvent());
+		});
+		expect(answers).toEqual([]);
+		await act(async () => {
+			typeInto(text, "  release-branch  ");
+			onChangeOf(text)({ target: text, currentTarget: text });
+		});
+		// The draft rides the trimmed text; the button enables.
+		expect(drafts).toEqual(["release-branch"]);
+		expect(button.disabled).toBe(false);
+		await act(async () => {
+			form.dispatchEvent(submitEvent());
+		});
+		expect(answers).toEqual(["release-branch"]);
+		// Emptying the field withdraws the draft and disables the button again.
+		await act(async () => {
+			typeInto(text, "");
+			onChangeOf(text)({ target: text, currentTarget: text });
+		});
+		expect(drafts).toEqual(["release-branch", null]);
+		expect(button.disabled).toBe(true);
 	});
 });
 
@@ -5287,6 +5403,7 @@ describe("Drawer approve button", () => {
 				options: [],
 				multi: false,
 				recommended: null,
+				text: true,
 			},
 		],
 	} satisfies Partial<TaskCard>;
@@ -5337,6 +5454,7 @@ describe("Drawer approve button", () => {
 					options: [],
 					multi: false,
 					recommended: null,
+					text: true,
 				},
 			],
 			worktreeFiles: ["mockup.html"],
@@ -10021,6 +10139,7 @@ describe("Drawer prompt gate Start anyway", () => {
 					options: [],
 					multi: false,
 					recommended: null,
+					text: true,
 				},
 			],
 			gate,
@@ -10253,12 +10372,14 @@ describe("Drawer ask drafts on the server", () => {
 				options: [{ label: "Postgres" }, { label: "SQLite" }],
 				multi: true,
 				recommended: null,
+				text: false,
 			},
 			{
 				question: "Which region?",
 				options: [{ label: "EU" }, { label: "US" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		],
 		gate: null,

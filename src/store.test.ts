@@ -939,6 +939,7 @@ describe("asked", () => {
 			options: [{ label: "A", description: "faster" }, { label: "B" }],
 			multi: false,
 			recommended: 1,
+			text: false,
 		},
 	];
 
@@ -6797,6 +6798,7 @@ describe("ask drafts", () => {
 				options: [{ label: "yes" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			})),
 		});
 

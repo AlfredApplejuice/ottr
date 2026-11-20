@@ -7744,6 +7744,18 @@ a.lineage-row:hover .lineage-title {
 	flex: 1;
 	min-width: 0;
 }
+/* A text question's row: the field takes the free width, the Answer button rides beside it.
+   The global input styles own the border, the accent focus ring and the locked look. */
+.ask-text-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-top: 8px;
+}
+.ask-text-row input {
+	flex: 1;
+	min-width: 0;
+}
 .kept-panel {
 	margin: 8px 0;
 	padding: 10px 12px;

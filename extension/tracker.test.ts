@@ -1062,9 +1062,12 @@ describe("arch-review changed-line coverage", () => {
 		}
 	});
 
-	test("ask delivers questions and reports the pause", async () => {
+	test("ask delivers mixed questions with one without options and reports the pause", async () => {
 		const out = await fakePi().ask!.execute("t1", {
-			questions: [{ question: "Go left?", options: [{ label: "yes" }] }],
+			questions: [
+				{ question: "Go left?", options: [{ label: "yes" }] },
+				{ question: "Name it?" },
+			],
 		});
 		expect(text(out)).toBe(
 			"Your question was delivered to the tracker user. The run is paused; the answer arrives as the next user message. End your turn now WITHOUT calling report_outcome (the tracker knows you are waiting).",
@@ -1211,7 +1214,7 @@ describe("arch-review changed-line coverage", () => {
 			"Optional explanation of the choice",
 		);
 		expect(questions.element?.options?.description).toBe(
-			"2-5 answer choices; the user can also type a custom answer",
+			"2-5 answer choices; omit for a free-text question the user answers by typing one line",
 		);
 	});
 

@@ -352,10 +352,18 @@ function renderAsk(args: unknown): string | null {
 	const qs = askQuestions(args);
 	if (qs === null) return null;
 	return `\n▸ ask\n${qs
-		.map(
-			(q) =>
-				`  ? ${q.question}\n${q.options.map((o) => `    • ${o.label}${o.description ? ` — ${o.description}` : ""}`).join("\n")}`,
-		)
+		.map((q) => {
+			// A text question has no options: the user types a single-line answer.
+			const bullets = q.text
+				? "    • <type your answer>"
+				: q.options
+						.map(
+							(o) =>
+								`    • ${o.label}${o.description ? ` — ${o.description}` : ""}`,
+						)
+						.join("\n");
+			return `  ? ${q.question}\n${bullets}`;
+		})
 		.join("\n")}\n`;
 }
 

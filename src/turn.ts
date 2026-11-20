@@ -4628,6 +4628,7 @@ export function createTurnLoop(
 				options: q.options.map((label) => ({ label })),
 				multi: false,
 				recommended: null,
+				text: q.options.length === 0,
 			}));
 			// Questions without inline choices get their options from the gate model (the
 			// same seam the evaluation uses); the call never judges readiness and never
@@ -4659,6 +4660,7 @@ export function createTurnLoop(
 							options: mq.options.map((label) => ({ label })),
 							multi: false,
 							recommended: rec >= 0 ? rec : null,
+							text: false,
 						};
 					});
 				} catch (e) {
@@ -9271,6 +9273,7 @@ export function createTurnLoop(
 				],
 				multi: false,
 				recommended: null,
+				text: false,
 			}));
 			if (open !== undefined) {
 				const q = await st.store.getTask(open.id);
@@ -10851,6 +10854,7 @@ export function createTurnLoop(
 								],
 								multi: false,
 								recommended: null,
+								text: false,
 							})),
 							needsReason: `Wants your answer: ${n} question${n === 1 ? "" : "s"} about the review's needs-validation leads`,
 						});

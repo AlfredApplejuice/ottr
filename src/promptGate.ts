@@ -557,6 +557,7 @@ export function gateAskQuestions(check: GateCheck): AskQuestion[] {
 			options: q.options.slice(0, 5).map((label) => ({ label })),
 			multi: false,
 			recommended: null,
+			text: false,
 		}));
 }
 
@@ -568,6 +569,7 @@ export function startAnywayQuestion(): AskQuestion {
 		options: [{ label: START_ANYWAY }],
 		multi: false,
 		recommended: null,
+		text: false,
 	};
 }
 
@@ -596,6 +598,7 @@ export function missingCheckQuestion(): AskQuestion {
 		options: [],
 		multi: false,
 		recommended: null,
+		text: true,
 	};
 }
 

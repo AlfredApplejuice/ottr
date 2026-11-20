@@ -1636,6 +1636,7 @@ describe("turn loop", () => {
 										options: [{ label: "a" }],
 										multi: false,
 										recommended: null,
+										text: false,
 									},
 								],
 							}),
@@ -1660,6 +1661,7 @@ describe("turn loop", () => {
 				options: [{ label: "a" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 	});
@@ -2393,6 +2395,7 @@ describe("turn quarantine", () => {
 									options: [],
 									multi: false,
 									recommended: null,
+									text: true,
 								},
 							],
 						}),
@@ -23070,6 +23073,7 @@ describe("turn PR-mode merge settle", () => {
 									],
 									multi: false,
 									recommended: null,
+									text: false,
 								},
 							],
 						}),
@@ -23092,6 +23096,7 @@ describe("turn PR-mode merge settle", () => {
 				options: [{ label: "fix main first" }, { label: "push anyway" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 
@@ -28321,6 +28326,7 @@ describe("stored review findings", () => {
 				],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 		expect(questions[0]!.needsReason).toBe(
@@ -29200,6 +29206,7 @@ describe("prompt gate", () => {
 				options: [{ label: "sqlite" }, { label: "postgres" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 		expect(after.gate?.parked).toBe(true);
@@ -29646,6 +29653,7 @@ describe("prompt gate", () => {
 				options: [{ label: "fail" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 		// The failure signature counts the blocking questions only.
@@ -30109,12 +30117,14 @@ describe("prompt gate", () => {
 				options: [{ label: "postgres" }, { label: "sqlite" }],
 				multi: false,
 				recommended: 0,
+				text: false,
 			},
 			{
 				question: "Which migration tool?",
 				options: [{ label: "golang-migrate" }, { label: "dbmate" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 		expect(after.gate?.parked).toBe(true);
@@ -30169,6 +30179,7 @@ describe("prompt gate", () => {
 				],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 			{
 				question:
@@ -30179,6 +30190,7 @@ describe("prompt gate", () => {
 				],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 		for (const q of after.asked ?? []) {
@@ -30225,6 +30237,7 @@ describe("prompt gate", () => {
 				options: [],
 				multi: false,
 				recommended: null,
+				text: true,
 			},
 		]);
 		expect(await logText(store, task.id)).toContain(

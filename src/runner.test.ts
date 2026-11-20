@@ -814,6 +814,24 @@ describe("renderEvent", () => {
 		).toBe("\n▸ ask\n  ? Which way?\n    • A\n    • B — safer\n");
 	});
 
+	test("ask start renders a text question as a type-your-answer line", () => {
+		expect(
+			renderEvent({
+				type: "tool_execution_start",
+				toolCallId: "t9",
+				toolName: "ask",
+				args: {
+					questions: [
+						{ question: "What name?" },
+						{ question: "Which way?", options: [{ label: "A" }] },
+					],
+				},
+			}),
+		).toBe(
+			"\n▸ ask\n  ? What name?\n    • <type your answer>\n  ? Which way?\n    • A\n",
+		);
+	});
+
 	test("task tool is not mistaken for ask", () => {
 		expect(
 			renderEvent({
@@ -1657,6 +1675,7 @@ describe("classify", () => {
 			options: [{ label: "A" }, { label: "B" }],
 			multi: false,
 			recommended: null,
+			text: false,
 		},
 	];
 
@@ -1675,6 +1694,22 @@ describe("classify", () => {
 			),
 		).toMatchObject({
 			needsReason: `Wants your answer: ${"x".repeat(160)}…`,
+		});
+		// A text question carries through needs_you unchanged too.
+		const textAsk = [
+			{
+				question: "Which way?",
+				options: [],
+				multi: false,
+				recommended: null,
+				text: true,
+			},
+		];
+		expect(run("work", result({ asked: textAsk }))).toEqual({
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: "Wants your answer: Which way?",
+			asked: textAsk,
 		});
 	});
 
@@ -2029,6 +2064,7 @@ describe("classify grill", () => {
 					options: [],
 					multi: false,
 					recommended: null,
+					text: true,
 				},
 			],
 		});
@@ -2926,6 +2962,7 @@ describe("applyEvent", () => {
 				options: [{ label: "a" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 	});
@@ -2968,6 +3005,26 @@ describe("applyEvent", () => {
 				options: [{ label: "y" }],
 				multi: false,
 				recommended: null,
+				text: false,
+			},
+		]);
+	});
+
+	test("m. a text question takes the ask slot normalized with text set", () => {
+		const s = newEventState();
+		feed(s, {
+			type: "tool_execution_start",
+			toolName: "ask",
+			toolCallId: "a1",
+			args: { questions: [{ question: "Name the branch?" }] },
+		});
+		expect(s.asked).toEqual([
+			{
+				question: "Name the branch?",
+				options: [],
+				multi: false,
+				recommended: null,
+				text: true,
 			},
 		]);
 	});
@@ -4760,6 +4817,7 @@ describe("arch-review changed-line coverage", () => {
 						options: [{ label: "y" }],
 						multi: false,
 						recommended: null,
+						text: false,
 					},
 				],
 				proposed: null,

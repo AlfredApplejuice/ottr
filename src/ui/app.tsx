@@ -8851,8 +8851,56 @@ function AskCustom({
 	);
 }
 
+/** A text question's answer row: one single-line field, labeled with the question text.
+ * Enter or the button answers with the trimmed text; a text answer is one wire line,
+ * so nothing but the trim joins the field's value. */
+function AskTextRow({
+	q,
+	busy,
+	selected,
+	onDraft,
+	onAnswer,
+}: {
+	q: AskQuestion;
+	busy: boolean;
+	selected: string | null;
+	onDraft: (text: string | null) => void;
+	onAnswer: (text: string) => void;
+}) {
+	// The saved answer seeds the field once: a loaded draft remounts the block through its key.
+	const [draft, setDraft] = useState(selected ?? "");
+	const value = draft.trim();
+	return (
+		<form
+			className="ask-text-row"
+			onSubmit={(e) => {
+				e.preventDefault();
+				if (value !== "") onAnswer(value);
+			}}
+		>
+			{/* The question paragraph above is the visible label; aria-label ties it to the field. */}
+			<input
+				type="text"
+				value={draft}
+				aria-label={q.question}
+				disabled={busy}
+				onChange={(e) => {
+					setDraft(e.target.value);
+					const v = e.target.value.trim();
+					onDraft(v === "" ? null : v);
+				}}
+			/>
+			<button type="submit" disabled={busy || value === ""}>
+				{busy && <span className="spinner" aria-hidden="true" />}
+				{selected === null ? "Answer" : "Replace answer"}
+			</button>
+		</form>
+	);
+}
+
 /** One ask question: single-choice presets answer in one click; multi questions collect
- * checkbox picks plus an "Other" pick or typed text and answer with one comma list. */
+ * checkbox picks plus an "Other" pick or typed text and answer with one comma list; a
+ * text question answers from one labeled free-text field. */
 export function AskBlock({
 	q,
 	name,
@@ -8912,6 +8960,26 @@ export function AskBlock({
 	const multiTotal = picked.length + (customJoined ? 1 : 0);
 	// A multi question counts as answered as soon as anything is checked.
 	const done = answered || (multi && multiTotal > 0);
+	// A text question has no picks: its row is one labeled field and its Answer button;
+	// the recorded answer sits back in the field and ticks the question like a check does.
+	if (q.text)
+		return (
+			<div className={`ask-q${answered ? " answered" : ""}`}>
+				<AskText
+					q={q}
+					changed={changed}
+					done={answered}
+					onOpenDiff={onOpenDiff}
+				/>
+				<AskTextRow
+					q={q}
+					busy={busy}
+					selected={selected}
+					onDraft={onDraft}
+					onAnswer={onAnswer}
+				/>
+			</div>
+		);
 	return (
 		<div className={`ask-q${done ? " answered" : ""}`}>
 			<AskText q={q} changed={changed} done={done} onOpenDiff={onOpenDiff} />

@@ -818,6 +818,7 @@ describe("stale needs_you re-classification", () => {
 					options: [],
 					multi: false,
 					recommended: null,
+					text: true,
 				},
 			],
 		});

@@ -685,9 +685,10 @@ export default function (pi: Pi) {
 		name: "ask",
 		label: "Ask the user",
 		description:
-			"Ask the tracker user one or more questions with clickable choices. Pauses the run until the answer " +
-			"arrives as the next message. Use it instead of guessing a direction. Bundle all questions of one " +
-			"pause into a single call.",
+			"Ask the tracker user one or more questions with clickable choices. A question without " +
+			"options is a free-text question the user answers by typing one line. Pauses the run until " +
+			"the answer arrives as the next message. Use it instead of guessing a direction. Bundle all " +
+			"questions of one pause into a single call.",
 		parameters: z.object({
 			questions: z
 				.array(
@@ -703,8 +704,9 @@ export default function (pi: Pi) {
 										.describe("Optional explanation of the choice"),
 								}),
 							)
+							.optional()
 							.describe(
-								"2-5 answer choices; the user can also type a custom answer",
+								"2-5 answer choices; omit for a free-text question the user answers by typing one line",
 							),
 						multi: z
 							.boolean()

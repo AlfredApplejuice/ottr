@@ -1967,6 +1967,7 @@ describe("task routes", () => {
 				options: [{ label: "yes" }, { label: "no" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			})),
 		});
 		return t;
@@ -2015,6 +2016,7 @@ describe("task routes", () => {
 					options: [{ label: "yes" }, { label: "no" }],
 					multi: false,
 					recommended: null,
+					text: false,
 				})),
 			});
 		await round(["Old?"]);
@@ -2125,6 +2127,116 @@ describe("task routes", () => {
 		expect(await store.getAskDraft(t.id)).toBeNull();
 	});
 
+	/** A needs-you card with a mixed three-question ask: one single-choice, one
+	 * multi, one text — the drawer answers each with its own wire line. */
+	const mixedAskTask = async (title: string) => {
+		const t = await store.createTask(title);
+		await store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: "the agent asked",
+			asked: [
+				{
+					question: "Which store?",
+					options: [{ label: "SQLite" }, { label: "Postgres" }],
+					multi: false,
+					recommended: 0,
+					text: false,
+				},
+				{
+					question: "Which flags?",
+					options: [
+						{ label: "verbose" },
+						{ label: "dry-run" },
+						{ label: "watch" },
+					],
+					multi: true,
+					recommended: null,
+					text: false,
+				},
+				{
+					question: "Any extra note?",
+					options: [],
+					multi: false,
+					recommended: null,
+					text: true,
+				},
+			],
+		});
+		return t;
+	};
+
+	test("a mixed-form ask reply queues all three answer lines and clears the ask", async () => {
+		const t = await mixedAskTask("mixed ask round trip");
+		const before = calls;
+		// The drawer sends one wire line per question: the picked label, a comma
+		// list for the multi question, and the typed text for the text question.
+		const reply = [
+			askAnswerLine("Which store?", "SQLite"),
+			askAnswerLine("Which flags?", "verbose, watch"),
+			askAnswerLine("Any extra note?", "keep the old key name"),
+		].join("\n");
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: reply,
+		});
+		expect(res.status).toBe(200);
+		const row = await store.getTask(t.id);
+		expect(row?.state).toBe("queued");
+		expect(row?.asked).toBeNull();
+		expect(row?.needsReason).toBeNull();
+		expect(row?.pendingPrompt).toBe(reply);
+		expect(calls).toBe(before + 1);
+	});
+
+	test("a single text question takes the raw answer as the queued turn", async () => {
+		const t = await store.createTask("one text question");
+		await store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: "the agent asked",
+			asked: [
+				{
+					question: "What should the release note say?",
+					options: [],
+					multi: false,
+					recommended: null,
+					text: true,
+				},
+			],
+		});
+		const before = calls;
+		// One question: AskPanel sends the typed text bare, without the wire line.
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: "ships with the pooled client",
+		});
+		expect(res.status).toBe(200);
+		const row = await store.getTask(t.id);
+		expect(row?.state).toBe("queued");
+		expect(row?.asked).toBeNull();
+		expect(row?.needsReason).toBeNull();
+		expect(row?.pendingPrompt).toBe("ships with the pooled client");
+		expect(calls).toBe(before + 1);
+	});
+
+	test("a mixed reply keeps a comma list and a quoted word intact on the queued turn", async () => {
+		const t = await mixedAskTask("mixed ask punctuation");
+		const before = calls;
+		const reply = [
+			askAnswerLine("Which store?", "SQLite"),
+			askAnswerLine("Which flags?", "dry-run, watch"),
+			askAnswerLine("Any extra note?", 'keep the "legacy" name'),
+		].join("\n");
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: reply,
+		});
+		expect(res.status).toBe(200);
+		const row = await store.getTask(t.id);
+		expect(row?.state).toBe("queued");
+		expect(row?.asked).toBeNull();
+		// The session turn carries the reply verbatim: no line lost, no quote mangled.
+		expect(row?.pendingPrompt).toBe(reply);
+		expect(row?.pendingPrompt).toContain('keep the "legacy" name');
+		expect(calls).toBe(before + 1);
+	});
+
 	test("reply and Resume keep a steer queued before the stop", async () => {
 		const t = await store.createTask("stopped while steered");
 		await store.updateTask(t.id, {
@@ -2183,6 +2295,7 @@ describe("task routes", () => {
 				],
 				multi: false,
 				recommended: null,
+				text: false,
 			})),
 		});
 		return { review, lead1: leads[0]!, lead2: leads[1]!, ask };
@@ -2224,6 +2337,7 @@ describe("task routes", () => {
 				],
 				multi: false,
 				recommended: null,
+				text: false,
 			})),
 		});
 		return {
@@ -2337,6 +2451,7 @@ describe("task routes", () => {
 					],
 					multi: false,
 					recommended: null,
+					text: false,
 				},
 			],
 		});
@@ -2753,6 +2868,7 @@ describe("task routes", () => {
 					],
 					multi: false,
 					recommended: null,
+					text: false,
 				},
 			],
 		});
@@ -5781,6 +5897,7 @@ describe("alate routes", () => {
 						options: [{ label: "SQLite" }],
 						multi: false,
 						recommended: null,
+						text: false,
 					},
 				],
 				gate: {

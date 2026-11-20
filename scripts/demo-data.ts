@@ -54,8 +54,11 @@ export interface Spec {
 	deps?: number[];
 	/** Index of the done task this follow-up continues. */
 	followUpOf?: number;
-	/** Open question shown on the card; stored as the ask tool's JSON shape. */
-	asked?: { q: string; options: string[] };
+	/** Open questions shown on the card; stored as the ask tool's JSON shape. A
+	 *  question without options is a free-text question (the ask tool's mixed forms). */
+	asked?: {
+		questions: Array<{ q: string; options?: string[]; multi?: boolean }>;
+	};
 	research?: boolean;
 	release?: { version: string; notes: string };
 	/** Sets the trusted review kind on the card; the ARCH_REVIEW_MARKER prompt stays for realism. */
@@ -149,8 +152,20 @@ const POOL: ProjectSpec[] = [
 				needs:
 					"Wants your answer: keep the local-only token or move to the OAuth device flow?",
 				asked: {
-					q: "Which auth flow should the dashboard use for thermostat control?",
-					options: ["A local-only token", "The OAuth device flow"],
+					questions: [
+						{
+							q: "Which auth flow should the dashboard use for thermostat control?",
+							options: ["A local-only token", "The OAuth device flow"],
+						},
+						{
+							q: "Which data may the token read?",
+							options: ["Live temperature", "Schedules", "Energy history"],
+							multi: true,
+						},
+						{
+							q: "Which release tag should the migration land under?",
+						},
+					],
 				},
 			},
 			{
@@ -433,14 +448,25 @@ export function insertEvent(
 // The ask tool's shape (parseAsked → askQuestions): a bare string parses to null.
 function askedJson(t: Spec): string | null {
 	if (!t.asked) return null;
-	return JSON.stringify([
-		{
-			question: t.asked.q,
-			options: t.asked.options.map((label) => ({ label })),
-			multi: false,
-			recommended: 0,
-		},
-	]);
+	return JSON.stringify(
+		t.asked.questions.map((q) =>
+			q.options === undefined
+				? {
+						question: q.q,
+						options: [],
+						multi: false,
+						recommended: null,
+						text: true,
+					}
+				: {
+						question: q.q,
+						options: q.options.map((label) => ({ label })),
+						multi: q.multi === true,
+						recommended: q.multi === true ? null : 0,
+						text: false,
+					},
+		),
+	);
 }
 
 function taskDoneAt(t: Spec, now: number): number | null {
@@ -643,7 +669,7 @@ function insertWorkTurn(
 			closed.exitCode,
 			closed.outcome,
 			closed.summary,
-			t.asked?.q ?? null,
+			t.asked?.questions[0]?.q ?? null,
 			t.crashed ? STALE_ERROR : null,
 		],
 	);

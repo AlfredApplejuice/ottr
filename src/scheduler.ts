@@ -1187,6 +1187,7 @@ export function workCheckAsk(
 			],
 			multi: false,
 			recommended: 0,
+			text: false,
 		},
 	];
 }
@@ -1334,6 +1335,7 @@ export function workCheckDivergeAsk(
 			],
 			multi: false,
 			recommended: 0,
+			text: false,
 		},
 	];
 }

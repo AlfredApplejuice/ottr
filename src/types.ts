@@ -60,13 +60,17 @@ export interface ProposalSummary {
 	decision?: string;
 }
 
-/** One question of the agent's outstanding `ask` call; the UI renders options as click-to-answer buttons. */
+/** One question of the agent's outstanding `ask` call; the UI renders options as click-to-answer
+ * buttons, and a text question (`text`, no options) as a single-line typed answer. */
 export interface AskQuestion {
 	question: string;
 	options: AskOption[];
 	multi: boolean;
 	/** Zero-based recommended option index; null when the agent gave none. */
 	recommended: number | null;
+	/** Free-text question: true exactly when `options` is empty; `multi` is then false and
+	 * `recommended` null. */
+	text: boolean;
 }
 
 /** One gate question the gate itself answered with the default it would build with (OTTR-904). */
@@ -127,19 +131,25 @@ export function askAnswerLine(question: string, answer: string): string {
 	return `For "${question}": ${answer}`;
 }
 
-/** One normalized ask question, or null when its question/options are unusable. */
+/** One normalized ask question, or null when its question text is unusable; unusable or
+ * missing options degrade to a text question instead of null. */
 function askQuestionOf(item: unknown): AskQuestion | null {
-	if (
-		typeof item !== "object" ||
-		item === null ||
-		!("question" in item) ||
-		!("options" in item)
-	)
+	if (typeof item !== "object" || item === null || !("question" in item))
 		return null;
-	const { question, options: rawOptions } = item;
+	const { question } = item;
+	if (typeof question !== "string") return null;
+	// No options (absent or not an array): the user answers by typing one line.
+	const rawOptions = "options" in item ? item.options : null;
+	if (!Array.isArray(rawOptions))
+		return {
+			question,
+			options: [],
+			multi: false,
+			recommended: null,
+			text: true,
+		};
 	const multi = "multi" in item ? item.multi : undefined;
 	const recommended = "recommended" in item ? item.recommended : undefined;
-	if (typeof question !== "string" || !Array.isArray(rawOptions)) return null;
 	const options: AskOption[] = [];
 	const keptRaw: number[] = [];
 	for (const [rawIdx, entry] of rawOptions.entries()) {
@@ -148,6 +158,16 @@ function askQuestionOf(item: unknown): AskQuestion | null {
 		options.push(option);
 		keptRaw.push(rawIdx);
 	}
+	// No usable option survived (including an empty options array): the text form
+	// wins over multi/recommended, which have nothing to point at.
+	if (options.length === 0)
+		return {
+			question,
+			options: [],
+			multi: false,
+			recommended: null,
+			text: true,
+		};
 	// recommended is a raw index; map it onto the kept options or null when that
 	// option was dropped. indexOf rejects non-integers/out-of-range for free.
 	const at =
@@ -157,6 +177,7 @@ function askQuestionOf(item: unknown): AskQuestion | null {
 		options,
 		multi: multi === true,
 		recommended: at === -1 ? null : at,
+		text: false,
 	};
 }
 

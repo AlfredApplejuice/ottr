@@ -434,6 +434,7 @@ describe("ask mapping", () => {
 				options: [{ label: "sqlite" }, { label: "postgres" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 	});
@@ -823,6 +824,7 @@ describe("gateAskQuestions blocking-only", () => {
 				options: [{ label: "fail" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 	});
@@ -913,6 +915,7 @@ describe("replayGateParks", () => {
 					options: [],
 					multi: false,
 					recommended: null,
+					text: true,
 				},
 			],
 			...(o.pending === undefined ? {} : { pendingPrompt: o.pending }),
@@ -1069,6 +1072,7 @@ describe("replayGateParks", () => {
 					options: [],
 					multi: false,
 					recommended: null,
+					text: true,
 				},
 			],
 		});
