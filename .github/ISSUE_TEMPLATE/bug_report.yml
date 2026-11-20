@@ -1,0 +1,31 @@
+name: Bug report
+description: Report a problem in Ottr
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Before you open a bug, check the open issues. A security problem goes
+        through [private vulnerability reporting](https://github.com/ottr-ai/ottr/security/advisories/new).
+        See [SECURITY.md](https://github.com/ottr-ai/ottr/blob/main/SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you see, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest steps that show the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Your operating system, the output of `bun --version`, and the install path (Docker Compose, Podman, or bare metal).
+    validations:
+      required: true

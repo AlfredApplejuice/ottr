@@ -131,7 +131,7 @@ See the [service quota specification](docs/specs/service-quotas.md) for the inte
 
 ## Contribute
 
-Run Ottr on your own projects and check the result against [docs/development.md](docs/development.md). Report a vulnerability per [SECURITY.md](SECURITY.md).
+Run Ottr on your own projects and check the result against [docs/development.md](docs/development.md). To change Ottr itself, start with [CONTRIBUTING.md](CONTRIBUTING.md). The project follows its [code of conduct](CODE_OF_CONDUCT.md), and [ACCESSIBILITY.md](ACCESSIBILITY.md) states the accessibility commitment. Report a vulnerability per [SECURITY.md](SECURITY.md).
 
 ## Built with Ottr
 
