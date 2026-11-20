@@ -3015,21 +3015,28 @@ function fakeStart(o: {
 
 /** OTTR-990: a local run must park the worktree's custom-tool dirs out of omp's
  * discovery for the run and restore them at settle. The launcher sees the cwd exactly
- * when omp would import the planted modules, so the parked state is asserted there. */
+ * when omp would import the planted modules, so the parked state is asserted there.
+ * This list is the test's own spec, deliberately not read from the code's
+ * CUSTOM_TOOL_DIRS: a change that drops one of the five dirs from the code's list must
+ * fail here (the planted dir would still sit at its discovery path at spawn), not pass
+ * because the expectation shrank with the bug. */
+const PARKED_RELS = [
+	".omp/tools",
+	".omp/plugins",
+	".claude/tools",
+	".claude/plugins",
+	".codex/tools",
+] as const;
+
 describe("startRun custom-tool park", () => {
-	/** Plants `.omp/tools/` and runs one local startRun whose launcher records the cwd's
-	 * park shape at spawn, then closes the child cleanly. */
+	/** Plants every parked dir and runs one local startRun whose launcher records the
+	 * cwd's park shape at spawn, then closes the child cleanly. */
 	async function plantedRun(cwd: string) {
-		const atSpawn: { tools: boolean; plugins: boolean } = {
-			tools: false,
-			plugins: false,
-		};
+		const atSpawn: Record<string, boolean> = {};
 		const fake = new FakeOmp(4242);
 		const launcher: RunLauncher = (_c, _a, options) => {
-			atSpawn.tools = existsSync(join(String(options.cwd), ".omp", "tools"));
-			atSpawn.plugins = existsSync(
-				join(String(options.cwd), ".omp", "plugins"),
-			);
+			for (const rel of PARKED_RELS)
+				atSpawn[rel] = existsSync(join(String(options.cwd), rel));
 			queueMicrotask(() => fake.emit("close", 0));
 			return fake as unknown as ChildProcess;
 		};
@@ -3046,35 +3053,31 @@ describe("startRun custom-tool park", () => {
 		return { handle, atSpawn };
 	}
 
+	/** Every parked dir must be out of omp's sight at spawn: an entry still present is a
+	 * planted module omp would import into the server process. */
+	function expectAllParked(atSpawn: Record<string, boolean>): void {
+		expect(atSpawn).toEqual(
+			Object.fromEntries(PARKED_RELS.map((rel) => [rel, false])),
+		);
+	}
+
 	test("parks planted custom-tool dirs at spawn and restores their content after", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-park-"));
 		try {
 			const planted =
 				'.omp/tools/planted.ts\nexport default () => ({ name: "planted" });\n';
-			for (const rel of [
-				join(".omp", "tools"),
-				join(".omp", "plugins"),
-				join(".claude", "tools"),
-				join(".claude", "plugins"),
-				join(".codex", "tools"),
-			]) {
+			for (const rel of PARKED_RELS) {
 				mkdirSync(join(dir, rel), { recursive: true });
 				writeFileSync(join(dir, rel, "planted.ts"), planted);
 			}
 			const { handle, atSpawn } = await plantedRun(dir);
 			const result = await handle.done;
-			// omp would import the planted modules from these exact paths at spawn:
-			// both the discovery targets must be gone while the run owns the cwd.
-			expect(atSpawn).toEqual({ tools: false, plugins: false });
+			// omp would import the planted modules from these exact paths at spawn: none
+			// of the five discovery targets may exist while the run owns the cwd.
+			expectAllParked(atSpawn);
 			expect(result.exitCode).toBe(0);
 			// Every planted dir is back, byte for byte, and no park sibling remains.
-			for (const rel of [
-				join(".omp", "tools"),
-				join(".omp", "plugins"),
-				join(".claude", "tools"),
-				join(".claude", "plugins"),
-				join(".codex", "tools"),
-			]) {
+			for (const rel of PARKED_RELS) {
 				expect(readFileSync(join(dir, rel, "planted.ts"), "utf8")).toBe(
 					planted,
 				);
@@ -3097,7 +3100,7 @@ describe("startRun custom-tool park", () => {
 			await handle.done;
 			// The heal runs before the spawn, so the leftover content sits at the park
 			// target again while the run owns the cwd.
-			expect(atSpawn).toEqual({ tools: false, plugins: false });
+			expectAllParked(atSpawn);
 			expect(
 				readFileSync(join(dir, ".omp", "tools", "planted.ts"), "utf8"),
 			).toBe("committed\n");
