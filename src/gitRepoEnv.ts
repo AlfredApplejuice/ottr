@@ -1,11 +1,14 @@
 /**
- * Ambient env vars that relocate a git spawn to another repository (OTTR-1162). A session that
- * carries `GIT_DIR` (a merge-turn shell, a process launched from a git hook) once redirected the
- * suite's fixture writes into the board's own repository: a fixture `git commit --allow-empty`
- * landed on the board main, `git config` wrote the board config, and `git update-ref -d` deleted
- * the board's `refs/remotes/origin/main`. git honors these over its cwd, so every git spawn the
- * board or the suite makes strips them from the child env; a caller that genuinely needs them
- * passes them via an explicit env value, which merges after the strip (sealedGit's per-call env).
+ * Ambient env vars that relocate a git spawn to another repository (OTTR-1162). A drill run with
+ * `GIT_DIR` aimed at an enclosing repository made a fixture helper's `git config` and
+ * `git commit --allow-empty` write that repository while the fixture test stayed green — the
+ * same signature as the stray commit and config write the board repo picked up during the
+ * 2026-11-20 OTTR-1097 merge turn. How that session's environment got poisoned was not found,
+ * and the loss of the board's `refs/remotes/origin/main` around the same time was not
+ * reproduced (it may have another cause). git honors these variables over its cwd, so every
+ * git spawn the board or the suite makes strips them from the child env; a caller that
+ * genuinely needs them passes them via an explicit env value, which merges after the strip
+ * (sealedGit's per-call env).
  */
 export const GIT_REPO_ENV = [
 	"GIT_DIR",
@@ -14,6 +17,8 @@ export const GIT_REPO_ENV = [
 	"GIT_OBJECT_DIRECTORY",
 	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
 	"GIT_NAMESPACE",
+	// Relocates the common dir: refs, objects and the repo config (OTTR-1162 send-back).
+	"GIT_COMMON_DIR",
 ] as const;
 
 /**

@@ -48,6 +48,7 @@ import {
 	vmProviders,
 	vmRunnerFromEnv,
 	WORKER_LOST,
+	withoutGitAuth,
 	workerFromEnv,
 	workerTurnLists,
 } from "./runner.ts";
@@ -6496,4 +6497,18 @@ describe("startRun commit identity env", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	}, 30_000);
+});
+
+test("withoutGitAuth strips the repo-relocating vars and keeps git auth (OTTR-1162)", () => {
+	const env = withoutGitAuth({
+		GIT_DIR: "/workspace/ottr/.git",
+		GIT_WORK_TREE: "/workspace/ottr",
+		GIT_COMMON_DIR: "/workspace/ottr/.git",
+		GH_TOKEN: "ghp_aaaaaaaaaaaaaaaaaaaa",
+	});
+	expect(env.GIT_DIR).toBeUndefined();
+	expect(env.GIT_WORK_TREE).toBeUndefined();
+	expect(env.GIT_COMMON_DIR).toBeUndefined();
+	// GH_TOKEN is not in the stripped set: a merge turn keeps it for its push.
+	expect(env.GH_TOKEN).toBe("ghp_aaaaaaaaaaaaaaaaaaaa");
 });

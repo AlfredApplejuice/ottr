@@ -5756,3 +5756,29 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		rmSync(join(wt, ".."), { recursive: true, force: true });
 	}, 30_000);
 });
+
+describe("git() ambient env (OTTR-1162)", () => {
+	test("rev-parse reads the cwd repo even with GIT_DIR exported", async () => {
+		const checkout = mkdtempSync(join(tmpdir(), "ott-gitenv-strip-"));
+		try {
+			await must(checkout, "init", "-q", "-b", "main");
+			await must(checkout, "commit", "-q", "--allow-empty", "-m", "init");
+			const previous = process.env.GIT_DIR;
+			process.env.GIT_DIR = join(checkout, "no-such-gitdir");
+			try {
+				// Without the strip, rev-parse reads the exported GIT_DIR (a dead gitdir) and
+				// fails; with it, the call reads the repo the cwd names.
+				const r = await git(["rev-parse", "--absolute-git-dir"], checkout);
+				expect(r.code).toBe(0);
+				expect(r.stdout.trim()).toBe(
+					await must(checkout, "rev-parse", "--absolute-git-dir"),
+				);
+			} finally {
+				if (previous === undefined) delete process.env.GIT_DIR;
+				else process.env.GIT_DIR = previous;
+			}
+		} finally {
+			rmSync(checkout, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}, 60_000);
+});

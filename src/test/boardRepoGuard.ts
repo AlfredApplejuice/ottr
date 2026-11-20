@@ -1,18 +1,20 @@
 /**
- * OTTR-1162: a bun test run must never write the board's own repository. A session whose env
- * carried `GIT_DIR` (a merge-turn shell, a process launched from a git hook) once redirected the
- * suite's fixture writers into /workspace/ottr/.git: a fixture `commit -m a` landed on the board
- * main, `git config` wrote the board config, and `git update-ref -d` deleted the board's
- * refs/remotes/origin/main — while the suite stayed green, because the redirected calls succeed.
- * The spawn-level strip (gitRepoEnv, production gitEnv, fixture helpers) removes the env vector;
- * this preload (bunfig [test] preload, bun test only) removes the rest of the class: every git
- * exec of the suite runs through a PATH shim that refuses a write command whose repo resolves to
- * the enclosing repository. Reads stay allowed (the suite reads the checkout legitimately, and a
- * concurrent tracker merge may move the refs — so a byte-compare would false-red on a busy board;
- * the shim's refusal is the proof that this run wrote nothing).
+ * OTTR-1162: a bun test run must never write the board's own repository. A drill run with
+ * `GIT_DIR` aimed at the enclosing repository made fixture helpers write that repository while
+ * the fixture test stayed green — the same signature as the stray commit and config write the
+ * board repo picked up during the 2026-11-20 OTTR-1097 merge turn. How that session's
+ * environment got poisoned was not found; the traced full-suite runs of this card wrote nothing.
+ * The spawn-level strip (gitRepoEnv, production gitEnv, fixture helpers) removes the env
+ * vector; this preload (bunfig [test] preload, bun test only) removes the rest of the class:
+ * every git exec of the suite runs through a PATH shim that refuses a write command whose repo
+ * resolves to the enclosing repository. Reads stay allowed (the suite reads the checkout
+ * legitimately, and a concurrent tracker merge may move the refs — so a byte-compare would
+ * false-red on a busy board; the shim's refusal is the proof that this run wrote nothing).
  *
  * Fail-closed: an installation error throws (red run). No enclosing repo (a Stryker sandbox, a
- * bare checkout) keeps the guard inert: there is nothing to protect there.
+ * bare checkout) keeps the guard inert (the handle becomes null): there is nothing to protect
+ * there, and the drill test skips only on that explicit null — a missing preload wires no
+ * handle at all and the drill fails.
  */
 import { spawnSync } from "node:child_process";
 import { chmodSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
@@ -31,7 +33,7 @@ export interface BoardGuard {
 	log: string;
 }
 
-const holder = globalThis as { __ottrBoardGuard?: BoardGuard };
+const holder = globalThis as { __ottrBoardGuard?: BoardGuard | null };
 
 const SHIM = [
 	"#!/bin/bash",
@@ -95,6 +97,14 @@ const SHIM = [
 	'    case "$t" in "$repodir"|"$repodir"/*) inrepo=1;; esac',
 	"  fi",
 	"fi",
+	"# GIT_COMMON_DIR relocates refs, objects and the repo config wholesale: a call whose",
+	"# common dir resolves into the watched repo is suspect even when its cwd is a fixture.",
+	'if [ -n "${GIT_COMMON_DIR:-}" ]; then',
+	'  c="$(cd "${GIT_COMMON_DIR}" 2>/dev/null && pwd -P)" || c=""',
+	'  if [ -n "$c" ]; then',
+	'    case "$c" in "$repodir"|"$repodir"/*) inrepo=1;; esac',
+	"  fi",
+	"fi",
 	"# Server-side commands serve the repository named by their first non-flag operand, not the",
 	"# cwd: a fixture server execs them from the suite's own cwd with a /tmp repo path, and cwd",
 	"# discovery there would misread the enclosing repo as the served one (OTTR-1162 follow-up).",
@@ -115,12 +125,12 @@ const SHIM = [
 	"    fi",
 	"  ;;",
 	"esac",
-	"# Write decision. Unconditional writers, then per-subcommand reads (config/remote/worktree/",
-	"# tag/branch/reflog have read forms; init/clone are safe with an explicit path operand).",
+	"# Write decision: allow-list of reads. A subcommand not named here counts as a writer",
+	"# (it can move HEAD, refs or .git/config), so a coverage gap fails loud and red.",
 	"write=0",
 	'case "$sub" in',
 	'  "") ;;',
-	"  commit|update-ref|push|fetch|pull|merge|rebase|revert|cherry-pick|reset|checkout|switch|stash|am|apply|mv|rm|add|gc|prune|repack|notes|replace|filter-branch|filter-repo|maintenance|send-pack|receive-pack|unpack-objects|index-pack|read-tree|write-tree|annotate) write=1;;",
+	"  rev-parse|rev-list|status|log|show|diff|diff-files|diff-index|diff-tree|blame|annotate|grep|shortlog|whatchanged|name-rev|cherry|describe|cat-file|ls-files|ls-tree|ls-remote|for-each-ref|merge-base|count-objects|verify-pack|fsck|var|range-diff|show-branch|verify-commit|verify-tag|check-ignore|check-attr|check-mailmap|credential) ;;",
 	"  config)",
 	"    vals=0; j=$((i+1))",
 	'    while [ "$j" -lt "$n" ]; do',
@@ -155,6 +165,15 @@ const SHIM = [
 	'      *" --list "*|*" -v "*|*" -vv "*|*" -a "*|*" -r "*|*" --show-current "*|*" --contains "*|*" --merged "*|*" --no-merged "*|*" --format "*|*" --sort "*|*" --points-at "*) ;;',
 	'      *) [ "$((i+1))" -lt "$n" ] && write=1;;',
 	"    esac;;",
+	"  submodule)",
+	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash expansion, not a TS template
+	'    case "${args[$((i+1))]}" in add|init|update|sync|deinit|absorbgitdirs|foreach) write=1;; esac;;',
+	"  sparse-checkout)",
+	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash expansion, not a TS template
+	'    case "${args[$((i+1))]}" in set|init|add|disable|reapply) write=1;; esac;;',
+	"  stash)",
+	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash expansion, not a TS template
+	'    case "${args[$((i+1))]}" in push|save|apply|pop|drop|branch|clear|store|create) write=1;; esac;;',
 	'  init) [ "$((i+1))" -ge "$n" ] && write=1;;',
 	"  symbolic-ref)",
 	'    case " ${args[*]:$((i+1))} " in',
@@ -167,6 +186,8 @@ const SHIM = [
 	"        done",
 	'        [ "$ops" -ge 2 ] && write=1;;',
 	"    esac;;",
+	"  clone) ;;",
+	"  *) write=1;;",
 	"esac",
 	'if [ "$inrepo" = 1 ] && [ "$write" = 1 ]; then',
 	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash expansion, not a TS template
@@ -206,7 +227,10 @@ function install(): BoardGuard | null {
 }
 
 try {
-	holder.__ottrBoardGuard = install() ?? undefined;
+	// The property is always PRESENT after the preload ran: null = inert (no enclosing repo,
+	// a Stryker sandbox). A missing property means the preload never ran at all, and the
+	// drill test fails on that.
+	holder.__ottrBoardGuard = install();
 } catch (err) {
 	throw new Error(`ottr board-repo guard failed to install: ${err}`);
 }

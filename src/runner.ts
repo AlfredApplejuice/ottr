@@ -1589,17 +1589,20 @@ export function createRunSink(o: {
 /** D6: no agent run holds Ottr's ssh command, the env-scoped credential helper or the
  * per-host tokens; the server alone runs that git. GH_TOKEN is not in this set: a local run
  * (a merge turn in the server container) keeps it for its push. Worker turns never get it:
- * startRun drops it from the forwarded env, and serveWorker strips it from its own env. */
-function withoutGitAuth(
+ * startRun drops it from the forwarded env, and serveWorker strips it from its own env.
+ * Exported for the repo-relocating-env strip test (OTTR-1162). */
+export function withoutGitAuth(
 	env: Record<string, string | undefined>,
 ): Record<string, string | undefined> {
 	const out = { ...env };
 	for (const k of Object.keys(out))
 		if (GIT_AUTH_ENV_NAME.test(k)) delete out[k];
-	// OTTR-1162: a session env carrying GIT_DIR (a process launched from a git hook) once
-	// redirected a turn's test run into the board's own repository. A turn's git names its
-	// repos with path arguments; the ambient repo-relocating vars never help and only
-	// redirect. Guests strip the same set (vmGuest toolEnv).
+	// OTTR-1162: a session env carrying GIT_DIR (for example a process launched from a git
+	// hook) redirects a turn's test run into the foreign gitdir — the drill on this card made
+	// fixture writes land in the enclosing repository this way, and the stray board-repo
+	// writes of 2026-11-20 matched that shape. A turn's git names its repos with path
+	// arguments; the ambient repo-relocating vars never help and only redirect. Guests strip
+	// the same set (vmGuest toolEnv).
 	stripRepoRelocatingEnv(out);
 	return out;
 }

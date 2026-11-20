@@ -1089,8 +1089,9 @@ function releaseArgv(command: string): string[] {
 	return argv;
 }
 
-/** The command's env excludes server secrets and includes the release facts. */
-function releaseEnv(o: {
+/** The release command's child env: the command's git names its repos with path arguments,
+ * so the ambient repo-relocating vars are stripped (OTTR-1162). Exported for the strip test. */
+export function releaseEnv(o: {
 	sha: string;
 	version: string;
 	notesFile: string;

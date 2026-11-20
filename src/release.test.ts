@@ -27,6 +27,7 @@ import {
 	publishRelease,
 	releaseBlocked,
 	releaseChip,
+	releaseEnv,
 	releasePushAuth,
 	runGh,
 	runReleaseCommand,
@@ -1951,4 +1952,21 @@ describe("releaseChip", () => {
 		expect(chip).toEqual({ release: null, url: null });
 		expect(probes).toBe(0);
 	});
+});
+
+test("releaseEnv strips the repo-relocating vars (OTTR-1162)", () => {
+	const previous = process.env.GIT_DIR;
+	process.env.GIT_DIR = "/workspace/ottr/.git";
+	try {
+		const env = releaseEnv({
+			sha: "a".repeat(40),
+			version: "v1.2.3",
+			notesFile: "/tmp/notes.md",
+		});
+		expect(env.GIT_DIR).toBeUndefined();
+		expect(env.OTTR_RELEASE_VERSION).toBe("v1.2.3");
+	} finally {
+		if (previous === undefined) delete process.env.GIT_DIR;
+		else process.env.GIT_DIR = previous;
+	}
 });
