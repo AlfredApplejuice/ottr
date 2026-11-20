@@ -1,6 +1,6 @@
 # Automatic PR reviews
 
-A project can let Ottr review its open GitHub pull requests. Ottr files one review card for each PR. The server asks the model for a draft review in one tool-free call, as fork research does. A person edits the draft and clicks Post. Ottr then sends one GitHub review with the `COMMENT` event.
+A project can let Ottr review its open GitHub pull requests. Ottr files one review card for each PR. The server asks the model for a draft review in one tool-free call, as fork research does. A person edits the draft and clicks Post. Ottr then sends one GitHub review with the `COMMENT` event. A project can instead let the board post each finished draft by itself; [pr-review-auto-post.md](pr-review-auto-post.md) owns that setting and flow.
 
 No agent runs over PR code. An agent turn in a checkout of the PR was the first design. The merge security review rejected it: omp loads project config and user MCP tools from the cwd, and no flag turns all of them off. So a PR could run code through the agent.
 
@@ -14,8 +14,9 @@ No agent runs over PR code. An agent turn in a checkout of the PR was the first 
 - `POST /api/projects/:project/settings` accepts `prReviewApprove`. A value that is not a boolean gets 400 `prReviewApprove must be a boolean`.
 - `ProjectSettings.prReviewRequestChanges: boolean`. The default is `false`.
 - `POST /api/projects/:project/settings` accepts `prReviewRequestChanges`. A value that is not a boolean gets 400 `prReviewRequestChanges must be a boolean`.
+- `ProjectSettings.prReviewManualPost: boolean`. The default is `true`. With it off, the board posts each finished draft by itself through the Post path; [pr-review-auto-post.md](pr-review-auto-post.md) owns the behavior.
 - The watcher works only when `prReviews` is true and the project has a GitHub repo (`project.github !== null`). In other cases, the watcher makes no `gh` call for the project.
-- Project settings show a "PR reviews" checkbox next to "Fork research", a "PR review notifications" checkbox under it, and a "PR review approvals" checkbox under those. A "PR review request changes" checkbox sits under "PR review approvals", disabled until PR reviews is on. When `prReviewApprove` is on, the Post click sends the review with event `APPROVE` when the draft's run found no blocking findings (see "Post"). When `prReviewRequestChanges` is on, a blocking draft posts as `REQUEST_CHANGES` (see "Post").
+- Project settings show a "PR reviews" checkbox next to "Fork research", a "PR review notifications" checkbox under it, and a "PR review approvals" checkbox under those. A "PR review request changes" checkbox sits under "PR review approvals", disabled until PR reviews is on. An "Only post reviews after manual approval" checkbox sits under "PR review request changes", disabled until PR reviews is on (see [pr-review-auto-post.md](pr-review-auto-post.md)). When `prReviewApprove` is on, the Post click sends the review with event `APPROVE` when the draft's run found no blocking findings (see "Post"). When `prReviewRequestChanges` is on, a blocking draft posts as `REQUEST_CHANGES` (see "Post").
 
 ### Watcher (`src/prs.ts`)
 
@@ -185,7 +186,7 @@ A deterministic scan looks for two classic performance defects in the added diff
 
 ## Boundaries
 
-- The only GitHub write is the Post click. The watcher reads only.
+- The only GitHub writes are the Post click and, with `prReviewManualPost` off, the watcher's automatic post of a finished draft ([pr-review-auto-post.md](pr-review-auto-post.md)); both run the same post path. Every other watcher step reads only.
 - No agent runs over PR code. The model gets the PR only as data and has no tools.
 - The event is `COMMENT` by default, `APPROVE` when `prReviewApprove` is on and the draft's run found no blocking findings, and `REQUEST_CHANGES` when `prReviewRequestChanges` is on and the run found blocking findings. With both settings on, a blocking draft sends `REQUEST_CHANGES` and a clean draft sends `APPROVE`.
 - Only the PR review post uses the GitHub App. Merge pushes, releases and CI reads keep the board token.
@@ -242,7 +243,7 @@ A deterministic scan looks for two classic performance defects in the added diff
 - Comments on deleted lines (the `LEFT` side) or on whole files.
 - Running PR tests or CI.
 - GitHub webhooks.
-- A post without a click.
+- With `prReviewManualPost` on (the default), a post still needs a click; the watcher posts nothing by itself. The off behavior is [pr-review-auto-post.md](pr-review-auto-post.md)'s subject, not a non-goal.
 - The comment watch starts no re-review and no model call; it reads only.
 - Comments on closed or merged PRs, and comment bodies as stored data.
 - The performance lens runs only in the PR review flow. The board's Review-button and release reviews (whole-repo agent turns) have no label surface and are out of scope. The lens never blocks or fails a review; it only adds candidates.
