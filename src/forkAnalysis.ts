@@ -47,9 +47,10 @@ const REDACT_PATTERNS: RegExp[] = [
 // Redact QUOTED literal values: `apiKey = whisparr.apiKey` is an identifier copy, a
 // quoted 16+ char value is likely a real secret. Fixture/example values stay visible.
 // A false match must never stop a review (OTTR-942): every other matched value becomes
-// [REDACTED], so the model never sees it.
+// [REDACTED], so the model never sees it. The value run is bounded to 8 KiB like the
+// token shapes, so no accepted match can cross the raw patch pre-cut (OTTR-997).
 const SUSPICIOUS_ASSIGN_RE =
-	/\b(password|passwd|secret|api[_-]?key|access[_-]?token|private[_-]?key)\b\s*[:=]\s*(?:"([^"\n]{16,})"|'([^'\n]{16,})')/gi;
+	/\b(password|passwd|secret|api[_-]?key|access[_-]?token|private[_-]?key)\b\s*[:=]\s*(?:"([^"\n]{16,8192})"|'([^'\n]{16,8192})')/gi;
 const FIXTURE_VALUE_RE =
 	/^(?:fixture|test|example|sample|dummy|placeholder|changeme|redacted)[-_. ]/i;
 
@@ -153,11 +154,12 @@ function patchCap(commitCount: number): number {
 	return Math.max(2000, Math.floor(PROMPT_CHAR_BUDGET / commitCount));
 }
 
-/** OTTR-997: clean() runs before the budget cut, so each raw patch is cut here first:
- * bounded regexes stay linear in patch length, and length itself stays bounded. The
- * +4 KiB slack keeps any real token straddling the cut fully inside the cleaned
- * region, so capPatches trims redacted text instead of half a raw secret. */
-const PATCH_PRECAP_SLACK = 4096;
+/** Longest span any redaction rule accepts: PEM block ~8.3 KiB, quoted value
+ * ~8.25 KiB, JWT ~4.2 KiB, stored tokens are short literals. clean() must see a
+ * whole match to redact it, so the raw pre-cut sits one MAX_TOKEN_LEN past the
+ * per-patch cap: a token straddling the trim boundary is fully inside the
+ * cleaned region (OTTR-997). */
+const MAX_TOKEN_LEN = 16_384;
 
 /** All labelled blocks after stripInvisible + redactSecrets, before budget capping. */
 function cleanBlocks(
@@ -171,15 +173,21 @@ function cleanBlocks(
 	upstreamDocs: string;
 	priorSection: string;
 } {
-	const precap =
-		patchCap([...range.commits, ...range.merges].length) + PATCH_PRECAP_SLACK;
+	const cap = patchCap([...range.commits, ...range.merges].length);
+	const precap = cap + MAX_TOKEN_LEN;
 	return {
 		fork: clean(
 			`owner/name: ${range.fork.owner}/${range.fork.name}\n` +
 				range.heads.map((h) => `${h.branch}: ${h.head}`).join("\n"),
 		),
 		patches: [...range.commits, ...range.merges].map((c) =>
-			clean(c.patch.length > precap ? c.patch.slice(0, precap) : c.patch),
+			c.patch.length > precap
+				? // OTTR-997: bound clean()'s input, then keep at most cap cleaned chars.
+					// The dropped tail zone before the cut can hold the prefix of a token
+					// whose rest lies beyond the cut; capPatches would not trim it when
+					// the range stays in budget, so it must never reach the prompt.
+					clean(c.patch.slice(0, precap)).slice(0, cap)
+				: clean(c.patch),
 		),
 		upstreamCommits: clean(range.upstreamCommits.join("\n")),
 		upstreamFiles: clean(range.upstreamFiles.join("\n")),

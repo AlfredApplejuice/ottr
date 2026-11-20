@@ -250,6 +250,17 @@ describe("redactSecrets", () => {
 		expect(r.hits).toBe(0);
 		expect(r.text).toBe("password = superlongunquotedvalue123");
 	});
+	test("quoted value at the 8 KiB bound redacts (OTTR-997)", () => {
+		const r = redactSecrets(`password: "${"a".repeat(8192)}"`);
+		expect(r.hits).toBe(1);
+		expect(r.text).toBe('password: "[REDACTED]"');
+	});
+	test("quoted value beyond the 8 KiB bound stays visible (OTTR-997)", () => {
+		const s = `password: "${"a".repeat(8193)}"`;
+		const r = redactSecrets(s);
+		expect(r.hits).toBe(0);
+		expect(r.text).toBe(s);
+	});
 	test("property: no quoted suspicious value survives redaction", () => {
 		const key = fc.constantFrom(
 			"password",
@@ -396,10 +407,10 @@ describe("buildUserMessage", () => {
 	});
 	test("a token straddling the raw cut still redacts (OTTR-997)", () => {
 		const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4";
-		// Two commits -> per-patch cap 200_000, raw cut at 204_096. The token
-		// straddles the cap; the 4 KiB slack keeps it inside the cleaned region,
-		// so it redacts before any budget trim instead of leaking its prefix.
-		const patch = `${"a".repeat(199_990)}${jwt}${"b".repeat(9000)}ZZTAILZZ`;
+		// Two commits -> per-patch cap 200_000, raw cut at 216_384. The token
+		// straddles the cap and sits fully inside the cleaned region, so it
+		// redacts; the marker beyond the raw cut is dropped with the tail zone.
+		const patch = `${"a".repeat(199_990)}${jwt}${"b".repeat(20_000)}ZZTAILZZ`;
 		const r = range({
 			commits: [
 				{
@@ -427,6 +438,105 @@ describe("buildUserMessage", () => {
 		expect(msg).toContain("[REDACTED]");
 		expect(msg).not.toContain("eyJ");
 		expect(msg).not.toContain("ZZTAILZZ");
+	});
+	test("a PEM block straddling the old precap cut redacts in budget (OTTR-997)", () => {
+		// Two commits -> per-patch cap 200_000. The block spans the position the
+		// earlier 4 KiB slack pre-cut sat at; the range stays in budget, so
+		// capPatches would never trim it and the raw body would reach the model.
+		const patch1 =
+			`${"a".repeat(204_000)}-----BEGIN RSA PRIVATE KEY-----\n` +
+			`${"X".repeat(3000)}\n-----END RSA PRIVATE KEY-----${"b".repeat(1000)}`;
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: patch1,
+					branches: [],
+				},
+				{
+					sha: SHA2,
+					subject: "t",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "+x",
+					branches: [],
+				},
+			],
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("[REDACTED]");
+		expect(msg).not.toContain("XXXXXXXXXX");
+	});
+	test("a 6 KiB PEM block straddling the cap redacts before the trim (OTTR-997)", () => {
+		// The block is longer than the earlier 4 KiB slack: even when capPatches
+		// trims, the pre-cut must sit far enough past the cap to cover it whole.
+		const patch1 =
+			`${"a".repeat(199_500)}-----BEGIN RSA PRIVATE KEY-----\n` +
+			`${"X".repeat(6000)}\n-----END RSA PRIVATE KEY-----${"b".repeat(10_000)}`;
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: patch1,
+					branches: [],
+				},
+				{
+					sha: SHA2,
+					subject: "t",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "a".repeat(199_000),
+					branches: [],
+				},
+			],
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("[REDACTED]");
+		expect(msg).not.toContain("XXXXXXXXXX");
+	});
+	test("a JWT straddling the old precap cut redacts in budget (OTTR-997)", () => {
+		// The token spans the position the earlier 4 KiB slack pre-cut sat at;
+		// a prefix of it must never reach the model unredacted.
+		const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4";
+		const patch1 = `${"a".repeat(204_060)}${jwt}${"b".repeat(2000)}`;
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: patch1,
+					branches: [],
+				},
+				{
+					sha: SHA2,
+					subject: "t",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "+x",
+					branches: [],
+				},
+			],
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("[REDACTED]");
+		expect(msg).not.toContain("eyJ");
 	});
 	test("throws RangeError when oversized patches bust the budget", () => {
 		const big = "x".repeat(600_000);
