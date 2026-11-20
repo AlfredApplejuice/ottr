@@ -1227,15 +1227,16 @@ describe("hosted credit stop and release end to end", () => {
 		expect(kills).toEqual([stopChildren[0]!]);
 		expect(liveStopRuns.size).toBe(0);
 
-		// The gate's answer carried the stub's balance; the state frame ships it with
-		// the control plane's account page.
+		// The gate recorded the stub's 37; the stop is the control plane's zero-credit
+		// fact, so the state frame ships 0, not the stale gate balance
+		// (docs/specs/hosted-mode.md section 5), with the control plane's account page.
 		const state = await proxyFetch("/api/state", { to: board2 });
 		expect(state.status).toBe(200);
 		const payload = (await state.json()) as {
 			credits?: { balance: number | null; accountUrl: string };
 		};
 		expect(payload.credits).toEqual({
-			balance: 37,
+			balance: 0,
 			accountUrl: new URL("/account", `${cp2.url}/`).toString(),
 		});
 

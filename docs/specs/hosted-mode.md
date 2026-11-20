@@ -164,7 +164,8 @@ usage that it saw for the run, so a late or repeated record never counts twice. 
   The answer is `{"stopped": <count>}`, with all three types in the count. After the credit
   park, no later write of the turn changes the reason or puts the card back in the queue. A
   marked turn that settles before a dispatch point (for example, its run ended before the
-  kill) settles with its own outcome.
+  kill) settles with its own outcome. The stop also records balance 0 in the board's credits
+  state, so the credits chip names the hard stop at once. The next gate answer overwrites it.
 - Credit hold: the stop also sets a hold for the board. While the hold is set, no turn starts
   a model run: before each work or merge run, each check attempt (also the second attempt),
   and each title call, a turn that sees the hold parks `needs_you` with the credit reason. A
@@ -261,9 +262,11 @@ In hosted mode the top bar shows a credits chip. It shows the balance with one d
 `/account` page. The page URL comes from `OTTR_HOSTED_CONTROL_URL`, with no new env var.
 
 The balance updates when the credit gate answers `GET /credit`. The value reaches the chip on
-the state refresh the board already does, so the board adds no polling of its own. The chip
-renders only when a balance is known. With the flag off, the payload has no `credits` key, no
-chip DOM exists, and the board sends no new request (self-hosted stays byte-identical).
+the state refresh the board already does, so the board adds no polling of its own. A credit
+stop records balance 0 at once, so the chip names the hard stop before the next gate answer
+reaches a state frame. The chip renders only when a balance is known. With the flag off, the
+payload has no `credits` key, no chip DOM exists, and the board sends no new request
+(self-hosted stays byte-identical).
 
 ## 8. Forwarded GitHub events
 

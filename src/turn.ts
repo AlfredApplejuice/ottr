@@ -11777,6 +11777,10 @@ export function createTurnLoop(
 		// Before any await: from here on, no turn dispatches a model until a fresh gate answer.
 		creditHold = true;
 		creditStops += 1;
+		// The control plane stops the tenant only at zero credit (docs/specs/hosted-mode.md
+		// section 5). Record it at once, so the credits chip names the hard stop instead of
+		// the last gate balance until a queued card runs the gate again.
+		if (ops.hosted !== undefined) ops.hosted.creditBalance.balance = 0;
 		const stops: Promise<boolean>[] = [];
 		for (const e of projects.values()) {
 			try {
