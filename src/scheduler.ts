@@ -4,6 +4,7 @@ import { WORK_CHECK_MAX_SENDBACKS } from "./prompts.ts";
 import type {
 	ArchReview,
 	AskQuestion,
+	CheckRoutingSetting,
 	ListedTask,
 	RecordedFinding,
 	Task,
@@ -11,6 +12,7 @@ import type {
 	WorkCheckBlocker,
 	WorkCheckRun,
 } from "./types.ts";
+import { modelVendor } from "./vendor.ts";
 
 /** A live turn whose card log has not grown for this long may wait on a hung command (ALAT-23
  * sat 25 h on a hung Stryker run with its omp process alive). The card warns; the board never kills. */
@@ -853,76 +855,77 @@ export function selectFindings(
 	return picked;
 }
 
-/** Model-id tokens that name a vendor, matched after the provider prefix is stripped: Claude
- *  via github-copilot, Bedrock, Vertex, OpenRouter or a gateway is still an Anthropic model.
- *  omp's model catalog cannot say: its entries carry `provider` — the prefix itself, exactly
- *  the signal that misleads — and no vendor field (checked against `omp models --json`). */
-const VENDOR_TOKENS: Record<string, string> = {
-	anthropic: "anthropic",
-	claude: "anthropic",
-	openai: "openai",
-	gpt: "openai",
-	codex: "openai",
-	google: "google",
-	gemini: "google",
-	zai: "zai",
-	zhipu: "zai",
-	glm: "zai",
-	xai: "xai",
-	grok: "xai",
-	deepseek: "deepseek",
-	moonshot: "moonshot",
-	kimi: "moonshot",
-	meta: "meta",
-	llama: "meta",
-	mistral: "mistral",
-	mixtral: "mistral",
-	ministral: "mistral",
-	codestral: "mistral",
-	magistral: "mistral",
-	pixtral: "mistral",
-	devstral: "mistral",
-	qwen: "qwen",
-	alibaba: "qwen",
-	tongyi: "qwen",
-	cohere: "cohere",
-	command: "cohere",
-	amazon: "amazon",
-	nova: "amazon",
-	titan: "amazon",
-};
-/** OpenAI's o-series ids ("o4-mini"): the family prefix is the bare letter and a number. */
-const O_SERIES = /^o\d+$/;
-
-/** The vendor a model selector names, read from the model id after the provider prefix; the
- *  id may carry its own vendor path (OpenRouter's "openrouter/anthropic/claude-x") or dotted
- *  qualifiers (Bedrock's "bedrock/us.anthropic.claude-x"), so every separator-separated token
- *  is tried in order and the first known one decides. Null when no known token shows up.
- *  The `:level` thinking suffix is ignored. Pure. */
-export function modelVendor(selector: string): string | null {
-	const [base] = splitLevel(selector);
-	const slash = base.indexOf("/");
-	const id = slash === -1 ? base : base.slice(slash + 1);
-	for (const token of id.toLowerCase().split(/[./_-]+/)) {
-		if (O_SERIES.test(token)) return "openai";
-		// hasOwn, not a bare member read: an id may hold any token, and "constructor"
-		// must stay an unknown vendor, not Object.prototype's.
-		if (Object.hasOwn(VENDOR_TOKENS, token))
-			return VENDOR_TOKENS[token] as string;
-	}
-	return null;
+/** The check run's model role for a work model: the user-set vendor rules first
+ *  (checkRoutingSetting), else the built-in default rule below. The vendor comes from the
+ *  model id, not the provider prefix (modelVendor), so Claude through another provider is
+ *  still an Anthropic model. Never fails: every path returns a role name. */
+export function checkRoleFor(
+	settings: CheckRoutingSetting | null,
+	roles: Record<string, string>,
+	reviewModel: string | null,
+): string {
+	return routeCheck(settings, roles, reviewModel).role;
 }
 
-/** The check run's model role: a review that ran on an Anthropic model gets a second vendor's
- *  opinion. The vendor comes from the model id, not the provider prefix (modelVendor), so
- *  Claude through another provider still gets the critic role; unknown and other vendors get
- *  the adversary role. */
-export function checkRoleFor(
+/** Why the routing fell back from a user rule or the user fallback to the default rule,
+ *  as one card-log line; null when the route needs no explanation (no setting, a matched
+ *  rule whose role has a configured model, or a fallback with one). Pure. */
+export function checkRoutingNote(
+	settings: CheckRoutingSetting | null,
+	roles: Record<string, string>,
 	reviewModel: string | null,
-): "critic" | "adversary" {
-	return modelVendor(reviewModel ?? "") === "anthropic"
-		? "critic"
-		: "adversary";
+): string | null {
+	return routeCheck(settings, roles, reviewModel).note;
+}
+
+/** The two exports above share this one resolution (docs/specs/check-role-routing.md).
+ *  `roles` is the omp config role map (role -> selector, file order); a null vendor
+ *  (no known token in the model id) counts as the vendor "unknown". Pure. */
+function routeCheck(
+	settings: CheckRoutingSetting | null,
+	roles: Record<string, string>,
+	reviewModel: string | null,
+): { role: string; note: string | null } {
+	const workVendor = modelVendor(reviewModel ?? "");
+	const def = defaultCheckRole(roles, workVendor);
+	if (settings === null) return { role: def, note: null };
+	const vendor = workVendor ?? "unknown";
+	const rule = settings.rules.find((r) => r.vendor === vendor);
+	if (rule !== undefined) {
+		if (roles[rule.role] !== undefined) return { role: rule.role, note: null };
+		return {
+			role: def,
+			note: `check routing: rule ${rule.vendor} -> ${rule.role} names no configured role, using the default rule`,
+		};
+	}
+	if (settings.fallback !== "") {
+		if (roles[settings.fallback] !== undefined)
+			return { role: settings.fallback, note: null };
+		return {
+			role: def,
+			note: `check routing: fallback ${settings.fallback} names no configured role, using the default rule`,
+		};
+	}
+	return { role: def, note: null };
+}
+
+/** The built-in routing, also the fallback of every failed user rule: the first configured
+ *  candidate role (critic, adversary, then every other role in config order, except default)
+ *  whose model's vendor differs from the work model's; when none differs, today's rule — an
+ *  Anthropic work model checks with critic, everything else with adversary. Pure. */
+function defaultCheckRole(
+	roles: Record<string, string>,
+	workVendor: string | null,
+): string {
+	const candidates = ["critic", "adversary"];
+	for (const role of Object.keys(roles))
+		if (role !== "default" && role !== "critic" && role !== "adversary")
+			candidates.push(role);
+	for (const role of candidates) {
+		const vendor = modelVendor(roles[role] ?? "");
+		if (vendor !== null && vendor !== workVendor) return role;
+	}
+	return workVendor === "anthropic" ? "critic" : "adversary";
 }
 
 /** Why the check cannot give a second-model opinion: "same model" when the check model is the

@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import type {
 	AppCheck,
+	CheckRoutingSetting,
 	ProjectView,
 	TaskCard,
 	TrendingStatus,
@@ -5553,13 +5554,28 @@ const rolesFetch = (
 	roles: Record<string, string>,
 	fallbacks: Record<string, string[]> = {},
 ): typeof fetch =>
-	(async (input: RequestInfo | URL) => {
+	(async (input: RequestInfo | URL, init?: RequestInit) => {
 		const ok = (body: unknown): Response =>
 			new Response(JSON.stringify(body), {
 				status: 200,
 				headers: { "Content-Type": "application/json" },
 			});
 		const url = String(input);
+		if (url.endsWith("/api/settings/check-routing")) {
+			if (init?.method !== "POST") return ok({ routing: null });
+			// Echo the posted body back as the saved setting, like the server does;
+			// null/null is the cleared (automatic) setting.
+			const body = JSON.parse(String(init.body ?? "{}")) as {
+				rules: { vendor: string; role: string }[] | null;
+				fallback: string | null;
+			};
+			return ok({
+				routing:
+					body.rules === null && body.fallback === null
+						? null
+						: { rules: body.rules, fallback: body.fallback },
+			});
+		}
 		if (url.endsWith("/api/model-roles"))
 			return ok({
 				base: "abc1234",
@@ -5603,45 +5619,41 @@ const rolesFetch = (
 	}) as typeof fetch;
 
 describe("ModelRolesSection missing check roles", () => {
-	test("Add critic adds the role and drops only its own button", async () => {
+	test("the warning names the uncovered vendor and clears when another vendor's role lands", async () => {
 		resetCatalogCache();
 		const { container, unmount } = await mountRoles(
-			rolesFetch({ default: "zai/glm-5.3-flash" }),
+			rolesFetch({ adversary: "zai/glm-5.3-flash" }),
 		);
 		try {
 			await act(async () => {});
-			const buttons = (): string[] =>
-				[...container.querySelectorAll(".role-warn-actions button")].map(
-					(b) => b.textContent ?? "",
-				);
-			expect(buttons()).toEqual(["Add critic", "Add adversary"]);
-			const critic = container.querySelector<HTMLButtonElement>(
-				".role-warn-actions button",
+			// The board's one vendor (zai) has no role of another vendor: the note
+			// names the vendor and says both fixes. The old per-role Add buttons
+			// are gone.
+			expect(container.querySelector(".role-warn b")?.textContent).toBe(
+				"No second opinion for zai",
 			);
-			if (critic === null) throw new Error("Add critic did not render");
+			const note = container.querySelector(".role-warn p")?.textContent ?? "";
+			expect(note).toContain("another vendor");
+			expect(note).toContain("routing rule");
+			expect(container.querySelectorAll(".role-warn-actions").length).toBe(0);
+
+			// Adding a role on another vendor's model (the first catalog model is
+			// the Anthropic one) covers zai: the note leaves.
 			const field =
 				container.querySelector<HTMLInputElement>(".role-add input");
 			if (field === null) throw new Error("role field did not render");
-			await act(async () => onChangeOf(field)({ target: { value: "draft" } }));
-			await act(async () => critic.click());
-			expect(
-				[...container.querySelectorAll(".role-row .role-name")].map(
-					(n) => n.textContent,
-				),
-			).toEqual(["default", "critic"]);
-			expect(buttons()).toEqual(["Add adversary"]);
-			expect(container.querySelector(".role-warn b")?.textContent).toBe(
-				"No adversary role",
-			);
-			// A typed draft survives: the button adds its own name, not the field's.
-			expect(field.value).toBe("draft");
+			await act(async () => onChangeOf(field)({ target: { value: "critic" } }));
+			const add = container.querySelector<HTMLButtonElement>(".role-add-btn");
+			if (add === null) throw new Error("add button did not render");
+			await act(async () => add.click());
+			expect(container.querySelector(".role-warn")).toBeNull();
 		} finally {
 			await unmount();
 		}
 	});
 
-	test("the missing-role warning shows only while a check role is unset", async () => {
-		// Both check roles set: no warning.
+	test("the warning shows only while a vendor lacks a cross-vendor role", async () => {
+		// Both vendors cover each other: no warning.
 		resetCatalogCache();
 		const full = await mountRoles(
 			rolesFetch({
@@ -5655,7 +5667,8 @@ describe("ModelRolesSection missing check roles", () => {
 		} finally {
 			await full.unmount();
 		}
-		// critic unset while adversary is set: the warning names only critic.
+		// zai has no role of another vendor: the warning names the vendor, not
+		// the missing role name.
 		resetCatalogCache();
 		const half = await mountRoles(
 			rolesFetch({ adversary: "zai/glm-5.3-flash" }),
@@ -5663,10 +5676,218 @@ describe("ModelRolesSection missing check roles", () => {
 		try {
 			await act(async () => {});
 			expect(half.container.querySelector(".role-warn b")?.textContent).toBe(
-				"No critic role",
+				"No second opinion for zai",
 			);
 		} finally {
 			await half.unmount();
+		}
+	});
+});
+
+/** A POST /api/settings/check-routing body as the UI sends it. */
+type RoutingPost = {
+	rules: { vendor: string; role: string }[] | null;
+	fallback: string | null;
+};
+
+/** Wraps rolesFetch with a /api/settings/check-routing mock: GET serves `saved`,
+ *  POST records the body and (unless `postError` is set) answers it back as the
+ *  saved setting, null/null clearing it, like the server does. */
+const routingFetch = (
+	roles: Record<string, string>,
+	posts: RoutingPost[],
+	saved: { current: CheckRoutingSetting | null },
+	postError: string | null = null,
+): typeof fetch => {
+	const base = rolesFetch(roles);
+	return (async (input: RequestInfo | URL, init?: RequestInit) => {
+		const url = String(input);
+		if (url.endsWith("/api/settings/check-routing")) {
+			const ok = (body: unknown): Response =>
+				new Response(JSON.stringify(body), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			if (init?.method === "POST") {
+				const body = JSON.parse(String(init.body ?? "{}")) as RoutingPost;
+				posts.push(body);
+				if (postError !== null)
+					return new Response(JSON.stringify({ error: postError }), {
+						status: 400,
+						headers: { "Content-Type": "application/json" },
+					});
+				saved.current =
+					body.rules === null && body.fallback === null
+						? null
+						: { rules: body.rules ?? [], fallback: body.fallback ?? "" };
+				return ok({ routing: saved.current });
+			}
+			return ok({ routing: saved.current });
+		}
+		return base(input, init);
+	}) as typeof fetch;
+};
+
+describe("ModelRolesSection check routing", () => {
+	test("the table lists the vendors in use, and Save posts the rules", async () => {
+		resetCatalogCache();
+		const posts: RoutingPost[] = [];
+		const saved: { current: CheckRoutingSetting | null } = { current: null };
+		const { container, unmount } = await mountRoles(
+			routingFetch(
+				{
+					critic: "anthropic/claude-opus-5-5",
+					adversary: "zai/glm-5.3-flash",
+				},
+				posts,
+				saved,
+			),
+		);
+		try {
+			await act(async () => {});
+			// One row per vendor in use, plus the fallback row.
+			const labels = [
+				...container.querySelectorAll(".check-routing tbody tr"),
+			].map((tr) => tr.querySelector("th")?.textContent ?? "");
+			expect(labels).toEqual(["anthropic", "zai", "Fallback"]);
+			const selects = [
+				...container.querySelectorAll<HTMLSelectElement>(
+					".check-routing tbody select",
+				),
+			];
+			expect(selects.length).toBe(3);
+			// Nothing saved: every row reads Automatic.
+			expect(selects.map((s) => s.value)).toEqual(["", "", ""]);
+			const [save, reset] = [
+				...container.querySelectorAll<HTMLButtonElement>(
+					".check-routing .alate-def-actions button",
+				),
+			];
+			expect(save?.textContent).toContain("Save");
+			expect(reset?.textContent).toContain("Reset to automatic");
+			// Clean draft: Save off, Reset off (nothing saved, nothing to clear).
+			expect(save?.disabled).toBe(true);
+			expect(reset?.disabled).toBe(true);
+
+			// Pin a rule: a zai work model checks with the critic role.
+			const zaiSelect = selects[1];
+			if (zaiSelect === undefined) throw new Error("zai row did not render");
+			zaiSelect.value = "critic";
+			// happy-dom's select wrapper holds no React props, so the change must
+			// dispatch natively; React's root listener picks it up (the inputs
+			// above need onChangeOf instead).
+			await act(async () =>
+				zaiSelect.dispatchEvent(new Event("change", { bubbles: true })),
+			);
+			expect(save?.disabled).toBe(false);
+			await act(async () => save?.click());
+			await act(async () => {});
+			expect(posts).toEqual([
+				{ rules: [{ vendor: "zai", role: "critic" }], fallback: null },
+			]);
+			// The saved answer landed: the draft is clean again.
+			expect(save?.disabled).toBe(true);
+			expect(selects[1]!.value).toBe("critic");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("Reset to automatic posts the cleared setting and empties the pickers", async () => {
+		resetCatalogCache();
+		const posts: RoutingPost[] = [];
+		const saved: { current: CheckRoutingSetting | null } = {
+			current: {
+				rules: [{ vendor: "zai", role: "critic" }],
+				fallback: "adversary",
+			},
+		};
+		const { container, unmount } = await mountRoles(
+			routingFetch(
+				{
+					critic: "anthropic/claude-opus-5-5",
+					adversary: "zai/glm-5.3-flash",
+				},
+				posts,
+				saved,
+			),
+		);
+		try {
+			await act(async () => {});
+			const selects = [
+				...container.querySelectorAll<HTMLSelectElement>(
+					".check-routing tbody select",
+				),
+			];
+			// The saved setting arms the pickers: zai -> critic, fallback -> adversary.
+			expect(selects.map((s) => s.value)).toEqual(["", "critic", "adversary"]);
+			const [save, reset] = [
+				...container.querySelectorAll<HTMLButtonElement>(
+					".check-routing .alate-def-actions button",
+				),
+			];
+			expect(save?.disabled).toBe(true);
+			expect(reset?.disabled).toBe(false);
+			await act(async () => reset?.click());
+			await act(async () => {});
+			// Reset saves the cleared setting, not just a local revert.
+			expect(posts).toEqual([{ rules: null, fallback: null }]);
+			expect(selects.map((s) => s.value)).toEqual(["", "", ""]);
+			expect(save?.disabled).toBe(true);
+			expect(reset?.disabled).toBe(true);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a 400 save answer shows the error and flags the selects", async () => {
+		resetCatalogCache();
+		const posts: RoutingPost[] = [];
+		const saved: { current: CheckRoutingSetting | null } = { current: null };
+		const { container, unmount } = await mountRoles(
+			routingFetch(
+				{
+					critic: "anthropic/claude-opus-5-5",
+					adversary: "zai/glm-5.3-flash",
+				},
+				posts,
+				saved,
+				"unknown role noman",
+			),
+		);
+		try {
+			await act(async () => {});
+			const selects = [
+				...container.querySelectorAll<HTMLSelectElement>(
+					".check-routing tbody select",
+				),
+			];
+			const zaiSelect = selects[1];
+			if (zaiSelect === undefined) throw new Error("zai row did not render");
+			zaiSelect.value = "critic";
+			await act(async () =>
+				zaiSelect.dispatchEvent(new Event("change", { bubbles: true })),
+			);
+			const save = container.querySelector<HTMLButtonElement>(
+				".check-routing .alate-def-actions button",
+			);
+			if (save === null) throw new Error("routing Save did not render");
+			await act(async () => save.click());
+			await act(async () => {});
+			// WCAG 4.1.3: the failure is error feedback in an alert region, and the
+			// selects point at it.
+			const alert = container.querySelector('.check-routing [role="alert"]');
+			expect(alert?.textContent).toBe("unknown role noman");
+			expect(alert?.id).toBeTruthy();
+			for (const s of selects) {
+				expect(s.getAttribute("aria-invalid")).toBe("true");
+				expect(s.getAttribute("aria-describedby")).toBe(alert?.id ?? null);
+			}
+			// The draft stays: the user can fix the rule and Save again.
+			expect(save.disabled).toBe(false);
+			expect(save.className).toContain("failed");
+		} finally {
+			await unmount();
 		}
 	});
 });

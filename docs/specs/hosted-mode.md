@@ -113,8 +113,8 @@ other value keeps the last balance.
 
 - `kind`: the turn kind (`work`, `merge`, and the other turn kinds).
 - `role`: the model role that resolved the run's model. The work or merge run uses `default`
-  (also when the card or session names its own model). The second-model check run uses its check role
-  (`critic` or `adversary`).
+  (also when the card or session names its own model). The second-model check run uses its routed
+  check role (the role name the routing picked, or `default`).
 - `run`: the index of the run in its turn. The first agent run of the turn is `0`, the next
   is `1`, and so on (a check retry is a new run). `(project, taskId, turnId, kind, role, run)`
   names one agent run, and each record of that run has the same key.

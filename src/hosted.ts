@@ -171,7 +171,7 @@ export interface MeteringRecord {
 	turnId: number;
 	/** The turn's kind (work, merge, ...). */
 	kind: string;
-	/** The model role the run resolved its model from (default, critic, adversary). */
+	/** The model role the run resolved its model from: the routed check role, or "default". */
 	role: string;
 	/** provider/model the run used; null when omp never named it. */
 	model: string | null;

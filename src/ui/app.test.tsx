@@ -5888,7 +5888,8 @@ describe("Drawer research report button", () => {
 	test("the work check rows name the role each check ran with", async () => {
 		// OTTR-916: the row names the role the model came from. A fallback check
 		// (picked role unset, model from the default role) reads "default role",
-		// and a record written before the field existed renders without a role.
+		// a record written before the field existed renders without a role, and
+		// a routed check names its own role (OTTR-1116).
 		const at = 1_700_000_000_000;
 		detailBody.workCheckLog = [
 			{
@@ -5927,6 +5928,15 @@ describe("Drawer research report button", () => {
 				notes: [],
 				durationMs: 9_000,
 			},
+			{
+				at,
+				model: "zai/glm-5.3-flash",
+				role: "reviewer",
+				outcome: "pass",
+				blockers: [],
+				notes: [],
+				durationMs: 3_000,
+			},
 		] as unknown as typeof detailBody.workCheckLog;
 		const row = cardFixture({
 			id: "R-1",
@@ -5939,9 +5949,9 @@ describe("Drawer research report button", () => {
 		const { container, unmount } = await mountDrawer(row);
 		try {
 			const rows = container.querySelectorAll(".wc-run");
-			expect(rows.length).toBe(4);
+			expect(rows.length).toBe(5);
 			const texts = Array.from(rows, (p) => p.textContent ?? "");
-			const [adversary, fallback, fallbackDefault, legacy] = texts;
+			const [adversary, fallback, fallbackDefault, legacy, routed] = texts;
 			expect(adversary).toContain("adversary");
 			expect(adversary).toContain("gpt-6");
 			expect(fallback).toContain("default role");
@@ -5957,6 +5967,12 @@ describe("Drawer research report button", () => {
 			expect(legacy).not.toContain("critic");
 			expect(legacy).not.toContain("adversary");
 			expect(legacy).not.toContain("default role");
+			// A routing rule's own role shows by name with its model.
+			expect(routed).toContain("reviewer");
+			expect(routed).toContain("glm-5.3-flash");
+			expect(routed).not.toContain("default role");
+			expect(routed).not.toContain("critic");
+			expect(routed).not.toContain("adversary");
 		} finally {
 			await act(async () => {
 				detailBody.workCheckLog = [];
@@ -16107,6 +16123,9 @@ describe("memoized Card renders", () => {
 
 	test("a state push that changes one card does not re-render the unchanged card", async () => {
 		const realFetch = globalThis.fetch;
+		// A sibling test file can leave the shared catalog cache filled (one bun
+		// process runs several files); the two-paint premise needs it empty.
+		resetCatalogCache();
 		// Card's model catalog fetch degrades to no catalog on a failed response.
 		globalThis.fetch = (async () =>
 			new Response("{}", { status: 404 })) as unknown as typeof fetch;

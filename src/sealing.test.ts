@@ -486,6 +486,16 @@ describe("ADR-0011 config row sealing", () => {
 			expect(res.status).toBe(503);
 			expect(res.json.error).toBe("OTTR_SECRET_KEY is invalid");
 		}
+		// The check-routing save holds no credential, so it stays allowed under the
+		// no-box boot (like the general settings save) and keeps every blob intact.
+		const routing = await app.call("/api/settings/check-routing", {
+			rules: [{ vendor: "zai", role: "reviewer" }],
+			fallback: "",
+		});
+		expect(routing.status).toBe(200);
+		expect(routing.json).toEqual({
+			routing: { rules: [{ vendor: "zai", role: "reviewer" }], fallback: "" },
+		});
 		// The stored row kept every blob byte-identical.
 		const row = await storedRow(g);
 		expect(row.githubToken).toBe(seeded.githubToken);

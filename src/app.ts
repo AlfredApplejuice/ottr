@@ -398,6 +398,7 @@ import {
 	type AskQuestion,
 	answeredCard,
 	askAnswerLine,
+	type CheckRoutingSetting,
 	DONE_PAGE,
 	doneReadKey,
 	type ListedTask,
@@ -686,6 +687,10 @@ interface AppDeps {
 		trendingScan: boolean;
 		/** OTTR-693: the commit identity Settings names; null keeps the built-in Ottr default. */
 		commitIdentity: CommitIdentity | null;
+		/** OTTR-1116: the user-set vendor routing for the check run's role (POST
+		 *  /api/settings/check-routing); null = automatic. Optional so the test shared
+		 *  literals need nothing; absent reads as null. */
+		checkRouting?: CheckRoutingSetting | null;
 		removedPaths: string[];
 		projectPaths: string[];
 		/** Project names in board order; names not listed keep discovery order after them. */
@@ -2032,6 +2037,13 @@ class TaskConflict extends Error {
 		this.task = task;
 	}
 }
+
+/** The vendor keys and the role names the check routing accepts; the role rule is the
+ *  same one modelRoles.ts's ROLE_NAME holds (the model-roles editor rule). Module scope,
+ *  not createApp's: boot restores a stored routing before createApp's later consts run,
+ *  and a TDZ read would crash the boot. */
+const CHECK_VENDOR_RE = /^[a-z][a-z0-9_-]*$/;
+const CHECK_ROLE_RE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 
 export async function createApp(deps: AppDeps) {
 	const { gh, latestReleaseOf, githubAppFetch, rerunFetch } =
@@ -3931,6 +3943,7 @@ export async function createApp(deps: AppDeps) {
 				idleReviews: deps.shared.idleReviews,
 				trendingScan: deps.shared.trendingScan,
 				commitIdentity: deps.shared.commitIdentity,
+				checkRouting: deps.shared.checkRouting ?? null,
 				removed: deps.shared.removedPaths,
 				projects: deps.shared.projectPaths,
 				projectOrder: deps.shared.projectOrder,
@@ -4153,6 +4166,7 @@ export async function createApp(deps: AppDeps) {
 		envPlain?: unknown;
 		hindsightToken?: unknown;
 		hindsightUrl?: unknown;
+		checkRouting?: unknown;
 	};
 	/** Restores the run cap and the check toggles; a wrong type keeps the default. */
 	function restoreRunConfig(p: StoredConfig): void {
@@ -4177,6 +4191,32 @@ export async function createApp(deps: AppDeps) {
 		if (typeof p.trendingScan === "boolean") {
 			deps.shared.trendingScan = p.trendingScan;
 		}
+		// The vendor routing restores only from a fully valid shape; anything else
+		// (an old database holds no field at all) keeps the default null.
+		const routing = parseCheckRouting(p.checkRouting);
+		if (routing !== null) deps.shared.checkRouting = routing;
+	}
+	/** The stored check-routing value, or null when it is wrong-shaped: restoreRunConfig
+	 *  keeps the default null, so one corrupt field never breaks a boot. Pure. */
+	function parseCheckRouting(v: unknown): CheckRoutingSetting | null {
+		if (typeof v !== "object" || v === null) return null;
+		const o = v as Record<string, unknown>;
+		if (!Array.isArray(o.rules) || typeof o.fallback !== "string") return null;
+		const rules: { vendor: string; role: string }[] = [];
+		for (const r of o.rules) {
+			if (typeof r !== "object" || r === null) return null;
+			const e = r as Record<string, unknown>;
+			if (
+				typeof e.vendor !== "string" ||
+				typeof e.role !== "string" ||
+				!CHECK_VENDOR_RE.test(e.vendor) ||
+				e.role === "" ||
+				!CHECK_ROLE_RE.test(e.role)
+			)
+				return null;
+			rules.push({ vendor: e.vendor, role: e.role });
+		}
+		return { rules, fallback: o.fallback };
 	}
 	/** Restores the commit identity; null keeps the built-in Ottr identity and a bad
 	 * mapping keeps the default (null). */
@@ -8127,6 +8167,80 @@ export async function createApp(deps: AppDeps) {
 				502,
 			);
 		return probed;
+	}
+
+	/** Validates a POST /api/settings/check-routing body; a Response rejects the save.
+	 *  rules null and fallback null clear the setting (back to null); either one alone
+	 *  keeps its empty meaning (no rules, straight to the default rule). A null
+	 *  fallback next to rules is the UI's "Automatic" pick and lands as "". */
+	function checkRoutingTarget(
+		body: Record<string, unknown>,
+	): { error: Response } | { routing: CheckRoutingSetting | null } {
+		const { rules, fallback } = body as {
+			rules?: unknown;
+			fallback?: unknown;
+		};
+		if (rules === undefined || fallback === undefined)
+			return {
+				error: json(
+					{ error: "rules and fallback must be saved together" },
+					400,
+				),
+			};
+		if (rules === null && fallback === null) return { routing: null };
+		const fallbackRole = fallback === null ? "" : fallback;
+		const parsed: { vendor: string; role: string }[] = [];
+		if (rules !== null) {
+			if (!Array.isArray(rules))
+				return {
+					error: json({ error: "rules must be a rule list or null" }, 400),
+				};
+			for (const r of rules) {
+				if (typeof r !== "object" || r === null)
+					return {
+						error: json(
+							{ error: "each rule must be an object with vendor and role" },
+							400,
+						),
+					};
+				const e = r as Record<string, unknown>;
+				if (typeof e.vendor !== "string" || !CHECK_VENDOR_RE.test(e.vendor))
+					return {
+						error: json(
+							{ error: "vendor must be a lowercase vendor key" },
+							400,
+						),
+					};
+				if (
+					typeof e.role !== "string" ||
+					e.role === "" ||
+					!CHECK_ROLE_RE.test(e.role)
+				)
+					return { error: json({ error: "role must be a role name" }, 400) };
+				parsed.push({ vendor: e.vendor, role: e.role });
+			}
+		}
+		if (
+			typeof fallbackRole !== "string" ||
+			(fallbackRole !== "" && !CHECK_ROLE_RE.test(fallbackRole))
+		)
+			return {
+				error: json(
+					{ error: "fallback must be a role name, empty, or null" },
+					400,
+				),
+			};
+		return { routing: { rules: parsed, fallback: fallbackRole } };
+	}
+
+	async function saveCheckRouting(req: Request): Promise<Response> {
+		const r = await readJson(req);
+		if ("error" in r) return r.error;
+		const picked = checkRoutingTarget(r.body);
+		if ("error" in picked) return picked.error;
+		deps.shared.checkRouting = picked.routing;
+		await saveConfig();
+		return json({ routing: deps.shared.checkRouting ?? null });
 	}
 
 	async function saveHindsight(req: Request): Promise<Response> {
@@ -14422,6 +14536,14 @@ export async function createApp(deps: AppDeps) {
 		"/api/settings/hindsight": {
 			GET: async (req) => await api(req, async () => json(hindsightView())),
 			POST: async (req) => await api(req, async () => await saveHindsight(req)),
+		},
+		"/api/settings/check-routing": {
+			GET: async (req) =>
+				await api(req, async () =>
+					json({ routing: deps.shared.checkRouting ?? null }),
+				),
+			POST: async (req) =>
+				await api(req, async () => await saveCheckRouting(req)),
 		},
 		// --- Web Push (begin) ---
 		"/api/push/config": {

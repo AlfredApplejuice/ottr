@@ -24,6 +24,7 @@ import { liveCardOf } from "../scheduler.ts";
 import type {
 	AppCheck,
 	ArchReview,
+	CheckRoutingSetting,
 	GitHubAppView,
 	GithubFacts,
 	JiraConnectionView,
@@ -74,6 +75,7 @@ import {
 } from "./model-menu.tsx";
 import {
 	addRoleError,
+	checkRoutingDirty,
 	classifyRolesSave,
 	fallbacksDirty,
 	type ModelCatalog,
@@ -83,6 +85,7 @@ import {
 	ownField,
 	type RolesState,
 	rolesDirty,
+	roleVendors,
 	roleWarnings,
 	rowChains,
 	seedStep,
@@ -6417,8 +6420,186 @@ function ModelRolesSaveButton({
 	);
 }
 
-/** The model roles body while its data is available: the rows, the missing-role note,
- *  the read-only note, the add form, and the save button. */
+/** Settings → Model roles "Check routing": one check-role select per vendor the configured
+ *  models use plus a fallback select, saved board-wide through
+ *  /api/settings/check-routing. "Automatic" means no rule: the built-in routing (another
+ *  vendor's role, else the default rule) picks the check. Own dirty state, Save and error
+ *  line, apart from the roles editor above. */
+function CheckRoutingBlock({ roles }: { roles: Record<string, string> }) {
+	const uid = useId();
+	const [saved, setSaved] = useState<CheckRoutingSetting | null>(null);
+	// vendor → role; "" or absent = automatic for that vendor.
+	const [rules, setRules] = useState<Record<string, string>>({});
+	const [fallback, setFallback] = useState("");
+	const [error, setError] = useState<string | null>(null);
+	const [loadErr, setLoadErr] = useState<string | null>(null);
+	const save = useBusy();
+	const apply = useCallback((r: CheckRoutingSetting | null): void => {
+		setSaved(r);
+		setRules(
+			Object.fromEntries((r?.rules ?? []).map((v) => [v.vendor, v.role])),
+		);
+		setFallback(r?.fallback ?? "");
+	}, []);
+	useEffect(() => {
+		let live = true;
+		fetch("/api/settings/check-routing")
+			.then((res) => unwrap<{ routing: CheckRoutingSetting | null }>(res))
+			.then((v) => {
+				if (live) apply(v.routing);
+			})
+			.catch((err: unknown) => {
+				if (live) setLoadErr(err instanceof Error ? err.message : String(err));
+			});
+		return () => {
+			live = false;
+		};
+	}, [apply]);
+	// A saved rule for a vendor the role map no longer lists keeps its row, so a
+	// save never silently drops it.
+	const inUse = roleVendors(roles);
+	const vendorRows = [
+		...inUse,
+		...(saved?.rules ?? [])
+			.map((r) => r.vendor)
+			.filter((v, i, all) => !inUse.includes(v) && all.indexOf(v) === i),
+	];
+	const dirty = checkRoutingDirty(saved, rules, fallback);
+	const send = async (body: {
+		rules: { vendor: string; role: string }[] | null;
+		fallback: string | null;
+	}): Promise<boolean> => {
+		setError(null);
+		try {
+			apply(
+				(
+					await post<{ routing: CheckRoutingSetting | null }>(
+						"/api/settings/check-routing",
+						body,
+					)
+				).routing,
+			);
+			return true;
+		} catch (err) {
+			setError(err instanceof Error ? err.message : String(err));
+			return false;
+		}
+	};
+	const submit = (): void =>
+		save.start(async () => {
+			const active = Object.entries(rules)
+				.filter(([, role]) => role !== "")
+				.map(([vendor, role]) => ({ vendor, role }));
+			// Automatic everywhere is the cleared setting: null/null, not empty rules.
+			return send(
+				active.length === 0 && fallback === ""
+					? { rules: null, fallback: null }
+					: { rules: active, fallback: fallback === "" ? null : fallback },
+			);
+		});
+	const reset = (): void =>
+		save.start(() => send({ rules: null, fallback: null }));
+	const roleOptions = Object.keys(roles).map((role) => (
+		<option key={role} value={role}>
+			{role}
+		</option>
+	));
+	return (
+		<section className="check-routing" aria-labelledby={`${uid}-head`}>
+			<h4 id={`${uid}-head`}>Check routing</h4>
+			<p className="hint">
+				Which role checks each vendor's models. Automatic leaves the pick to the
+				board: another vendor's role, else the default rule.
+			</p>
+			{loadErr !== null ? (
+				<p className="hint" role="status">
+					Cannot load the routing setting: {loadErr}.
+				</p>
+			) : (
+				<>
+					<table>
+						<thead>
+							<tr>
+								<th scope="col">Vendor</th>
+								<th scope="col">Check role</th>
+							</tr>
+						</thead>
+						<tbody>
+							{vendorRows.map((vendor) => (
+								<tr key={vendor}>
+									<th scope="row">{vendor}</th>
+									<td>
+										<select
+											value={ownField(rules, vendor) ?? ""}
+											onChange={(e) =>
+												setRules((rs) =>
+													e.target.value === ""
+														? withoutKey(rs, vendor)
+														: { ...rs, [vendor]: e.target.value },
+												)
+											}
+											aria-label={`Check role for ${vendor} models`}
+											aria-invalid={error !== null}
+											aria-describedby={
+												error !== null ? `${uid}-err` : undefined
+											}
+											disabled={save.busy}
+										>
+											<option value="">Automatic</option>
+											{roleOptions}
+										</select>
+									</td>
+								</tr>
+							))}
+							<tr>
+								<th scope="row">Fallback</th>
+								<td>
+									<select
+										value={fallback}
+										onChange={(e) => setFallback(e.target.value)}
+										aria-label="Fallback check role for vendors without a rule"
+										aria-invalid={error !== null}
+										aria-describedby={error !== null ? `${uid}-err` : undefined}
+										disabled={save.busy}
+									>
+										<option value="">Automatic</option>
+										{roleOptions}
+									</select>
+								</td>
+							</tr>
+						</tbody>
+					</table>
+					<div className="alate-def-actions">
+						<button
+							type="button"
+							className={save.failed ? "failed" : undefined}
+							onClick={submit}
+							disabled={!dirty || save.busy}
+						>
+							{save.busy && <span className="spinner" aria-hidden="true" />}
+							Save
+						</button>
+						<button
+							type="button"
+							onClick={reset}
+							disabled={save.busy || (saved === null && !dirty)}
+						>
+							Reset to automatic
+						</button>
+					</div>
+					{error !== null && (
+						<p className="auth-error" id={`${uid}-err`} role="alert">
+							{error}
+						</p>
+					)}
+				</>
+			)}
+		</section>
+	);
+}
+
+/** The model roles body while its data is available: the rows, the missing-vendor note,
+ *  the read-only note, the add form, the save button, and the Check routing block. */
 function ModelRolesContent({
 	loadErr,
 	loadBusy,
@@ -6472,8 +6653,8 @@ function ModelRolesContent({
 	onSetValue: (name: string, value: string) => void;
 	onRemoveRole: (name: string) => void;
 	onEditChain: (name: string, fn: (chain: string[]) => string[]) => void;
-	/** Adds the typed name, or `name` (a missing check role's button). */
-	onAdd: (name?: string) => void;
+	/** Adds the typed new role. */
+	onAdd: () => void;
 	onSubmit: () => void;
 }) {
 	return (
@@ -6514,27 +6695,16 @@ function ModelRolesContent({
 					{missing.length > 0 && (
 						<div className="role-warn" role="note">
 							<Mark kind="needs" />
-							<b>
-								No {missing.join(" or ")} role
-								{missing.length > 1 ? "s" : ""}
-							</b>
+							<b>No second opinion for {missing.join(" and ")}</b>
 							<p>
-								Second-model checks fall back to the default model, which is
-								often the model they check. critic checks Anthropic models,
-								adversary the rest.
+								Second-model checks of{" "}
+								{missing
+									.map((v) => (v === "unknown" ? "an unknown" : `a ${v}`))
+									.join(" or ")}{" "}
+								model fall back to the default model, which is often the model
+								they check. Add a role of another vendor above, or set a routing
+								rule below.
 							</p>
-							<div className="role-warn-actions">
-								{missing.map((m) => (
-									<button
-										key={m}
-										type="button"
-										disabled={locked || first === undefined}
-										onClick={() => onAdd(m)}
-									>
-										Add {m}
-									</button>
-								))}
-							</div>
 						</div>
 					)}
 					{ro !== null && <RoleReadonlyNote ro={ro} uid={uid} />}
@@ -6581,6 +6751,7 @@ function ModelRolesContent({
 						locked={locked}
 						onClick={onSubmit}
 					/>
+					<CheckRoutingBlock roles={state.roles} />
 				</>
 			)}
 		</>
@@ -6754,9 +6925,9 @@ export function ModelRolesSection() {
 				chains,
 				state.fallbacks,
 			));
-	// The check roles the board would fall back from: without them a check runs on the
-	// default model, which is often the model it checks.
-	const missing = missingCheckRoles(rows.map(([name]) => name));
+	// The vendors in use with no cross-vendor check role: their checks fall back
+	// to the default model, which is often the model they check.
+	const missing = missingCheckRoles(Object.fromEntries(rows));
 	const setValue = (name: string, value: string): void => {
 		setRows((rs) => rs.map((r) => (r[0] === name ? [name, value] : r)));
 		setFields((f) => withoutKey(f, name));
@@ -6776,8 +6947,8 @@ export function ModelRolesSection() {
 		setChains((c) => withoutKey(c, name));
 		setFallbackFields((f) => withoutKey(f, name));
 	};
-	const add = (picked?: string): void => {
-		const name = (picked ?? newName).trim();
+	const add = (): void => {
+		const name = newName.trim();
 		const err = addRoleError(name, rows, first);
 		setAddErr(err);
 		if (err === null && first !== undefined) {
@@ -6787,7 +6958,7 @@ export function ModelRolesSection() {
 				state !== null ? ownField(state.fallbacks, name) : undefined;
 			if (loaded !== undefined)
 				setChains((c) => ({ ...c, [name]: [...loaded] }));
-			if (picked === undefined) setNewName("");
+			setNewName("");
 		}
 	};
 	const provision = async (): Promise<void> => {

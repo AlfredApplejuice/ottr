@@ -917,10 +917,9 @@ function parseWorkCheckRun(r: unknown): WorkCheckRun | null {
 	return {
 		at: e.at,
 		model: typeof e.model === "string" ? e.model : null,
-		role:
-			e.role === "critic" || e.role === "adversary" || e.role === "default"
-				? e.role
-				: undefined,
+		// The routed check role is user data (any nonempty role name); a non-string
+		// drops, so one corrupt field never erases the run's history.
+		role: typeof e.role === "string" && e.role !== "" ? e.role : undefined,
 		outcome: e.outcome,
 		blockers,
 		notes: e.notes.filter((n): n is string => typeof n === "string"),

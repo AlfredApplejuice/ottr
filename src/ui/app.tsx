@@ -11270,7 +11270,10 @@ function DrawerWorkCheck(p: {
 											? "Blocked"
 											: "Error"}
 									{" · "}
-									{run.role === "critic" || run.role === "adversary" ? (
+									{/* The routed check role, any name the routing picked; "default"
+									    keeps its own wording, and records from before the field
+									    existed render without a role. */}
+									{run.role !== undefined && run.role !== "default" ? (
 										<>
 											{run.role}
 											{" · "}

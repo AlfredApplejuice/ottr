@@ -15449,6 +15449,103 @@ describe("work card check", () => {
 		expect(after.workCheckLog[0]!.role).toBe("critic");
 	});
 
+	test("a check-routing rule routes the work check to the rule's role", async () => {
+		const head = { sha: "sha1" };
+		const record = baseRecord();
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			commitsAhead: async () => 1,
+			targetSha: async () => head.sha,
+			modelRoles: () => ({
+				critic: "openai/gpt-6",
+				adversary: "anthropic/claude-opus-5-5",
+				reviewer: "moonshot/kimi-k2:low",
+			}),
+			checkRouting: () => ({
+				rules: [{ vendor: "zai", role: "reviewer" }],
+				fallback: "",
+			}),
+			workCheck: () => true,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				await o.onSession?.(`sess-${record.runs.length}`);
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						record.runs.length === 1
+							? runResult({
+									model: "zai/glm-5.3-flash",
+									outcome: {
+										status: "ready",
+										summary: "did it",
+									} satisfies Outcome,
+								})
+							: pass(),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs[1]!.model).toBe("moonshot/kimi-k2:low");
+		const after = (await store.getTask(task.id))!;
+		expect(after.workCheckLog[0]!.role).toBe("reviewer");
+		// A matched rule whose role has a model needs no explanation.
+		expect(await logText(store, task.id)).not.toContain("check routing:");
+	});
+
+	test("a rule to a missing role falls back to the default rule and logs the note once", async () => {
+		const head = { sha: "sha1" };
+		const record = baseRecord();
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			commitsAhead: async () => 1,
+			targetSha: async () => head.sha,
+			modelRoles: () => ({
+				critic: "openai/gpt-6",
+				adversary: "anthropic/claude-opus-5-5",
+			}),
+			checkRouting: () => ({
+				rules: [{ vendor: "zai", role: "reviewer" }],
+				fallback: "",
+			}),
+			workCheck: () => true,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				await o.onSession?.(`sess-${record.runs.length}`);
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						record.runs.length === 1
+							? runResult({
+									model: "zai/glm-5.3-flash",
+									outcome: {
+										status: "ready",
+										summary: "did it",
+									} satisfies Outcome,
+								})
+							: pass(),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		// The default rule took over: the OpenAI critic differs from the zai work model.
+		expect(record.runs[1]!.model).toBe("openai/gpt-6");
+		const after = (await store.getTask(task.id))!;
+		expect(after.workCheckLog[0]!.role).toBe("critic");
+		const text = await logText(store, task.id);
+		expect(text).toContain(
+			"check routing: rule zai -> reviewer names no configured role, using the default rule",
+		);
+		expect((text.match(/check routing: /g) ?? []).length).toBe(1);
+	});
+
 	test("a check that runs on the work model itself warns on the card", async () => {
 		const head = { sha: "sha1" };
 		const record = baseRecord();

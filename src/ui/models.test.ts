@@ -4,6 +4,7 @@ import type { ModelOption } from "../models.ts";
 import fc from "../test/properties.ts";
 import {
 	addRoleError,
+	checkRoutingDirty,
 	classifyRolesSave,
 	displayModel,
 	fallbacksDirty,
@@ -16,19 +17,73 @@ import {
 	resetCatalogCache,
 	reviewModel,
 	rolesDirty,
+	roleVendors,
 	roleWarnings,
 	rowChains,
 	seedStep,
 	stepIndex,
 } from "./models.ts";
 
-test("missingCheckRoles lists the check roles the edited roles lack", () => {
-	expect(missingCheckRoles(["default", "slow"])).toEqual([
-		"critic",
-		"adversary",
-	]);
-	expect(missingCheckRoles(["adversary"])).toEqual(["critic"]);
-	expect(missingCheckRoles(["critic", "adversary", "default"])).toEqual([]);
+test("missingCheckRoles flags the vendors with no cross-vendor check role", () => {
+	// Every vendor in use has a configured role of another vendor: nothing to flag.
+	expect(
+		missingCheckRoles({
+			critic: "anthropic/claude-opus-5-5",
+			adversary: "zai/glm-5.3-flash",
+		}),
+	).toEqual([]);
+	// A lone vendor has no second opinion; the default role's model is no check role.
+	expect(missingCheckRoles({ default: "zai/glm-5.3-flash" })).toEqual(["zai"]);
+	expect(
+		missingCheckRoles({
+			default: "zai/glm-5.3-flash",
+			critic: "anthropic/claude-opus-5-5",
+		}),
+	).toEqual(["anthropic"]);
+	// A selector no vendor token names counts as "unknown", and a cross-vendor
+	// role covers it like any other vendor.
+	expect(missingCheckRoles({ plan: "legacy/old-model" })).toEqual(["unknown"]);
+	expect(
+		missingCheckRoles({
+			plan: "legacy/old-model",
+			critic: "anthropic/claude-opus-5-5",
+		}),
+	).toEqual([]);
+	// First appearance decides the order; a vendor shared by several roles lists
+	// once, and the thinking level never changes the vendor.
+	expect(
+		roleVendors({
+			slow: "zai/glm-5.3-flash",
+			plan: "zai/glm-5.3-flash:max",
+			review: "qwen/qwen-max",
+		}),
+	).toEqual(["zai", "qwen"]);
+	// Every vendor in that map has a role of the other vendor: nothing flagged.
+	expect(
+		missingCheckRoles({
+			slow: "zai/glm-5.3-flash",
+			plan: "zai/glm-5.3-flash:max",
+			review: "qwen/qwen-max",
+		}),
+	).toEqual([]);
+});
+
+test("checkRoutingDirty compares the draft with the saved setting", () => {
+	const saved = {
+		rules: [{ vendor: "zai", role: "reviewer" }],
+		fallback: "critic",
+	};
+	expect(checkRoutingDirty(saved, { zai: "reviewer" }, "critic")).toBe(false);
+	expect(checkRoutingDirty(saved, {}, "critic")).toBe(true);
+	expect(checkRoutingDirty(saved, { zai: "reviewer" }, "")).toBe(true);
+	expect(
+		checkRoutingDirty(saved, { zai: "reviewer", openai: "critic" }, "critic"),
+	).toBe(true);
+	// An empty draft against no setting is the automatic board: clean.
+	expect(checkRoutingDirty(null, {}, "")).toBe(false);
+	expect(checkRoutingDirty(null, { zai: "reviewer" }, "")).toBe(true);
+	// A vendor reverted to Automatic drops out of the comparison.
+	expect(checkRoutingDirty(null, { zai: "" }, "")).toBe(false);
 });
 
 test("rolesDirty compares rows with the roles in order", () => {

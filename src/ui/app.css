@@ -9965,6 +9965,28 @@ button.log-mode[aria-pressed="true"] {
 	color: var(--text-strong);
 	border-color: var(--alarm-line);
 }
+/* Check routing: the same table voice as the System page (left-aligned th, dim header). */
+.check-routing table {
+	width: 100%;
+	max-width: 480px;
+	border-collapse: collapse;
+	font-size: 13px;
+}
+.check-routing th,
+.check-routing td {
+	padding: 6px 12px 6px 0;
+	text-align: left;
+}
+.check-routing thead th {
+	font-size: 12.5px;
+	font-weight: 600;
+	color: var(--dim);
+}
+.check-routing tbody th {
+	font-weight: 600;
+	color: var(--text-strong);
+	white-space: nowrap;
+}
 @container (max-width: 640px) {
 	.role-warn {
 		grid-template-columns: auto minmax(0, 1fr);

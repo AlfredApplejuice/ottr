@@ -130,6 +130,7 @@ import {
 	badDep,
 	checkModelWarning,
 	checkRoleFor,
+	checkRoutingNote,
 	demoteUnquoted,
 	depHold,
 	depProjectOf,
@@ -180,6 +181,7 @@ import { type SkillEntry, skillCatalog } from "./tools.ts";
 import type {
 	ArchReview,
 	AskQuestion,
+	CheckRoutingSetting,
 	DiffFileStat,
 	DupGateStamp,
 	GitFacts,
@@ -887,6 +889,10 @@ export interface TurnOps {
 	workCheck?: () => boolean | Promise<boolean>;
 	/** Role → selector map the check run's model resolves from; overridable for tests. */
 	modelRoles?: typeof modelRoles;
+	/** OTTR-1116: the user-set vendor routing for the check run's role (POST
+	 *  /api/settings/check-routing); null = automatic. Absent counts as null, so test
+	 *  fakes need nothing. */
+	checkRouting?: () => CheckRoutingSetting | null;
 	/** The chat catalog a retro or review run's propose_task checks a model against; overridable for tests. */
 	modelList?: typeof modelList;
 	/** Prepare-phase title generator; overridable for tests. */
@@ -10316,6 +10322,8 @@ export function createTurnLoop(
 		limitHit: boolean;
 	} | null> {
 		const built = await reviewCheckInput(st, selected);
+		// The routing's fallback explanation, once per check flow, before the first attempt.
+		if (built.note !== null) await st.log(built.note);
 		const loop = await reviewCheckLoop(st, selected, built);
 		if (loop === null) return null;
 		return {
@@ -10344,6 +10352,7 @@ export function createTurnLoop(
 		selector: string | undefined;
 		checkModel: string | null;
 		checkWarn: "same model" | "same vendor" | null;
+		note: string | null;
 	}> {
 		const [openCards, commitsSince] = await Promise.all([
 			Promise.resolve(
@@ -10363,7 +10372,8 @@ export function createTurnLoop(
 				: Promise.resolve([] as string[]),
 		]);
 		const roles = (ops.modelRoles ?? modelRoles)();
-		const checkRole = checkRoleFor(st.result.model);
+		const routing = ops.checkRouting?.() ?? null;
+		const checkRole = checkRoleFor(routing, roles, st.result.model);
 		const selector = roles[checkRole];
 		// A missing role falls back to the board's default role (omp's default
 		// model), which is often the reviewed model itself — shown on the card.
@@ -10380,7 +10390,14 @@ export function createTurnLoop(
 			openCards,
 			commitsSince,
 		});
-		return { input, checkRole, selector, checkModel, checkWarn };
+		return {
+			input,
+			checkRole,
+			selector,
+			checkModel,
+			checkWarn,
+			note: checkRoutingNote(routing, roles, st.result.model),
+		};
 	}
 
 	/** The review check attempts (two, then the user decides: a half-checked review files no
@@ -11073,6 +11090,8 @@ export function createTurnLoop(
 	): Promise<boolean> {
 		const built = await workCheckInput(st, cur, head, open, replies);
 		const roles = workCheckRoles(st);
+		// The routing's fallback explanation, once per check flow, before the first attempt.
+		if (roles.note !== null) await st.log(roles.note);
 		return await workCheckAttempts(st, cur, head, open, priorLog, roles, built);
 	}
 
@@ -11253,15 +11272,19 @@ export function createTurnLoop(
 
 	/** The check's model: the role's selector, else the board's default role (omp's fallback).
 	 * The check must not be the model it checks — same model or vendor goes on the card as a
-	 * warning. */
+	 * warning. The role comes from the user-set vendor routing (ops.checkRouting), else the
+	 * built-in default rule (checkRoleFor); `note` carries the fallback explanation to log
+	 * once before the first attempt. */
 	function workCheckRoles(st: TurnSettle): {
 		selector: string | undefined;
-		checkRole: "critic" | "adversary";
+		checkRole: string;
 		checkModel: string | null;
 		warn: { warn?: string };
+		note: string | null;
 	} {
 		const roles = (ops.modelRoles ?? modelRoles)();
-		const checkRole = checkRoleFor(st.result.model);
+		const routing = ops.checkRouting?.() ?? null;
+		const checkRole = checkRoleFor(routing, roles, st.result.model);
 		const selector = roles[checkRole];
 		const checkModel = selector ?? roles.default ?? null;
 		const checkWarn = checkModelWarning(st.result.model, checkModel);
@@ -11274,7 +11297,13 @@ export function createTurnLoop(
 								? `The check model ${checkModel} is the same model as the run it checks — no second-model opinion.`
 								: `The check model ${checkModel} is from the same vendor as the run it checks — no second-vendor opinion.`,
 					};
-		return { selector, checkRole, checkModel, warn };
+		return {
+			selector,
+			checkRole,
+			checkModel,
+			warn,
+			note: checkRoutingNote(routing, roles, st.result.model),
+		};
 	}
 
 	/** One work-check attempt (the review check shares awaitCheckAttempt): a credit stop
@@ -11302,7 +11331,7 @@ export function createTurnLoop(
 		cur: Task,
 		head: string | null,
 		checkModel: string | null,
-		checkRole: "critic" | "adversary" | "default",
+		checkRole: string,
 		open: WorkCheckBlocker[],
 		priorLog: WorkCheckRun[],
 		warn: { warn?: string },
@@ -11419,7 +11448,7 @@ export function createTurnLoop(
 		priorLog: WorkCheckRun[],
 		warn: { warn?: string },
 		checkModel: string | null,
-		checkRole: "critic" | "adversary" | "default",
+		checkRole: string,
 		checkStart: number,
 		checkMs: number,
 		checkFailed: string,

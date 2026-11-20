@@ -3259,6 +3259,92 @@ describe("settings routes", () => {
 		expect(state.trendingScan).toBe(true);
 	});
 
+	test("check routing: GET answers null on boot, POST validates and saves, a re-mount restores", async () => {
+		const g = await GlobalStore.open(
+			join(root, `g-check-routing-${Math.random().toString(36).slice(2)}`),
+		);
+		mountStores.push(g);
+		const m = await mount({ gstore: g, projects: new Map() });
+		// A board without the setting runs the automatic routing.
+		const before = await m.call("/api/settings/check-routing");
+		expect(before.status).toBe(200);
+		expect(await before.json()).toEqual({ routing: null });
+
+		// A bad vendor, a bad role, and a bad fallback each refuse with 400.
+		const badVendor = await m.call("/api/settings/check-routing", {
+			rules: [{ vendor: "Zai", role: "reviewer" }],
+			fallback: "",
+		});
+		expect(badVendor.status).toBe(400);
+		const badRole = await m.call("/api/settings/check-routing", {
+			rules: [{ vendor: "zai", role: "1st-reviewer" }],
+			fallback: "",
+		});
+		expect(badRole.status).toBe(400);
+		const badFallback = await m.call("/api/settings/check-routing", {
+			rules: [],
+			fallback: "1st-reviewer",
+		});
+		expect(badFallback.status).toBe(400);
+		// A refusal stores nothing: the GET still answers null.
+		expect(await (await m.call("/api/settings/check-routing")).json()).toEqual({
+			routing: null,
+		});
+
+		// A valid save lands in shared and in the config row, and answers the saved shape.
+		const routing = {
+			rules: [{ vendor: "zai", role: "reviewer" }],
+			fallback: "reviewer",
+		};
+		const save = await m.call("/api/settings/check-routing", routing);
+		expect(save.status).toBe(200);
+		expect(await save.json()).toEqual({ routing });
+		expect(await (await m.call("/api/settings/check-routing")).json()).toEqual({
+			routing,
+		});
+
+		// A re-mount restores the saved routing through restoreRunConfig.
+		const m2 = await mount({ gstore: g, projects: new Map() });
+		expect(await (await m2.call("/api/settings/check-routing")).json()).toEqual(
+			{ routing },
+		);
+
+		// The editor's "Automatic fallback" posts fallback null next to rules; the
+		// route lands it as the empty fallback (the default rule when no rule matches).
+		const auto = await m2.call("/api/settings/check-routing", {
+			rules: [{ vendor: "zai", role: "critic" }],
+			fallback: null,
+		});
+		expect(auto.status).toBe(200);
+		expect(await auto.json()).toEqual({
+			routing: { rules: [{ vendor: "zai", role: "critic" }], fallback: "" },
+		});
+
+		// rules null and fallback null clear the setting, and the clear survives a boot.
+		const clear = await m2.call("/api/settings/check-routing", {
+			rules: null,
+			fallback: null,
+		});
+		expect(clear.status).toBe(200);
+		expect(await clear.json()).toEqual({ routing: null });
+		const m3 = await mount({ gstore: g, projects: new Map() });
+		expect(await (await m3.call("/api/settings/check-routing")).json()).toEqual(
+			{ routing: null },
+		);
+	});
+
+	test("a wrong-shaped stored check routing keeps the default null", async () => {
+		const g = await GlobalStore.open(
+			join(root, `g-check-routing-bad-${Math.random().toString(36).slice(2)}`),
+		);
+		mountStores.push(g);
+		await g.set("config", { checkRouting: { rules: "all", fallback: 7 } });
+		const m = await mount({ gstore: g, projects: new Map() });
+		expect(await (await m.call("/api/settings/check-routing")).json()).toEqual({
+			routing: null,
+		});
+	});
+
 	// OTTR-693: the Commit identity Settings pair validates, saves together, and resets.
 	describe("commit identity", () => {
 		type IdentityState = {

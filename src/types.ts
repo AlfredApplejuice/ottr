@@ -677,6 +677,26 @@ export interface WorkCheckBlocker {
 	statusReason?: string;
 }
 
+/** One user-set vendor rule of the check routing: a work model whose vendor is `vendor`
+ *  checks with the model of role `role`. */
+export interface CheckRoutingRule {
+	/** Lowercase vendor key (modelVendor's keys, or "unknown" for a model with no known vendor). */
+	vendor: string;
+	/** The model role the check uses; the role needs no configured model at save time. */
+	role: string;
+}
+
+/** User-set vendor routing for the second-model check (Settings -> Model roles). The first
+ *  rule whose vendor matches the work model's vendor names the check role; when no rule
+ *  matches, a nonempty fallback names it; otherwise the built-in default rule applies
+ *  (checkRoleFor). null = automatic routing, no setting. Board-wide, stored in the
+ *  GlobalStore config row. */
+export type CheckRoutingSetting = {
+	rules: CheckRoutingRule[];
+	/** Role for models no rule matches; "" = straight to the default rule. */
+	fallback: string;
+} | null;
+
 /** One run of the second-model check of a work card. */
 export interface WorkCheckRun {
 	/** Epoch milliseconds when the check run started. */
@@ -685,10 +705,11 @@ export interface WorkCheckRun {
 	 *  board's default role (omp's fallback when a model is unset); null = omp's own default
 	 *  (no role names it, so the card shows "default model"). */
 	model: string | null;
-	/** The role the check's model came from: the picked critic or adversary role, or
+	/** The role the check's model came from: the routed check role (checkRoleFor), or
 	 *  "default" when that role is unset and the model fell back to the default role.
+	 *  Old records carry only "critic", "adversary", or "default".
 	 *  Absent on records written before this field existed and on lost runs (settleLostCheck). */
-	role?: "critic" | "adversary" | "default";
+	role?: string;
 	/** pass = nothing blocks, blockers = real problems found, error = the run itself failed after a retry. */
 	outcome: "pass" | "blockers" | "error";
 	blockers: WorkCheckBlocker[];

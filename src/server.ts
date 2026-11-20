@@ -89,7 +89,7 @@ import {
 	parseReleaseVersion,
 	type TurnLoop,
 } from "./turn.ts";
-import type { LatestImage, OpenPrsView } from "./types.ts";
+import type { CheckRoutingSetting, LatestImage, OpenPrsView } from "./types.ts";
 import { probeVmRunner } from "./vmHealth.ts";
 import { VmTokens } from "./vmTokens.ts";
 import {
@@ -292,6 +292,8 @@ const shared: {
 	trendingScan: boolean;
 	/** OTTR-693: the commit identity Settings names for board and turn commits; null keeps the built-in Ottr default. */
 	commitIdentity: CommitIdentity | null;
+	/** OTTR-1116: the user-set vendor routing for the check run's role; null = automatic. */
+	checkRouting: CheckRoutingSetting | null;
 	removedPaths: string[]; // projects removed from the board; discovery must not re-find them
 	projectPaths: string[]; // explicitly added projects; discovery finds these even outside the roots
 	/** Project names in board order, persisted via /api/projects/order. */
@@ -311,6 +313,7 @@ const shared: {
 	idleReviews: true,
 	trendingScan: true,
 	commitIdentity: null,
+	checkRouting: null,
 	envValues: {},
 	envPlain: {},
 	...(await storedProjectPaths(gstore)),
@@ -830,6 +833,7 @@ const loop = createTurnLoop(projects, {
 	maxTotalRuns: () => shared.maxTotalRuns,
 	reviewCheck: () => shared.reviewCheck,
 	workCheck: () => shared.workCheck,
+	checkRouting: () => shared.checkRouting ?? null,
 	quota: () => fetchQuota(boardOmpEnv()),
 	drained: () => shuttingDown || app.drained(),
 	stopping: () => shuttingDown,

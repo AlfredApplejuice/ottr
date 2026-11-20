@@ -82,8 +82,17 @@ const SECRET = "e2e-tenant-secret-".repeat(3);
 const PUBLIC = "acme.ottr.cloud";
 const BOOT = "boot-token-e2e";
 const WORK_MODEL = "anthropic/claude-opus-5-5";
-const CHECK_ROLE = checkRoleFor(WORK_MODEL);
+// Today's board shape: the OpenAI critic differs from the Anthropic work model.
+const CHECK_ROLE = checkRoleFor(
+	null,
+	{ critic: "openai/gpt-6", adversary: WORK_MODEL },
+	WORK_MODEL,
+);
 const CHECK_MODEL = "openai/gpt-6";
+/** The routed board's rule role and its model (the end-to-end routing test). */
+const ROUTED_ROLE = "reviewer";
+const ROUTED_MODEL = "moonshot/kimi-k2";
+const ROUTED_PROMPT = "Add a routed.txt file that greets the tenant.";
 const WORK_PROMPT = "Add a hello.txt file that greets the tenant.";
 const PASS = JSON.stringify({ blockers: [], fixed: [], notes: [] });
 
@@ -521,6 +530,8 @@ async function mountBoard(
 		/** OTTR-1143: a second project folder, so the frame test can hold the overlap across
 		 * two projects (the card loop reads them in map order). */
 		secondProject?: string;
+		/** Role -> selector map; defaults to today's board (default + the check role). */
+		modelRoles?: TurnOps["modelRoles"];
 	} = {},
 ): Promise<Board> {
 	const name = o.name ?? "app";
@@ -578,6 +589,7 @@ async function mountBoard(
 		idleReviews: true,
 		trendingScan: true,
 		commitIdentity: null,
+		checkRouting: null,
 		removedPaths: [] as string[],
 		envValues: {} as Record<string, string>,
 		envPlain: {} as Record<string, string>,
@@ -597,8 +609,11 @@ async function mountBoard(
 		maxTotalRuns: () => shared.maxTotalRuns,
 		reviewCheck: () => shared.reviewCheck,
 		workCheck: () => shared.workCheck,
+		checkRouting: () => shared.checkRouting ?? null,
 		// The check role's model; the board reads omp's role config otherwise.
-		modelRoles: () => ({ default: WORK_MODEL, [CHECK_ROLE]: CHECK_MODEL }),
+		modelRoles:
+			o.modelRoles ??
+			(() => ({ default: WORK_MODEL, [CHECK_ROLE]: CHECK_MODEL })),
 		// An empty catalog: the real modelList spawns this machine's omp and caches
 		// its answer process-wide, which would leak into the other test files here.
 		modelList: async () => [],
@@ -921,6 +936,119 @@ describe("hosted mode end to end", () => {
 		// Every control-plane call carried a valid tenant identity, and none failed.
 		expect(cp.refused).toEqual([]);
 		expect(board.logs).toEqual([]);
+	}, 30_000);
+
+	test("a check-routing rule routes the check through the rule's role, end to end", async () => {
+		// A second board with its own control plane, whose configured roles include the
+		// rule's reviewer role (mountBoard + createApp + gstore, like src/server.ts).
+		const cp2 = startControlPlane();
+		const config2 = readHostedConfig({
+			OTTR_HOSTED: "1",
+			OTTR_HOSTED_TENANT: TENANT,
+			OTTR_HOSTED_SECRET: SECRET,
+			OTTR_HOSTED_CONTROL_URL: cp2.url,
+		});
+		if (config2 === null) throw new Error("hosted config did not parse");
+		const routed = await mountBoard(
+			{
+				config: config2,
+				hooks: controlPlaneHooks(config2, { log: () => {} }),
+			},
+			{
+				name: "routed",
+				modelRoles: () => ({
+					default: WORK_MODEL,
+					critic: CHECK_MODEL,
+					adversary: "zai/glm-5.3-flash",
+					[ROUTED_ROLE]: ROUTED_MODEL,
+				}),
+			},
+		);
+
+		// The user rule, saved through the real admin-guarded settings route.
+		const saved = await proxyFetch("/api/settings/check-routing", {
+			to: routed,
+			body: {
+				rules: [{ vendor: "anthropic", role: ROUTED_ROLE }],
+				fallback: "",
+			},
+		});
+		expect(saved.status).toBe(200);
+		expect(await saved.json()).toEqual({
+			routing: {
+				rules: [{ vendor: "anthropic", role: ROUTED_ROLE }],
+				fallback: "",
+			},
+		});
+
+		// A work card runs work + check like the first board; the rule sends the
+		// Anthropic work model's check to the reviewer role.
+		const created = await proxyFetch(
+			`/api/projects/${routed.store.name}/tasks`,
+			{ to: routed, body: { prompt: ROUTED_PROMPT, backlog: true } },
+		);
+		expect(created.status).toBe(200);
+		const task = (await routed.store.listTasks()).find(
+			(t) => t.prompt === ROUTED_PROMPT,
+		);
+		expect(task).toBeDefined();
+		const id = task!.id;
+		const started = await proxyFetch(
+			`/api/projects/${routed.store.name}/tasks/${id}/backlog`,
+			{ to: routed, body: { to: "todo" } },
+		);
+		expect(started.status).toBe(200);
+		await cp2.meteringCount(4);
+		await eventually(
+			"the routed merge turn to park at the credit gate",
+			async () => (await routed.store.getTask(id))!.state === "needs_you",
+		);
+
+		// The stored check run names the routed role and its model.
+		const card = (await routed.store.getTask(id))!;
+		expect(card.workCheckLog.map((r) => r.outcome)).toEqual(["pass"]);
+		expect(card.workCheckLog[0]!.role).toBe(ROUTED_ROLE);
+		expect(card.workCheckLog[0]!.model).toBe(ROUTED_MODEL);
+		const checkLaunch = launches.findLast((l) =>
+			l.cwd.startsWith(join(root, "routed")),
+		);
+		expect(checkLaunch).toBeDefined();
+		expect(checkLaunch!.args[checkLaunch!.args.indexOf("--model") + 1]).toBe(
+			ROUTED_MODEL,
+		);
+
+		// The meter (and so the hosted report) carries the rule's role, and the
+		// work run stays on the default role.
+		const turns = await routed.store.listTurns(id);
+		expect(turns).toHaveLength(1);
+		const base = {
+			tenant: TENANT,
+			project: routed.store.name,
+			taskId: id,
+			turnId: turns[0]!.id,
+			kind: "work",
+		};
+		expect(byRun(cp2.metering.filter((r) => r.final))).toEqual([
+			{
+				...base,
+				role: "default",
+				model: WORK_MODEL,
+				run: 0,
+				final: true,
+				usage: WORK_USAGE,
+				outcome: "ready",
+				title: ROUTED_PROMPT,
+			},
+			{
+				...base,
+				role: ROUTED_ROLE,
+				model: ROUTED_MODEL,
+				run: 1,
+				final: true,
+				usage: CHECK_USAGE,
+			},
+		]);
+		expect(cp2.refused).toEqual([]);
 	}, 30_000);
 
 	test("through the proxy the board says hosted; unsigned and replayed requests are 401", async () => {

@@ -15,6 +15,7 @@ import {
 	blockingReview,
 	checkModelWarning,
 	checkRoleFor,
+	checkRoutingNote,
 	type DepIndex,
 	type DepProject,
 	demoteUnquoted,
@@ -36,7 +37,6 @@ import {
 	liveCardOf,
 	mergeAnywayPatch,
 	mergeHold,
-	modelVendor,
 	openWorkBlockers,
 	overrideWorkBlockers,
 	PUSH_HOLD,
@@ -64,6 +64,7 @@ import {
 } from "./scheduler.ts";
 import fc from "./test/properties.ts";
 import type { Task, WorkCheckRun } from "./types.ts";
+import { modelVendor } from "./vendor.ts";
 
 describe("silentSince", () => {
 	test("flags a preparing or running log silent past SILENT_LOG_MS, floored; else null", () => {
@@ -1843,20 +1844,122 @@ describe("review check policy", () => {
 		});
 	});
 
-	test("checkRoleFor picks the role by model vendor, not provider prefix", () => {
+	test("checkRoleFor keeps today's roles for Claude and GPT runs on today's board", () => {
+		// Today's setup: critic = an OpenAI model, adversary = an Anthropic model.
+		const roles = {
+			critic: "openai/gpt-6",
+			adversary: "anthropic/claude-opus-5-5",
+		};
 		// Claude through another provider is still Anthropic: the critic role checks it.
-		expect(checkRoleFor("anthropic/claude-opus-5-5")).toBe("critic");
-		expect(checkRoleFor("github-copilot/claude-sonnet-4-5")).toBe("critic");
-		expect(checkRoleFor("openrouter/anthropic/claude-opus-4-1")).toBe("critic");
-		expect(checkRoleFor("bedrock/us.anthropic.claude-sonnet-4-5")).toBe(
+		expect(checkRoleFor(null, roles, "anthropic/claude-opus-5-5")).toBe(
 			"critic",
 		);
-		// Other vendors and unknown ids keep the adversary role.
-		expect(checkRoleFor("openai/gpt-6.1")).toBe("adversary");
-		expect(checkRoleFor("openai-codex/gpt-5.6-luna")).toBe("adversary");
-		expect(checkRoleFor("zai/glm-5.3-flash")).toBe("adversary");
-		expect(checkRoleFor("fake/default-model")).toBe("adversary");
-		expect(checkRoleFor(null)).toBe("adversary");
+		expect(checkRoleFor(null, roles, "github-copilot/claude-sonnet-4-5")).toBe(
+			"critic",
+		);
+		expect(
+			checkRoleFor(null, roles, "openrouter/anthropic/claude-opus-4-1"),
+		).toBe("critic");
+		expect(
+			checkRoleFor(null, roles, "bedrock/us.anthropic.claude-sonnet-4-5"),
+		).toBe("critic");
+		// A GPT run gets the Anthropic adversary.
+		expect(checkRoleFor(null, roles, "openai/gpt-6.1")).toBe("adversary");
+		expect(checkRoleFor(null, roles, "openai-codex/gpt-5.6-luna")).toBe(
+			"adversary",
+		);
+		// A third vendor gets the OpenAI critic: a real second vendor's opinion, the
+		// routing this change introduces (the old rule sent it to the adversary too).
+		expect(checkRoleFor(null, roles, "zai/glm-5.3-flash")).toBe("critic");
+		// An unknown or unset work model: the OpenAI critic differs from its unknown vendor.
+		expect(checkRoleFor(null, roles, "fake/default-model")).toBe("critic");
+		expect(checkRoleFor(null, roles, null)).toBe("critic");
+	});
+
+	test("checkRoleFor routes an only-Chinese board across vendors with no setting", () => {
+		const roles = {
+			adversary: "zai/glm-5.3-flash",
+			critic: "qwen/qwen-max",
+		};
+		expect(checkRoleFor(null, roles, "zai/glm-5.3-flash")).toBe("critic");
+		expect(checkRoleFor(null, roles, "qwen/qwen-max")).toBe("adversary");
+	});
+
+	test("a user rule routes the vendor to its role, else the fallback applies", () => {
+		const roles = {
+			critic: "openai/gpt-6",
+			adversary: "anthropic/claude-opus-5-5",
+			reviewer: "moonshot/kimi-k2",
+		};
+		const settings = {
+			rules: [{ vendor: "zai", role: "reviewer" }],
+			fallback: "",
+		};
+		expect(checkRoleFor(settings, roles, "zai/glm-5.3-flash")).toBe("reviewer");
+		expect(checkRoutingNote(settings, roles, "zai/glm-5.3-flash")).toBeNull();
+		// The first matching rule wins; later duplicates never run.
+		const dup = {
+			rules: [
+				{ vendor: "zai", role: "reviewer" },
+				{ vendor: "zai", role: "critic" },
+			],
+			fallback: "",
+		};
+		expect(checkRoleFor(dup, roles, "zai/glm-5.3-flash")).toBe("reviewer");
+		// A model no rule names takes a configured fallback role.
+		const fb = {
+			rules: [{ vendor: "zai", role: "reviewer" }],
+			fallback: "reviewer",
+		};
+		expect(checkRoleFor(fb, roles, "anthropic/claude-opus-5-5")).toBe(
+			"reviewer",
+		);
+		expect(checkRoutingNote(fb, roles, "anthropic/claude-opus-5-5")).toBeNull();
+		// An empty fallback and no match: the default rule, with no note.
+		expect(checkRoleFor(settings, roles, "anthropic/claude-opus-5-5")).toBe(
+			"critic",
+		);
+		expect(checkRoutingNote(settings, roles, "anthropic/claude-opus-5-5")).toBe(
+			null,
+		);
+	});
+
+	test("a rule or fallback to a missing role falls back to the default rule and logs one line", () => {
+		const roles = {
+			critic: "openai/gpt-6",
+			adversary: "anthropic/claude-opus-5-5",
+		};
+		const settings = {
+			rules: [{ vendor: "zai", role: "reviewer" }],
+			fallback: "",
+		};
+		expect(checkRoleFor(settings, roles, "zai/glm-5.3-flash")).toBe("critic");
+		expect(checkRoutingNote(settings, roles, "zai/glm-5.3-flash")).toBe(
+			"check routing: rule zai -> reviewer names no configured role, using the default rule",
+		);
+		// The same for a nonempty fallback whose role has no configured model.
+		const fb = { rules: [], fallback: "reviewer" };
+		expect(checkRoleFor(fb, roles, "anthropic/claude-opus-5-5")).toBe("critic");
+		expect(checkRoutingNote(fb, roles, "anthropic/claude-opus-5-5")).toBe(
+			"check routing: fallback reviewer names no configured role, using the default rule",
+		);
+	});
+
+	test("the unknown vendor rule matches a model with no known vendor", () => {
+		const roles = {
+			critic: "openai/gpt-6",
+			adversary: "anthropic/claude-opus-5-5",
+		};
+		const settings = {
+			rules: [{ vendor: "unknown", role: "adversary" }],
+			fallback: "critic",
+		};
+		expect(checkRoleFor(settings, roles, "fake/default-model")).toBe(
+			"adversary",
+		);
+		expect(checkRoleFor(settings, roles, null)).toBe("adversary");
+		// A known vendor never matches the unknown rule: the fallback applies.
+		expect(checkRoleFor(settings, roles, "zai/glm-5.3-flash")).toBe("critic");
 	});
 
 	test("modelVendor reads the vendor from the model id after the provider prefix", () => {

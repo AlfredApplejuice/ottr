@@ -2266,29 +2266,40 @@ describe("work check log", () => {
 				{
 					at: 3000,
 					model: null,
-					// A value the union never names: the parse whitelist drops it.
-					role: "plan" as unknown as "critic" | "adversary" | "default",
+					// A non-string role drops: the parse whitelist keeps strings only.
+					role: 5 as unknown as string,
 					outcome: "error",
 					blockers: [],
 					notes: [],
 					durationMs: 0,
 					error: "the run was lost",
 				},
+				{
+					at: 4000,
+					model: "moonshot/kimi-k2",
+					// A routed role is user data: any nonempty string role survives.
+					role: "reviewer",
+					outcome: "pass",
+					blockers: [],
+					notes: [],
+					durationMs: 1000,
+				},
 			],
 		});
 		await store.close();
 		const reopened = await open(join(root, "wc-log"));
 		const log = (await reopened.getTask(task.id))?.workCheckLog ?? [];
-		expect(log).toHaveLength(3);
+		expect(log).toHaveLength(4);
 		expect(log[0]?.warn).toBe(
 			"The check model zai/glm-5.3-flash:medium is the same model as the run it checks — no second-model opinion.",
 		);
 		expect(log[2]?.warn).toBeUndefined();
-		// The role rides the same whitelist: a picked role survives, a bogus
-		// value lands as undefined.
+		// The role rides the same whitelist: a picked role and a routed role survive,
+		// a non-string drops.
 		expect(log[0]?.role).toBe("critic");
 		expect(log[1]?.role).toBe("default");
 		expect(log[2]?.role).toBeUndefined();
+		expect(log[3]?.role).toBe("reviewer");
 		await reopened.close();
 	});
 });
@@ -6326,6 +6337,8 @@ describe("review findings storage", () => {
 		detail TEXT
 	)`;
 
+	// The upgrade backfill walks many stores; under a full parallel suite run it
+	// can pass the 5 s default, so this test carries its own budget.
 	test("open adds lead_at_done and backfills it on the upgrade open itself (OTTR-963)", async () => {
 		const dir = join(root, "lead-flag-upgrade");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
@@ -6427,7 +6440,7 @@ describe("review findings storage", () => {
 		await store.close();
 		const again = await open(dir);
 		expect((await again.getTask("f1"))?.leadAtDone).toBe(true);
-	});
+	}, 15_000);
 
 	test("a review landing done stamps its backlog findings, and the stamp survives re-queues (OTTR-963)", async () => {
 		const dir = join(root, "lead-flag-forward");
