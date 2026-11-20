@@ -141,7 +141,9 @@ export async function bootstrap(): Promise<void> {
 			},
 		],
 	});
-	process.env.OMP_TRACKER_MAX_TOTAL = "none"; // the header shows n/∞, as on a board with no cap
+	// The header shows n/∞ by default, as on a board with no cap; an explicit
+	// OMP_TRACKER_MAX_TOTAL (a shot of the Slots meter needs a cap) wins.
+	process.env.OMP_TRACKER_MAX_TOTAL ??= "none";
 	// Opts into Bun's HTML dev server (HMR); see the development flag in server.ts.
 	process.env.NODE_ENV ??= "development";
 	// Dynamic on purpose: server.ts reads the env and scans the roots while it loads, and a static

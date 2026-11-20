@@ -1185,7 +1185,9 @@ function systemQuotaGrp(
 	);
 }
 
-/** The Agents section of the System popover: running, merging, waiting and the slot cap. */
+/** The Agents section of the System popover: running, merging, waiting and the slot cap.
+ *  Running is the scheduler's own count (OTTR-1143): it includes preparing claims and merge
+ *  turns. Merging stays the frame's stage split. */
 function systemAgents(
 	slots: SlotCounts,
 	maxTotal: number | null,
@@ -1196,12 +1198,12 @@ function systemAgents(
 		<section>
 			<h2>Agents</h2>
 			<dl className="ag-nums">
-				<div data-zero={slots.in_progress + slots.todo === 0 || undefined}>
+				<div data-zero={used === 0 || undefined}>
 					<dt>
 						<Mark kind="running" />
 						Running
 					</dt>
-					<dd>{slots.in_progress + slots.todo}</dd>
+					<dd>{used}</dd>
 				</div>
 				<div data-zero={slots.merging === 0 || undefined}>
 					<dt>
@@ -1404,6 +1406,7 @@ function systemQuotaSection(quota: QuotaState | null): ReactNode {
 export function SystemBar({
 	tasks,
 	maxTotal,
+	slotsUsed,
 	quota,
 	serviceQuotas,
 	navigate,
@@ -1411,6 +1414,8 @@ export function SystemBar({
 }: {
 	tasks: TaskCard[];
 	maxTotal: number | null;
+	/** OTTR-1143: the scheduler's own slot count; absent on frames from an older server. */
+	slotsUsed?: number;
 	quota: QuotaState | null;
 	serviceQuotas?: StateResponse["serviceQuotas"];
 	/** Plain-click navigation to a view path (see navClick). */
@@ -1421,7 +1426,10 @@ export function SystemBar({
 	const system = useSystem();
 	const catalog = useModels();
 	const slots = slotUse(tasks);
-	const used = SLOT_STAGES.reduce((n, s) => n + slots[s], 0);
+	// OTTR-1143: the scheduler's own count wins; the frame's cards are not a snapshot
+	// across projects, so their sum can exceed the cap. Without the field (older
+	// server) the board keeps today's card count.
+	const used = slotsUsed ?? SLOT_STAGES.reduce((n, s) => n + slots[s], 0);
 	const waiting = queueOrder(tasks).length;
 	// The bar tracks the default model's provider: that is the quota that stops agents first.
 	const tightest = tightestFor(
@@ -1462,7 +1470,8 @@ export function SystemBar({
 			</button>
 			<div id="system-detail" popover="auto" className="popover">
 				{/* Order by urgency: agents first (big figures, no table to read), quota second.
-				    Running counts preparing todo slots too. */}
+				    Running is the scheduler's own count; it includes preparing claims and merge
+				    turns. */}
 				{systemAgents(slots, maxTotal, used, waiting)}
 				{!hosted && systemQuotaSection(quota)}
 				{!hosted && <ServiceQuotas sources={serviceQuotas} now={Date.now()} />}
@@ -1636,8 +1645,9 @@ function eventCount(total: number | null, hour: number | null): ReactNode {
 
 /** The System view at /system: one row per container (the server, then each worker), the
  *  Docker VM, and the board-wide holds. Containers and VM come from the 30 s System snapshot;
- *  the holds read the live board state with the top bar's own slotUse and queueOrder, so the
- *  two always show the same numbers. */
+ *  the holds read the live board state with the top bar's own slotUse and queueOrder. The
+ *  Agent cap line prefers the server's slotsUsed (OTTR-1143) like the top bar, so the two
+ *  always show the same numbers. */
 /** One container row of the System table: warn head, metrics or gap, turns, mutation lock. */
 function containerRow(
 	c: SystemSnapshot["containers"][number],
@@ -1893,8 +1903,10 @@ function SystemView({
 }) {
 	const system = useSystem();
 	const tasks = state.tasks;
-	const slots = slotUse(tasks);
-	const running = SLOT_STAGES.reduce((n, s) => n + slots[s], 0);
+	// OTTR-1143: the Agent cap line shows the scheduler's own count; the frame's own
+	// cards are only the fallback (older server).
+	const running =
+		state.slotsUsed ?? SLOT_STAGES.reduce((n, s) => n + slotUse(tasks)[s], 0);
 	const queue = queueOrder(tasks);
 	const oldest = queue[0];
 	const links = (cards: SystemCard[]): ReactNode =>
@@ -18037,10 +18049,10 @@ export function App() {
 			? [...tasks, fallbackTask]
 			: tasks;
 	const deltas = commitDeltas(tasks);
-	// Live agent counts for the drawer's Workflow modal: slots busy now machine-wide, against
-	// the global cap (SystemBar shows the same count in the app bar).
-	const slotsAll = slotUse(tasks);
-	const usedTotal = SLOT_STAGES.reduce((n, s) => n + slotsAll[s], 0);
+	// Live agent counts for the drawer's Workflow modal: the scheduler's own slot count
+	// (OTTR-1143) against the global cap; SystemBar shows the same number in the app bar.
+	const usedTotal =
+		state?.slotsUsed ?? SLOT_STAGES.reduce((n, s) => n + slotUse(tasks)[s], 0);
 	// One split for the bell, the popover groups and the counts (shared with the rail rows/Overview).
 	const { needs: needTasks, asks: askCards } = splitAlarms(tasks);
 	// Projects with PR review notifications off show no PR rows in the bell.
@@ -18244,6 +18256,7 @@ export function App() {
 					<SystemBar
 						tasks={tasks}
 						maxTotal={state.maxTotal}
+						slotsUsed={state.slotsUsed}
 						quota={state.quota}
 						serviceQuotas={state.serviceQuotas}
 						navigate={navigate}

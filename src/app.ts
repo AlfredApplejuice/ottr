@@ -706,6 +706,10 @@ interface AppDeps {
 		workers: Record<string, number>;
 		preparing: number;
 	};
+	/** OTTR-1143: the turn loop's live slot count — the running ∪ preparing keys the claim
+	 * gate caps. Absent in narrow test mounts: the state frame then omits slotsUsed and
+	 * the UI keeps its own card count (the old-server behavior). */
+	slotsUsed?: () => number | Promise<number>;
 	/** OTTR-763: the cross-project checkout guard's ambiguous-change bell notices (one per
 	 * change; names the commit and the running cards); absent = none. */
 	checkoutNotices?: () => string[];
@@ -5870,6 +5874,10 @@ export async function createApp(deps: AppDeps) {
 			restartWait: restartWaitView(),
 			seedFailed: seedFailedView(),
 			updateCycle: cycle,
+			// Read at frame assembly, not at build start: the card loop spans seconds
+			// (OTTR-866), so a count taken early goes stale before the frame ships (OTTR-1143).
+			slotsUsed:
+				deps.slotsUsed === undefined ? undefined : await deps.slotsUsed(),
 		};
 		return { state, tasksBufs, summaries };
 	}

@@ -15137,6 +15137,39 @@ describe("service quotas in the overview", () => {
 				/>,
 			),
 		);
+	// OTTR-1143: minimal cards for the slot meter; its slot path reads only stage,
+	// state and cancelledAt.
+	const slotCard = (
+		id: string,
+		stage: "todo" | "in_progress" | "merging",
+		state: "running" | "preparing",
+	): TaskCard =>
+		({
+			id,
+			stage,
+			state,
+			cancelledAt: null,
+			queuedAt: null,
+			createdAt: 1,
+		}) as unknown as TaskCard;
+	// One in_progress/running and one todo/preparing card: the frame's own sum is 2.
+	const slotCards = [
+		slotCard("slot-a", "in_progress", "running"),
+		slotCard("slot-b", "todo", "preparing"),
+	];
+	const slotOverview = (slotsUsed?: number) =>
+		documentOf(
+			renderToStaticMarkup(
+				<SystemBar
+					tasks={slotCards}
+					maxTotal={1}
+					slotsUsed={slotsUsed}
+					quota={null}
+					hosted={false}
+					navigate={() => {}}
+				/>,
+			),
+		);
 
 	test("model quotas coexist with ordered service identities and equal labels", () => {
 		const document = overview(quota, [
@@ -15184,6 +15217,23 @@ describe("service quotas in the overview", () => {
 		expect(document.querySelector(".meters")?.outerHTML).toBe(
 			overview(null, undefined).querySelector(".meters")?.outerHTML,
 		);
+	});
+
+	test("the slot meter shows the server's count over the frame's own cards", () => {
+		const document = slotOverview(1);
+		expect(document.querySelector(".sb-big")?.textContent).toBe("1");
+		expect(
+			document.querySelector("#system-detail .meter-value")?.textContent,
+		).toContain("1/1");
+		expect(document.querySelector(".ag-nums div dd")?.textContent).toBe("1");
+	});
+
+	test("without the server field the meter keeps the frame's own count", () => {
+		const document = slotOverview();
+		expect(document.querySelector(".sb-big")?.textContent).toBe("2");
+		expect(
+			document.querySelector("#system-detail .meter-value")?.textContent,
+		).toContain("2/1");
 	});
 
 	test("absent and empty services stay hidden and hosted mode hides supplied service data", () => {

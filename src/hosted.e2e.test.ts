@@ -35,6 +35,8 @@ import { type RunLauncher, startRun } from "./runner.ts";
 import { checkRoleFor } from "./scheduler.ts";
 import { ProjectStore } from "./store.ts";
 import { createTurnLoop, type TurnLoop, type TurnOps } from "./turn.ts";
+import { type RunResult, type StateResponse } from "./types.ts";
+import { SLOT_STAGES, slotUse } from "./ui/queue.ts";
 import { VmTokens } from "./vmTokens.ts";
 import {
 	archReviewDelta,
@@ -484,6 +486,11 @@ interface Board {
 	store: ProjectStore;
 	loop: TurnLoop;
 	logs: string[];
+	/** The board's projects in state-build order (OTTR-1143: the frame test reads the
+	 * second project's entry to stop its run). */
+	projects: Map<string, Entry>;
+	/** The board's project stores in the same order; stores[0] pairs with store. */
+	stores: ProjectStore[];
 }
 
 let cp: ControlPlane;
@@ -506,6 +513,9 @@ async function mountBoard(
 		name?: string;
 		maxTotalRuns?: number;
 		startRun?: TurnOps["startRun"];
+		/** OTTR-1143: a second project folder, so the frame test can hold the overlap across
+		 * two projects (the card loop reads them in map order). */
+		secondProject?: string;
 	} = {},
 ): Promise<Board> {
 	const name = o.name ?? "app";
@@ -515,6 +525,7 @@ async function mountBoard(
 	makeRepo(projectDir);
 	const store = await ProjectStore.open(projectDir);
 	stores.push(store);
+	const boardStores = [store];
 	const projects = new Map<string, Entry>();
 	projects.set(store.name, {
 		path: projectDir,
@@ -532,6 +543,29 @@ async function mountBoard(
 		latestImage: null,
 		archReview: null,
 	});
+	if (o.secondProject !== undefined) {
+		const secondDir = join(root, o.secondProject);
+		makeRepo(secondDir);
+		const second = await ProjectStore.open(secondDir);
+		stores.push(second);
+		boardStores.push(second);
+		projects.set(second.name, {
+			path: secondDir,
+			name: second.name,
+			store: second,
+			target: null,
+			gitless: false,
+			github: null,
+			protectedTarget: false,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		});
+	}
 	const shared = {
 		maxTotalRuns: o.maxTotalRuns ?? 3,
 		reviewCheck: true,
@@ -652,6 +686,9 @@ async function mountBoard(
 		finishKept: loop.finishKept,
 		claimedPids: () => new Set<number>(),
 		schedule: loop.schedule,
+		// Mirrors src/server.ts's wiring: the frame stamp reads the loop's own live count
+		// (OTTR-1143), the path the frame test proves.
+		slotsUsed: () => loop.slotsUsed(),
 		serverVersion: "test",
 		port: 0,
 		publicHosts: [],
@@ -665,7 +702,14 @@ async function mountBoard(
 	const srv = Bun.serve({ port: 0, ...app.serveOptions });
 	serverRef.current = srv;
 	servers.push(srv);
-	return { url: srv.url.href, store, loop, logs: [] };
+	return {
+		url: srv.url.href,
+		store,
+		loop,
+		logs: [],
+		projects,
+		stores: boardStores,
+	};
 }
 
 /**
@@ -899,6 +943,171 @@ describe("hosted mode end to end", () => {
 			(await board.store.listTasks()).some((t) => t.prompt === prompt),
 		).toBe(false);
 	});
+
+	test("the state frame ships the loop's own slot count, not the frame cards' sum", async () => {
+		// Its own control plane: credit always passes, so it never blocks this test.
+		const cp3 = startControlPlane({ credit: () => true });
+		const config = readHostedConfig({
+			OTTR_HOSTED: "1",
+			OTTR_HOSTED_TENANT: TENANT,
+			OTTR_HOSTED_SECRET: SECRET,
+			OTTR_HOSTED_CONTROL_URL: cp3.url,
+		});
+		if (config === null) throw new Error("hosted config did not parse");
+		// Runs never finish on their own; a kill settles them. Distinct prompts key the
+		// per-run resolvers.
+		let launches = 0;
+		const doneResolvers = new Map<string, (killed: boolean) => void>();
+		const holdStartRun: TurnOps["startRun"] = async (o) => {
+			launches += 1;
+			const n = launches;
+			const pid = 4242 + n;
+			// The sweep reaps a live run whose pid is dead; the held runs must survive the
+			// swap, so their fakes pids count as alive until the run's kill settles them.
+			livePids.add(pid);
+			const done = Promise.withResolvers<RunResult>();
+			doneResolvers.set(o.prompt, (killed) => {
+				livePids.delete(pid);
+				done.resolve({
+					exitCode: 0,
+					sessionId: `sess-${n}`,
+					model: "m",
+					outcome: null,
+					asked: null,
+					proposed: null,
+					recorded: [],
+					approvalRefused: false,
+					sawTerminalEnd: false,
+					finalText: "ok",
+					killed,
+					stderrTail: "",
+				});
+			});
+			await o.onSession?.(`sess-${launches}`);
+			return {
+				pid,
+				done: done.promise,
+				kill: async () => {
+					doneResolvers.get(o.prompt)?.(true);
+				},
+			};
+		};
+		const board3 = await mountBoard(
+			{ config, hooks: controlPlaneHooks(config, { log: () => {} }) },
+			{
+				name: "slots",
+				maxTotalRuns: 1,
+				startRun: holdStartRun,
+				secondProject: "slots-two",
+			},
+		);
+		board3.logs = [];
+		const [storeA, storeB] = board3.stores;
+		if (storeA === undefined || storeB === undefined)
+			throw new Error("the second project's store is missing");
+
+		// Two cards parked in the backlog, one per project.
+		const file = async (
+			store: ProjectStore,
+			prompt: string,
+		): Promise<string> => {
+			const res = await proxyFetch(`/api/projects/${store.name}/tasks`, {
+				body: { prompt, backlog: true },
+				to: board3,
+			});
+			expect(res.status).toBe(200);
+			return (await store.listTasks()).find((t) => t.prompt === prompt)!.id;
+		};
+		const a = await file(storeA, "Slots A: add hello.txt");
+		const b = await file(storeB, "Slots B: add hello.txt");
+
+		// A takes the one slot. The stop below must find a live run handle, so the wait keys
+		// on `loop.running` (the claim alone only holds a preparing slot): stopping during the
+		// dispatch window would 409 and the stop would silently never land.
+		const movedA = await proxyFetch(
+			`/api/projects/${storeA.name}/tasks/${a}/backlog`,
+			{ body: { to: "todo" }, to: board3 },
+		);
+		expect(movedA.status).toBe(200);
+		await eventually(
+			"A's card holding the slot",
+			async () =>
+				board3.loop.running.has(`${storeA.name}/${a}`) &&
+				["preparing", "running"].includes((await storeA.getTask(a))!.state),
+		);
+
+		// B wants the slot too; the cap is full, so B stays queued.
+		const movedB = await proxyFetch(
+			`/api/projects/${storeB.name}/tasks/${b}/backlog`,
+			{ body: { to: "todo" }, to: board3 },
+		);
+		expect(movedB.status).toBe(200);
+		await eventually(
+			"B's card queued",
+			async () => (await storeB.getTask(b))!.state === "queued",
+		);
+
+		// Arm the swap on B's boardCardFacts — only the state build calls it, so this parks
+		// the build exactly between the A block and the B read.
+		const realFacts = storeB.boardCardFacts.bind(storeB);
+		const reachedB = Promise.withResolvers<void>();
+		const swapGo = Promise.withResolvers<void>();
+		let armed = true;
+		// Test seam: shadow the prototype method with an instance override of the same
+		// signature; no runtime check can express "assign a method", so the cast is the seam.
+		const factsPatch = storeB as unknown as {
+			boardCardFacts: typeof realFacts;
+		};
+		factsPatch.boardCardFacts = async () => {
+			if (!armed) return await realFacts();
+			armed = false;
+			reachedB.resolve();
+			await swapGo.promise;
+			// A's card frees its slot while the build already read project A; the freed
+			// slot lets B's queued card claim (the release's own schedule re-dispatches).
+			// The stop's outcome is asserted: a discarded 409 here would stall this swap.
+			expect(
+				await board3.loop.stopTurn(board3.projects.get(storeA.name)!, a),
+			).toEqual({ ok: true });
+			// Wait for the swap's end state, not for a transient empty set: the release and
+			// B's claim land within one tick cascade, so a poll can miss slotsUsed === 0.
+			// A released (its keys left the loop's maps) and B holding the cap's one slot.
+			await eventually(
+				"A released and B holding the slot",
+				async () =>
+					!board3.loop.running.has(`${storeA.name}/${a}`) &&
+					board3.loop.running.has(`${storeB.name}/${b}`) &&
+					["preparing", "running"].includes((await storeB.getTask(b))!.state),
+			);
+			return await realFacts();
+		};
+
+		// The frame fetch blocks in the swap; release it and read the frame it ships.
+		const frameP = proxyFetch("/api/state", { to: board3 });
+		await reachedB.promise;
+		swapGo.resolve();
+		const frame = (await (await frameP).json()) as StateResponse;
+
+		// The overlap the incident shipped (this is what made the board show 31/30): the frame
+		// read A's card live, then B claimed the freed slot, so the frame's own cards add up
+		// past the cap. slotsUsed must still report the loop's count, at most the cap.
+		expect(frame.slotsUsed).toBe(1);
+		expect(frame.maxTotal).toBe(1);
+		expect(
+			["preparing", "running"].includes(
+				frame.tasks.find((t) => t.id === a)!.state,
+			),
+		).toBe(true);
+		const used = SLOT_STAGES.reduce((n, s) => n + slotUse(frame.tasks)[s], 0);
+		expect(used).toBe(2);
+		expect(frame.slotsUsed!).toBeLessThanOrEqual(frame.maxTotal!);
+
+		// End the test cleanly: a stop on the still-running B run settles it (afterAll must
+		// not wait on a live run).
+		expect(
+			await board3.loop.stopTurn(board3.projects.get(storeB.name)!, b),
+		).toEqual({ ok: true });
+	}, 60_000);
 });
 
 describe("hosted credit stop and release end to end", () => {

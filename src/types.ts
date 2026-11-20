@@ -1364,6 +1364,11 @@ export interface StateResponse {
 	tasks: TaskCard[];
 	/** Global cap of concurrently running omp processes; null = no cap. */
 	maxTotal: number | null;
+	/** The scheduler's own live slot count at frame assembly: the distinct running and
+	 *  preparing run keys the claim gate compares against maxTotal (OTTR-1143). The frame's
+	 *  card list is not a snapshot across projects, so its own sum can exceed the cap.
+	 *  Absent on frames from an older server; the UI then counts the frame's own cards. */
+	slotsUsed?: number;
 	/** True when a review's findings are checked by a second model before they become cards. */
 	reviewCheck: boolean;
 	/** True when a finished work card is checked by a second model before it enters the merge queue. */

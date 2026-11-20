@@ -911,7 +911,9 @@ const MUTATION_TURN_PROMPT = /mutation (?:gate|testing)/i;
 /** Store slice the map builder reads; ProjectStore satisfies it structurally. */
 interface DemoStore {
 	transaction<T>(work: () => T | Promise<T>): Promise<T>;
-	listTasks(): Promise<Array<{ id: string; state: string }>>;
+	listTasks(): Promise<
+		Array<{ id: string; state: string; cancelledAt: number | null }>
+	>;
 	listTurns(taskId: string): Promise<
 		Array<{
 			kind: string;
@@ -943,6 +945,25 @@ export async function demoProgressMap(
 		});
 	}
 	return lines;
+}
+
+/** Slot count the demo board's state frame ships (OTTR-1143): the seeded pool's live claims.
+ * The loop's own count stays 0 because OTTR_DEMO runs no agents (see demoProgressMap). */
+export async function demoSlotsUsed(
+	projects: Iterable<[string, { store: DemoStore }]>,
+): Promise<number> {
+	let used = 0;
+	for (const [, { store }] of projects) {
+		await store.transaction(async () => {
+			for (const t of await store.listTasks())
+				if (
+					t.cancelledAt === null &&
+					(t.state === "running" || t.state === "preparing")
+				)
+					used += 1;
+		});
+	}
+	return used;
 }
 
 /** Make sure the board has an admin login; an existing one always wins. The plain password

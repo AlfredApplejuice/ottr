@@ -1635,6 +1635,8 @@ export interface TurnLoop {
 		workers: Record<string, number>;
 		preparing: number;
 	};
+	/** OTTR-1143: the live slot count the claim gate caps (the running ∪ preparing keys). */
+	slotsUsed(): number;
 	/** OTTR-763: the cross-project checkout guard's ambiguous-change notices for the bell
 	 * (one per change; names the commit and the running cards), oldest first. */
 	checkoutNotices(): string[];
@@ -2108,6 +2110,12 @@ export function createTurnLoop(
 	 * The claim also covers a run whose `done` resolved while its settle awaits git (row open,
 	 * `running` entry gone, pid dead): sweepLostTurns leaves it to runTurn. */
 	const preparing = new Set<string>();
+	/** The scheduler's own live slot count: the distinct run keys holding a slot. A live run
+	 *  sits in both `running` and `preparing`, so a sum would double-count; this is the exact
+	 *  number the claim gate compares against maxTotal, and the state frame ships it as
+	 *  slotsUsed (OTTR-1143). */
+	const slotsUsed = (): number =>
+		new Set([...running.keys(), ...preparing]).size;
 	/** Keys a stop-turn request marked, with the park reason: runTurn consumes the mark at
 	 * settle, so a kill from stopTurn settles the card as stopped instead of leaving it to
 	 * cancelTask. */
@@ -3261,7 +3269,7 @@ export function createTurnLoop(
 		// The authoritative claim rechecks this count after each async selection.
 		// The dev board's fabricated cards must never start a real agent, whatever the cap says.
 		const cap = demoBoard() ? 0 : await ops.maxTotalRuns();
-		const active = () => new Set([...running.keys(), ...preparing]).size;
+		const active = slotsUsed;
 		// OTTR-708: the pickers resolve foreign dependsOn ids across the board's projects.
 		const depProjects = await turnDepProjects();
 		for (const e of projects.values()) {
@@ -4128,7 +4136,7 @@ export function createTurnLoop(
 					id,
 					(current, settings, tasks, boardCheckId) => {
 						const cap = demoBoard() ? 0 : ops.maxTotalRuns();
-						const active = new Set([...running.keys(), ...preparing]).size;
+						const active = slotsUsed();
 						if (
 							projects.get(name) !== e ||
 							ops.stopping?.() === true ||
@@ -12181,6 +12189,7 @@ export function createTurnLoop(
 		recoverRestarted,
 		running,
 		runnerTurns,
+		slotsUsed,
 		checkoutNotices,
 	};
 }

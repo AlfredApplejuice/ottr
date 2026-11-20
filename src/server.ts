@@ -803,11 +803,13 @@ every(() => probeVmRunner(vmTarget), 30_000);
 // Demo board (src/dev.ts): the seeded gate card's meter needs a fabricated progress line,
 // because no agent runs and loop.running stays empty. Real boards never set OTTR_DEMO and
 // take loop.running only. The import is dynamic: the image ships src/ only, never scripts/,
-// so a static import crashes every real board at boot.
-const demoProgress =
+// so a static import crashes every real board at boot. The demo board's slotsUsed comes
+// from demoSlotsUsed for the same reason (OTTR-1143).
+const demoData =
 	process.env.OTTR_DEMO === "1"
-		? await (await import("../scripts/demo-data.ts")).demoProgressMap(projects)
+		? await import("../scripts/demo-data.ts")
 		: null;
+const demoProgress = demoData ? await demoData.demoProgressMap(projects) : null;
 
 // The loop owns the engine; the request layer calls back into it through deps.schedule, and
 // the loop's publish/log plumbing is late-bound to createApp's handles (both exist by boot).
@@ -1090,6 +1092,14 @@ const app = await createApp({
 	// the VM fleet on that row.
 	vmTarget,
 	runnerTurns: () => loop.runnerTurns(),
+	// OTTR-1143: the state frame's slotsUsed is the loop's own live slot count — the exact
+	// number the claim gate caps. The demo board runs no agents (the loop sets stay empty)
+	// while its seeded pool shows running/preparing cards, so there the frame carries the
+	// seeded count, like demoProgress does for progress lines.
+	slotsUsed:
+		demoData !== null
+			? () => demoData.demoSlotsUsed(projects)
+			: () => loop.slotsUsed(),
 	// OTTR-1071: the Settings watches row shows when the next regular PR poll runs.
 	prPollNextAt: () => prPollGrid.nextAt,
 	// OTTR-1087: the same for the code-scanning watch's next regular poll.
