@@ -255,6 +255,7 @@ import {
 } from "./socket.ts";
 import {
 	alarmLabel,
+	bellAlarms,
 	cardMark,
 	holdFor,
 	holdLeft,
@@ -16150,6 +16151,7 @@ export function appInboxMeta(
 	needTasks: TaskCard[],
 	askCards: TaskCard[],
 	prActivity: TaskCard[],
+	prPosted: TaskCard[],
 	infoKeys: (string | null)[],
 	warnings: string[],
 	alarmCount: number,
@@ -16175,6 +16177,10 @@ export function appInboxMeta(
 		})),
 		...prActivity.map((t) => ({
 			key: `pr:${t.id}:${t.prOccurrence?.comments}`,
+			level: "needs" as const,
+		})),
+		...prPosted.map((t) => ({
+			key: `pr:${t.id}:posted`,
 			level: "needs" as const,
 		})),
 		...askCards.map((t) => ({ key: taskEntryKey(t), level: "asked" as const })),
@@ -16271,6 +16277,7 @@ export function AppInboxPanel(p: {
 	needTasks: TaskCard[];
 	askCards: TaskCard[];
 	prActivity: TaskCard[];
+	prPosted: TaskCard[];
 	alarmCount: number;
 	updatesKey: string | null;
 	updateCount: number;
@@ -16315,6 +16322,7 @@ export function AppInboxPanel(p: {
 		needTasks,
 		askCards,
 		prActivity,
+		prPosted,
 		alarmCount,
 		updatesKey,
 		updateCount,
@@ -16398,50 +16406,86 @@ export function AppInboxPanel(p: {
 					{
 						heading: "PR review activity",
 						tasks: prActivity,
+						posted: prPosted,
 						prKey: true,
 					},
 				]
-					.filter((g) => g.tasks.length > 0)
+					.filter((g) => g.tasks.length > 0 || (g.posted?.length ?? 0) > 0)
 					.map((g) => (
 						<section key={g.heading}>
 							<h2>
-								{g.heading} · {g.tasks.length}
+								{g.heading} · {g.tasks.length + (g.posted?.length ?? 0)}
 							</h2>
-							<ul className="alarm-list">
-								{g.tasks.map((t) => {
-									const owner = projects.find((p) => p.name === t.project);
-									const key = g.prKey
-										? `pr:${t.id}:${t.prOccurrence?.comments}`
-										: taskEntryKey(t);
-									return (
-										<li key={t.id} data-inbox-key={key}>
-											<a
-												className="alarm-link"
-												href={taskPath(t.project, t.id)}
-												onClick={(e) => {
-													navClick(e, () => openTask(t.id));
-													// Hides the inbox panel; hiding a closed one is a no-op.
-													document.getElementById("inbox")?.hidePopover();
-												}}
-											>
-												<Mark kind={cardMark(t)} />
-												<span className="alarm-project">
-													{owner === undefined
-														? t.project
-														: projectLabel(owner)}
-												</span>
-												<span className="alarm-key" title={`Task ${t.id}`}>
-													{t.id}
-												</span>
-												<span className="alarm-title">
-													{t.sessionTitle ?? t.title}
-												</span>
-												{isNew(key) && <span className="new-tag">New</span>}
-											</a>
-										</li>
-									);
-								})}
-							</ul>
+							{g.tasks.length > 0 && (
+								<ul className="alarm-list">
+									{g.tasks.map((t) => {
+										const owner = projects.find((p) => p.name === t.project);
+										const key = g.prKey
+											? `pr:${t.id}:${t.prOccurrence?.comments}`
+											: taskEntryKey(t);
+										return (
+											<li key={t.id} data-inbox-key={key}>
+												<a
+													className="alarm-link"
+													href={taskPath(t.project, t.id)}
+													onClick={(e) => {
+														navClick(e, () => openTask(t.id));
+														// Hides the inbox panel; hiding a closed one is a no-op.
+														document.getElementById("inbox")?.hidePopover();
+													}}
+												>
+													<Mark kind={cardMark(t)} />
+													<span className="alarm-project">
+														{owner === undefined
+															? t.project
+															: projectLabel(owner)}
+													</span>
+													<span className="alarm-key" title={`Task ${t.id}`}>
+														{t.id}
+													</span>
+													<span className="alarm-title">
+														{t.sessionTitle ?? t.title}
+													</span>
+													{isNew(key) && <span className="new-tag">New</span>}
+												</a>
+											</li>
+										);
+									})}
+								</ul>
+							)}
+							{(g.posted?.length ?? 0) > 0 && (
+								<ul className="alarm-list">
+									{g.posted?.map((t) => {
+										const owner = projects.find((p) => p.name === t.project);
+										// The filter guarantees the stamp; the optional chain keeps TS honest.
+										const posted = t.prOccurrence?.posted;
+										const key = `pr:${t.id}:posted`;
+										return (
+											<li key={t.id} data-inbox-key={key}>
+												<a
+													className="alarm-link"
+													href={posted?.url}
+													target="_blank"
+													rel="noreferrer"
+												>
+													<span className="alarm-project">
+														{owner === undefined
+															? t.project
+															: projectLabel(owner)}
+													</span>
+													<span className="alarm-key" title={`Task ${t.id}`}>
+														{posted != null ? `PR #${posted.number}` : null}
+													</span>
+													<span className="alarm-title">
+														Ottr posted the review on GitHub
+													</span>
+													{isNew(key) && <span className="new-tag">New</span>}
+												</a>
+											</li>
+										);
+									})}
+								</ul>
+							)}
 						</section>
 					))
 			: null;
@@ -18273,23 +18317,17 @@ export function App() {
 	const usedTotal =
 		state?.slotsUsed ?? SLOT_STAGES.reduce((n, s) => n + slotUse(tasks)[s], 0);
 	// One split for the bell, the popover groups and the counts (shared with the rail rows/Overview).
-	const { needs: needTasks, asks: askCards } = splitAlarms(tasks);
-	// Projects with PR review notifications off show no PR rows in the bell.
-	const prQuiet = (t: TaskCard): boolean =>
-		t.kind === "pr_review" &&
-		projects.find((p) => p.name === t.project)?.settings.prReviewNotify ===
-			false;
-	const needsShown = needTasks.filter((t) => !prQuiet(t));
-	const prActivity = tasks.filter(
-		(t) =>
-			t.kind === "pr_review" && t.prOccurrence?.comments != null && !prQuiet(t),
-	);
-	const alarmLine = alarmLabel(
-		needsShown.length,
-		askCards.length,
-		prActivity.length,
-	);
-	const alarmCount = needsShown.length + askCards.length + prActivity.length;
+	const { needs, asks: askCards } = splitAlarms(tasks);
+	// Projects with PR review notifications off show no PR rows in the bell; the
+	// board's own posted reviews show as external PR links (docs/specs/pr-review-auto-post.md).
+	const {
+		needsShown,
+		activity: prActivity,
+		posted: prPosted,
+	} = bellAlarms(tasks, needs, projects);
+	const prAlarms = prActivity.length + prPosted.length;
+	const alarmLine = alarmLabel(needsShown.length, askCards.length, prAlarms);
+	const alarmCount = needsShown.length + askCards.length + prAlarms;
 	const {
 		draining,
 		drainCommits,
@@ -18357,6 +18395,7 @@ export function App() {
 			needsShown,
 			askCards,
 			prActivity,
+			prPosted,
 			infoKeys,
 			warnings,
 			alarmCount,
@@ -18524,6 +18563,7 @@ export function App() {
 					needTasks={needsShown}
 					askCards={askCards}
 					prActivity={prActivity}
+					prPosted={prPosted}
 					alarmCount={alarmCount}
 					updatesKey={updatesKey}
 					updateCount={updateCount}

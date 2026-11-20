@@ -1753,6 +1753,7 @@ const BOOLEAN_SETTING_FIELDS = [
 	"prReviewNotify",
 	"prReviewApprove",
 	"prReviewRequestChanges",
+	"prReviewManualPost",
 	"prMode",
 	"issueWatch",
 	"codeScanWatch",
@@ -2366,6 +2367,7 @@ export async function createApp(deps: AppDeps) {
 					errorText: err.errorText,
 					prDraft: t.prOccurrence?.draft ?? null,
 					prComments: t.prOccurrence?.comments ?? null,
+					prPosted: t.prOccurrence?.posted?.url ?? null,
 					cancelled: t.cancelledAt !== null,
 				};
 			}),
@@ -2374,8 +2376,9 @@ export async function createApp(deps: AppDeps) {
 
 	/** Drops task-derived seen keys whose occurrence is over: a `task:` key no card's current
 	 * needs_you entry carries, `done:<id>` of a card gone or out of done, `error:<id>:<turn>` of a
-	 * card gone or past that turn, and a `pr:<id>:<stamp>` key whose stamp is read or whose card
-	 * is gone. Notice and crit keys stay; the client drops those itself. */
+	 * card gone or past that turn, and a `pr:<id>:<stamp>` key whose stamp is read, whose card
+	 * is gone, or whose board-posted stamp is no longer current. Notice and crit keys stay; the
+	 * client drops those itself. */
 	function pruneInboxSeen(
 		seen: readonly string[],
 		inputs: readonly AlertCardInput[],
@@ -2386,16 +2389,17 @@ export async function createApp(deps: AppDeps) {
 			byId.set(c.id, c);
 			if (c.state === "needs_you") entryKeys.add(taskEntryKey(c));
 		}
-		/** Whether a `pr:<id>:<stamp>` key's stamp is still the card's unseen comment wave. */
+		/** Whether a `pr:<id>:<stamp>` key is still live: the card's unseen comment
+		 * wave, or its board-posted stamp while that stamp is current. */
 		function prKeyLive(k: string): boolean {
 			const rest = k.slice("pr:".length);
 			const cut = rest.lastIndexOf(":");
-			const c = cut > 0 ? byId.get(rest.slice(0, cut)) : undefined;
-			return (
-				c !== undefined &&
-				c.prComments !== null &&
-				k === `pr:${c.id}:${c.prComments}`
-			);
+			if (cut <= 0) return false;
+			const c = byId.get(rest.slice(0, cut));
+			if (c === undefined) return false;
+			const stamp = rest.slice(cut + 1);
+			if (stamp === "posted") return c.prPosted !== null;
+			return c.prComments !== null && k === `pr:${c.id}:${c.prComments}`;
 		}
 		/** Whether a seen key still has its occurrence live: a `task:` key a current needs_you
 		 * entry carries, `done:<id>` of a card in done, `error:<id>:<turn>` of a card on that
@@ -3081,6 +3085,11 @@ export async function createApp(deps: AppDeps) {
 		log: (msg: string) => console.log(`[pr] ${msg}`),
 		gh,
 		spawn: deps.prReviewSpawn,
+		// OTTR-1094: a finished draft run posts by itself when the project turned the
+		// manual approval off; the seam runs the Post click's steps after the save.
+		postDraft: async ({ project, number }) => {
+			await autoPostPrDraft(project, number);
+		},
 		// OTTR-1071: the quiet-time timer's tick runs under the same background control
 		// as the hourly poll: no new scan once the app closes, close() drains the run,
 		// and a rejection reaches the error log.
@@ -5500,6 +5509,22 @@ export async function createApp(deps: AppDeps) {
 		if (ms !== undefined) extra.etaMs = ms;
 		return extra;
 	}
+	/** The board build's PR occurrence stamp: the draft and comment waves, plus the
+	 * board-posted stamp (the PR link) while the board's own review is the current
+	 * one (docs/specs/pr-review-auto-post.md). */
+	function prOccurrenceOf(
+		e: Entry,
+		f: { draft: number | null; comments: number | null; posted: number | null },
+	): NonNullable<TaskCard["prOccurrence"]> {
+		const repo = e.github === null ? null : (ownerRepo(e.github) ?? e.github);
+		return {
+			draft: f.draft,
+			comments: f.comments,
+			...(f.posted !== null && repo !== null
+				? { posted: { url: prUrl(repo, f.posted), number: f.posted } }
+				: {}),
+		};
+	}
 	/** One card's TaskCard: per-task turn facts and stored titles batched by the caller
 	 * (two queries per project instead of three statements and a no-op UPDATE per card,
 	 * OTTR-721). */
@@ -5510,7 +5535,14 @@ export async function createApp(deps: AppDeps) {
 			facts: {
 				turns: Map<string, BoardTurnFacts>;
 				titles: Map<string, string | null>;
-				pr: Map<string, { draft: number | null; comments: number | null }>;
+				pr: Map<
+					string,
+					{
+						draft: number | null;
+						comments: number | null;
+						posted: number | null;
+					}
+				>;
 			};
 			medians: Map<string, number>;
 			trendingRepos: Map<string, string>;
@@ -5557,11 +5589,12 @@ export async function createApp(deps: AppDeps) {
 				? { trendingRepo: ctx.trendingRepos.get(t.id) }
 				: {}),
 			// PR review occurrence stamp: the bell and the event diff read it. A project
-			// with notifications off ships no stamp, so no pr event raises at all.
+			// with notifications off ships no stamp, so no pr event raises at all. The
+			// board-posted stamp rides along as the PR link the bell row opens.
 			...(t.kind === "pr_review" &&
 			ctx.settings.prReviewNotify === true &&
 			ctx.facts.pr.has(t.id)
-				? { prOccurrence: ctx.facts.pr.get(t.id) }
+				? { prOccurrence: prOccurrenceOf(e, ctx.facts.pr.get(t.id)!) }
 				: {}),
 			// OTTR-1073: the draft-run record rides the row, so a run's start and end
 			// change the row an open drawer compares: the drawer refetches its detail
@@ -10677,20 +10710,7 @@ export async function createApp(deps: AppDeps) {
 	}
 	async function preparePrPost(
 		req: BunRequest<"/api/projects/:project/tasks/:id/pr-review/post">,
-	): Promise<
-		| Response
-		| {
-				e: Entry;
-				task: Task;
-				row: PrReviewRow;
-				head: string;
-				prev: string | null;
-				event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
-				blocking: boolean;
-				draft: ParsedReview;
-				github: string;
-		  }
-	> {
+	): Promise<PrPostPrep | Response> {
 		const picked = await readPrPostDraft(req);
 		if (picked instanceof Response) return picked;
 		const found = await resolveTask(req.params.project, req.params.id);
@@ -10711,14 +10731,40 @@ export async function createApp(deps: AppDeps) {
 			blocking: claimed.blocking,
 			draft: picked.draft,
 			github: storedGithub,
+			via: "user",
 		};
 	}
-	async function handlePOSTProjectsTasksPrPostByProjectAndId(
-		req: BunRequest<"/api/projects/:project/tasks/:id/pr-review/post">,
-	): Promise<Response> {
-		const prep = await preparePrPost(req);
-		if (prep instanceof Response) return prep;
-		const { e, row, head, prev, draft, github } = prep;
+	/** The claimed post inputs: preparePrPost builds them from the request, the
+	 * watcher's automatic post rebuilds them from the saved draft. via names the
+	 * caller: the Post click records "user", the seam records "auto". */
+	interface PrPostPrep {
+		e: Entry;
+		task: Task;
+		row: PrReviewRow;
+		head: string;
+		prev: string | null;
+		event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
+		blocking: boolean;
+		draft: ParsedReview;
+		github: string;
+		via: "user" | "auto";
+	}
+	/** The post core the Post click and the automatic post share: everything after
+	 * the head claim, in the click's order (docs/specs/pr-review-auto-post.md). A
+	 * Response is the failure; the helpers already released the claim and stored
+	 * post_error, so the card stays waiting with the draft. */
+	async function completePrPost(prep: PrPostPrep): Promise<
+		| Response
+		| {
+				ok: true;
+				login: string | null;
+				via: "app" | "token";
+				inline: number;
+				approveSkipped?: string;
+				changesSkipped?: string;
+		  }
+	> {
+		const { e, row, head, prev, draft, github, event } = prep;
 		const repo = ownerRepo(github) ?? github;
 		const slash = repo.indexOf("/");
 		const owner = repo.slice(0, slash);
@@ -10727,10 +10773,6 @@ export async function createApp(deps: AppDeps) {
 			draft.comments.length > 0
 				? { comments: reviewPayloadComments(draft.comments) }
 				: {};
-		// REQUEST_CHANGES when the project opted in and this draft's own run found
-		// blocking findings, APPROVE when opted in and clean; an unknown verdict or
-		// no opt-in posts a plain comment.
-		const event = prep.event;
 		const app = await postReviewViaApp(
 			e,
 			row,
@@ -10814,6 +10856,7 @@ export async function createApp(deps: AppDeps) {
 				approveSkipped !== undefined || changesSkipped !== undefined
 					? "COMMENT"
 					: event,
+				prep.via,
 			);
 			// A skipped review or a failed dismissal must show on the card: the note
 			// lands in post_error, the post itself stays.
@@ -10827,14 +10870,99 @@ export async function createApp(deps: AppDeps) {
 			return null;
 		});
 		if (applied !== null) return applied;
-		return json({
+		return {
 			ok: true,
 			login,
 			via,
 			inline: draft.comments.length,
 			...(approveSkipped !== undefined ? { approveSkipped } : {}),
 			...(changesSkipped !== undefined ? { changesSkipped } : {}),
+		};
+	}
+	async function handlePOSTProjectsTasksPrPostByProjectAndId(
+		req: BunRequest<"/api/projects/:project/tasks/:id/pr-review/post">,
+	): Promise<Response> {
+		const prep = await preparePrPost(req);
+		if (prep instanceof Response) return prep;
+		const result = await completePrPost(prep);
+		if (result instanceof Response) return result;
+		return json(result);
+	}
+	/** The error text of a post refusal or failure Response, for the [pr] log line. */
+	async function prPostErrorResponseText(res: Response): Promise<string> {
+		try {
+			const body: unknown = await res.json();
+			const error =
+				typeof body === "object" && body !== null && "error" in body
+					? body.error
+					: null;
+			return typeof error === "string" && error !== ""
+				? error
+				: `HTTP ${res.status}`;
+		} catch {
+			return `HTTP ${res.status}`;
+		}
+	}
+	/** The watcher's automatic post of one saved draft (docs/specs/pr-review-auto-post.md):
+	 * the Post click's steps without the request. A quiet skip or a refusal logs one
+	 * [pr] line; a failed post leaves the card parked with the stored post_error. */
+	async function autoPostPrDraft(
+		project: string,
+		number: number,
+	): Promise<void> {
+		const entry = deps.projects.get(project);
+		if (entry === undefined) return;
+		const settings = await entry.store.getSettings();
+		if (settings.prReviewManualPost !== false || settings.prReviews !== true)
+			return;
+		const row = await entry.store.getPrReview(number);
+		if (row === null || row.taskId === null) return;
+		const task = await entry.store.getTask(row.taskId);
+		if (task === null || task.cancelledAt !== null || task.details === null)
+			return;
+		// The claim would refuse both: log the reason and skip without claiming.
+		if (row.state !== "open") {
+			console.log(
+				`[pr] ${project}: #${number} auto-post skipped: PR is ${row.state}`,
+			);
+			return;
+		}
+		if (row.postedHead === row.reviewedHead) {
+			console.log(
+				`[pr] ${project}: #${number} auto-post skipped: already posted for this head`,
+			);
+			return;
+		}
+		const draft = parseReviewDraft(task.details);
+		if (draft.body.trim() === "") {
+			console.log(`[pr] ${project}: #${number} auto-post skipped: empty draft`);
+			return;
+		}
+		const claimed = await claimPrPostCard(entry, task, row.reviewedHead);
+		if (claimed instanceof Response) {
+			console.log(
+				`[pr] ${project}: #${number} auto-post failed: ${await prPostErrorResponseText(claimed)}`,
+			);
+			return;
+		}
+		const storedGithub = entry.github;
+		if (storedGithub === null) return;
+		const result = await completePrPost({
+			e: entry,
+			task,
+			row: claimed.row,
+			head: claimed.head,
+			prev: claimed.prev,
+			event: claimed.event,
+			blocking: claimed.blocking,
+			draft,
+			github: storedGithub,
+			via: "auto",
 		});
+		if (result instanceof Response)
+			console.log(
+				`[pr] ${project}: #${number} auto-post failed: ${await prPostErrorResponseText(result)}`,
+			);
 	}
 
 	/** The latest finished grill report's details, or null when none finished. */

@@ -1228,6 +1228,7 @@ describe("settings", () => {
 			prReviewNotify: true,
 			prReviewApprove: false,
 			prReviewRequestChanges: false,
+			prReviewManualPost: true,
 			prMode: false,
 			microVm: false,
 			trendingScout: false,
@@ -1267,6 +1268,7 @@ describe("settings", () => {
 			prReviewNotify: true,
 			prReviewApprove: false,
 			prReviewRequestChanges: false,
+			prReviewManualPost: true,
 			prMode: false,
 			microVm: false,
 			trendingScout: false,
@@ -5168,6 +5170,7 @@ describe("pr review store methods", () => {
 		postedUrl: null,
 		postedLogin: null,
 		postedEvent: null,
+		postedVia: null,
 		state: "open" as const,
 		draft: false,
 		title: "Fix the thing",
@@ -5219,6 +5222,19 @@ describe("pr review store methods", () => {
 			(await (await open(join(root, "pr-request-changes"))).getSettings())
 				.prReviewRequestChanges,
 		).toBe(true);
+	});
+
+	test("prReviewManualPost defaults to true and persists across reopen", async () => {
+		expect(DEFAULT_SETTINGS.prReviewManualPost).toBe(true);
+		const store = await open(join(root, "pr-manual-post"));
+		expect((await store.getSettings()).prReviewManualPost).toBe(true);
+		await store.setSettings({ prReviewManualPost: false });
+		expect((await store.getSettings()).prReviewManualPost).toBe(false);
+		await store.close();
+		expect(
+			(await (await open(join(root, "pr-manual-post"))).getSettings())
+				.prReviewManualPost,
+		).toBe(false);
 	});
 
 	test("savePrReview upserts by number and round-trips booleans and nulls", async () => {
@@ -5493,6 +5509,7 @@ describe("pr review store methods", () => {
 			postedUrl: "https://github.com/acme/widget/pull/7#pullrequestreview-2",
 			postedLogin: null,
 			postedEvent: null,
+			postedVia: null,
 		});
 		await store.setPrPostedUrl(7, null, "octocat");
 		expect((await store.getPrReview(7))?.postedLogin).toBe("octocat");
@@ -5523,6 +5540,46 @@ describe("pr review store methods", () => {
 			postedLogin: "ottr[bot]",
 			postedEvent: "REQUEST_CHANGES",
 		});
+		// The poster lands with its own argument; a later update without one keeps it.
+		await store.setPrPostedUrl(7, changesUrl, "ottr[bot]", "COMMENT", "auto");
+		expect((await store.getPrReview(7))?.postedVia).toBe("auto");
+		await store.setPrPostedUrl(7, changesUrl, "octocat", "COMMENT", "user");
+		expect((await store.getPrReview(7))?.postedVia).toBe("user");
+		await store.setPrPostedUrl(7, changesUrl, "octocat");
+		expect((await store.getPrReview(7))?.postedVia).toBe("user");
+		await store.close();
+	});
+
+	test("boardCardFacts stamps posted only while the board's own post is current", async () => {
+		const store = await open(join(root, "pr-posted-facts"));
+		const url = "https://github.com/acme/widget/pull/12#pullrequestreview-1";
+		await store.savePrReview({
+			...row,
+			number: 12,
+			taskId: "T-9",
+			reviewedHead: "h1",
+			postedHead: "h1",
+		});
+		// No post yet: no stamp.
+		expect((await store.boardCardFacts()).pr.get("T-9")?.posted).toBeNull();
+		// A person's post never stamps.
+		await store.setPrPostedUrl(12, url, "ottr[bot]", "COMMENT", "user");
+		expect((await store.boardCardFacts()).pr.get("T-9")?.posted).toBeNull();
+		// The board's own post, still current: stamped with the PR number.
+		await store.setPrPostedUrl(12, url, "ottr[bot]", "COMMENT", "auto");
+		expect((await store.boardCardFacts()).pr.get("T-9")).toMatchObject({
+			posted: 12,
+		});
+		// A newer reviewed head ends the currency: the stamp clears.
+		await store.savePrReview({
+			...row,
+			number: 12,
+			taskId: "T-9",
+			reviewedHead: "h2",
+			head: "h2",
+			postedHead: "h1",
+		});
+		expect((await store.boardCardFacts()).pr.get("T-9")?.posted).toBeNull();
 		await store.close();
 	});
 
@@ -7613,6 +7670,7 @@ describe("async store serial operations", () => {
 			postedUrl: null,
 			postedLogin: null,
 			postedEvent: null,
+			postedVia: null,
 			state: "open",
 			draft: false,
 			title: "PR",

@@ -9,7 +9,7 @@ import {
 	type ReviewTask,
 	reviewFindings,
 } from "../scheduler.ts";
-import type { Task, TaskCard } from "../types.ts";
+import type { ProjectView, Task, TaskCard } from "../types.ts";
 import { duration, until } from "./time.ts";
 
 /** "about X left" for a live turn against its project/kind/model median turn length, in the
@@ -335,6 +335,32 @@ export function splitAlarms(tasks: readonly TaskCard[]): {
 		else if (t.state === "running" || t.state === "preparing") running.push(t);
 	}
 	return { needs, asks, running };
+}
+
+/** The bell's rows for PR review cards: plain needs-you cards, unseen comment stamps,
+ *  and the board's own posted-review stamps, minus projects whose PR review notifications
+ *  are off (docs/specs/pr-review-auto-post.md). `needs` is splitAlarms' needs split, still
+ *  to quiet-filter. */
+export function bellAlarms(
+	tasks: readonly TaskCard[],
+	needs: readonly TaskCard[],
+	projects: readonly ProjectView[],
+): { needsShown: TaskCard[]; activity: TaskCard[]; posted: TaskCard[] } {
+	const quiet = (t: TaskCard): boolean =>
+		t.kind === "pr_review" &&
+		projects.find((p) => p.name === t.project)?.settings.prReviewNotify ===
+			false;
+	return {
+		needsShown: needs.filter((t) => !quiet(t)),
+		activity: tasks.filter(
+			(t) =>
+				t.kind === "pr_review" && t.prOccurrence?.comments != null && !quiet(t),
+		),
+		posted: tasks.filter(
+			(t) =>
+				t.kind === "pr_review" && t.prOccurrence?.posted != null && !quiet(t),
+		),
+	};
 }
 
 /** One-line alarm summary for the bell/title; "" when nothing needs attention. */

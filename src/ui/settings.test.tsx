@@ -1916,6 +1916,7 @@ describe("PR reviews watch facts and Check PRs now", () => {
 			forkResearch: false,
 			trendingScout: false,
 			prReviews,
+			prReviewManualPost: true,
 			prMode: false,
 			issueWatch: false,
 			codeScanWatch: false,
@@ -1980,9 +1981,13 @@ describe("PR reviews watch facts and Check PRs now", () => {
 	): Promise<{
 		container: HTMLDivElement;
 		checkCalls: { url: string; method: string }[];
+		posted: { body: Record<string, unknown> | undefined };
 		unmount: () => Promise<void>;
 	}> {
 		const checkCalls: { url: string; method: string }[] = [];
+		const posted: { body: Record<string, unknown> | undefined } = {
+			body: undefined,
+		};
 		const answers = [...checks];
 		const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
 			const url = String(input);
@@ -1991,6 +1996,13 @@ describe("PR reviews watch facts and Check PRs now", () => {
 				const answer = answers.shift();
 				if (answer === undefined) throw new Error(`unexpected fetch ${url}`);
 				return answer;
+			}
+			if (
+				url.endsWith("/api/projects/proj/settings") &&
+				init?.method === "POST"
+			) {
+				posted.body = JSON.parse(String(init.body)) as Record<string, unknown>;
+				return json(200, p);
 			}
 			if (url.endsWith("/api/projects/proj/github/visibility"))
 				return json(200, { private: false });
@@ -2022,6 +2034,7 @@ describe("PR reviews watch facts and Check PRs now", () => {
 		return {
 			container,
 			checkCalls,
+			posted,
 			unmount: async () => {
 				await act(async () => {
 					root.unmount();
@@ -2178,6 +2191,70 @@ describe("PR reviews watch facts and Check PRs now", () => {
 					input.getAttribute("aria-describedby"),
 				);
 			}
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the manual-post row shows its short name and description", async () => {
+		const { container, unmount } = await prForm(
+			project(true, { lastPollAt: null, lastError: null, nextPollAt: null }),
+			[],
+		);
+		try {
+			const row = rowByLabel(
+				container,
+				"Only post reviews after manual approval",
+			);
+			expect(row.querySelector('[id$="-desc"]')?.textContent).toBe(
+				"Turn off to let the board post each review draft by itself.",
+			);
+			expect(row.querySelector("input")?.disabled).toBe(false);
+			expect(container.textContent).not.toContain("Needs PR reviews");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("with PR reviews off the manual-post row is disabled and names the reason", async () => {
+		const { container, unmount } = await prForm(
+			project(false, { lastPollAt: null, lastError: null, nextPollAt: null }),
+			[],
+		);
+		try {
+			const row = rowByLabel(
+				container,
+				"Only post reviews after manual approval",
+			);
+			const input = row.querySelector("input") as HTMLInputElement;
+			expect(input.disabled).toBe(true);
+			const desc = row.querySelector('[id$="-desc"]') as Element;
+			expect(desc.textContent).toContain("Needs PR reviews.");
+			expect(desc.getAttribute("id")).toBe(
+				input.getAttribute("aria-describedby"),
+			);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("toggling the manual-post row posts the setting off", async () => {
+		const { container, posted, unmount } = await prForm(
+			project(true, { lastPollAt: null, lastError: null, nextPollAt: null }),
+			[],
+		);
+		try {
+			const row = rowByLabel(
+				container,
+				"Only post reviews after manual approval",
+			);
+			const input = row.querySelector("input") as HTMLInputElement;
+			expect(input.checked).toBe(true);
+			await act(async () => {
+				onChangeOf(input)({ target: { checked: false }, currentTarget: input });
+			});
+			expect(posted.body).not.toBeUndefined();
+			expect(posted.body?.prReviewManualPost).toBe(false);
 		} finally {
 			await unmount();
 		}

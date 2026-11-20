@@ -14565,6 +14565,7 @@ describe("web push (R1-1, R2-3)", () => {
 			postedUrl: null,
 			postedLogin: null,
 			postedEvent: null,
+			postedVia: null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -14660,6 +14661,7 @@ describe("web push (R1-1, R2-3)", () => {
 			postedUrl: null,
 			postedLogin: null,
 			postedEvent: null,
+			postedVia: null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -14720,6 +14722,7 @@ describe("web push (R1-1, R2-3)", () => {
 			postedUrl: null,
 			postedLogin: null,
 			postedEvent: null,
+			postedVia: null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -16023,6 +16026,7 @@ describe("read marks (/api/seen)", () => {
 			postedUrl: null,
 			postedLogin: null,
 			postedEvent: null,
+			postedVia: null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -18043,6 +18047,7 @@ describe(
 				postedUrl: prev?.postedUrl ?? null,
 				postedLogin: prev?.postedLogin ?? null,
 				postedEvent: prev?.postedEvent ?? null,
+				postedVia: prev?.postedVia ?? null,
 				state: "open",
 				draft: false,
 				title: "Fix it",
@@ -18214,6 +18219,7 @@ describe(
 					postedUrl: prev?.postedUrl ?? null,
 					postedLogin: prev?.postedLogin ?? null,
 					postedEvent: prev?.postedEvent ?? null,
+					postedVia: prev?.postedVia ?? null,
 					state: "open",
 					draft: false,
 					title: "Fix it",
@@ -18444,6 +18450,23 @@ describe(
 				expect(await errorOf(bad)).toBe("prReviewNotify must be a boolean");
 				await post("/api/projects/p1/settings", { prReviewNotify: true });
 				expect((await store.getSettings()).prReviewNotify).toBe(true);
+			});
+
+			test("project settings route accepts prReviewManualPost and rejects non-boolean", async () => {
+				const ok = await post("/api/projects/p1/settings", {
+					prReviewManualPost: true,
+				});
+				expect(ok.status).toBe(200);
+				expect((await store.getSettings()).prReviewManualPost).toBe(true);
+				const bad = await post("/api/projects/p1/settings", {
+					prReviewManualPost: "yes",
+				});
+				expect(bad.status).toBe(400);
+				expect(await errorOf(bad)).toBe("prReviewManualPost must be a boolean");
+				await post("/api/projects/p1/settings", {
+					prReviewManualPost: false,
+				});
+				expect((await store.getSettings()).prReviewManualPost).toBe(false);
 			});
 
 			test("project settings route accepts prMode and rejects non-boolean", async () => {
@@ -18765,6 +18788,8 @@ describe(
 				expect(ghCalls).toEqual([expectedArgv(1)]);
 				expect(ghPayloads).toEqual([expectedPayload("Looks good.", H1)]);
 				expect((await row(1)).postedHead).toBe(H1);
+				// The Post click records who posted: the board's own posts stamp "auto".
+				expect((await row(1)).postedVia).toBe("user");
 				// The default gh body is "{}": no parseable html_url, no link.
 				expect((await row(1)).postedUrl).toBeNull();
 				expect((await row(1)).postError).toBeNull();
@@ -20144,6 +20169,335 @@ describe(
 		};
 	})(),
 );
+
+// --- The automatic post (OTTR-1094, docs/specs/pr-review-auto-post.md): a finished
+// draft run posts by itself when prReviewManualPost is off, through the Post click's
+// code path. Each test mounts its own store: the review runs here would otherwise
+// exhaust the shared 24h daily cap and make the tests order-dependent.
+describe("PR review auto-post routes", () => {
+	const opened: ProjectStore[] = [];
+	afterAll(async () => {
+		for (const s of opened) await closeTestStore(s);
+	});
+	let autoSeq = 0;
+	/** One harness: project "pg-auto" with github acme/widget, a fake gh whose canned
+	 * read-only GETs feed a real watcher tick, and a swappable review answer whose
+	 * verdict line stays the last non-blank line. `setPostAnswer` replaces the gh
+	 * answer of the reviews POST alone, so the GETs and the POST fail independently. */
+	const makeAuto = async () => {
+		const H1 = "a".repeat(40);
+		const dir = join(root, `pg-auto-${autoSeq++}`);
+		mkdirSync(dir, { recursive: true });
+		const store = await ProjectStore.open(dir);
+		opened.push(store);
+		const projects = new Map<string, Entry>();
+		projects.set("pg-auto", {
+			path: dir,
+			name: "pg-auto",
+			store,
+			target: null,
+			gitless: false,
+			github: "acme/widget",
+			protectedTarget: false,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		});
+		const calls: string[][] = [];
+		/** The JSON payload of each `gh api ... --input <file>` call, read inside the
+		 * fake: the route deletes the file after the call. */
+		const payloads: unknown[] = [];
+		const ghResult = { code: 0, stdout: "", stderr: "" };
+		let postAnswer: { code: number; stdout: string; stderr: string } | null =
+			null;
+		/** The open pulls page the tick lists; the seeded row's head must match, so
+		 * the scan never resets the row's firstSeenAt and un-passes the quiet gate. */
+		const pullList = [
+			{
+				number: 4,
+				head: { sha: H1, ref: "patch", repo: { id: 1004 } },
+				draft: false,
+				state: "open",
+				title: "Fix it",
+			},
+		];
+		let spawnAnswer =
+			"## Auto review\nthe change looks correct.\n\n<!-- blocking: no -->";
+		const apiStub = async (
+			args: string[],
+		): Promise<{ code: number; stdout: string; stderr: string } | null> => {
+			if (args.length !== 2 || args[0] !== "api") return null;
+			const path = args[1]!;
+			if (path === "repos/acme/widget/pulls?state=open&per_page=100&page=1")
+				return { code: 0, stdout: JSON.stringify(pullList), stderr: "" };
+			const pull = path.match(/^repos\/acme\/widget\/pulls\/(\d+)$/);
+			if (pull !== null) {
+				const r = await store.getPrReview(Number(pull[1]));
+				return {
+					code: 0,
+					stdout: JSON.stringify({
+						head: { sha: r?.head ?? H1 },
+						body: "Please merge.",
+						title: r?.title ?? "Fix it",
+					}),
+					stderr: "",
+				};
+			}
+			const empty =
+				/^repos\/acme\/widget\/(pulls\/\d+\/(reviews|comments)|issues\/\d+\/comments)(\?|$)/.test(
+					path,
+				);
+			if (empty) return { code: 0, stdout: "[]", stderr: "" };
+			if (
+				/^repos\/acme\/widget\/compare\/[0-9a-f]{40}\.\.\.[0-9a-f]{40}$/.test(
+					path,
+				)
+			)
+				return {
+					code: 0,
+					stdout: JSON.stringify({ commits: [], files: [] }),
+					stderr: "",
+				};
+			return null;
+		};
+		const m = await mount({
+			projects,
+			gh: async (args) => {
+				calls.push(args);
+				const input = args.indexOf("--input");
+				if (input !== -1)
+					payloads.push(JSON.parse(readFileSync(args[input + 1]!, "utf8")));
+				const stubbed = await apiStub(args);
+				if (stubbed !== null) return stubbed;
+				if (args.includes("-X") && postAnswer !== null) return postAnswer;
+				return ghResult;
+			},
+			prReviewSpawn: async () => ({
+				code: 0,
+				stdout: [
+					JSON.stringify({ ready: true }),
+					JSON.stringify({
+						id: 1,
+						status: 200,
+						body: { choices: [{ message: { content: spawnAnswer } }] },
+					}),
+				].join("\n"),
+				stderr: "",
+			}),
+		});
+		await store.setSettings({ prReviews: true });
+		/** Seeds PR 4 the way the watcher's first scan would, with the quiet gate
+		 * already passed (firstSeenAt 0) and no draft yet. */
+		const seed = async (head: string): Promise<void> => {
+			await store.savePrReview({
+				number: 4,
+				taskId: null,
+				head,
+				firstSeenAt: 0,
+				reviewedHead: null,
+				postedHead: null,
+				postedUrl: null,
+				postedLogin: null,
+				postedEvent: null,
+				postedVia: null,
+				state: "open",
+				draft: false,
+				title: "Fix it",
+				postError: null,
+				commentsAt: null,
+				commentsUnseen: false,
+			});
+		};
+		const row = async (): Promise<PrReviewRow> => (await store.getPrReview(4))!;
+		/** The watcher's reviews POSTs: only they carry -X, the reads never do. */
+		const postCalls = () => calls.filter((a) => a.includes("-X"));
+		const expectedArgv = [
+			"api",
+			"repos/acme/widget/pulls/4/reviews",
+			"-X",
+			"POST",
+			"--input",
+			expect.any(String),
+		];
+		return {
+			H1,
+			m,
+			store,
+			payloads,
+			seed,
+			row,
+			expectedArgv,
+			postCalls,
+			tick: () => m.call("/api/projects/pg-auto/prs/check", {}),
+			setSpawn: (s: string) => {
+				spawnAnswer = s;
+			},
+			setPostAnswer: (a: { code: number; stdout: string; stderr: string }) => {
+				postAnswer = a;
+			},
+		};
+	};
+
+	test("manual post on (default): a finished run saves the draft and posts nothing", async () => {
+		const h = await makeAuto();
+		await h.seed(h.H1);
+		expect((await h.tick()).status).toBe(200);
+		// The run saved its draft: the head is reviewed and the card waits.
+		const r = await h.row();
+		expect(r.reviewedHead).toBe(h.H1);
+		expect(r.postedHead).toBeNull();
+		expect(r.taskId).not.toBeNull();
+		const card = (await h.store.getTask(r.taskId!))!;
+		expect(card).toMatchObject({
+			stage: "in_progress",
+			state: "needs_you",
+		});
+		expect(card.details).toBe("## Auto review\nthe change looks correct.");
+		// No reviews POST went out: every gh call is one of the watcher's reads.
+		expect(h.postCalls()).toEqual([]);
+	});
+
+	test("manual post off: the finished run posts the draft by itself as a comment", async () => {
+		const h = await makeAuto();
+		await h.store.setSettings({ prReviewManualPost: false });
+		h.setPostAnswer({
+			code: 0,
+			stdout: JSON.stringify({
+				html_url: "https://github.com/acme/widget/pull/4#pullrequestreview-1",
+			}),
+			stderr: "",
+		});
+		await h.seed(h.H1);
+		expect((await h.tick()).status).toBe(200);
+		// Exactly one reviews POST at the reviewed head, with the saved draft's body.
+		expect(h.postCalls()).toHaveLength(1);
+		expect(h.postCalls()[0]).toEqual(h.expectedArgv);
+		expect(h.payloads).toEqual([
+			{
+				event: "COMMENT",
+				body: `## Auto review\nthe change looks correct.${REVIEW_FOOTER}`,
+				commit_id: h.H1,
+			},
+		]);
+		const r = await h.row();
+		expect(r.postedHead).toBe(h.H1);
+		expect(r.postedVia).toBe("auto");
+		expect(r.postedUrl).toBe(
+			"https://github.com/acme/widget/pull/4#pullrequestreview-1",
+		);
+		// The posted head moved the card out of needs_you for done/idle.
+		const card = (await h.store.getTask(r.taskId!))!;
+		expect(card).toMatchObject({
+			stage: "done",
+			state: "idle",
+			needsReason: null,
+		});
+	});
+
+	test("manual off with approve on: a clean run posts APPROVE", async () => {
+		const h = await makeAuto();
+		await h.store.setSettings({
+			prReviewManualPost: false,
+			prReviewApprove: true,
+		});
+		h.setSpawn("## Auto review\nno blockers found.\n\n<!-- blocking: no -->");
+		await h.seed(h.H1);
+		expect((await h.tick()).status).toBe(200);
+		expect(h.postCalls()).toHaveLength(1);
+		expect(h.payloads).toEqual([
+			{
+				event: "APPROVE",
+				body: `## Auto review\nno blockers found.${REVIEW_FOOTER}`,
+				commit_id: h.H1,
+			},
+		]);
+		expect((await h.row()).postedHead).toBe(h.H1);
+	});
+
+	test("manual off with request-changes on: a blocking run posts REQUEST_CHANGES", async () => {
+		const h = await makeAuto();
+		await h.store.setSettings({
+			prReviewManualPost: false,
+			prReviewRequestChanges: true,
+		});
+		h.setSpawn(
+			"## Auto review\nthe error path swallows failures.\n\n<!-- blocking: yes -->",
+		);
+		await h.seed(h.H1);
+		expect((await h.tick()).status).toBe(200);
+		expect(h.postCalls()).toHaveLength(1);
+		expect(h.payloads).toEqual([
+			{
+				event: "REQUEST_CHANGES",
+				body: `## Auto review\nthe error path swallows failures.${REVIEW_FOOTER}`,
+				commit_id: h.H1,
+			},
+		]);
+		expect((await h.row()).postedHead).toBe(h.H1);
+	});
+
+	test("manual off: a re-review of a posted head saves a draft but posts no second review", async () => {
+		const h = await makeAuto();
+		await h.store.setSettings({ prReviewManualPost: false });
+		h.setPostAnswer({
+			code: 0,
+			stdout: JSON.stringify({
+				html_url: "https://github.com/acme/widget/pull/4#pullrequestreview-1",
+			}),
+			stderr: "",
+		});
+		await h.seed(h.H1);
+		expect((await h.tick()).status).toBe(200);
+		expect(h.postCalls()).toHaveLength(1);
+		const r = await h.row();
+		// The reply runs a fresh draft for the same head, like the drawer's reply box.
+		const res = await h.m.call(
+			`/api/projects/pg-auto/tasks/${r.taskId}/reply`,
+			{
+				text: "look again",
+			},
+		);
+		expect(res.status).toBe(200);
+		await h.m.app.prReviewIdle();
+		// The reply's own run saved its draft: the store counts two runs now.
+		const runs = await h.store.prReviewRunsSince(0);
+		expect(runs).toBe(2);
+		const after = await h.row();
+		expect(after.postedHead).toBe(h.H1);
+		const card = (await h.store.getTask(after.taskId!))!;
+		expect(card.details).toBe("## Auto review\nthe change looks correct.");
+		// The claim refuses the posted head: still exactly one reviews POST.
+		expect(h.postCalls()).toHaveLength(1);
+	});
+
+	test("manual off: a failed auto post parks the card with the error and frees the claim", async () => {
+		const h = await makeAuto();
+		await h.store.setSettings({ prReviewManualPost: false });
+		h.setPostAnswer({ code: 1, stdout: "", stderr: "HTTP 502: upstream" });
+		await h.seed(h.H1);
+		await h.tick();
+		// The attempt went out and GitHub refused it.
+		expect(h.postCalls()).toHaveLength(1);
+		expect(h.postCalls()[0]).toEqual(h.expectedArgv);
+		const r = await h.row();
+		expect(r.postError).toBe("HTTP 502: upstream");
+		// The claim is released: a later draft of the same head can post again.
+		expect(r.postedHead).toBeNull();
+		// The card stays waiting with the draft, so a person can post by hand.
+		const card = (await h.store.getTask(r.taskId!))!;
+		expect(card).toMatchObject({
+			stage: "in_progress",
+			state: "needs_you",
+		});
+		expect(card.details).toBe("## Auto review\nthe change looks correct.");
+		// The failed run was the only attempt: no retry loop inside the tick.
+		expect(h.postCalls()).toHaveLength(1);
+	});
+});
 
 describe("backlog routes", () => {
 	test("grill queues an idle backlog task", async () => {

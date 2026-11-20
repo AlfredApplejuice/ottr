@@ -969,6 +969,10 @@ interface PrWatcherCtx {
 		number: number;
 		line: string;
 	}) => void | Promise<void>;
+	/** OTTR-1094: posts the just-saved draft when the project let the board post by
+	 * itself (prReviewManualPost off); the board's seam owns every post semantic.
+	 * Optional: absent in bare watchers. */
+	postDraft?: (o: { project: string; number: number }) => Promise<void>;
 	/** The deterministic lens over one PR diff; defaults to perfFindings. */
 	perfScan: (diff: string, labels: string[]) => PerfFinding[];
 	/** Called with the card id when a re-review rewrites a draft the user may have read. */
@@ -1026,6 +1030,7 @@ async function syncSeenPulls(
 				head: p.head,
 				firstSeenAt: t,
 				reviewedHead: null,
+				postedVia: null,
 				postedHead: null,
 				postedUrl: null,
 				postedLogin: null,
@@ -1617,6 +1622,24 @@ async function reviewOnce(
 			{ kind: "saved", text: null },
 			row.taskId,
 		);
+		// OTTR-1094: the board can post the fresh draft itself (docs/specs/pr-review-auto-post.md).
+		// The gate reads the saved row: the run may have filed the card just now, so the
+		// scan-time row still shows no task. The seam runs after the saved end; a seam
+		// failure never fails the saved run.
+		const savedRow = await store.getPrReview(row.number);
+		if (
+			savedRow !== null &&
+			savedRow.taskId !== null &&
+			(await store.getSettings()).prReviewManualPost === false
+		) {
+			try {
+				await ctx.postDraft?.({ project: project.name, number: row.number });
+			} catch (e) {
+				ctx.log(
+					`prs: ${project.name}: #${row.number} auto-post seam failed: ${(e as Error).message}`,
+				);
+			}
+		}
 	} catch (e) {
 		const error = (e as Error).message;
 		ctx.log(`prs: ${project.name}: #${row.number} review failed: ${error}`);
@@ -1866,6 +1889,9 @@ export function createPrWatcher(deps: {
 		number: number;
 		line: string;
 	}) => void | Promise<void>;
+	/** OTTR-1094: called after a saved draft when the project's prReviewManualPost is
+	 * off; the board's seam posts it through the Post click's path. */
+	postDraft?: (o: { project: string; number: number }) => Promise<void>;
 	/** OTTR-1073: called when a run record actually starts or ends. The record is in-memory state, so a quiet board needs this edge to rebuild the frame the drawer compares. */
 	runEdge?: () => void;
 }): {
@@ -2017,6 +2043,7 @@ export function createPrWatcher(deps: {
 		prRunEnd,
 		prRun,
 		cardLog: deps.cardLog,
+		postDraft: deps.postDraft,
 		perfScan: deps.perfScan ?? perfFindings,
 		forgetSeen: deps.forgetSeen,
 		recordSkipNotice,

@@ -106,6 +106,7 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	prReviewNotify: true,
 	prReviewApprove: false,
 	prReviewRequestChanges: false,
+	prReviewManualPost: true,
 	prMode: false,
 	issueWatch: false,
 	codeScanWatch: false,
@@ -252,6 +253,7 @@ CREATE TABLE IF NOT EXISTS pr_review (
   posted_url TEXT,
   posted_login TEXT,
   posted_event TEXT,
+  posted_via TEXT,
   state TEXT NOT NULL CHECK (state IN ('open','closed','merged')),
   draft INTEGER NOT NULL,
   title TEXT NOT NULL,
@@ -505,6 +507,7 @@ interface PrReviewDbRow {
 	posted_url: string | null;
 	posted_login: string | null;
 	posted_event: string | null;
+	posted_via: string | null;
 	state: string;
 	draft: number;
 	title: string;
@@ -524,6 +527,7 @@ function toPrReview(r: PrReviewDbRow): PrReviewRow {
 		postedUrl: r.posted_url,
 		postedLogin: r.posted_login,
 		postedEvent: r.posted_event ?? null,
+		postedVia: r.posted_via ?? null,
 		state: r.state as PrState,
 		draft: r.draft !== 0,
 		title: r.title,
@@ -1371,6 +1375,7 @@ const SETTINGS_SHAPES = {
 	prReviewNotify: "boolean",
 	prReviewApprove: "boolean",
 	prReviewRequestChanges: "boolean",
+	prReviewManualPost: "boolean",
 	prMode: "boolean",
 	issueWatch: "boolean",
 	codeScanWatch: "boolean",
@@ -2739,6 +2744,15 @@ export class ProjectStore {
 					"posted_event",
 					"ALTER TABLE pr_review ADD COLUMN posted_event TEXT",
 				);
+				// posted_via landed with the board's automatic posts (docs/specs/pr-review-auto-post.md):
+				// same additive convergence; null reads as "not posted by this build", the state of
+				// every older row.
+				await ProjectStore.addColumn(
+					db,
+					prCols,
+					"posted_via",
+					"ALTER TABLE pr_review ADD COLUMN posted_via TEXT",
+				);
 				// The comment watch landed with the PR review notifications: same additive
 				// convergence, so an older database still sweeps and alerts without a rebuild.
 				await ProjectStore.addColumn(
@@ -4023,25 +4037,30 @@ export class ProjectStore {
 		});
 	}
 
-	/** Stores the posted review's html_url, posting login, and decided event after a successful
-	 * Post; null clears url and login; an undefined event leaves the stored event untouched. */
+	/** Stores the posted review's html_url, posting login, decided event, and who posted it
+	 * after a successful Post; null clears url and login; an undefined event or via leaves the
+	 * stored column untouched. */
 	async setPrPostedUrl(
 		number: number,
 		url: string | null,
 		login: string | null = null,
 		event?: string | null,
+		via?: "user" | "auto",
 	): Promise<void> {
 		return this.queue.run(async () => {
-			if (event === undefined) {
-				await this.db.run(
-					"UPDATE pr_review SET posted_url = ?, posted_login = ? WHERE number = ?",
-					[url, login, number],
-				);
-				return;
+			const sets = ["posted_url = ?", "posted_login = ?"];
+			const args: (string | null)[] = [url, login];
+			if (event !== undefined) {
+				sets.push("posted_event = ?");
+				args.push(event);
+			}
+			if (via !== undefined) {
+				sets.push("posted_via = ?");
+				args.push(via);
 			}
 			await this.db.run(
-				"UPDATE pr_review SET posted_url = ?, posted_login = ?, posted_event = ? WHERE number = ?",
-				[url, login, event, number],
+				`UPDATE pr_review SET ${sets.join(", ")} WHERE number = ?`,
+				[...args, number],
 			);
 		});
 	}
@@ -4971,8 +4990,12 @@ export class ProjectStore {
 		turns: Map<string, BoardTurnFacts>;
 		/** Raw stored session_title per task id; frozenTitleFrom applies the cleaning. */
 		titles: Map<string, string | null>;
-		/** Per pr_review card: the draft run stamp and the unseen comment stamp. */
-		pr: Map<string, { draft: number | null; comments: number | null }>;
+		/** Per pr_review card: the draft run stamp, the unseen comment stamp, and the board-posted
+		 * PR number while the board's own post is still the current one. */
+		pr: Map<
+			string,
+			{ draft: number | null; comments: number | null; posted: number | null }
+		>;
 	}> {
 		return this.queue.run(async () => {
 			const turns = await this.boardTurnFacts();
@@ -5054,12 +5077,15 @@ export class ProjectStore {
 	/** One grouped query and one row scan per project: the occurrence stamps the board
 	 * build and the alert diff read for pr_review cards. */
 	private async boardPrFacts(): Promise<
-		Map<string, { draft: number | null; comments: number | null }>
+		Map<
+			string,
+			{ draft: number | null; comments: number | null; posted: number | null }
+		>
 	> {
 		return this.queue.run(async () => {
 			const pr = new Map<
 				string,
-				{ draft: number | null; comments: number | null }
+				{ draft: number | null; comments: number | null; posted: number | null }
 			>();
 			const runs = new Map<number, number>();
 			for (const r of await this.db
@@ -5075,6 +5101,16 @@ export class ProjectStore {
 					comments:
 						row.commentsUnseen && row.commentsAt !== null
 							? row.commentsAt
+							: null,
+					// The board's own post, while it is still the current one: the bell row
+					// and the auto-post complete event read it
+					// (docs/specs/pr-review-auto-post.md). Null otherwise.
+					posted:
+						row.postedVia === "auto" &&
+						row.postedHead !== null &&
+						row.postedHead === row.reviewedHead &&
+						row.state === "open"
+							? row.number
 							: null,
 				});
 			}

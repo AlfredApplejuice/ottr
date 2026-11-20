@@ -170,6 +170,8 @@ const PR_REVIEW_APPROVE_DESC =
 	"Posting a review approves the PR once all blocking issues are resolved.";
 const PR_REVIEW_REQUEST_CHANGES_DESC =
 	"Posting a review requests changes when it finds a blocking issue. The comment still posts.";
+const PR_REVIEW_MANUAL_POST_DESC =
+	"Turn off to let the board post each review draft by itself.";
 const OMP_WATCH_DESC =
 	"Hourly, a model reads each new omp release's notes. A fail files a card and holds the pin. A pass files a card that bumps Dockerfile.worker.";
 const DEPENDABOT_DESC =
@@ -9275,6 +9277,16 @@ function ProjectWatchesCard({
 					checked={st.prReviewRequestChanges}
 					disabled={!st.prReviews}
 					save={(v) => send({ prReviewRequestChanges: v })}
+					act={act}
+				/>
+				<CheckRow
+					settingKey="prReviewManualPost"
+					sub
+					name="Only post reviews after manual approval"
+					desc={`${st.prReviews ? "" : "Needs PR reviews. "}${PR_REVIEW_MANUAL_POST_DESC}`}
+					checked={st.prReviewManualPost}
+					disabled={!st.prReviews}
+					save={(v) => send({ prReviewManualPost: v })}
 					act={act}
 				/>
 				<CheckRow

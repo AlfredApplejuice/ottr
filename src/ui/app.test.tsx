@@ -36,6 +36,8 @@ import { resetCatalogCache } from "./models.ts";
 // Static: notify.ts reads localStorage only when called, never at load.
 import { loadAskDrafts, saveAskDraft } from "./notify.ts";
 import { ServiceQuotas } from "./serviceQuotas.tsx";
+// Static: status.ts touches no browser global at load.
+import { bellAlarms } from "./status.ts";
 
 // app.tsx reads sessionStorage at module load; bun test has no browser storage.
 globalThis.sessionStorage = {
@@ -15472,6 +15474,7 @@ describe("AppInboxBell badge", () => {
 			need,
 			ask,
 			[],
+			[],
 			info,
 			[],
 			0,
@@ -15487,6 +15490,7 @@ describe("AppInboxBell badge", () => {
 			null,
 			need,
 			ask,
+			[],
 			[],
 			info,
 			[],
@@ -15533,6 +15537,7 @@ describe("AppInboxBell badge", () => {
 			[],
 			[],
 			[],
+			[],
 			0,
 			"",
 		);
@@ -15544,6 +15549,7 @@ describe("AppInboxBell badge", () => {
 			null,
 			[],
 			ask,
+			[],
 			[],
 			[],
 			[],
@@ -15570,6 +15576,7 @@ describe("AppInboxBell badge", () => {
 			[],
 			[],
 			[],
+			[],
 			info,
 			[],
 			0,
@@ -15581,6 +15588,7 @@ describe("AppInboxBell badge", () => {
 			ackLocal,
 			null,
 			null,
+			[],
 			[],
 			[],
 			[],
@@ -15599,51 +15607,53 @@ describe("AppInboxBell badge", () => {
 	});
 });
 
+// The panel renders every section from null keys and empty lists, so tests override
+// only the props they look at.
+const panelBase = {
+	error: null,
+	critKey: null,
+	needTasks: [],
+	askCards: [],
+	prActivity: [],
+	prPosted: [],
+	alarmCount: 0,
+	updatesKey: null,
+	updateCount: 0,
+	isNew: () => false,
+	notice: null,
+	noticeKey: null,
+	orphansError: null,
+	drainNotice: false,
+	drainKey: null,
+	drainCommits: [],
+	behind: 0,
+	behindKey: null,
+	behindCommits: [],
+	restartWait: null,
+	restartWaitKey: null,
+	seedFailed: null,
+	seedFailKey: null,
+	provisionError: null,
+	provisionErrKey: null,
+	state: null,
+	warnings: [],
+	orphanList: [],
+	orphansErrorKey: null,
+	orphansKey: null,
+	keptCount: { held: 0, stale: 0 },
+	keptKey: null,
+	alatePendingKey: null,
+	signinAdvisories: [],
+	projects: [],
+	nowMs: 0,
+	openTask: () => {},
+	ackInbox: () => {},
+	setShowUpdates: () => {},
+	setError: () => {},
+	setNotice: () => {},
+};
+
 describe("Inbox panel ack footer", () => {
-	// The panel renders every section from null keys and empty lists, so the
-	// footer button is the only stateful markup under test.
-	const panelBase = {
-		error: null,
-		critKey: null,
-		needTasks: [],
-		askCards: [],
-		prActivity: [],
-		alarmCount: 0,
-		updatesKey: null,
-		updateCount: 0,
-		isNew: () => false,
-		notice: null,
-		noticeKey: null,
-		orphansError: null,
-		drainNotice: false,
-		drainKey: null,
-		drainCommits: [],
-		behind: 0,
-		behindKey: null,
-		behindCommits: [],
-		restartWait: null,
-		restartWaitKey: null,
-		seedFailed: null,
-		seedFailKey: null,
-		provisionError: null,
-		provisionErrKey: null,
-		state: null,
-		warnings: [],
-		orphanList: [],
-		orphansErrorKey: null,
-		orphansKey: null,
-		keptCount: { held: 0, stale: 0 },
-		keptKey: null,
-		alatePendingKey: null,
-		signinAdvisories: [],
-		projects: [],
-		nowMs: 0,
-		openTask: () => {},
-		ackInbox: () => {},
-		setShowUpdates: () => {},
-		setError: () => {},
-		setNotice: () => {},
-	};
 	const askedMeta = (ackedCount: number) => {
 		const ask = Array.from({ length: 18 }, (_, n) =>
 			cardFixture({ id: `ask${n}` }),
@@ -15658,13 +15668,27 @@ describe("Inbox panel ack footer", () => {
 			[],
 			[],
 			[],
+			[],
 			0,
 			"",
 		);
 		const ackLocal = new Set(
 			probe.entries.slice(probe.entries.length - ackedCount).map((e) => e.key),
 		);
-		return appInboxMeta(null, ackLocal, null, null, [], ask, [], [], [], 0, "");
+		return appInboxMeta(
+			null,
+			ackLocal,
+			null,
+			null,
+			[],
+			ask,
+			[],
+			[],
+			[],
+			[],
+			0,
+			"",
+		);
 	};
 	const footerButton = (meta: ReturnType<typeof appInboxMeta>) => {
 		const html = renderToStaticMarkup(
@@ -15693,6 +15717,140 @@ describe("Inbox panel ack footer", () => {
 		const meta = askedMeta(17);
 		expect(meta.inbox.fresh.length).toBe(1);
 		expect(footerButton(meta)).toBe(false);
+	});
+});
+
+describe("PR review activity posted rows", () => {
+	const postedCard = cardFixture({
+		id: "pr1",
+		kind: "pr_review",
+		stage: "done",
+		state: "idle",
+		prOccurrence: {
+			draft: 3,
+			comments: null,
+			posted: { url: "https://github.com/acme/widget/pull/7", number: 7 },
+		},
+	});
+	const panel = (prActivity: TaskCard[], prPosted: TaskCard[]) => {
+		const meta = appInboxMeta(
+			null,
+			new Set<string>(),
+			null,
+			null,
+			[],
+			[],
+			prActivity,
+			prPosted,
+			[],
+			[],
+			1,
+			"1 PR review has activity",
+		);
+		const html = renderToStaticMarkup(
+			<AppInboxPanel
+				{...panelBase}
+				prActivity={prActivity}
+				prPosted={prPosted}
+				alarmCount={1}
+				entries={meta.entries}
+				inbox={meta.inbox}
+			/>,
+		);
+		const { window } = new Window({ url: "http://localhost/" });
+		window.document.body.innerHTML = html;
+		return { meta, document: window.document };
+	};
+
+	test("a posted-stamped review renders an external PR row and the count", () => {
+		const { meta, document } = panel([], [postedCard]);
+		// The posted key joins the inbox entries: the badge counts it and the seen
+		// prune keeps it only while the stamp is current.
+		expect(meta.entries.map((e) => e.key)).toEqual(["pr:pr1:posted"]);
+		const link = document.querySelector(
+			'#inbox [data-inbox-key="pr:pr1:posted"] a.alarm-link',
+		) as HTMLAnchorElement | null;
+		expect(link).not.toBeNull();
+		// An external link to the PR, not a drawer link.
+		expect(link!.getAttribute("href")).toBe(
+			"https://github.com/acme/widget/pull/7",
+		);
+		expect(link!.getAttribute("target")).toBe("_blank");
+		expect(link!.getAttribute("rel")).toBe("noreferrer");
+		expect(link!.textContent).toContain("proj");
+		expect(link!.textContent).toContain("PR #7");
+		expect(link!.textContent).toContain("Ottr posted the review on GitHub");
+		expect(document.querySelector("#inbox h2")?.textContent).toBe(
+			"PR review activity · 1",
+		);
+	});
+
+	test("a manually posted review renders no posted row", () => {
+		const manual = cardFixture({
+			id: "pr2",
+			kind: "pr_review",
+			stage: "done",
+			state: "idle",
+			prOccurrence: { draft: 2, comments: 5 },
+		});
+		const { meta, document } = panel([manual], []);
+		expect(meta.entries.map((e) => e.key)).toEqual(["pr:pr2:5"]);
+		expect(document.querySelector('[data-inbox-key$=":posted"]')).toBeNull();
+		expect(document.body.innerHTML).not.toContain(
+			"Ottr posted the review on GitHub",
+		);
+		// The unseen-comment row still renders as today.
+		expect(
+			document.querySelector('[data-inbox-key="pr:pr2:5"]'),
+		).not.toBeNull();
+	});
+});
+
+describe("bell PR rows in quiet projects", () => {
+	const project = (prReviewNotify: boolean): ProjectView =>
+		({ name: "proj", settings: { prReviewNotify } }) as unknown as ProjectView;
+	const card = (id: string, over: Partial<TaskCard>): TaskCard =>
+		cardFixture({
+			id,
+			kind: "pr_review",
+			stage: "done",
+			state: "idle",
+			...over,
+		});
+
+	test("a quiet project drops the posted, comment and needs rows", () => {
+		const posted = card("pr1", {
+			prOccurrence: {
+				draft: 1,
+				comments: null,
+				posted: { url: "https://github.com/acme/widget/pull/7", number: 7 },
+			},
+		});
+		const commented = card("pr2", { prOccurrence: { draft: 1, comments: 4 } });
+		const waiting = card("pr3", { state: "needs_you" });
+		const plain = cardFixture({ id: "t9", state: "needs_you" });
+		const split = bellAlarms(
+			[posted, commented, waiting, plain],
+			[waiting, plain],
+			[project(false)],
+		);
+		expect(split.posted).toEqual([]);
+		expect(split.activity).toEqual([]);
+		expect(split.needsShown.map((t) => t.id)).toEqual(["t9"]);
+	});
+
+	test("a notifying project keeps the posted and comment rows", () => {
+		const posted = card("pr1", {
+			prOccurrence: {
+				draft: 3,
+				comments: null,
+				posted: { url: "https://github.com/acme/widget/pull/7", number: 7 },
+			},
+		});
+		const commented = card("pr2", { prOccurrence: { draft: 3, comments: 4 } });
+		const split = bellAlarms([posted, commented], [], [project(true)]);
+		expect(split.posted.map((t) => t.id)).toEqual(["pr1"]);
+		expect(split.activity.map((t) => t.id)).toEqual(["pr2"]);
 	});
 });
 

@@ -248,6 +248,8 @@ export interface ProjectSettings {
 	prReviewApprove: boolean;
 	/** Post requests changes when the run found blocking findings; off by default. */
 	prReviewRequestChanges: boolean;
+	/** Only a Post click posts a review draft; off lets the board post each finished draft by itself (docs/specs/pr-review-auto-post.md). */
+	prReviewManualPost: boolean;
 	/** Per-project PR mode: integration pushes the card branch and opens a GitHub pull request instead of merging into the target branch (off by default). */
 	prMode: boolean;
 	/** Run work turns in a Firecracker microVM via vm-runner instead of a worker container (off by default; docs/adr/0009-microvm-workers.md). */
@@ -426,6 +428,8 @@ export interface PrReviewRow {
 	postedLogin: string | null;
 	/** The event the posted review used (REQUEST_CHANGES); null for COMMENT/APPROVE or no post. */
 	postedEvent: string | null;
+	/** Who posted the current review: "user" for a Post click, "auto" for the board (docs/specs/pr-review-auto-post.md); null for no post or an older post. */
+	postedVia: string | null;
 	state: PrState;
 	draft: boolean;
 	title: string;
@@ -1112,8 +1116,12 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	savedFiles?: { name: string; size: number }[];
 	/** Set only for kind "pr_review". */
 	prReview?: PrReviewView;
-	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and the unseen comment stamp that key the bell occurrences. */
-	prOccurrence?: { draft: number | null; comments: number | null };
+	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and the unseen comment stamp that key the bell occurrences, plus the board-posted stamp (docs/specs/pr-review-auto-post.md). */
+	prOccurrence?: {
+		draft: number | null;
+		comments: number | null;
+		posted?: { url: string; number: number } | null;
+	};
 	/** OTTR-1073: set only for kind "pr_review". The watcher's last draft run; its start and end change the board row, so an open drawer refetches the detail and the composer's run status moves. */
 	prRun?: PrRunState | null;
 	/** Present on the drawer detail of a release card waiting for approval; commits between the reviewed base and the target head. */
@@ -1196,8 +1204,13 @@ export type TaskCard = Omit<
 	 * <version>"); present on release cards only, and only when the list is non-empty. */
 	heldMerges?: string[];
 	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and
-	 * the unseen comment stamp that key the bell occurrences (board build and event diff). */
-	prOccurrence?: { draft: number | null; comments: number | null };
+	 * the unseen comment stamp that key the bell occurrences (board build and event diff), plus
+	 * the board-posted stamp (docs/specs/pr-review-auto-post.md). */
+	prOccurrence?: {
+		draft: number | null;
+		comments: number | null;
+		posted?: { url: string; number: number } | null;
+	};
 	/** OTTR-506: stamped on queued merges the push hold parks while local main has commits
 	 * origin lacks (a rejected server push); the board shows the hold reason — the browser
 	 * gets no git, so the server derives the fact (pushHold) and stamps it. */
