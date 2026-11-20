@@ -2643,6 +2643,7 @@ describe("headVersion", () => {
 describe("describeVersion", () => {
 	test("release tag at HEAD, tag-plus-commits form past it, short sha on dev, timestamp without commits", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-desc-"));
+		// A worker's image stamp would win over the fixture's repo state.
 		const old = process.env.OTTR_VERSION;
 		delete process.env.OTTR_VERSION;
 		try {
@@ -2686,6 +2687,7 @@ describe("describeVersion", () => {
 
 	test("a directory without .git falls back to the boot-time stamp (the image shape)", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-nogit-"));
+		// A worker's image stamp would win over the fixture's missing repo.
 		const old = process.env.OTTR_VERSION;
 		delete process.env.OTTR_VERSION;
 		try {
