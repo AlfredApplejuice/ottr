@@ -2161,6 +2161,53 @@ describe("task routes", () => {
 		return { review, lead1: leads[0]!, lead2: leads[1]!, ask };
 	};
 
+	/** The three-question shape: a partial reply renumbers the remaining plain
+	 * forms, so two questions must stay waiting to catch a stale number. */
+	const seedLeadAskThree = async () => {
+		const review = await store.createTask("review", null, "review");
+		const leads = [
+			await store.createTask("Needs validation: confirm the proxy allowlist"),
+			await store.createTask("Needs validation: confirm the cron job env"),
+			await store.createTask("Needs validation: confirm the deploy token"),
+		];
+		for (const lead of leads)
+			await store.updateTask(lead.id, {
+				followUpOf: review.id,
+				stage: "backlog",
+				state: "idle",
+				queuedAt: null,
+			});
+		const ask = await store.createTask(
+			`${LEAD_QUESTIONS_PROMPT_PREFIX}${review.id}: reply with one answer per question, and the board applies each answer to its lead card.`,
+		);
+		await store.updateTask(ask.id, {
+			followUpOf: review.id,
+			stage: "backlog",
+			state: "needs_you",
+			queuedAt: null,
+			needsReason:
+				"Wants your answer: 3 questions about the review's needs-validation leads",
+			asked: leads.map((lead, i) => ({
+				question: `Q ${
+					i === 0 ? "one" : i === 1 ? "two" : "three"
+				}? (card #${lead.id})`,
+				options: [
+					{ label: LEAD_APPLIES_OPTION },
+					{ label: LEAD_NOT_APPLY_OPTION },
+				],
+				multi: false,
+				recommended: null,
+			})),
+		});
+		return {
+			review,
+			lead1: leads[0]!,
+			lead2: leads[1]!,
+			lead3: leads[2]!,
+			ask,
+		};
+	};
+
 	test("a lead-question reply queues the applies lead, cancels the other, and lands the card Done", async () => {
 		const { lead1, lead2, ask } = await seedLeadAsk();
 		const before = calls;
@@ -2227,7 +2274,7 @@ describe("task routes", () => {
 			expect.objectContaining({ question: `Q two? (card #${lead2.id})` }),
 		]);
 		expect(card.needsReason).toBe(
-			`Waiting for answers to 1 of 2 questions: "Q two? (card #${lead2.id})"`,
+			`Waiting for answers to 1 of 2 questions: Q1 "Q two? (card #${lead2.id})"`,
 		);
 	});
 
@@ -2370,7 +2417,7 @@ describe("task routes", () => {
 				expect.objectContaining({ question: `Q two? (card #${lead2.id})` }),
 			]);
 			expect(card.needsReason).toBe(
-				`Waiting for answers to 1 of 2 questions: "Q two? (card #${lead2.id})"`,
+				`Waiting for answers to 1 of 2 questions: Q1 "Q two? (card #${lead2.id})"`,
 			);
 		},
 	);
@@ -2433,6 +2480,72 @@ describe("task routes", () => {
 		const done = (await store.getTask(ask.id))!;
 		expect(done.stage).toBe("done");
 		expect(done.asked).toBeNull();
+	});
+
+	test("after a partial reply the plain forms follow the card's current question order", async () => {
+		const { lead1, lead2, lead3, ask } = await seedLeadAskThree();
+		const first = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(`Q one? (card #${lead1.id})`, LEAD_APPLIES_OPTION),
+		});
+		expect(first.status).toBe(200);
+		// The card names the current number of each question it still asks.
+		expect((await store.getTask(ask.id))!.needsReason).toBe(
+			`Waiting for answers to 2 of 3 questions: Q1 "Q two? (card #${lead2.id})", Q2 "Q three? (card #${lead3.id})"`,
+		);
+		const second = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "Q1: Yes, the risk applies",
+		});
+		expect(second.status).toBe(200);
+		// Q1 now names the original Q2, the first question the card still asks.
+		const two = (await store.getTask(lead2.id))!;
+		expect(two.stage).toBe("todo");
+		expect(two.state).toBe("queued");
+		const three = (await store.getTask(lead3.id))!;
+		expect(three.stage).toBe("backlog");
+		expect(three.state).toBe("idle");
+		expect(three.details).toBeNull();
+		expect((await store.getTask(ask.id))!.asked).toEqual([
+			expect.objectContaining({ question: `Q three? (card #${lead3.id})` }),
+		]);
+	});
+
+	test("a plain line numbered past the waiting questions refuses the whole reply", async () => {
+		const { lead1, lead2, lead3, ask } = await seedLeadAskThree();
+		const first = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(`Q one? (card #${lead1.id})`, LEAD_APPLIES_OPTION),
+		});
+		expect(first.status).toBe(200);
+		// The operator answers from the original numbering: Q3 names nothing now,
+		// so the whole reply is refused and no lead moves.
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "Q2: Yes, the risk applies\nQ3: No, it does not apply",
+		});
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			`answer line "Q3" names no question: 2 questions are waiting, numbered Q1 to Q2. Answer with one line per question, as: ${askAnswerLine(`Q two? (card #${lead2.id})`, "<answer>")}`,
+		);
+		for (const id of [lead2.id, lead3.id]) {
+			const lead = (await store.getTask(id))!;
+			expect(lead.stage).toBe("backlog");
+			expect(lead.state).toBe("idle");
+			expect(lead.cancelledAt).toBeNull();
+			expect(lead.details).toBeNull();
+		}
+		const card = (await store.getTask(ask.id))!;
+		expect(card.state).toBe("needs_you");
+		expect(card.asked).toHaveLength(2);
+	});
+
+	test("a plain line out of range on a fresh card refuses the reply", async () => {
+		const { lead1, ask } = await seedLeadAskThree();
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "Q4: Yes, the risk applies",
+		});
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			`answer line "Q4" names no question: 3 questions are waiting, numbered Q1 to Q3. Answer with one line per question, as: ${askAnswerLine(`Q one? (card #${lead1.id})`, "<answer>")}`,
+		);
+		expect((await store.getTask(ask.id))!.state).toBe("needs_you");
 	});
 
 	test("a started lead cancels through the sanctioned cancel", async () => {

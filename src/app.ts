@@ -11763,21 +11763,29 @@ export async function createApp(deps: AppDeps) {
 		await deps.schedule();
 		return await taskResponse(e, task.id);
 	}
-	/** One plain-form answer line: `Q<n>: <answer>` or `<n>. <answer>`, n the 1-based
-	 * question order. Null: the line starts no answer. Pure. */
-	function plainAskAnswer(
-		line: string,
-		count: number,
-	): { n: number; answer: string } | null {
-		const parsed = /^\s*(?:Q\s*(\d+)\s*:|(\d+)\.\s+)(.*)$/i.exec(line);
+	/** The shape of a plain-form answer line: `Q<n>: <answer>` or `<n>. <answer>`. */
+	const PLAIN_ASK_RE = /^\s*(?:Q\s*(\d+)\s*:|(\d+)\.\s+)(.*)$/i;
+	/** One plain-form answer line. Null: the line starts no answer. The number is
+	 * unchecked; callers gate it on the card's current question order. Pure. */
+	function plainAskAnswer(line: string): { n: number; answer: string } | null {
+		const parsed = PLAIN_ASK_RE.exec(line);
 		if (parsed === null) return null;
 		const n = Number(parsed[1] ?? parsed[2]);
 		const answer = (parsed[3] ?? "").trim();
-		if (n < 1 || n > count || answer === "") return null;
-		return { n, answer };
+		return answer === "" ? null : { n, answer };
+	}
+	/** The number of the first plain-form line that names no question of the card,
+	 * or null. Pure. */
+	function plainAskOutOfRangeLine(text: string, count: number): number | null {
+		for (const line of text.split("\n")) {
+			const plain = plainAskAnswer(line);
+			if (plain !== null && (plain.n < 1 || plain.n > count)) return plain.n;
+		}
+		return null;
 	}
 	/** One parsed answer per asked question: the drawer's wire line, a plain
-	 * `Q<n>:`/`<n>.` line by question order, or — on a single-question card, whose
+	 * `Q<n>:`/`<n>.` line by the card's current question order, or — on a
+	 * single-question card, whose
 	 * drawer sends the raw answer text instead of the wire line — the whole reply.
 	 * The range marks the consumed text, so the reply's free text can be recovered
 	 * afterwards. Pure. */
@@ -11808,8 +11816,7 @@ export async function createApp(deps: AppDeps) {
 				for (const line of rest.split("\n")) {
 					if (
 						offset > 0 &&
-						(line.startsWith('For "') ||
-							plainAskAnswer(line, asked.length) !== null)
+						(line.startsWith('For "') || plainAskAnswer(line) !== null)
 					) {
 						stop = offset;
 						break;
@@ -11826,12 +11833,18 @@ export async function createApp(deps: AppDeps) {
 					});
 			}
 		}
-		// Plain-form lines fill the questions the wire lines left unmatched.
+		// Plain-form lines fill the questions the wire lines left unmatched. Their
+		// numbers follow the card's current question order.
 		const taken = new Set(matches.map((m) => m.question));
 		let at = 0;
 		for (const line of text.split("\n")) {
-			const plain = plainAskAnswer(line, asked.length);
-			if (plain !== null && !taken.has(asked[plain.n - 1]!.question)) {
+			const plain = plainAskAnswer(line);
+			if (
+				plain !== null &&
+				plain.n >= 1 &&
+				plain.n <= asked.length &&
+				!taken.has(asked[plain.n - 1]!.question)
+			) {
 				taken.add(asked[plain.n - 1]!.question);
 				matches.push({
 					question: asked[plain.n - 1]!.question,
@@ -11862,9 +11875,12 @@ export async function createApp(deps: AppDeps) {
 	 * branch), never through the bare patch. Free text no question consumed appends
 	 * to the details of every open lead that got no per-question answer. A
 	 * multi-question reply that matches no question is refused with 400 before any
-	 * write (OTTR-1130). A partial reply applies the matched answers and leaves the
-	 * card at needs_you with only the unanswered questions; a complete reply lands
-	 * the card Done, so a second reply is refused. Null: a plain reply. */
+	 * write, and so is a plain-form line whose number names no question (both
+	 * OTTR-1130): a stale number from before a partial reply can not silently drop
+	 * or misapply an answer. A partial reply applies the matched answers and leaves
+	 * the card at needs_you with only the unanswered questions, each named with its
+	 * current number in needsReason; a complete reply lands the card Done, so a
+	 * second reply is refused. Null: a plain reply. */
 	async function reviewLeadAskReply(
 		e: Entry,
 		task: Task,
@@ -11897,6 +11913,19 @@ export async function createApp(deps: AppDeps) {
 		for (const m of [...matches].sort((a, b) => b.start - a.start))
 			free = free.slice(0, m.start) + free.slice(m.end);
 		free = free.trim();
+		// A plain line whose number names no question refuses the whole reply, so a
+		// stale number from before a partial reply can not silently drop or
+		// misapply an answer (OTTR-1130).
+		if (asked.length > 1) {
+			const bad = plainAskOutOfRangeLine(text, asked.length);
+			if (bad !== null)
+				return json(
+					{
+						error: `answer line "Q${bad}" names no question: ${asked.length} questions are waiting, numbered Q1 to Q${asked.length}. Answer with one line per question, as: ${askAnswerLine(asked[0]!.question, "<answer>")}`,
+					},
+					400,
+				);
+		}
 		// OTTR-1130: a multi-question reply matching no question is refused before
 		// anything is written, so a mis-formatted reply cannot land the card Done
 		// with the whole text as a note on every lead.
@@ -12013,7 +12042,7 @@ export async function createApp(deps: AppDeps) {
 				else
 					await e.store.updateTask(task.id, {
 						asked: left,
-						needsReason: `Waiting for answers to ${left.length} of ${asked.length} questions: ${left.map((q) => `"${q.question}"`).join(", ")}`,
+						needsReason: `Waiting for answers to ${left.length} of ${asked.length} questions: ${left.map((q, i) => `Q${i + 1} "${q.question}"`).join(", ")}`,
 					});
 				return null;
 			};

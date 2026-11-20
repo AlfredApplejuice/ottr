@@ -110,18 +110,22 @@ The reply route applies the answers (`src/app.ts`). A reply to a card whose prom
 starts with the question-card prefix and whose `asked` is set parses one answer per
 question — from the drawer's wire line `For "<question>": <answer>` (shared helper
 `askAnswerLine`), from a plain form `Q<n>: <answer>` or `<n>. <answer>` whose n is
-the question's 1-based position in `asked`, or, on a single-question card, from the
-whole reply text (the drawer sends the raw answer without the wire line). An
+the question's 1-based position in the card's current `asked` order, or, on a
+single-question card, from the whole reply text (the drawer sends the raw answer
+without the wire line). A plain line whose number names no question on the card
+refuses the whole reply with 400, so a stale number left by a partial reply can
+not silently drop or misapply an answer (OTTR-1130). An
 answer matches an option label case-insensitively, with one trailing period
 ignored. A multi-question reply that matches no question is refused with 400 and
 an error that shows the expected line format; the card and the leads stay
 unchanged (OTTR-1130). When some questions match and others do not, the matched
 answers apply, and the card stays at `needs_you` with `asked` holding only the
-unanswered questions and a `needsReason` naming them, so the next reply answers
-the rest. A reply that answers every question applies it to each question's lead
-card, records free text no question consumed on the unanswered open leads, and
-lands the question card Done (`stage: "done"`, `state: "idle"`, `asked: null`,
-`doneAt` set by the store's Done stamp):
+unanswered questions and a `needsReason` naming each one with its current answer
+number (`Q1 "..."`, `Q2 "..."`), so the next reply answers the rest with the
+numbering the card shows. A reply that answers every question applies it to each
+question's lead card, records free text no question consumed on the unanswered
+open leads, and lands the question card Done (`stage: "done"`, `state: "idle"`,
+`asked: null`, `doneAt` set by the store's Done stamp):
 
 - `Yes, the risk applies`: an idle backlog lead moves to `stage: "todo"`,
   `state: "queued"`, `queuedAt` set, and the answer appends to its prompt. A lead
