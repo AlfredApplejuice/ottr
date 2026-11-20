@@ -1,5 +1,11 @@
 import { type VmGrant, type VmTokens, vmTokenOf } from "./vmTokens.ts";
-import { git, gitExe, sealedGit } from "./worktree.ts";
+import {
+	git,
+	gitExe,
+	hostedGitAuth,
+	networkGitAuth,
+	sealedGit,
+} from "./worktree.ts";
 
 /**
  * The board's git endpoint for microVM turns (OTTR-532): smart HTTP through `git http-backend`
@@ -11,6 +17,14 @@ import { git, gitExe, sealedGit } from "./worktree.ts";
  *   GET  /git/<project>.git/info/refs?service=git-upload-pack|git-receive-pack
  *   POST /git/<project>.git/git-upload-pack
  *   POST /git/<project>.git/git-receive-pack
+ *   POST /git/<project>.git/info/lfs/objects/batch
+ *   GET  /git/<project>.git/info/lfs/objects/<oid>
+ *
+ * The LFS routes (OTTR-1152) serve git-lfs's smudge: the batch answers with hrefs that
+ * point back at the board, and the object route fetches the bytes from the project's
+ * pinned origin with the board's own credential and streams them through. No provider
+ * credential and no upstream-signed URL reach the VM; uploads stay refused (OTTR-1058,
+ * the server push uploads LFS objects).
  */
 const ROUTE =
 	/^\/git\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
@@ -18,6 +32,15 @@ const SERVICES: Record<string, true> = {
 	"git-upload-pack": true,
 	"git-receive-pack": true,
 };
+/** The LFS routes (OTTR-1152): one batch answer, and one streamed object download. */
+const LFS_ROUTE =
+	/^\/git\/([^/]+)\.git\/info\/lfs\/objects\/(batch|[0-9a-f]{64})$/;
+/** The one LFS media type: on the board's upstream batch and every batch answer. */
+const LFS_TYPE = "application/vnd.git-lfs+json";
+/** A batch body is a list of oids; 16 MiB is far above anything git-lfs sends. */
+const MAX_LFS_BATCH_BODY = 16 * 1024 * 1024;
+/** An LFS object oid: 64 lowercase hex, the sha256 form git-lfs speaks. */
+const LFS_OID = /^[0-9a-f]{64}$/;
 const SHA = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
 const ZERO = /^0+$/;
 /** A CGI header block larger than this is not git http-backend talking. */
@@ -26,6 +49,11 @@ const MAX_CGI_HEAD = 64 * 1024;
 export interface GitHttpOptions {
 	tokens: VmTokens;
 	log: (line: string) => void;
+	/**
+	 * The project's pinned origin URL (settings originUrl); null when it has no pin.
+	 * Required and fail-closed: no pin, no LFS proxy for that project.
+	 */
+	originUrl: (project: string) => Promise<string | null>;
 }
 
 /**
@@ -157,6 +185,37 @@ export function pushRefusal(
 }
 
 /**
+ * Validates an LFS batch body (OTTR-1152): operation exactly "download", at least one
+ * object, every oid 64 lowercase hex, every size a number >= 0. Anything else reads as
+ * { error }; a rejected body is never trusted further.
+ */
+export function parseLfsBatch(
+	body: unknown,
+):
+	| { operation: "download"; objects: { oid: string; size?: number }[] }
+	| { error: string } {
+	if (typeof body !== "object" || body === null || Array.isArray(body))
+		return { error: "the batch body is not a JSON object" };
+	const { operation, objects } = body as Record<string, unknown>;
+	if (operation !== "download")
+		return { error: `operation must be exactly "download"` };
+	if (!Array.isArray(objects) || objects.length < 1)
+		return { error: "objects must be an array with at least one member" };
+	const out: { oid: string; size?: number }[] = [];
+	for (const entry of objects) {
+		if (typeof entry !== "object" || entry === null || Array.isArray(entry))
+			return { error: "an object entry is not a JSON object" };
+		const { oid, size } = entry as Record<string, unknown>;
+		if (typeof oid !== "string" || !LFS_OID.test(oid))
+			return { error: "an object oid is not 64 lowercase hex chars" };
+		if (size !== undefined && (typeof size !== "number" || !(size >= 0)))
+			return { error: "an object size is not a number >= 0" };
+		out.push(size === undefined ? { oid } : { oid, size });
+	}
+	return { operation: "download", objects: out };
+}
+
+/**
  * Moves the server worktree's files and index to `sha` after a VM push. The pushed ref is the
  * branch checked out there, so HEAD already names `sha`; reset --hard brings the files along.
  * sealedGit: the shared gitdir's config is worker-writable, and a planted smudge filter must
@@ -279,7 +338,9 @@ type GitAccess = { grant: VmGrant; rest: string } | { response: Response };
 /** Route match, token check, and project ownership; also picks the request kind. */
 function checkAccess(req: Request, url: URL, o: GitHttpOptions): GitAccess {
 	const m = ROUTE.exec(url.pathname);
-	if (!m) return { response: plain("not found", 404) };
+	const lfs = m === null ? LFS_ROUTE.exec(url.pathname) : null;
+	const matched = m ?? lfs;
+	if (matched === null) return { response: plain("not found", 404) };
 	const grant = o.tokens.check(vmTokenOf(req));
 	if (grant === null)
 		return {
@@ -289,7 +350,7 @@ function checkAccess(req: Request, url: URL, o: GitHttpOptions): GitAccess {
 		};
 	let project: string;
 	try {
-		project = decodeURIComponent(m[1] ?? "");
+		project = decodeURIComponent(matched[1] ?? "");
 	} catch {
 		return { response: plain("not found", 404) };
 	}
@@ -297,7 +358,10 @@ function checkAccess(req: Request, url: URL, o: GitHttpOptions): GitAccess {
 		return {
 			response: plain(`this token opens only ${grant.project}.git`, 403),
 		};
-	return { grant, rest: m[2] ?? "" };
+	return {
+		grant,
+		rest: lfs === null ? (m?.[2] ?? "") : `info/lfs/objects/${lfs[2] ?? ""}`,
+	};
 }
 
 /** The method/service guard; null when the request may continue. */
@@ -446,6 +510,377 @@ async function runBackend(
 	return { res: await cgiResponse(proc.stdout, kill), exited: proc.exited };
 }
 
+/** Reads a request body up to `cap` bytes; null when it runs over (a 413, never a buffer bomb). */
+async function cappedBody(
+	req: Request,
+	cap: number,
+): Promise<Uint8Array | null> {
+	const reader = req.body?.getReader();
+	if (reader === undefined) return new Uint8Array(0);
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	for (;;) {
+		const { value, done } = await reader.read();
+		if (done) break;
+		total += value.byteLength;
+		if (total > cap) {
+			void reader.cancel();
+			return null;
+		}
+		chunks.push(value);
+	}
+	const body = new Uint8Array(total);
+	let at = 0;
+	for (const chunk of chunks) {
+		body.set(chunk, at);
+		at += chunk.byteLength;
+	}
+	return body;
+}
+
+/**
+ * The pinned origin for an LFS request, parsed. No pin, an unparseable pin, or a pin that
+ * is not http(s) each refuse with a 502: the board proxies LFS only through http(s)
+ * origins (an ssh pin has no batch API to talk to).
+ */
+async function lfsOrigin(
+	grant: VmGrant,
+	o: GitHttpOptions,
+): Promise<{ url: URL } | { response: Response }> {
+	const pin = await o.originUrl(grant.project);
+	if (pin === null)
+		return {
+			response: plain(
+				`no pinned origin URL; the board cannot proxy LFS for ${grant.project}`,
+				502,
+			),
+		};
+	try {
+		const url = new URL(pin);
+		if (url.protocol !== "http:" && url.protocol !== "https:")
+			return {
+				response: plain(
+					`the board cannot proxy LFS for a ${url.protocol.slice(0, -1)} origin; only http(s) origins are supported`,
+					502,
+				),
+			};
+		return { url };
+	} catch {
+		// scp-style remotes ("git@host:path") do not parse; name the scheme they hint at.
+		const scheme = /^[a-z][a-z0-9+.-]*(?=:)/i.exec(pin)?.[0];
+		return {
+			response: plain(
+				scheme === undefined
+					? `LFS proxy needs a URL: the pinned origin of ${grant.project} does not parse`
+					: `the board cannot proxy LFS for a ${scheme} origin; only http(s) origins are supported`,
+				502,
+			),
+		};
+	}
+}
+
+/**
+ * The upstream Authorization header for the pinned origin: userinfo in the URL itself
+ * first, else `git credential fill` run in the repo with the board's own network auth
+ * (hosted mode mints the per-project env, self-hosted uses the resolver). The credential
+ * lands only in the header: never in a response, a log line, or an error text.
+ */
+async function lfsUpstreamAuth(
+	origin: URL,
+	grant: VmGrant,
+): Promise<{ header: string } | { response: Response }> {
+	if (origin.username !== "") {
+		try {
+			const user = decodeURIComponent(origin.username) || "ottr";
+			const pass = decodeURIComponent(origin.password);
+			return { header: `Basic ${btoa(`${user}:${pass}`)}` };
+		} catch {
+			return { response: plain(`no LFS credential for ${origin.host}`, 502) };
+		}
+	}
+	try {
+		const hosted = hostedGitAuth();
+		const env =
+			hosted === null
+				? networkGitAuth(grant.repoPath)
+				: (
+						await hosted.network(grant.repoPath, [
+							"ls-remote",
+							origin.toString(),
+						])
+					).env;
+		const stdin: Uint8Array<ArrayBuffer> = new TextEncoder().encode(
+			`url=${origin.toString()}\n\n`,
+		);
+		const proc = Bun.spawn([gitExe(), "credential", "fill"], {
+			cwd: grant.repoPath,
+			// The auth env from the resolver (or hosted minting) carries no prompt paths; belt
+			// them anyway: a prompt attempt would hang this VM request until its own timeout.
+			env: { ...env, GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "" },
+			stdin,
+			stdout: "pipe",
+			stderr: "pipe",
+			windowsHide: true,
+		});
+		const [out] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		const user = /^username=(.*)$/m.exec(out)?.[1] ?? "";
+		const pass = /^password=(.*)$/m.exec(out)?.[1] ?? "";
+		if (pass === "") throw new Error("credential fill gave no password");
+		return { header: `Basic ${btoa(`${user}:${pass}`)}` };
+	} catch {
+		return { response: plain(`no LFS credential for ${origin.host}`, 502) };
+	}
+}
+
+/** One upstream batch answer object, narrowed to what the board passes on. */
+interface LfsUpstreamObject {
+	oid: string;
+	/** The upstream size, null when the upstream omitted it (the board answers 0). */
+	size: number | null;
+	href: string;
+}
+
+/**
+ * One upstream LFS batch for `objects` (OTTR-1152): the board rebuilds the body — the
+ * VM's bytes are never echoed — signs it with the board's own credential, and narrows
+ * the answer to oid/size/href. No upstream-signed URL, header or expiry survives; the
+ * storage route does the upstream fetch itself, with the board's storage href in its place.
+ */
+async function lfsUpstreamBatch(
+	req: Request,
+	grant: VmGrant,
+	objects: readonly { oid: string; size?: number }[],
+	o: GitHttpOptions,
+): Promise<
+	| { objects: LfsUpstreamObject[]; host: string; originHostname: string }
+	| { response: Response }
+> {
+	const origin = await lfsOrigin(grant, o);
+	if ("response" in origin) return origin;
+	const auth = await lfsUpstreamAuth(origin.url, grant);
+	if ("response" in auth) return auth;
+	const host = origin.url.host;
+	const upstream = new URL(origin.url.toString());
+	upstream.username = "";
+	upstream.password = "";
+	let res: Response;
+	try {
+		res = await fetch(
+			`${upstream.toString().replace(/\/+$/, "")}/info/lfs/objects/batch`,
+			{
+				method: "POST",
+				headers: {
+					"Content-Type": LFS_TYPE,
+					Accept: LFS_TYPE,
+					Authorization: auth.header,
+				},
+				body: JSON.stringify({
+					operation: "download",
+					objects: objects.map((x) =>
+						x.size === undefined
+							? { oid: x.oid }
+							: { oid: x.oid, size: x.size },
+					),
+					transfers: ["basic"],
+				}),
+				signal: AbortSignal.any([AbortSignal.timeout(60_000), req.signal]),
+			},
+		);
+	} catch {
+		return { response: plain("LFS upstream request failed", 502) };
+	}
+	if (!res.ok) {
+		o.log(
+			`${grant.project}/${grant.taskId}: LFS upstream batch at ${host} answered ${res.status}`,
+		);
+		return { response: plain("LFS upstream batch failed", 502) };
+	}
+	let body: unknown;
+	try {
+		body = await res.json();
+	} catch {
+		return { response: plain("LFS upstream batch failed", 502) };
+	}
+	const items =
+		typeof body === "object" &&
+		body !== null &&
+		Array.isArray((body as Record<string, unknown>).objects)
+			? (body as { objects: unknown[] }).objects
+			: null;
+	if (items === null)
+		return { response: plain("LFS upstream batch failed", 502) };
+	const out: LfsUpstreamObject[] = [];
+	for (const item of items) {
+		const it = item as {
+			oid?: unknown;
+			size?: unknown;
+			actions?: { download?: { href?: unknown } };
+		} | null;
+		const href = it?.actions?.download?.href;
+		if (it === null || typeof it.oid !== "string" || typeof href !== "string")
+			return { response: plain("LFS upstream batch failed", 502) };
+		out.push({
+			oid: it.oid,
+			size: typeof it.size === "number" && it.size >= 0 ? it.size : null,
+			href,
+		});
+	}
+	return { objects: out, host, originHostname: origin.url.hostname };
+}
+
+/** The board storage URL for one LFS oid, on the request's own origin: the VM fetches bytes from the board, never from the upstream-signed href. */
+function lfsBoardHref(url: URL, project: string, oid: string): string {
+	return new URL(
+		`/git/${encodeURIComponent(project)}.git/info/lfs/objects/${oid}`,
+		url.origin,
+	).toString();
+}
+
+/**
+ * Belt before the board fetches a download href: a literal-IP host must not be loopback,
+ * private (RFC1918), link-local, CGNAT, unique-local or 0.0.0.0 — an upstream must not
+ * point the board into its own network. Residual: a href may target the pinned origin's
+ * own host even when private; name-based hosts are not resolved; the pinned origin is
+ * admin-set.
+ */
+function hrefRefusal(href: string, originHostname: string): string | null {
+	let u: URL;
+	try {
+		u = new URL(href);
+	} catch {
+		return "href is not a URL";
+	}
+	if (u.protocol !== "http:" && u.protocol !== "https:")
+		return `href is ${u.protocol.slice(0, -1)}, not http(s)`;
+	const host = u.hostname.toLowerCase();
+	const originHost = originHostname.toLowerCase(); // no port: hrefs may use another port on the same host
+	// WHATWG canonicalizes IPv4-mapped loopback to hex (::ffff:7f00:1); both forms refuse.
+	if (host.includes(":")) {
+		if (host === originHost) return null; // the pinned origin's own host is exempt
+		const v6 =
+			host === "::1" ||
+			/^::ffff:(127\.|7f00:)/.test(host) ||
+			/^fe[89ab]/.test(host) || // link-local fe80::/10
+			/^f[cd]/.test(host); // unique-local fc00::/7
+		return v6 ? "href points at a reserved IPv6 address" : null;
+	}
+	const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+	if (v4 === null) return null; // a name-based host is not resolved here
+	if ([v4[1], v4[2], v4[3], v4[4]].some((p) => Number(p) > 255))
+		return "href host is not a valid IPv4 address";
+	const a = Number(v4[1]);
+	const b = Number(v4[2]);
+	if (host === originHost) return null; // the pinned origin's own host is exempt
+	const reserved =
+		a === 0 || // 0.0.0.0/8, 0.0.0.0 included
+		a === 127 || // loopback
+		a === 10 || // RFC1918
+		(a === 172 && b >= 16 && b <= 31) || // RFC1918
+		(a === 192 && b === 168) || // RFC1918
+		(a === 169 && b === 254) || // link-local
+		(a === 100 && b >= 64 && b <= 127); // CGNAT
+	return reserved ? "href points at a reserved IPv4 address" : null;
+}
+
+/**
+ * POST /git/<project>.git/info/lfs/objects/batch (OTTR-1152): the VM's batch proxied to
+ * the pinned origin, answered with board storage hrefs. Uploads stay refused: the
+ * board's server push uploads LFS objects (OTTR-1058).
+ */
+async function lfsBatch(
+	req: Request,
+	grant: VmGrant,
+	url: URL,
+	o: GitHttpOptions,
+): Promise<Response> {
+	if (req.method !== "POST") return plain("method not allowed", 405);
+	const body = await cappedBody(req, MAX_LFS_BATCH_BODY);
+	if (body === null) return plain("LFS batch body over 16 MiB", 413);
+	let json: unknown;
+	try {
+		json = JSON.parse(new TextDecoder().decode(body));
+	} catch {
+		return plain("the batch body is not valid JSON", 400);
+	}
+	// A string operation that is not "download" is the upload refusal (403), not a
+	// malformed body (400): the validator only admits exact downloads, so the refusal
+	// is decided here, before it.
+	const operation =
+		typeof json === "object" && json !== null
+			? (json as Record<string, unknown>).operation
+			: undefined;
+	if (typeof operation === "string" && operation !== "download") {
+		o.log(`${grant.project}/${grant.taskId}: LFS upload refused`);
+		return plain(
+			"this endpoint serves LFS downloads only; the board's server push uploads LFS objects (OTTR-1058)",
+			403,
+		);
+	}
+	const parsed = parseLfsBatch(json);
+	if ("error" in parsed) return plain(parsed.error, 400);
+	const up = await lfsUpstreamBatch(req, grant, parsed.objects, o);
+	if ("response" in up) return up.response;
+	o.log(
+		`${grant.project}/${grant.taskId}: LFS batch proxied to ${up.host} (${parsed.objects.length} object(s))`,
+	);
+	return new Response(
+		JSON.stringify({
+			transfer: "basic",
+			objects: up.objects.map((x) => ({
+				oid: x.oid,
+				size: x.size ?? 0,
+				actions: {
+					download: { href: lfsBoardHref(url, grant.project, x.oid) },
+				},
+			})),
+		}),
+		{ status: 200, headers: { "Content-Type": LFS_TYPE } },
+	);
+}
+
+/**
+ * GET /git/<project>.git/info/lfs/objects/<oid> (OTTR-1152): one upstream batch for the
+ * oid, then the board fetches the href itself and streams the bytes through. The href is
+ * checked against the board's own network first; the VM never sees an upstream URL.
+ */
+async function lfsObjectGet(
+	req: Request,
+	grant: VmGrant,
+	o: GitHttpOptions,
+	oid: string,
+): Promise<Response> {
+	if (req.method !== "GET") return plain("method not allowed", 405);
+	const up = await lfsUpstreamBatch(req, grant, [{ oid }], o);
+	if ("response" in up) return up.response;
+	const obj = up.objects[0];
+	// An upstream answer with no objects for exactly this oid is an upstream failure.
+	if (obj === undefined) return plain("LFS upstream batch failed", 502);
+	const refused = hrefRefusal(obj.href, up.originHostname);
+	if (refused !== null) {
+		o.log(`${grant.project}/${grant.taskId}: LFS href refused: ${refused}`);
+		return plain(`LFS download ${refused}`, 502);
+	}
+	let res: Response;
+	try {
+		res = await fetch(obj.href, {
+			signal: AbortSignal.any([AbortSignal.timeout(600_000), req.signal]),
+		});
+	} catch {
+		return plain("LFS object download failed", 502);
+	}
+	o.log(
+		`${grant.project}/${grant.taskId}: LFS object ${oid} streamed from ${up.host} (status ${res.status})`,
+	);
+	const headers = new Headers({ "Content-Type": "application/octet-stream" });
+	const len = res.headers.get("Content-Length");
+	if (len !== null) headers.set("Content-Length", len);
+	return new Response(res.body, { status: res.status, headers });
+}
+
 /** Serves one smart-HTTP request for a VM token's own project and branch. */
 export async function handleGit(
 	req: Request,
@@ -455,6 +890,10 @@ export async function handleGit(
 	const access = checkAccess(req, url, o);
 	if ("response" in access) return access.response;
 	const { grant, rest } = access;
+	if (rest.startsWith("info/lfs/")) {
+		if (rest === "info/lfs/objects/batch") return lfsBatch(req, grant, url, o);
+		return lfsObjectGet(req, grant, o, rest.slice("info/lfs/objects/".length));
+	}
 	const badMethod = methodGuard(req, rest, url);
 	if (badMethod !== null) return badMethod;
 	const badEncoding = encodingGuard(req, rest);

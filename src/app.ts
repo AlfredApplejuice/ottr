@@ -14058,7 +14058,18 @@ export async function createApp(deps: AppDeps) {
 		},
 		"/git/*": (req, server) =>
 			vmRoute(req, server, (tokens) =>
-				handleGit(req, { tokens, log: (l) => console.log(`[vm-git] ${l}`) }),
+				handleGit(req, {
+					tokens,
+					log: (l) => console.log(`[vm-git] ${l}`),
+					// The project's pinned origin (settings originUrl); null when unset.
+					// The LFS proxy fails closed on null: no pin, no proxy.
+					originUrl: async (project) => {
+						const e = deps.projects.get(project);
+						return e === undefined
+							? null
+							: (await e.store.getSettings()).originUrl;
+					},
+				}),
 			),
 		"/llm/*": (req, server) =>
 			vmRoute(req, server, (tokens) =>

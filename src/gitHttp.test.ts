@@ -101,7 +101,12 @@ beforeAll(async () => {
 	server = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
-		fetch: (req) => handleGit(req, { tokens, log: (l) => logs.push(l) }),
+		fetch: (req) =>
+			handleGit(req, {
+				tokens,
+				log: (l) => logs.push(l),
+				originUrl: async () => null,
+			}),
 	});
 }, 60_000);
 afterAll(() => server?.stop(true));

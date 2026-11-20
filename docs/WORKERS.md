@@ -1040,6 +1040,14 @@ the vm dispatch, never this mount. It never mounts
   a delete, or a compressed push body is refused. The VM pushes every 60 s while HEAD
   moves and once at the end; after each push the board resets the server worktree to the
   branch tip, never to a sha the VM reports.
+- Git LFS: the board's git endpoint also serves the LFS batch API for the per-turn
+  token, download only. It checks the same token rules as the git service, and
+  proxies the batch call to the project's pinned origin with the board's own
+  credential. The board rewrites the object links to board URLs, so no
+  upstream-signed URL or provider credential enters the VM. An upload batch gets
+  `403`, because the server push after a merge does the LFS uploads (OTTR-1058).
+  The board checks the project before it contacts the origin, so a token of one
+  project gets `403` for another project's LFS objects.
 - Provider credentials: none enter the VM. omp in the VM sends each provider through the
   board's `/llm` proxy (`transport: pi-native`, with the per-turn token as the key). The
   board forwards to its own `omp auth-gateway serve`, which resolves OAuth sign-ins and
