@@ -1042,7 +1042,8 @@ killed those VMs already.
   turn, keeps the pending reply, and counts no lost turn. The card stays queued with the
   hold **waiting for a free microVM**, its log gets one line ("every microVM was busy;
   the card waits in the queue for a free microVM"), and it holds no scheduler slot while
-  it waits. While the pool is full, no microVM card of the board claims or starts a turn.
+  it waits. While the pool is full, no microVM card of the board claims or starts a turn,
+  and every queued card of the project shows the same hold on the board.
   A freed slot wakes the queue: the settle of a board VM run probes the runner at once,
   the 30 s health probe keeps the count fresh, and the next tick then starts the oldest
   waiting card, one card per free slot.

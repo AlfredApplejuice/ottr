@@ -36,7 +36,9 @@ export const VM_BUSY_HOLD = "waiting for a free microVM";
 
 /**
  * The queued-card hold text for a project with microVM mode on, or null when nothing holds
- * the card back on the microVM side.
+ * the card back on the microVM side. A full pool holds every microVM card of the board
+ * (OTTR-1142), so each waiting card names the hold on the board, not only the one card
+ * whose own dispatch got the busy answer.
  */
 export function vmHoldFor(
 	microVm: boolean,
@@ -44,10 +46,14 @@ export function vmHoldFor(
 	id: string,
 	health: VmRunnerHealth = vmState.health,
 	busy: ReadonlySet<string> = vmState.busy,
+	pool: { busy: number; max: number } = vmState.pool,
+	inflight: number = vmState.inflight,
 ): string | null {
 	if (!microVm) return null;
 	if (!health.ok)
 		return `waiting for the microVM runner: ${health.reason ?? "not reachable"}`;
 	if (busy.has(`${project}/${id}`)) return VM_BUSY_HOLD;
+	if (pool.max > 0 && (pool.busy >= pool.max || inflight >= pool.max))
+		return VM_BUSY_HOLD;
 	return null;
 }
