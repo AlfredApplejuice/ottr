@@ -1,5 +1,12 @@
 import { Database } from "bun:sqlite";
-import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import {
+	afterAll,
+	afterEach,
+	describe,
+	expect,
+	setSystemTime,
+	test,
+} from "bun:test";
 import {
 	existsSync,
 	mkdirSync,
@@ -251,6 +258,33 @@ describe("moveInQueue", () => {
 		expect((await store.getTask(b.id))!.queuedAt).toBe(5);
 		expect((await store.getTask(a.id))!.queuedAt).toBe(1);
 		await store.close();
+	});
+
+	test("the renumber keeps same-queuedAt cards in queue order around the moved card", async () => {
+		const store = await open(join(root, "move-renumber-tie"));
+		try {
+			// Pinned createdAt: x and b tie on queuedAt, and x's earlier creation
+			// puts x above b in queueOrder, right where the moved card must land.
+			setSystemTime(new Date(1000));
+			const x = await store.createTask("x");
+			setSystemTime(new Date(2000));
+			const b = await store.createTask("b");
+			setSystemTime(new Date(3000));
+			const p = await store.createTask("p");
+			setSystemTime(new Date(4000));
+			const m = await store.createTask("m");
+			await store.updateTask(p.id, { queuedAt: 4 });
+			await store.updateTask(x.id, { queuedAt: 5 });
+			await store.updateTask(b.id, { queuedAt: 5 });
+			await store.updateTask(m.id, { queuedAt: 6 });
+			expect(await store.queueIds()).toEqual([p.id, x.id, b.id, m.id]);
+			// No integer slot between p (4) and b's anchor (5): the queue renumbers.
+			// m must land between x and b, not above x.
+			expect(await store.moveInQueue(m.id, b.id)).toBe(true);
+			expect(await store.queueIds()).toEqual([p.id, x.id, m.id, b.id]);
+		} finally {
+			setSystemTime();
+		}
 	});
 
 	test("adjacent queuedAt leaves no slot, so the queue renumbers", async () => {

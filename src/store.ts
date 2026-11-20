@@ -4635,8 +4635,21 @@ export class ProjectStore {
 				return true;
 			}
 			// No integer slot between the neighbours: renumber the whole queue in the
-			// desired order (the others keep their relative order).
-			const at = others.filter((t) => key(t) < anchor).length;
+			// desired order (the others keep their relative order). The moved card goes
+			// right above the anchor point, so the cards above it are the ones queueOrder
+			// sorts before that point: a lower sort key, or the same key with an earlier
+			// createdAt. When `before` itself is queued, its own position is exact even
+			// among full ties.
+			const queuedAt = others.findIndex((t) => t.id === before);
+			const at =
+				queuedAt >= 0
+					? queuedAt
+					: others.filter(
+							(t) =>
+								key(t) < anchor ||
+								(key(t) === anchor &&
+									t.createdAt < (anchorRow?.createdAt ?? 0)),
+						).length;
 			const next = [
 				...others.slice(0, at),
 				queue.find((t) => t.id === id)!,
