@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { probeVmRunner } from "./vmHealth.ts";
 import {
 	type Exec,
 	netStartup,
@@ -36,6 +37,7 @@ import {
 	type VmRunnerOptions,
 } from "./vmRunner.ts";
 import { parseSize, readVmRunnerEnv } from "./vmRunnerMain.ts";
+import { vmState } from "./vmState.ts";
 import {
 	type ValidateJobSpec,
 	type ValidateRequest,
@@ -1438,6 +1440,36 @@ describe("vm-runner /validate", () => {
 			await again.text();
 			return true;
 		}, "free slot");
+	});
+
+	test("healthz reports the pool usage the board's probe reads (OTTR-1142)", async () => {
+		const held = heldGuest();
+		const r = startRunner({ max: 2, script: { run: held.run } });
+		const free = await fetch(`${r.url}/healthz`);
+		expect(free.status).toBe(200);
+		expect(free.headers.get("x-ottr-vms-max")).toBe("2");
+		expect(free.headers.get("x-ottr-vms-busy")).toBe("0");
+		const first = await post(r.url, "/run", request());
+		const reader = first.body!.getReader();
+		await reader.read(); // the guest's first event: the VM holds the slot
+		const full = await fetch(`${r.url}/healthz`);
+		expect(full.status).toBe(200);
+		expect(full.headers.get("x-ottr-vms-busy")).toBe("1");
+		// The board's probe writes both counts into the pool state its start gate reads.
+		const savedPool = vmState.pool;
+		const savedHealth = vmState.health;
+		try {
+			await probeVmRunner({ urls: [r.url], token: "tok" });
+			expect(vmState.health.ok).toBe(true);
+			expect(vmState.pool).toEqual({ busy: 1, max: 2 });
+		} finally {
+			vmState.pool = savedPool;
+			vmState.health = savedHealth;
+		}
+		held.release();
+		while (!(await reader.read()).done) {
+			// drain to the end of the run
+		}
 	});
 
 	test("builds both disks with mkfs.ext4 -d and stages the job input before the scratch mkfs", async () => {

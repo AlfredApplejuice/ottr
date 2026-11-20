@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import {
 	afterEach,
+	beforeEach,
 	describe,
 	expect,
 	jest,
@@ -25448,6 +25449,254 @@ describe("microVM dispatch (OTTR-532)", () => {
 			expect((await store.getTask(task.id))!.state).toBe("queued");
 			expect(tokens.check(raw)).toBeNull();
 		});
+	});
+});
+
+describe("microVM pool hold (OTTR-1142)", () => {
+	const VM_URL = "http://vm-runner:8787";
+	const savedHealth = vmState.health;
+	const savedPool = vmState.pool;
+	const savedInflight = vmState.inflight;
+	beforeEach(() => {
+		vmState.health = { configured: true, ok: true, reason: null };
+	});
+	afterEach(() => {
+		vmState.health = savedHealth;
+		vmState.pool = savedPool;
+		vmState.inflight = savedInflight;
+		setSystemTime();
+	});
+
+	type RunOpts = Parameters<TurnOps["startRun"]>[0];
+
+	/** The fake vm dispatch: records the call, answers busy while `accepts.left` is 0,
+	 * and takes one run per count otherwise. A non-vm target (a local merge follow-up)
+	 * gets a plain accepted run. */
+	function vmPoolStartRun(
+		calls: RunOpts[],
+		accepts: { left: number },
+	): TurnOps["startRun"] {
+		return async (o) => {
+			calls.push(o);
+			const success = () =>
+				runResult({ outcome: { status: "answered", summary: "done" } });
+			const target = o.vm?.target ?? o.worker ?? null;
+			if (target === null) {
+				await o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(success()),
+					kill: async () => {},
+				};
+			}
+			const take = isVmRun(o) && accepts.left > 0;
+			if (take) accepts.left -= 1;
+			if (!take)
+				return {
+					pid: null,
+					url: target.urls[0],
+					accepted: Promise.resolve(false),
+					done: Promise.resolve(
+						runResult({ exitCode: null, sessionId: null, workerBusy: true }),
+					),
+					kill: async () => {},
+				};
+			await o.onSession?.("sess-1");
+			return {
+				pid: null,
+				url: target.urls[0],
+				accepted: Promise.resolve(true),
+				done: Promise.resolve(success()),
+				kill: async () => {},
+			};
+		};
+	}
+
+	/** True when the dispatch went to vm-runner (a vm grant; a classic run's vm is null). */
+	function isVmRun(o: RunOpts): boolean {
+		return o.vm?.grant !== undefined;
+	}
+
+	test("a full pool holds no scheduler slot: a classic card of another project starts (OTTR-1142)", async () => {
+		vmState.pool = { busy: 0, max: 1 };
+		const record = baseRecord();
+		const a = await freshStore();
+		const b = await freshStore();
+		const calls: RunOpts[] = [];
+		const loop = holdFollowUps(
+			new Map([
+				[a.name, fakeProject(a)],
+				[b.name, fakeProject(b)],
+			]),
+			fakeOps(record, {
+				maxTotalRuns: () => 2,
+				workerTarget: { urls: ["http://worker-a:8787"], token: "tok" },
+				vmTarget: { urls: [VM_URL], token: "tok" },
+				vmTokens: new VmTokens({ file: null }),
+				syncWorktreeTo: async () => {},
+				startRun: async (o) => {
+					calls.push(o);
+					if (!isVmRun(o)) {
+						await o.onSession?.("sess-b");
+						return {
+							pid: null,
+							url: "http://worker-a:8787",
+							done: Promise.resolve(
+								runResult({ outcome: { status: "answered", summary: "done" } }),
+							),
+							kill: async () => {},
+						};
+					}
+					// Every vm dispatch gets the busy answer: the fake pool stays full.
+					return {
+						pid: null,
+						url: VM_URL,
+						accepted: Promise.resolve(false),
+						done: Promise.resolve(
+							runResult({ exitCode: null, sessionId: null, workerBusy: true }),
+						),
+						kill: async () => {},
+					};
+				},
+				// The fake runner's truth: every vm dispatch gets the busy answer, the
+				// pool stays full, so a waiting card never re-claims.
+				vmProbe: async () => {
+					vmState.pool = { busy: 1, max: 1 };
+				},
+			}),
+		);
+		await a.setSettings({ microVm: true });
+		const v1 = await a.createTask("vm work one");
+		const v2 = await a.createTask("vm work two");
+		const v3 = await a.createTask("vm work three");
+		// Same-millisecond creates tie in queueOrder (newest-first from listTasks); pin
+		// the run order so the test observes oldest-first exactly.
+		const base = Date.now();
+		await a.updateTask(v1.id, { queuedAt: base + 1 });
+		await a.updateTask(v2.id, { queuedAt: base + 2 });
+		await a.updateTask(v3.id, { queuedAt: base + 3 });
+		const classic = await b.createTask("classic work");
+		for (let i = 0; i < 20; i++) {
+			await loop.scheduleTick();
+			await flushPromises();
+			if ((await b.getTask(classic.id))!.state !== "queued") break;
+		}
+		await flushPromises();
+		const vmCalls = calls.filter(isVmRun);
+		const firstClassic = calls.findIndex((c) => !isVmRun(c));
+		expect(firstClassic).toBeGreaterThan(-1);
+		// Exactly the oldest vm card discovered the busy answer before the classic card
+		// ran: the waiting cards took no slot, so the cap stayed free for project b.
+		expect(vmCalls).toHaveLength(1);
+		expect(calls.slice(0, firstClassic).filter(isVmRun)).toHaveLength(1);
+		expect(vmCalls[0]!.prompt?.startsWith("vm work one")).toBe(true);
+		expect((await a.getTask(v1.id))!.state).toBe("queued");
+		expect((await a.getTask(v2.id))!.state).toBe("queued");
+		expect(await a.listTurns(v2.id)).toHaveLength(0);
+		expect(await a.listTurns(v3.id)).toHaveLength(0);
+		expect(await b.listTurns(classic.id)).toHaveLength(1);
+		expect(vmState.inflight).toBe(0);
+	});
+
+	test("a freed slot starts exactly the oldest waiting card, one per slot (OTTR-1142)", async () => {
+		vmState.pool = { busy: 1, max: 1 };
+		const calls: RunOpts[] = [];
+		const accepts = { left: 0 };
+		const { store, loop } = await setup({
+			maxTotalRuns: () => 5,
+			vmTarget: { urls: [VM_URL], token: "tok" },
+			vmTokens: new VmTokens({ file: null }),
+			syncWorktreeTo: async () => {},
+			startRun: vmPoolStartRun(calls, accepts),
+			vmProbe: async () => {
+				vmState.pool = { busy: accepts.left > 0 ? 0 : 1, max: 1 };
+			},
+		});
+		await store.setSettings({ microVm: true });
+		const first = await store.createTask("vm work one");
+		const second = await store.createTask("vm work two");
+		// Same-millisecond creates tie in queueOrder (newest-first from listTasks); pin
+		// the run order so the test observes oldest-first exactly.
+		const base = Date.now();
+		await store.updateTask(first.id, { queuedAt: base + 1 });
+		await store.updateTask(second.id, { queuedAt: base + 2 });
+		await loop.scheduleTick();
+		await flushPromises();
+		// A full pool claims nothing: no dispatch, no turn row.
+		expect(calls).toHaveLength(0);
+		expect((await store.getTask(first.id))!.state).toBe("queued");
+		expect(await store.listTurns(first.id)).toHaveLength(0);
+
+		// One slot frees: exactly the oldest card claims and starts. Its settle probes
+		// the pool full again, so the second card keeps waiting without a claim.
+		accepts.left = 1;
+		vmState.pool = { busy: 0, max: 1 };
+		await loop.scheduleTick();
+		await flushPromises();
+		await eventually(async () => vmState.inflight === 0);
+		await flushPromises();
+		const vmCalls = () => calls.filter(isVmRun);
+		expect(vmCalls()).toHaveLength(1);
+		expect(vmCalls()[0]!.vm?.grant.taskId).toBe(first.id);
+		expect(vmState.pool.busy).toBe(1);
+		expect((await store.getTask(second.id))!.state).toBe("queued");
+		expect(await store.listTurns(second.id)).toHaveLength(0);
+
+		// The next freed slot starts the next oldest card.
+		accepts.left = 1;
+		vmState.pool = { busy: 0, max: 1 };
+		await loop.scheduleTick();
+		await flushPromises();
+		await eventually(async () => vmCalls().length === 2);
+		expect(vmCalls()[1]!.vm?.grant.taskId).toBe(second.id);
+	});
+
+	test("a waiting card writes no new turn header until a VM is free (OTTR-1142)", async () => {
+		vmState.pool = { busy: 0, max: 1 };
+		const calls: RunOpts[] = [];
+		const accepts = { left: 0 };
+		const { store, loop } = await setup({
+			maxTotalRuns: () => 5,
+			vmTarget: { urls: [VM_URL], token: "tok" },
+			vmTokens: new VmTokens({ file: null }),
+			syncWorktreeTo: async () => {},
+			startRun: vmPoolStartRun(calls, accepts),
+			vmProbe: async () => {
+				vmState.pool = { busy: accepts.left > 0 ? 0 : 1, max: 1 };
+			},
+		});
+		await store.setSettings({ microVm: true });
+		const task = await store.createTask("vm work one");
+		await loop.scheduleTick();
+		await flushPromises();
+		// The discovery dispatch: one turn header, one wait line, the card back queued.
+		expect(calls).toHaveLength(1);
+		expect((await store.getTask(task.id))!.state).toBe("queued");
+		const headers = async () =>
+			(await logText(store, task.id)).match(/^== work turn /gm)?.length ?? 0;
+		expect(await headers()).toBe(1);
+
+		// The old per-card back-off expires; the pool gate still holds the card:
+		// no re-claim, no new header, no second wait line.
+		setSystemTime(new Date(Date.now() + VM_BUSY_RETRY_MS + 60_000));
+		await loop.scheduleTick();
+		await flushPromises();
+		await loop.scheduleTick();
+		await flushPromises();
+		expect(await headers()).toBe(1);
+		expect(
+			(await logText(store, task.id)).match(
+				/waits in the queue for a free microVM/g,
+			),
+		).toHaveLength(1);
+
+		// A VM frees: the card starts, and only the start adds a header.
+		accepts.left = 1;
+		vmState.pool = { busy: 0, max: 1 };
+		await loop.scheduleTick();
+		await flushPromises();
+		await eventually(async () => vmState.inflight === 0);
+		expect(await headers()).toBe(2);
 	});
 });
 

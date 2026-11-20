@@ -2238,9 +2238,15 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 			const url = new URL(request.url);
 			if (request.method === "GET" && url.pathname === "/healthz") {
 				const reason = vmRunnerHealth(opts, exists);
+				// OTTR-1142 pool usage: the board's probe reads these into its start gate,
+				// so a full pool holds every microVM card queued without a claim.
+				const headers = {
+					"x-ottr-vms-busy": String(slots.size),
+					"x-ottr-vms-max": String(opts.max),
+				};
 				return reason === null
-					? new Response("ok")
-					: new Response(reason, { status: 503 });
+					? new Response("ok", { headers })
+					: new Response(reason, { status: 503, headers });
 			}
 			const answered = await handleDetach(request, url);
 			if (answered !== null) return answered;

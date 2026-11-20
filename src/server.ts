@@ -900,6 +900,8 @@ const loop = createTurnLoop(projects, {
 	workerTarget,
 	// OTTR-532: microVM projects' eligible turns, their token store and the worktree sync.
 	vmTarget,
+	// OTTR-1142: the settle of an accepted VM run probes the pool before its wake schedule.
+	vmProbe: () => probeVmRunner(vmTarget),
 	vmTokens,
 	syncWorktreeTo,
 	startRun,

@@ -1041,8 +1041,11 @@ killed those VMs already.
   The board records a turn only after `vm-runner` accepts it, so a busy answer writes no
   turn, keeps the pending reply, and counts no lost turn. The card stays queued with the
   hold **waiting for a free microVM**, its log gets one line ("every microVM was busy;
-  the card waits in the queue for a free microVM"), and the scheduler tries again after
-  10 s.
+  the card waits in the queue for a free microVM"), and it holds no scheduler slot while
+  it waits. While the pool is full, no microVM card of the board claims or starts a turn.
+  A freed slot wakes the queue: the settle of a board VM run probes the runner at once,
+  the 30 s health probe keeps the count fresh, and the next tick then starts the oldest
+  waiting card, one card per free slot.
 - Down: while `vm-runner` does not answer its health probe, the project's work cards
   stay queued with **waiting for the microVM runner: <reason>**. They never fall back to
   the classic pool.

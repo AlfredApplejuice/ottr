@@ -1036,6 +1036,10 @@ export interface TurnOps {
 	/** OTTR-532: parsed once at boot from OTTR_VM_RUNNER_URL; null = no microVM runner. A
 	 * microVM project's eligible turns go here only, never to workerTarget or the server. */
 	vmTarget?: WorkerTarget | null;
+	/** OTTR-1142: one vm-runner /healthz probe into vmState.pool. The settle of an
+	 * accepted microVM run probes before the wake schedule, so a freed slot re-opens
+	 * the pool start gate within one round-trip. */
+	vmProbe?: () => Promise<void>;
 	/** OTTR-532: the board's one per-turn VM token store; startRun issues, settle revokes. */
 	vmTokens?: VmTokens;
 	/** OTTR-532: resets the server worktree to the head a microVM pushed (src/gitHttp.ts). */
@@ -1691,6 +1695,10 @@ type TurnRunShared = {
 	/** OTTR-708: the other projects' main-checkout snapshots taken just before the run
 	 * started; null when this turn kind is not guarded. The settle re-checks them. */
 	guardBefore: Map<string, { head: string | null; status: string }> | null;
+	/** OTTR-1142: the claim took a microVM inflight count; the finally releases it. */
+	vmClaimed: boolean;
+	/** OTTR-1142: vm-runner accepted this run; its settle probes the pool before the wake. */
+	vmStarted: boolean;
 };
 
 /** The agent run one turn dispatches (ops.startRun's handle). */
@@ -2127,7 +2135,9 @@ export function createTurnLoop(
 	const detached = new Map<string, { url: string; runId: string }>();
 	/** OTTR-532: "project/id" → when vm-runner last refused the card's dispatch as busy; the
 	 * pre-claim gate waits VM_BUSY_RETRY_MS before the next try. Cleared by the next dispatch
-	 * vm-runner takes (with the card's vmState.busy mark). */
+	 * vm-runner takes (with the card's vmState.busy mark). OTTR-1142: with a known pool
+	 * size the pool gate replaces this back-off; it stays for a runner without the
+	 * /healthz pool headers. */
 	const vmBusyAt = new Map<string, number>();
 
 	/** The worker token for a runner url: vm-runner's own target when the url is the microVM
@@ -3703,6 +3713,8 @@ export function createTurnLoop(
 			turn: null,
 			checkTakenOver: false,
 			guardBefore: null,
+			vmClaimed: claim.vm,
+			vmStarted: false,
 		};
 		/** Hosted metering: one entry for each settled agent run of this turn, reported in the finally. */
 		const metered: MeteredRun[] = [];
@@ -3993,6 +4005,7 @@ export function createTurnLoop(
 			preparing.delete(key);
 			creditStopped.delete(key);
 		}
+		if (mx.vmClaimed) vmState.inflight -= 1;
 		publishing.delete(key);
 		for (const interim of interims) interim.close();
 		if (ops.hosted !== undefined && mx.turn !== null) {
@@ -4013,6 +4026,16 @@ export function createTurnLoop(
 		// below, which publishes on entry (OTTR-884). The call is contained: a
 		// rejection (a transient store read in the dispatch) must not become an
 		// unhandled rejection and crash the board process.
+		// OTTR-1142: the settle of an accepted microVM run freed a runner slot, so
+		// probe the pool first: the wake schedule then re-opens the start gate only
+		// when the probe saw a free slot, and exactly the oldest waiting card claims.
+		if (mx.vmStarted && ops.vmProbe !== undefined) {
+			void ops
+				.vmProbe()
+				.then(() => schedule())
+				.catch((err) => logStoreError(e.store.name, err));
+			return;
+		}
 		schedule().catch((err) => logStoreError(e.store.name, err));
 	}
 
@@ -4061,6 +4084,8 @@ export function createTurnLoop(
 		task: Task;
 		key: string;
 		kind: TurnKind;
+		/** True when this claim took a microVM inflight count (OTTR-1142). */
+		vm: boolean;
 	} | null> {
 		const previous = claimQueue;
 		const { promise, resolve: release } = Promise.withResolvers<void>();
@@ -4094,6 +4119,9 @@ export function createTurnLoop(
 			}
 			const hasRules = ops.hasRules(e.path, e.targetRules === true);
 			let reserved = false;
+			/** True when the claim took a microVM inflight count (OTTR-1142); released
+			 * with the claim when the turn never starts. */
+			let claimedVm = false;
 			let task: Task | null;
 			try {
 				task = await store.claimTurn(
@@ -4126,9 +4154,14 @@ export function createTurnLoop(
 							current.stage === "merging" ? "merge" : "work";
 						const retro = isRetro(current);
 						const boardCheck = boardCheckId === id;
-						if (
-							startGatesHold(settings, current, key, kind, retro, boardCheck)
-						) {
+						const vm = microVmTurn({
+							microVm: settings.microVm === true,
+							kind,
+							retro,
+							boardCheck,
+							task: current,
+						});
+						if (startGatesHold(vm, kind, retro, boardCheck, key)) {
 							const reason = startGateTmpReason(
 								settings,
 								current,
@@ -4143,16 +4176,26 @@ export function createTurnLoop(
 						}
 						preparing.add(key);
 						creditStopped.delete(key);
+						if (vm) {
+							claimedVm = true;
+							vmState.inflight += 1;
+						}
 						reserved = true;
 						return { allow: true };
 					},
 				);
 			} catch (err) {
-				if (reserved) preparing.delete(key);
+				if (reserved) {
+					preparing.delete(key);
+					if (claimedVm) vmState.inflight -= 1;
+				}
 				throw err;
 			}
 			if (task === null) {
-				if (reserved) preparing.delete(key);
+				if (reserved) {
+					preparing.delete(key);
+					if (claimedVm) vmState.inflight -= 1;
+				}
 				return null;
 			}
 			return {
@@ -4161,6 +4204,7 @@ export function createTurnLoop(
 				task,
 				key,
 				kind: task.stage === "merging" ? "merge" : "work",
+				vm: claimedVm,
 			};
 		} finally {
 			release();
@@ -4173,37 +4217,38 @@ export function createTurnLoop(
 	 * here — a "local" hold stops board checks too. Flags read before the claim: they are
 	 * the same ones the worker decision in routeTurnRun makes.
 	 * OTTR-532: an eligible turn of a microVM project goes to vm-runner only. A runner
-	 * that is down, unconfigured or drained, or a card whose last dispatch it refused as
-	 * busy moments ago, leaves the card queued and unclaimed (the board shows vmHoldFor);
-	 * it never falls back to the classic pool or the server. */
+	 * that is down, unconfigured or drained, or a full microVM pool (OTTR-1142), leaves
+	 * the card queued and unclaimed (the board shows vmHoldFor); it never falls back to
+	 * the classic pool or the server. */
 	function startGatesHold(
-		settings: ProjectSettings,
-		task: Task,
-		key: string,
+		vm: boolean,
 		kind: TurnKind,
 		preRetro: boolean,
 		preBoardCheck: boolean,
+		key: string,
 	): boolean {
-		if (
-			microVmTurn({
-				microVm: settings.microVm === true,
-				kind,
-				retro: preRetro,
-				boardCheck: preBoardCheck,
-				task,
-			})
-		)
-			return vmStartGateHolds(key);
+		if (vm) return vmStartGateHolds(key);
 		return poolStartGateHolds(kind, preRetro, preBoardCheck);
 	}
 
-	/** The microVM start gate: a down or unconfigured runner, a drain, or a recent busy
-	 * refusal leaves the card queued and unclaimed. */
+	/** The microVM start gate: a down or unconfigured runner, a drain, or a full pool
+	 * leaves the card queued and unclaimed. */
 	function vmStartGateHolds(key: string): boolean {
 		const vmTarget = ops.vmTarget ?? null;
 		if (vmTarget === null || !vmState.health.ok) return true;
 		if (vmTarget.urls.every((u) => ops.drainedRunner(new URL(u).hostname)))
 			return true;
+		// OTTR-1142: with a known pool size the gate is the pool state — the probe found
+		// every slot taken (or the last busy answer latched it), or this board's own
+		// claims fill every slot. A waiting card holds no preparing claim, so it takes
+		// no maxTotal slot and writes no turn header.
+		if (vmState.pool.max > 0)
+			return (
+				vmState.pool.busy >= vmState.pool.max ||
+				vmState.inflight >= vmState.pool.max
+			);
+		// Unknown pool size (a runner without the /healthz pool headers): the per-card
+		// busy back-off stays.
 		const busyAt = vmBusyAt.get(key);
 		if (busyAt !== undefined && Date.now() - busyAt < VM_BUSY_RETRY_MS)
 			return true;
@@ -6125,6 +6170,8 @@ export function createTurnLoop(
 		if (route.vmTurn && handle.accepted !== undefined) {
 			const ok = await vmAcceptance(store, id, task, key, handle, log);
 			if (!ok) return null;
+			// OTTR-1142: vm-runner took the run; its settle probes the pool before the wake.
+			mx.vmStarted = true;
 		}
 		const turn = await store.transaction(async () => {
 			await consumeTurnPending(store, id, input);
@@ -6145,7 +6192,9 @@ export function createTurnLoop(
 
 	/** Waits for vm-runner to take a microVM turn before anything records it: a busy answer
 	 * must leave the card exactly as it was before the claim (no turn row, the reply still
-	 * pending, no lost-worker count). Any other non-start (refused, unreachable, killed) falls
+	 * pending, no lost-worker count), latches the pool full, and marks the card for the
+	 * start gate (OTTR-1142), so it waits queued for the next probe that sees a free slot.
+	 * Any other non-start (refused, unreachable, killed) falls
 	 * through and settles like today's worker dispatch. False: busy — the caller stops. */
 	async function vmAcceptance(
 		store: ProjectStore,
@@ -6166,6 +6215,9 @@ export function createTurnLoop(
 		running.delete(key);
 		vmState.busy.add(key);
 		vmBusyAt.set(key, Date.now());
+		// OTTR-1142: the answer just said the pool is full — latch it, so no other card
+		// claims (and writes a turn header) before the next probe sees a free slot.
+		if (vmState.pool.max > 0) vmState.pool.busy = vmState.pool.max;
 		await log(
 			`- ${WORKER_BUSY}; the card waits in the queue for a free microVM`,
 		);

@@ -19,9 +19,17 @@ export const vmState: {
 	health: VmRunnerHealth;
 	/** "project/id" of cards whose last /run got the busy answer; cleared on the next dispatch. */
 	busy: Set<string>;
+	/** OTTR-1142 pool state from the /healthz probe headers (x-ottr-vms-busy / -max);
+	 * max 0 = unknown (a runner without the headers). */
+	pool: { busy: number; max: number };
+	/** OTTR-1142: claimed, unfinished microVM turns of this board; the pool start gate
+	 * counts them beside the probed busy count. */
+	inflight: number;
 } = {
 	health: { configured: false, ok: false, reason: VM_UNCONFIGURED },
 	busy: new Set(),
+	pool: { busy: 0, max: 0 },
+	inflight: 0,
 };
 
 export const VM_BUSY_HOLD = "waiting for a free microVM";
