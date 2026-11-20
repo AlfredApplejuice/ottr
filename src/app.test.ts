@@ -9788,6 +9788,35 @@ describe("release-summary route", () => {
 		}
 	});
 
+	test("the model input names the project and its package.json description", async () => {
+		const s = await setup("p-relsum-proj");
+		// The real handler runs readProductDescription on the repo dir, so the
+		// description must come from a real file in that directory.
+		writeFileSync(
+			join(s.dir, "package.json"),
+			JSON.stringify({
+				name: "p-relsum-proj",
+				description: "A quokka counter app",
+			}),
+		);
+		const gw = gateway("## Highlights\n\n- Consolidated");
+		try {
+			const { call } = await mount({
+				projects: s.projects,
+				releaseSummarySpawn: gw.spawn,
+			});
+			const res = await call("/api/projects/p-relsum-proj/release-summary", {
+				sha: run(s.dir, "git rev-parse HEAD"),
+			});
+			expect(res.status).toBe(200);
+			expect(gw.users[0]).toContain("PROJECT: p-relsum-proj");
+			expect(gw.users[0]).toContain("DESCRIPTION: A quokka counter app");
+			expect(gw.calls[0]).not.toContain("Ottr");
+		} finally {
+			s.cleanup();
+		}
+	});
+
 	test("card notes come from the ready report, not the overwritten details", async () => {
 		const s = await setup("p-relsum-source");
 		const gw = gateway("## Highlights\n\n- Consolidated");

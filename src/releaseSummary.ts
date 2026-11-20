@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import { modelRoles } from "./models.ts";
 import {
@@ -123,9 +125,65 @@ function breakingBullets(notes: string): string[] {
 	return out;
 }
 
+/** One description cap: about 500 characters, cut at a word boundary when one
+ * sits in the back half, so the model never sees a half word. */
+const DESCRIPTION_CAP = 500;
+
+function capDescription(text: string): string {
+	if (text.length <= DESCRIPTION_CAP) return text;
+	const cut = text.slice(0, DESCRIPTION_CAP);
+	const sp = cut.lastIndexOf(" ");
+	return (sp >= DESCRIPTION_CAP / 2 ? cut.slice(0, sp) : cut).trimEnd();
+}
+
+/** The first non-heading paragraph of a Markdown text: consecutive non-blank lines
+ * joined with spaces; null when the text holds none. */
+function firstParagraph(text: string): string | null {
+	const blocks: string[][] = [];
+	let current: string[] = [];
+	for (const line of text.split("\n")) {
+		const t = line.trim();
+		if (t === "") {
+			if (current.length > 0) blocks.push(current);
+			current = [];
+		} else current.push(t);
+	}
+	if (current.length > 0) blocks.push(current);
+	const para = blocks.find((b) => b[0]?.startsWith("#") === false);
+	return para === undefined ? null : para.join(" ");
+}
+
+/** The short product description the release notes open with: the package.json
+ * "description" when the repo has one, else the README's first paragraph, else null. */
+export function readProductDescription(dir: string): string | null {
+	let desc: unknown;
+	try {
+		desc = JSON.parse(
+			readFileSync(join(dir, "package.json"), "utf8"),
+		).description;
+	} catch {
+		desc = undefined;
+	}
+	if (typeof desc === "string" && desc.trim() !== "")
+		return capDescription(desc.trim());
+	for (const name of ["README.md", "README"]) {
+		let text: string;
+		try {
+			text = readFileSync(join(dir, name), "utf8");
+		} catch {
+			continue;
+		}
+		const first = firstParagraph(text);
+		if (first !== null) return capDescription(first);
+	}
+	return null;
+}
+
 export async function summarizeRelease(o: {
 	notes: string;
 	cards: ReleaseSummaryCard[];
+	projectName: string;
+	projectDescription?: string | null;
 	spawn?: SpawnFn;
 	roles?: Record<string, string>;
 	timeoutMs?: number;
@@ -172,6 +230,14 @@ export async function summarizeRelease(o: {
 			}
 			input = `${o.notes}\n\n${lines.join("\n")}`;
 		}
+		// The project block is data for the final call only: the chunk pass condenses
+		// raw card material and stays project-neutral.
+		const desc = (o.projectDescription ?? "").trim();
+		const head =
+			desc === ""
+				? `PROJECT: ${o.projectName}`
+				: `PROJECT: ${o.projectName}\nDESCRIPTION: ${desc}`;
+		input = `${head}\n\n${input}`;
 		const reply = await call(RELEASE_SUMMARY_INSTRUCTIONS, input);
 		if (reply === null)
 			return { summary: null, reason: "the model returned an empty reply" };

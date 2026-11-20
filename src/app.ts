@@ -293,7 +293,7 @@ import {
 	releaseBlocked,
 	runGh,
 } from "./release.ts";
-import { summarizeRelease } from "./releaseSummary.ts";
+import { readProductDescription, summarizeRelease } from "./releaseSummary.ts";
 import {
 	directLoopback,
 	hostMatches,
@@ -8972,6 +8972,8 @@ export async function createApp(deps: AppDeps) {
 			notes: plan.notes,
 			cards,
 			spawn: deps.releaseSummarySpawn,
+			projectName: e.name,
+			projectDescription: readProductDescription(e.path),
 		});
 		// The fallback is a normal outcome, not an error status.
 		return json(result);
