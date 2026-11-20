@@ -785,9 +785,10 @@ pointed at the flat shared home and moves the cache links (`.cache`, `.npm`,
 `.bun`, `.local`) into `home/`; the turn creates the cache dirs itself
 through those links, so one project's caches are not another project's
 write surface. Everything root touches in the turn home lives under the
-root-owned shell dirs, and every recursive chown pins its entries with
-`O_PATH|O_NOFOLLOW` file descriptors (`fchownSync`), so a turn cannot
-redirect a root chown by renaming or planting symlinks mid-walk.
+root-owned shell dirs, and every recursive chown anchors its listings and
+chowns to `/proc/self/fd` descriptors of the directories it opened once, so
+a turn cannot redirect a root chown by renaming or planting symlinks
+mid-walk.
 
 The daemon also closes the project's dirs on the shared volumes: the project
 dir under `/workspace` and the whole `/data/<project>` tree get the project

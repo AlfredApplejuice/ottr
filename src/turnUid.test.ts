@@ -1,12 +1,15 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import {
 	chmodSync,
+	chownSync,
+	closeSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
 	readlinkSync,
+	renameSync,
 	rmSync,
 	type Stats,
 	statSync,
@@ -21,9 +24,12 @@ import {
 	applyTurnHomeEnv,
 	assertProjectSegment,
 	bootTurnIsolation,
+	chownTree,
+	chownTreeFd,
 	closeProjectDir,
 	ensureLayerCopy,
 	isolationEnabled,
+	openPinned,
 	prepareRunWorkspace,
 	prepareTurnHome,
 	projectTurnUid,
@@ -410,15 +416,55 @@ rootTest("chownTree leaves symlink targets untouched", () => {
 	writeFileSync(outside, "v\n");
 	symlinkSync(outside, join(tree, "sub", "link"));
 
-	chownTreePublic(tree, ids);
+	chownTree(tree, ids);
 	// Every real entry is the uid's; the link target is not.
 	expect(statSync(join(tree, "sub", "f.txt")).uid).toBe(ids.uid);
 	expect(statSync(outside).uid).not.toBe(ids.uid);
 	expect(lstatSync(join(tree, "sub", "link")).uid).toBe(ids.uid);
+	// A symlink as the walked root fails the run (fail closed).
+	expect(() => chownTree(join(tree, "sub", "link"), ids)).toThrow(/symlink/);
 });
 
-// Import indirection kept local: the test exercises the exported walk.
-import { chownTree as chownTreePublic } from "./turnUid.ts";
+rootTest(
+	"a renamed walked root cannot redirect the walk into an impostor",
+	() => {
+		const ws = freshDir("rename-ws");
+		const ids = projectTurnUid("rename-proj");
+		const root = join(ws, "root");
+		mkdirSync(join(root, "sub"), { recursive: true });
+		writeFileSync(join(root, "sub", "mine.txt"), "x\n");
+		// First pass: the takeover, as a real first turn performs it.
+		chownTree(root, ids);
+
+		// The uid renames the walked dir and plants an impostor at the old path,
+		// holding a plain file that a walk following the path would chown.
+		renameSync(root, `${root}-moved`);
+		mkdirSync(join(root, "steal"), { recursive: true });
+		const stolen = join(root, "steal", "victim.txt");
+		writeFileSync(stolen, "v\n");
+		chmodSync(stolen, 0o644);
+		// Hand the moved tree back to root, so the pinned walk must visibly re-chown it.
+		const rootIds = { uid: 0, gid: 0 };
+		chownTree(`${root}-moved`, rootIds);
+		expect(statSync(join(`${root}-moved`, "sub", "mine.txt")).uid).toBe(0);
+
+		// The daemon pins the root by fd (the open is the race window's entry) and
+		// walks: the rename above stands in for a swap between listing and chown.
+		const fd = openPinned(`${root}-moved`);
+		try {
+			chownSync(`/proc/self/fd/${fd}`, ids.uid, ids.gid);
+			chownTreeFd(fd, ids);
+		} finally {
+			closeSync(fd);
+		}
+		// The walk followed the pinned inode: the moved tree is the uid's again, and
+		// the impostor's file was never touched.
+		expect(statSync(join(`${root}-moved`, "sub", "mine.txt")).uid).toBe(
+			ids.uid,
+		);
+		expect(statSync(stolen).uid).not.toBe(ids.uid);
+	},
+);
 
 rootTest("closeProjectDir chowns the whole project data tree", () => {
 	const root = freshDir("close-root");

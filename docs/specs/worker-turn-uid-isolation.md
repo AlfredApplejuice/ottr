@@ -48,11 +48,19 @@ the turn uid by construction:
   provisioning target for tools, venv and PATH link dirs). The uid can never
   create, rename or symlink-swap an entry the daemon then chowns, copies or
   follows: a rename would need write permission on the root-owned parent.
-- Recursive chowns pin every entry with an `O_PATH|O_NOFOLLOW` fd and chown
-  the inode through it (`fchownSync`, the fchownat equivalent), so a
-  same-uid rename during the walk cannot redirect the chown outside the
-  tree. A symlink entry is lchowned (the link itself), never its target, and
-  the walk never descends through it.
+- Recursive chowns anchor every operation to a pinned descriptor: the walk
+  opens the root once with `O_PATH|O_NOFOLLOW` (atomic path resolution) and
+  then lists, opens and chowns strictly through the kernel's
+  `/proc/self/fd/N` magic links of the pinned descriptors. The kernel
+  resolves a magic link to the exact inode the fd holds, so a same-uid
+  rename during the walk cannot redirect a chown or a descent to a file
+  outside the tree, and `O_NOFOLLOW` (plus an `fstat` symlink check on each
+  opened entry) refuses a symlink as any path part the walk controls. A
+  symlink entry is lchowned through its pinned parent (the link itself,
+  never the target) and never descended through. Bun omits `O_PATH` from
+  its constants, so the walk uses the stable Linux ABI value
+  (`010000000`); a kernel without it fails the opens and the run fails
+  closed. There is no path-based fallback branch.
 - The daemon creates no file below the uid-owned `home` after handoff. The
   per-project cache dirs the layer copy's links name (`<home>/.cache` and
   friends) the turn creates itself, through the link, as its own uid.
@@ -205,6 +213,10 @@ their repo's owner and need nothing.
   top dir are owned by the project uid with mode `0700`; a symlink planted
   in the tree is lchowned and its target is untouched; a cwd outside the
   workspace root fails the run.
+- The rename race has a regression test: the walked root is renamed and an
+  impostor planted at the old path mid-flight; the fd-anchored walk chowns
+  the original tree and never touches the impostor's files, and a symlink
+  as the walked root fails the run.
 - The turn home shell is root-owned; the layer copy reuses an existing final
   dir and prunes copies of deleted layers.
 - `bun run check` and `bun test` pass.
@@ -220,10 +232,11 @@ their repo's owner and need nothing.
   same-uid procfs read open, which is the claimed vector.
 - chmod hardening of the shared home without uids: root turns read and write
   everything regardless of file modes; no boundary.
-- A path-based recursive chown (`chownSync` after `lstat`, or `chown -R`):
-  a same-uid rename or symlink swap between the walk's read and the chown
-  could redirect a root chown to a file outside the tree. Rejected for the
-  fd-pinned walk above.
+- A path-based recursive chown (`chownSync` after `lstat`, `readdirSync` by
+  path, or `chown -R`): a same-uid rename or symlink swap between the walk's
+  read and the chown could redirect a root chown to a file outside the tree,
+  because `O_NOFOLLOW` guards only the last part of a path. Rejected for the
+  `/proc/self/fd`-anchored walk above, which pins every directory it lists.
 
 ## Risks
 

@@ -7,7 +7,6 @@ import {
 	constants,
 	cpSync,
 	existsSync,
-	fchownSync,
 	fstatSync,
 	lchownSync,
 	lstatSync,
@@ -304,59 +303,105 @@ export function retargetCacheLinks(
 	}
 }
 
+/** bun-types (and Bun's runtime constants) omit Linux's O_PATH; the value is a
+ * stable Linux ABI constant (asm-generic/fcntl.h: O_PATH 010000000). A kernel
+ * without it fails the opens below and the run fails closed. */
+const fsConstants = constants;
+const fsConstantsEx = fsConstants as typeof fsConstants & { O_PATH?: number };
+const oPath =
+	typeof fsConstantsEx.O_PATH === "number" ? fsConstantsEx.O_PATH : 0o10000000;
+const oNoFollow = fsConstants.O_NOFOLLOW;
+
+/** Pin a path with O_PATH|O_NOFOLLOW (the walk's root open). Exposed for the
+ * rename-race test seam; the returned fd must be closed by the caller. */
+export function openPinned(path: string): number {
+	return openSync(path, oPath | oNoFollow);
+}
+
 /**
- * chown every entry of a tree. Each entry is pinned with an O_PATH|O_NOFOLLOW
- * fd and the inode is chowned through it (the fchownat equivalent), so a
- * same-uid rename or symlink swap between the readdir of the parent and the
- * chown of the child cannot redirect the chown to a file outside this tree.
- * A symlink entry is lchowned (the link itself), never its target.
+ * chown every entry of a tree, race-free against the tree's owning uid.
+ * The root is opened once (atomic path resolution, O_NOFOLLOW on the final
+ * part); every listing, open and chown below it then goes through the
+ * `/proc/self/fd/N` magic link of a pinned descriptor, which the kernel
+ * resolves to the exact inode the fd holds. A same-uid rename or symlink
+ * swap during the walk therefore cannot redirect a chown or a descent to a
+ * file outside the tree: renames cannot change what a pinned fd points at,
+ * and O_NOFOLLOW refuses a symlink as the final part of each anchored child
+ * path. A symlink entry is lchowned through its pinned parent (the link
+ * itself, never the target) and never descended through.
  */
 export function chownTree(root: string, ids: TurnIdentity): void {
-	const oPath =
-		typeof fsConstantsEx.O_PATH === "number" ? fsConstantsEx.O_PATH : undefined;
-	const oNoFollow = fsConstants.O_NOFOLLOW;
-	const stack: string[] = [root];
-	while (stack.length > 0) {
-		const path = stack.pop();
-		if (path === undefined) break;
-		if (oPath !== undefined) {
-			let fd: number;
-			try {
-				fd = openSync(path, oPath | oNoFollow);
-			} catch (err) {
-				if ((err as NodeJS.ErrnoException).code === "ELOOP") {
-					// A symlink: own the link itself, never its target, and do not
-					// descend through it.
-					lchownSync(path, ids.uid, ids.gid);
-					continue;
-				}
-				throw err;
-			}
-			try {
-				fchownSync(fd, ids.uid, ids.gid);
-				if (fstatSync(fd).isDirectory())
-					for (const entry of readdirSync(path)) stack.push(join(path, entry));
-			} finally {
-				closeSync(fd);
-			}
-		} else {
-			// No O_PATH (non-Linux): identity is off there; keep a plain walk.
-			const st = lstatSync(path);
-			if (st.isSymbolicLink()) {
-				lchownSync(path, ids.uid, ids.gid);
-				continue;
-			}
-			chownSync(path, ids.uid, ids.gid);
-			if (st.isDirectory())
-				for (const entry of readdirSync(path)) stack.push(join(path, entry));
-		}
+	const rootFd = openPinned(root);
+	try {
+		// O_PATH|O_NOFOLLOW on a trailing symlink can return the link's fd: refuse
+		// a symlink root before any chown (its magic link would resolve to the
+		// target), and chown a plain file root without a walk.
+		const rootSt = fstatSync(rootFd);
+		if (rootSt.isSymbolicLink())
+			throw new Error(`turn-uid: ${root} is a symlink; refusing to chown it`);
+		// The pinned root inode is chowned through its magic link; chownTreeFd
+		// handles everything below it.
+		chownSync(`/proc/self/fd/${rootFd}`, ids.uid, ids.gid);
+		if (rootSt.isDirectory()) chownTreeFd(rootFd, ids);
+	} finally {
+		closeSync(rootFd);
 	}
 }
 
-const fsConstants = constants;
-// bun-types omits Linux's O_PATH; named extension of the real constants type,
-// read through a typeof guard so a kernel or platform without it still walks.
-const fsConstantsEx = fsConstants as typeof fsConstants & { O_PATH?: number };
+/** chown every entry below an already-pinned directory fd, race-free by the
+ * same /proc/self/fd anchoring; the pinned inode itself is the caller's (the
+ * test seam for the rename race: the caller can rename the root mid-flight
+ * and prove the walk follows the inode, not the path). */
+export function chownTreeFd(rootFd: number, ids: TurnIdentity): void {
+	// A dir fd stays open until its listing pass is done: each child path is
+	// `/proc/self/fd/<parentFd>/<entry>`, so the parent must live until every
+	// child is opened. Child dir fds are closed after their own pass.
+	const dirs: number[] = [rootFd];
+	while (dirs.length > 0) {
+		const dirFd = dirs.pop();
+		if (dirFd === undefined) break;
+		const viaDir = `/proc/self/fd/${dirFd}`;
+		for (const entry of readdirSync(viaDir)) {
+			const child = `${viaDir}/${entry}`;
+			let fd: number;
+			try {
+				fd = openSync(child, oPath | oNoFollow);
+			} catch (err) {
+				if ((err as NodeJS.ErrnoException).code === "ELOOP") {
+					// A symlink entry (kernel refused the no-follow open): own the
+					// link itself — lchown does not follow the final part, and the
+					// parent is the pinned magic link — and never descend.
+					lchownSync(child, ids.uid, ids.gid);
+					continue;
+				}
+				if ((err as NodeJS.ErrnoException).code === "ENOENT") continue; // unlinked mid-walk: nothing left to chown
+				throw err;
+			}
+			try {
+				const st = fstatSync(fd);
+				if (st.isSymbolicLink()) {
+					// O_PATH|O_NOFOLLOW can return the link's fd instead of failing:
+					// lchown it through the pinned parent (never the target) and do
+					// not descend.
+					closeSync(fd);
+					lchownSync(child, ids.uid, ids.gid);
+					continue;
+				}
+				// The magic link of a non-symlink fd resolves to the pinned inode:
+				// chown through it instead of any path a rename could move.
+				chownSync(`/proc/self/fd/${fd}`, ids.uid, ids.gid);
+				if (st.isDirectory()) dirs.push(fd);
+				else closeSync(fd);
+			} catch (err) {
+				closeSync(fd);
+				throw err;
+			}
+		}
+		// The root fd belongs to the caller (chownTree closes it in its finally);
+		// only the fds this walk opened itself are closed here.
+		if (dirFd !== rootFd) closeSync(dirFd);
+	}
+}
 
 /**
  * Per-run workspace handoff: the run's cwd tree and the project's git dir
@@ -394,9 +439,22 @@ export function prepareRunWorkspace(
 		throw new Error(`turn-uid: no git dir at ${gitDir} for cwd ${cwd}`);
 	chownTree(cwd, ids);
 	chmodSync(cwd, 0o700);
-	chownTree(gitDir, ids);
+	chownSameDir(gitDir, ids);
 	chownSync(projectDir, ids.uid, ids.gid);
 	chmodSync(projectDir, 0o700);
+}
+
+/** chownTree anchored to the exact dir entry the caller stat'ed: a swap of the
+ * entry between the walk's open and its end changes the inode on the path, and
+ * the run fails instead of chowning an impostor. */
+function chownSameDir(dir: string, ids: TurnIdentity): void {
+	const before = statOf(dir);
+	if (before === null || !before.isDirectory() || before.isSymbolicLink())
+		throw new Error(`turn-uid: ${dir} is not a directory`);
+	chownTree(dir, ids);
+	const after = statOf(dir);
+	if (after === null || after.ino !== before.ino || after.dev !== before.dev)
+		throw new Error(`turn-uid: ${dir} was swapped during the chown; refusing`);
 }
 
 /**
@@ -410,7 +468,7 @@ export function closeProjectDir(dir: string, ids: TurnIdentity): void {
 	const st = statOf(dir);
 	if (st === null) return; // Nothing here yet (a fresh project): nothing to close.
 	if (!st.isDirectory() || st.isSymbolicLink()) return;
-	chownTree(dir, ids);
+	chownSameDir(dir, ids);
 	chownSync(dir, ids.uid, ids.gid);
 	chmodSync(dir, 0o700);
 }
