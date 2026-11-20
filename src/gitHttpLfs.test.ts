@@ -13,14 +13,18 @@ import type { Server } from "bun";
 import { handleGit, parseLfsBatch } from "./gitHttp.ts";
 import fc from "./test/properties.ts";
 import { VmTokens } from "./vmTokens.ts";
-import { gitExe } from "./worktree.ts";
+import { gitExe, setNetworkGitAuth } from "./worktree.ts";
 
 /**
  * The LFS half of the board's git endpoint (OTTR-1152). A VM-mode clone of the card branch
  * must fetch real LFS object content through the board, and a token must only ever reach
  * its own project's objects. The fixture upstream is a two-route Git LFS server (batch and
- * storage) on 127.0.0.1; the fixture repo carries a hand-written pointer, so building it
- * needs no LFS store — only the clone's smudge needs git-lfs.
+ * storage) on 127.0.0.1 that enforces the board's credential on the batch call, so a clone
+ * only passes when the board signed it. The default pinned origin is a bare URL, so the
+ * clone exercises the production classic-board credential path (`git credential fill` with
+ * the network-git resolver env); a second clone pins the userinfo form, the hosted/pinned
+ * URL shape. The fixture repo carries a hand-written pointer, so building it needs no LFS
+ * store — only the clone's smudge needs git-lfs.
  */
 
 const dirs: string[] = [];
@@ -87,6 +91,10 @@ const pointerText = () =>
 	`version https://git-lfs.github.com/spec/v1\noid sha256:${LFS_OID}\nsize 64\n`;
 
 const BRANCH = "ott/alp-1-x";
+/** The one credential the fixture upstream accepts on a batch call: the board's own. */
+const LFS_USER = "ott";
+const LFS_TOKEN = "lfs-fixture-token";
+const expectedUpstreamAuth = `Basic ${btoa(`${LFS_USER}:${LFS_TOKEN}`)}`;
 const tokens = new VmTokens({ file: null });
 const logs: string[] = [];
 let board: Server<undefined>;
@@ -99,6 +107,8 @@ let originUrl: (project: string) => Promise<string | null> = async () =>
 const upstreamBatches: { operation: unknown; oids: unknown[] }[] = [];
 /** Every oid the fixture upstream has served from /storage. */
 const storageGets: string[] = [];
+/** Upstream batch calls that arrived with a missing or wrong board credential. */
+const upstreamAuthRejections: string[] = [];
 
 let main = "";
 let worktree = "";
@@ -115,6 +125,12 @@ beforeAll(async () => {
 				req.method === "POST" &&
 				url.pathname.endsWith("/info/lfs/objects/batch")
 			) {
+				// The board signs the batch with its own credential. A missing or wrong
+				// header must fail loudly, not pass silently: record it and refuse.
+				if (req.headers.get("authorization") !== expectedUpstreamAuth) {
+					upstreamAuthRejections.push(`batch ${url.pathname}`);
+					return new Response("unauthorized", { status: 401 });
+				}
 				const body = (await req.json()) as {
 					operation?: unknown;
 					objects?: { oid?: unknown }[];
@@ -156,11 +172,23 @@ beforeAll(async () => {
 			return new Response("not found", { status: 404 });
 		},
 	});
-	// The pinned origin carries userinfo (the shape a pinned origin URL with an embedded
-	// token has), so the board signs its upstream batch with it; the fixture ignores auth.
-	// The href host must not be a literal private IP: the board's belt refuses those
-	// hrefs, so the fixture names the same loopback server "localhost" instead.
-	upstreamBase = `http://ottr:lfs-fixture@localhost:${upstream.port}`;
+	// The default pinned origin is a bare URL, so the board takes the production
+	// classic-board credential path: `git credential fill` run with the network-git
+	// resolver env. The resolver below is the same env shape production installs
+	// (GIT_CONFIG credential helper reading its token from env), scoped to this
+	// fixture's exact host:port. Restored in afterAll.
+	upstreamBase = `http://localhost:${upstream.port}`;
+	setNetworkGitAuth(() => ({
+		GIT_TERMINAL_PROMPT: "0",
+		GIT_ASKPASS: "",
+		GIT_CONFIG_COUNT: "2",
+		GIT_CONFIG_KEY_0: "credential.helper",
+		GIT_CONFIG_VALUE_0: "",
+		GIT_CONFIG_KEY_1: `credential.http://localhost:${upstream.port}.helper`,
+		GIT_CONFIG_VALUE_1: `!f() { test "$1" = get || exit 0; printf 'username=%s\\npassword=%s\\n' "$OTTR_LFS_TEST_USER" "$OTTR_LFS_TEST_TOKEN"; }; f`,
+		OTTR_LFS_TEST_USER: LFS_USER,
+		OTTR_LFS_TEST_TOKEN: LFS_TOKEN,
+	}));
 
 	board = Bun.serve({
 		hostname: "127.0.0.1",
@@ -214,6 +242,8 @@ beforeAll(async () => {
 afterAll(() => {
 	board?.stop(true);
 	upstream?.stop(true);
+	// Back to the module default: no resolver env for later test files in this process.
+	setNetworkGitAuth(() => ({}));
 });
 
 const url = () => `http://127.0.0.1:${board.port}/git/alpha.git`;
@@ -241,7 +271,7 @@ const hasGitLfs = Bun.which("git-lfs") !== null;
 
 describe("handleGit LFS proxy", () => {
 	test.skipIf(!hasGitLfs)(
-		"a VM clone through the board endpoint gets the real LFS content, not the pointer",
+		"a VM clone gets the real LFS content through the board's credential fill",
 		async () => {
 			const clone = join(dir(), "vm");
 			await must(
@@ -260,13 +290,48 @@ describe("handleGit LFS proxy", () => {
 			expect(got.equals(LFS_CONTENT)).toBe(true);
 			expect(got.toString()).not.toContain("oid sha256:");
 			// The bytes came from upstream through the board: the batch named the oid and
-			// the storage endpoint served it.
+			// the storage endpoint served it, both under the credential fill produced.
 			expect(
 				upstreamBatches.some(
 					(b) => b.operation === "download" && b.oids.includes(LFS_OID),
 				),
 			).toBe(true);
 			expect(storageGets).toContain(LFS_OID);
+			// The fixture enforces the board's credential: nothing was refused.
+			expect(upstreamAuthRejections).toEqual([]);
+		},
+		60_000,
+	);
+
+	test.skipIf(!hasGitLfs)(
+		"an userinfo pinned origin signs the batch with the URL credential",
+		async () => {
+			const saved = originUrl;
+			originUrl = async () =>
+				`http://${LFS_USER}:${LFS_TOKEN}@localhost:${upstream.port}`;
+			try {
+				const before = upstreamBatches.length;
+				const clone = join(dir(), "vm-userinfo");
+				await must(
+					dir(),
+					...auth(token),
+					"clone",
+					"-q",
+					"--branch",
+					BRANCH,
+					"--no-single-branch",
+					"--",
+					url(),
+					clone,
+				);
+				expect(
+					readFileSync(join(clone, "assets", "blob.bin")).equals(LFS_CONTENT),
+				).toBe(true);
+				expect(upstreamBatches.length).toBeGreaterThan(before);
+				expect(upstreamAuthRejections).toEqual([]);
+			} finally {
+				originUrl = saved;
+			}
 		},
 		60_000,
 	);
