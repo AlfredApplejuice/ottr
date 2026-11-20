@@ -10203,14 +10203,98 @@ function DrawerMut(p: { mut: ReturnType<typeof strykerProgress> | null }) {
 function DrawerLineage(p: {
 	row: TaskCard;
 	parent: TaskCard | null;
-	retroSource: { id: string; card: TaskCard | null } | null;
+	retroSource: (LineageRef & { card: TaskCard | null }) | null;
 	kids: TaskCard[];
 	proposals: Map<string, TaskCard[]>;
 	branchRow: (k: TaskCard, tag: string) => ReactNode;
 	onOpenTask: (id: string) => void;
+	/** OTTR-1158: fetch state of a parent or retro source the state's Done window
+	 * dropped; null when the card sits in the state and nothing fetches. */
+	parentFetch: LineageFetch | null;
+	retroFetch: LineageFetch | null;
+	/** Refetches one lineage card after a failed fetch (the row's Retry button). */
+	onLineageRetry: (c: LineageRef) => void;
+	/** The live state span for a fetched card, built by the drawer. */
+	stateRow: (k: TaskCard) => ReactNode;
 }) {
-	const { row, parent, retroSource, kids, proposals, branchRow, onOpenTask } =
-		p;
+	const {
+		row,
+		parent,
+		retroSource,
+		kids,
+		proposals,
+		branchRow,
+		onOpenTask,
+		parentFetch,
+		retroFetch,
+		onLineageRetry,
+		stateRow,
+	} = p;
+	/** An inert rail row for a linked card the rail cannot link (yet): the same
+	 * three-column structure as a card row, so the loading, not-found and error rows
+	 * never shift the layout next to a real card row (OTTR-1158). */
+	const goneRow = (
+		id: string,
+		tag: string,
+		text: string,
+		title: string,
+		retry?: LineageRef,
+	): ReactNode => (
+		<li className="lineage-gone">
+			<span className="lineage-row" title={title}>
+				<span className="lineage-key">{id}</span>
+				<span className="lineage-title">{text}</span>
+				<span className="lineage-end">
+					<span className="lineage-tag">{tag}</span>
+					{retry !== undefined && (
+						<button
+							type="button"
+							className="notif-link"
+							onClick={() => onLineageRetry(retry)}
+						>
+							Retry
+						</button>
+					)}
+				</span>
+			</span>
+		</li>
+	);
+	/** The rail row for a linked card the state list dropped (OTTR-1158): a real link
+	 * once its fetch lands, loading / 404 / error rows before that. Only a 404 earns
+	 * "Card not found" — an older done card exists, it just left the window. */
+	const fetchRow = (
+		c: LineageRef,
+		fetch: LineageFetch | null,
+		tag: string,
+	): ReactNode => {
+		// No entry yet (first render before the fetch state lands) reads as loading.
+		if (fetch === null || fetch.status === "loading")
+			return goneRow(c.id, tag, "Loading…", `Loading ${c.id}`);
+		switch (fetch.status) {
+			case "card":
+				return (
+					<li>
+						<LineageCardLink
+							card={fetch.card}
+							selfProject={row.project}
+							tag={tag}
+							onOpenTask={onOpenTask}
+							state={stateRow(fetch.card)}
+						/>
+					</li>
+				);
+			case "missing":
+				return goneRow(c.id, tag, "Card not found", `${c.id} does not exist`);
+			case "error":
+				return goneRow(
+					c.id,
+					tag,
+					"Could not load card",
+					`${c.id}: ${fetch.message}`,
+					c,
+				);
+		}
+	};
 	return (
 		<>
 			{" "}
@@ -10220,18 +10304,7 @@ function DrawerLineage(p: {
 				<DrawerSec id="drawer-lineage" label="Lineage" className="lineage">
 					<ol className="lineage-rail">
 						{retroSource !== null &&
-							(retroSource.card === null ? (
-								<li className="lineage-gone">
-									<span
-										className="lineage-row"
-										title={`${retroSource.id} is not on the board`}
-									>
-										<span className="lineage-key">{retroSource.id}</span>
-										<span className="lineage-title">Not on the board</span>
-										<span className="lineage-tag">retro source</span>
-									</span>
-								</li>
-							) : (
+							(retroSource.card !== null ? (
 								<li>
 									<LineageCardLink
 										card={retroSource.card}
@@ -10240,30 +10313,37 @@ function DrawerLineage(p: {
 										onOpenTask={onOpenTask}
 									/>
 								</li>
+							) : (
+								fetchRow(
+									{ project: retroSource.project, id: retroSource.id },
+									retroFetch,
+									"retro source",
+								)
 							))}
 						{row.followUpOf !== null &&
-							(parent === null ? (
-								// The state no longer carries the parent (a cancelled card): the
-								// row keeps the lineage on the bare id, inert like the card's.
-								<li className="lineage-gone">
-									<span
-										className="lineage-row"
-										title={`${row.followUpOf} is not on the board`}
-									>
-										<span className="lineage-key">{row.followUpOf}</span>
-										<span className="lineage-title">Not on the board</span>
-										<span className="lineage-tag">parent</span>
-									</span>
-								</li>
-							) : (
+							(parent !== null ? (
 								<li>
 									<LineageCardLink
 										card={parent}
 										selfProject={row.project}
 										tag={retroSource !== null ? "retro" : "parent"}
 										onOpenTask={onOpenTask}
+										state={
+											parentFetch?.status === "card"
+												? stateRow(parent)
+												: undefined
+										}
 									/>
 								</li>
+							) : (
+								fetchRow(
+									{
+										project: row.followUpOfProject ?? row.project,
+										id: row.followUpOf,
+									},
+									parentFetch,
+									retroSource !== null ? "retro" : "parent",
+								)
 							))}
 						<li className="lineage-self" aria-current="true">
 							<span className="lineage-row">
@@ -13250,6 +13330,17 @@ const releaseWaits = (v: TaskView): boolean =>
 	v.state === "needs_you" &&
 	v.cancelledAt === null;
 
+/** A linked card named only by id and project: the state's Done window may not carry
+ * it, and the drawer fetches it from that project's tasks route (OTTR-1158). */
+type LineageRef = { project: string; id: string };
+
+/** Fetch state of one lineage card the state's Done window dropped (OTTR-1158). */
+type LineageFetch =
+	| ({ status: "loading" } & LineageRef)
+	| ({ status: "card"; card: TaskCard } & LineageRef)
+	| ({ status: "missing" } & LineageRef)
+	| ({ status: "error"; message: string } & LineageRef);
+
 /** The follow-up lineage of a drawer card: its parent row and, for a retro, the source
  * card above it. Null when the card is a root, or the parent is no retro. */
 function followUpParent(
@@ -13257,7 +13348,7 @@ function followUpParent(
 	tasks: TaskCard[],
 ): {
 	parent: TaskCard | null;
-	retroSource: { id: string; card: TaskCard | null } | null;
+	retroSource: (LineageRef & { card: TaskCard | null }) | null;
 } {
 	const parent =
 		row.followUpOf === null
@@ -13268,12 +13359,14 @@ function followUpParent(
 						t.project === (row.followUpOfProject ?? row.project),
 				) ?? null);
 	// A retro's proposal card reads its lineage from the retro's source: the parent row is the
-	// retro and the source card sits above it. Null when the parent is no retro.
+	// retro and the source card sits above it. Null when the parent is no retro. `project` is
+	// the route the drawer fetches an out-of-window source from.
 	const retroSource =
 		parent === null || parent.kind !== "retro" || parent.followUpOf === null
 			? null
 			: {
 					id: parent.followUpOf,
+					project: parent.followUpOfProject ?? parent.project,
 					card:
 						tasks.find(
 							(t) =>
@@ -13581,6 +13674,80 @@ export function Drawer({
 	maxTotal: number | null;
 }) {
 	const { parent, retroSource } = followUpParent(row, tasks);
+	// OTTR-1158: the state carries only the Done window (the newest done and cancelled
+	// cards plus the pinned ones), so a parent or retro source older than that window is
+	// absent here even while its card exists. Fetch each missing card once from its own
+	// tasks route so the rail keeps a real link; only a 404 earns the not-found row.
+	// Keyed by "<project>/<id>", so a same-id card on another board cannot stand in.
+	const parentRef: LineageRef | null =
+		row.followUpOf === null || parent !== null
+			? null
+			: {
+					project: row.followUpOfProject ?? row.project,
+					id: row.followUpOf,
+				};
+	const retroRef: LineageRef | null =
+		retroSource === null || retroSource.card !== null
+			? null
+			: { project: retroSource.project, id: retroSource.id };
+	const lineageKey = (c: LineageRef): string => `${c.project}/${c.id}`;
+	const [lineage, setLineage] = useState<Record<string, LineageFetch>>({});
+	const loadLineage = (refs: LineageRef[]): void => {
+		for (const c of refs) {
+			setLineage((m) => ({
+				...m,
+				[lineageKey(c)]: { status: "loading", ...c },
+			}));
+			void readDetail(
+				`/api/projects/${encodeURIComponent(c.project)}/tasks/${encodeURIComponent(c.id)}`,
+			)
+				.then((v) => {
+					// Only a loading entry takes the answer: a response that lands after the
+					// drawer moved to another card (entries reset) or after a retry armed a
+					// fresh request must not write stale state.
+					setLineage((m) =>
+						m[lineageKey(c)]?.status === "loading"
+							? {
+									...m,
+									[lineageKey(c)]: {
+										status: "card",
+										...c,
+										card: taskCardFromDetail(v),
+									},
+								}
+							: m,
+					);
+				})
+				.catch((e: unknown) => {
+					const msg = e instanceof Error ? e.message : String(e);
+					setLineage((m) =>
+						m[lineageKey(c)]?.status === "loading"
+							? {
+									...m,
+									[lineageKey(c)]:
+										msg === "404"
+											? { status: "missing", ...c }
+											: { status: "error", ...c, message: msg },
+								}
+							: m,
+					);
+				});
+		}
+	};
+	// lineageWant encodes exactly parentRef and retroRef: the fetch restarts when the
+	// drawer's card changes or its fetched lineage lands.
+	const lineageWant = `${parentRef === null ? "" : lineageKey(parentRef)} ${retroRef === null ? "" : lineageKey(retroRef)}`;
+	useEffect(() => {
+		const refs: LineageRef[] = [];
+		if (parentRef !== null) refs.push(parentRef);
+		if (retroRef !== null) refs.push(retroRef);
+		// Empty want: this card has both lineage cards in state — drop the old fetch state.
+		if (refs.length === 0) {
+			setLineage({});
+			return;
+		}
+		loadLineage(refs);
+	}, [lineageWant]);
 	// Oldest first: the rail reads top to bottom in the order the follow-ups were filed.
 	// Retros are follow-up rows too; each retro's proposals hang one more level in under it.
 	const kids = tasks
@@ -13591,6 +13758,21 @@ export function Drawer({
 		)
 		.sort((a, b) => a.createdAt - b.createdAt);
 	const proposals = retroProposals(kids, tasks, row.project);
+	/** The live state span a lineage row shows after its tags, as the meta line shows
+	 * it. Follow-up rows and fetched parent rows share it. */
+	const lineageState = (k: TaskCard): ReactNode => (
+		<span
+			className={
+				k.state === "needs_you"
+					? `st st-needs_you${k.asked !== null ? " st-asked" : ""}`
+					: "st"
+			}
+		>
+			{/* Same alarm marks as the meta line: markup, not ::before. */}
+			{k.state === "needs_you" && <Mark kind={cardMark(k)} />}
+			{statusLine(k, project.hasRules, holdFor(k, tasks), draining)}
+		</span>
+	);
 	/** A follow-up or proposal row: the linked card with its live state, as the meta line shows it. */
 	const branchRow = (k: TaskCard, tag: string): ReactNode => (
 		<LineageCardLink
@@ -13598,21 +13780,37 @@ export function Drawer({
 			selfProject={row.project}
 			tag={tag}
 			onOpenTask={onOpenTask}
-			state={
-				<span
-					className={
-						k.state === "needs_you"
-							? `st st-needs_you${k.asked !== null ? " st-asked" : ""}`
-							: "st"
-					}
-				>
-					{/* Same alarm marks as the meta line: markup, not ::before. */}
-					{k.state === "needs_you" && <Mark kind={cardMark(k)} />}
-					{statusLine(k, project.hasRules, holdFor(k, tasks), draining)}
-				</span>
-			}
+			state={lineageState(k)}
 		/>
 	);
+	// The rail rows for cards the Done window dropped: the fetch state fills the row
+	// until the card lands, then the plain link renders with its live state.
+	const parentFetch: LineageFetch | null =
+		parentRef === null
+			? null
+			: (lineage[lineageKey(parentRef)] ?? {
+					status: "loading",
+					...parentRef,
+				});
+	const retroFetch: LineageFetch | null =
+		retroRef === null
+			? null
+			: (lineage[lineageKey(retroRef)] ?? {
+					status: "loading",
+					...retroRef,
+				});
+	const parentCard =
+		parent ?? (parentFetch?.status === "card" ? parentFetch.card : null);
+	const retroCard =
+		retroSource === null
+			? null
+			: {
+					id: retroSource.id,
+					project: retroSource.project,
+					card:
+						retroSource.card ??
+						(retroFetch?.status === "card" ? retroFetch.card : null),
+				};
 	// A held card waits until these are done; a cancelled dependency counts as done.
 	const waiting = row.stage !== "done" ? waitingOn(tasks, row) : [];
 	const [reply, setReply] = useState("");
@@ -14382,12 +14580,16 @@ export function Drawer({
 					<DrawerMut mut={mut} />
 					<DrawerLineage
 						row={row}
-						parent={parent}
-						retroSource={retroSource}
+						parent={parentCard}
+						retroSource={retroCard}
 						kids={kids}
 						proposals={proposals}
 						branchRow={branchRow}
 						onOpenTask={onOpenTask}
+						parentFetch={parentFetch}
+						retroFetch={retroFetch}
+						onLineageRetry={(c) => loadLineage([c])}
+						stateRow={lineageState}
 					/>
 					<DrawerLateCommits task={task} cancelled={cancelled} />
 					<DrawerAskPanel

@@ -2747,6 +2747,224 @@ describe("Drawer parent chip", () => {
 		usedTotal: 0,
 		maxTotal: null,
 	};
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+	// The production onClick React rendered onto the node; happy-dom's dispatched
+	// events never reach React's plugin (same helper the prompt editor tests use).
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+	const json = (body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		});
+	/** Renders the drawer with `fetch` stubbed: every URL 404s except the ones
+	 * `serve` answers. The two acts let the mount fetches land, like the prompt
+	 * editor tests; `fetches` records every URL the drawer asked for. */
+	const mountDrawer = async (
+		task: TaskCard,
+		tasks: TaskCard[],
+		serve: (url: string) => Response | Promise<Response>,
+	): Promise<{
+		container: HTMLDivElement;
+		fetches: string[];
+		close: () => Promise<void>;
+	}> => {
+		const realFetch = globalThis.fetch;
+		const fetches: string[] = [];
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			fetches.push(url);
+			return serve(url);
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(<Drawer {...base} task={task} tasks={tasks} />);
+		});
+		await act(async () => {});
+		return {
+			container,
+			fetches,
+			close: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+			},
+		};
+	};
+
+	test("a parent outside the Done window loads: loading row first, then the card as a link", async () => {
+		const parent = cardFixture({
+			id: "P-9",
+			stage: "done",
+			state: "idle",
+			sessionTitle: "Parent work",
+		});
+		const child = childCard({
+			id: "C-1",
+			stage: "done",
+			state: "idle",
+			followUpOf: "P-9",
+		});
+		// Held release: the fetch stays pending until the test releases it, so the
+		// loading row is observable.
+		const { promise: pending, resolve: release } =
+			Promise.withResolvers<Response>();
+		const { container, fetches, close } = await mountDrawer(child, [], (url) =>
+			url.endsWith("/tasks/P-9")
+				? pending
+				: new Response("{}", { status: 404 }),
+		);
+		try {
+			// The fetch went to the parent's tasks route, the same one the drawer's
+			// detail read uses.
+			expect(fetches).toContain("/api/projects/proj/tasks/P-9");
+			// Before the fetch lands: the id on the same three-column row shape, so
+			// nothing shifts when the card arrives. Never "Not on the board".
+			expect(container.querySelector(".lineage-gone") !== null).toBe(true);
+			expect(container.textContent).toContain("P-9");
+			expect(container.textContent).toContain("Loading");
+			expect(container.textContent).not.toContain("Not on the board");
+			release(json({ ...parent, turns: [] }));
+			await act(async () => {});
+			const link = container.querySelector<HTMLAnchorElement>(
+				'.lineage-rail a.lineage-row[href="/projects/proj/tasks/P-9"]',
+			);
+			expect(link !== null).toBe(true);
+			// Real id, title and live stage; the link's text is its accessible name.
+			expect(link?.textContent).toContain("P-9");
+			expect(link?.textContent).toContain("Parent work");
+			expect(link?.textContent).toContain("done");
+			expect(container.textContent).not.toContain("Not on the board");
+			expect(container.querySelector(".lineage-gone")).toBeNull();
+		} finally {
+			await close();
+		}
+	});
+
+	test("a parent whose fetch fails offers Retry, and Retry loads the card", async () => {
+		const parent = cardFixture({
+			id: "P-5",
+			stage: "done",
+			state: "idle",
+			sessionTitle: "Late parent",
+		});
+		const child = childCard({
+			id: "C-1",
+			stage: "done",
+			state: "idle",
+			followUpOf: "P-5",
+		});
+		let fail = true;
+		const { container, close } = await mountDrawer(child, [], (url) =>
+			url.endsWith("/tasks/P-5")
+				? fail
+					? new Response("{}", { status: 500 })
+					: json({ ...parent, turns: [] })
+				: new Response("{}", { status: 404 }),
+		);
+		try {
+			// Only a 404 proves the card does not exist; a server error keeps the id
+			// visible with an inline retry.
+			expect(container.textContent).toContain("Could not load card");
+			expect(container.textContent).not.toContain("Card not found");
+			const retry = container.querySelector<HTMLButtonElement>(
+				".lineage-gone button",
+			);
+			expect(retry?.textContent).toBe("Retry");
+			fail = false;
+			await act(async () => {
+				onClickOf(retry as unknown as Element)({});
+			});
+			await act(async () => {});
+			const link = container.querySelector<HTMLAnchorElement>(
+				'.lineage-rail a.lineage-row[href="/projects/proj/tasks/P-5"]',
+			);
+			expect(link !== null).toBe(true);
+			expect(link?.textContent).toContain("Late parent");
+			expect(container.querySelector(".lineage-gone")).toBeNull();
+		} finally {
+			await close();
+		}
+	});
+
+	test("a cross-project parent outside the window fetches from its own project", async () => {
+		const parent = cardFixture({
+			id: "P-2",
+			project: "other",
+			stage: "done",
+			state: "idle",
+			sessionTitle: "Far parent",
+		});
+		const child = childCard({
+			id: "C-1",
+			stage: "done",
+			state: "idle",
+			followUpOf: "P-2",
+			followUpOfProject: "other",
+		});
+		const { container, fetches, close } = await mountDrawer(child, [], (url) =>
+			url.endsWith("/projects/other/tasks/P-2")
+				? json({ ...parent, turns: [] })
+				: new Response("{}", { status: 404 }),
+		);
+		try {
+			// The route uses the linked card's project, and the link href follows it.
+			expect(fetches).toContain("/api/projects/other/tasks/P-2");
+			const link = container.querySelector<HTMLAnchorElement>(
+				'.lineage-rail a.lineage-row[href="/projects/other/tasks/P-2"]',
+			);
+			expect(link !== null).toBe(true);
+			expect(link?.textContent).toContain("P-2");
+			expect(link?.textContent).toContain("Far parent");
+			expect(link?.textContent).toContain("other");
+			expect(container.textContent).not.toContain("Not on the board");
+		} finally {
+			await close();
+		}
+	});
 
 	test("a parent still on the board renders as a button naming it", () => {
 		const parent = cardFixture({
@@ -2768,22 +2986,6 @@ describe("Drawer parent chip", () => {
 		expect(html).toContain("parent");
 		expect(html).toContain("Parent work");
 		expect(html).toContain('aria-current="true"');
-	});
-
-	test("a parent the state dropped (cancelled) keeps the chip on the bare id", () => {
-		const child = childCard({
-			id: "C-1",
-			stage: "done",
-			state: "idle",
-			followUpOf: "P-9",
-		});
-		const html = renderToStaticMarkup(
-			<Drawer {...base} task={child} tasks={[]} />,
-		);
-		expect(html).toContain("lineage-gone");
-		expect(html).toContain("Not on the board");
-		expect(html).toContain("P-9");
-		expect(html).toContain('title="P-9 is not on the board"');
 	});
 
 	test("follow-ups list oldest first, whatever order the state sends", () => {
@@ -2817,6 +3019,52 @@ describe("Drawer parent chip", () => {
 		) => cardFixture({ id, followUpOf, createdAt, ...over });
 		const at = (html: string, id: string) => html.indexOf(`>${id}<`);
 		const PROPOSALS = 'aria-label="Proposals"';
+
+		test("a retro source outside the Done window loads as a link", async () => {
+			// The retro parent sits in the state; its source is older than the window,
+			// so the drawer fetches it from the source's tasks route.
+			const source = cardFixture({
+				id: "SRC-1",
+				stage: "done",
+				state: "idle",
+				sessionTitle: "Source work",
+			});
+			const retro = cardFixture({
+				id: "R-1",
+				kind: "retro",
+				stage: "done",
+				state: "idle",
+				followUpOf: "SRC-1",
+				sessionTitle: "The retro",
+			});
+			const self = childCard({
+				id: "S-1",
+				stage: "done",
+				state: "idle",
+				followUpOf: "R-1",
+			});
+			const { container, fetches, close } = await mountDrawer(
+				self,
+				[retro],
+				(url) =>
+					url.endsWith("/tasks/SRC-1")
+						? json({ ...source, turns: [] })
+						: new Response("{}", { status: 404 }),
+			);
+			try {
+				expect(fetches).toContain("/api/projects/proj/tasks/SRC-1");
+				const link = container.querySelector<HTMLAnchorElement>(
+					'.lineage-rail a.lineage-row[href="/projects/proj/tasks/SRC-1"]',
+				);
+				expect(link !== null).toBe(true);
+				expect(link?.textContent).toContain("SRC-1");
+				expect(link?.textContent).toContain("Source work");
+				expect(link?.textContent).toContain("retro source");
+				expect(container.textContent).not.toContain("Not on the board");
+			} finally {
+				await close();
+			}
+		});
 
 		test("a retro is a follow-up row and its proposals nest under it, oldest first", () => {
 			const html = renderToStaticMarkup(
@@ -2924,7 +3172,7 @@ describe("Drawer parent chip", () => {
 			expect(html).not.toContain(">V-1<");
 		});
 
-		test("a retro source off the board renders inert", () => {
+		test("a retro source the window dropped holds its id until its fetch lands", () => {
 			const proposal = childCard({ id: "P-1", followUpOf: "R-1" });
 			const html = renderToStaticMarkup(
 				<Drawer
@@ -2933,10 +3181,14 @@ describe("Drawer parent chip", () => {
 					tasks={[card("R-1", "S-9", 1000, { kind: "retro" })]}
 				/>,
 			);
-			expect(html).toContain('title="S-9 is not on the board"');
+			// Static render runs no fetch: the loading row keeps the source's id and
+			// tag on the same row shape, with no link yet and no "Not on the board".
+			expect(html).toContain("lineage-gone");
+			expect(html).toContain("Loading");
 			expect(html).not.toContain("/tasks/S-9");
 			const gone = html.slice(html.indexOf("lineage-gone"), at(html, "R-1"));
 			expect(gone).toContain(">retro source<");
+			expect(html).not.toContain("Not on the board");
 		});
 
 		test("a parent that is no retro gets no grandparent row", () => {
@@ -3081,6 +3333,35 @@ describe("Drawer cross-project lineage", () => {
 		usedTotal: 0,
 		maxTotal: null,
 	};
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		Node: window.Node,
+		getComputedStyle: window.getComputedStyle,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
 
 	test("a foreign parent renders as a link naming its project", () => {
 		const parent = cardFixture({
@@ -3128,7 +3409,10 @@ describe("Drawer cross-project lineage", () => {
 		expect(html).toContain('class="lineage-branch"');
 	});
 
-	test("a same-id card on another board does not pose as the parent", () => {
+	test("a same-id card on another board does not pose as the parent", async () => {
+		// The id+project lookup and the fetch both use the child's project
+		// (followUpOfProject ?? project), so the impostor's project never serves the
+		// row; the route's 404 earns the not-found row, never a stale link.
 		const child = childCard({
 			id: "C-1",
 			stage: "done",
@@ -3140,12 +3424,35 @@ describe("Drawer cross-project lineage", () => {
 			project: "other",
 			sessionTitle: "Impostor work",
 		});
-		const html = renderToStaticMarkup(
-			<Drawer {...base} task={child} tasks={[impostor]} />,
-		);
-		expect(html).toContain("lineage-gone");
-		expect(html).toContain("Not on the board");
-		expect(html).not.toContain("Impostor work");
+		const realFetch = globalThis.fetch;
+		const fetches: string[] = [];
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			fetches.push(url);
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} task={child} tasks={[impostor]} />);
+			});
+			await act(async () => {});
+			// The fetch went to the child's project, and its 404 reads as not-found.
+			expect(fetches).toContain("/api/projects/proj/tasks/P-1");
+			expect(container.textContent).toContain("Card not found");
+			expect(container.textContent).not.toContain("Impostor work");
+			expect(container.textContent).not.toContain("Not on the board");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
 	});
 
 	test("a foreign card sharing this card's id does not list as a kid", () => {
