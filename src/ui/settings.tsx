@@ -4982,7 +4982,17 @@ export function EnvSection() {
 	const [error, setError] = useState<string | null>(null);
 	// The set secret whose Replace click opened an empty field.
 	const [replacing, setReplacing] = useState<string | null>(null);
-	const saveState = useBusy();
+	// The one save in flight, by row name: the spinner shows only on that row.
+	// Every Save stays disabled while it runs (one save at a time), and a failed
+	// save marks only its row; the mark clears itself after 3 s, like useBusy.
+	const [saving, setSaving] = useState<string | null>(null);
+	const [failedRow, setFailedRow] = useState<string | null>(null);
+	const busy = saving !== null;
+	useEffect(() => {
+		if (failedRow === null) return;
+		const t = setTimeout(() => setFailedRow(null), 3000);
+		return () => clearTimeout(t);
+	}, [failedRow]);
 	const load = useCallback(async (): Promise<void> => {
 		setRows(
 			(await unwrap<{ names: EnvNameRow[] }>(await fetch("/api/settings/env")))
@@ -4996,20 +5006,25 @@ export function EnvSection() {
 	}, [load]);
 	const shown = (row: EnvNameRow): string =>
 		values[row.name] ?? (row.plain ? (row.value ?? "") : "");
-	const save = (row: EnvNameRow): void =>
-		saveState.start(async () => {
+	const save = (row: EnvNameRow): void => {
+		if (busy) return;
+		setSaving(row.name);
+		setFailedRow(null);
+		void (async () => {
 			setError(null);
 			try {
 				await post("/api/settings/env", { name: row.name, value: shown(row) });
 				setValues(({ [row.name]: _, ...rest }) => rest);
 				setReplacing(null);
 				await load();
-				return true;
 			} catch (err) {
 				setError(err instanceof Error ? err.message : String(err));
-				return false;
+				setFailedRow(row.name);
+			} finally {
+				setSaving(null);
 			}
-		});
+		})();
+	};
 	const stateOf = (row: EnvNameRow): "set" | "missing" | "unreadable" =>
 		!row.set ? "missing" : row.readable ? "set" : "unreadable";
 	// Missing and unreadable values lead: they are the rows that need a value.
@@ -5044,11 +5059,11 @@ export function EnvSection() {
 		editing(row) ? (
 			<button
 				type="button"
-				disabled={saveState.busy}
-				className={saveState.failed ? "failed" : undefined}
+				disabled={busy}
+				className={failedRow === row.name ? "failed" : undefined}
 				onClick={() => save(row)}
 			>
-				{saveState.busy && <span className="spinner" aria-hidden="true" />}
+				{saving === row.name && <span className="spinner" aria-hidden="true" />}
 				Save
 			</button>
 		) : (

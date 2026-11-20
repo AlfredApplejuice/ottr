@@ -8302,3 +8302,194 @@ describe("Unreadable stored secrets", () => {
 		}
 	});
 });
+
+describe("Env save state is per row", () => {
+	// Three editable rows: every row renders its own Save button.
+	const names = [
+		{
+			name: "AAA_KEY",
+			projects: ["_all"],
+			plain: false,
+			set: false,
+			readable: false,
+		},
+		{
+			name: "BBB_KEY",
+			projects: ["_all"],
+			plain: false,
+			set: false,
+			readable: false,
+		},
+		{
+			name: "CCC_KEY",
+			projects: ["_all"],
+			plain: false,
+			set: false,
+			readable: false,
+		},
+	];
+	const okRes = (body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	const settle = async (until: () => boolean): Promise<void> => {
+		for (let k = 0; k < 20 && !until(); k++)
+			await act(async () => {
+				const frame = Promise.withResolvers<void>();
+				setTimeout(frame.resolve, 0);
+				await frame.promise;
+			});
+		expect(until()).toBe(true);
+	};
+	async function mountEnv(post: () => Promise<Response>): Promise<{
+		container: HTMLDivElement;
+		rows: Element[];
+		saveButtons: HTMLButtonElement[];
+		unmount: () => Promise<void>;
+	}> {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (
+			_input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> =>
+			init?.method === "POST"
+				? post()
+				: okRes({ names })) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(<EnvSection />);
+		});
+		const rows = [...container.querySelectorAll(".env-table tbody tr")];
+		const saveButtons = rows.map(
+			(r) => r.querySelector("button") as HTMLButtonElement,
+		);
+		expect(saveButtons.map((b) => b.textContent)).toEqual([
+			"Save",
+			"Save",
+			"Save",
+		]);
+		return {
+			container,
+			rows,
+			saveButtons,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+				globalThis.fetch = realFetch;
+			},
+		};
+	}
+
+	test("a Save click shows the spinner only on the row it saves", async () => {
+		const { promise: postInFlight, resolve: resolvePost } =
+			Promise.withResolvers<Response>();
+		let posts = 0;
+		const env = await mountEnv(async () => {
+			posts++;
+			return postInFlight;
+		});
+		try {
+			expect(env.saveButtons.map((b) => b.disabled)).toEqual([
+				false,
+				false,
+				false,
+			]);
+
+			await act(async () => {
+				env.saveButtons[1]?.click();
+			});
+			expect(posts).toBe(1);
+			// Only the saved row carries the spinner; the other rows stay plain.
+			expect(env.container.querySelectorAll(".env-table .spinner").length).toBe(
+				1,
+			);
+			expect(env.rows[1]?.querySelector(".spinner")).not.toBeNull();
+			expect(env.rows[0]?.querySelector(".spinner")).toBeNull();
+			expect(env.rows[2]?.querySelector(".spinner")).toBeNull();
+			// Every Save stays disabled while one save runs (one save at a time).
+			expect(env.saveButtons.map((b) => b.disabled)).toEqual([
+				true,
+				true,
+				true,
+			]);
+
+			// A second save click while the first runs is dropped.
+			await act(async () => {
+				env.saveButtons[0]?.click();
+			});
+			expect(posts).toBe(1);
+
+			await act(async () => {
+				resolvePost(okRes({ ok: true }));
+			});
+			await settle(
+				() =>
+					env.container.querySelectorAll(".env-table .spinner").length === 0,
+			);
+			expect(env.saveButtons.map((b) => b.disabled)).toEqual([
+				false,
+				false,
+				false,
+			]);
+		} finally {
+			await env.unmount();
+		}
+	});
+
+	test("a failed save marks only the saved row as failed", async () => {
+		const { promise: postInFlight, resolve: resolvePost } =
+			Promise.withResolvers<Response>();
+		const env = await mountEnv(async () => postInFlight);
+		try {
+			await act(async () => {
+				env.saveButtons[2]?.click();
+			});
+			// In flight: no row is failed yet and only the saved row spins.
+			expect(
+				env.container.querySelectorAll(".env-table button.failed").length,
+			).toBe(0);
+			expect(env.container.querySelectorAll(".env-table .spinner").length).toBe(
+				1,
+			);
+
+			await act(async () => {
+				resolvePost(
+					new Response(JSON.stringify({ error: "nope" }), {
+						status: 500,
+						headers: { "Content-Type": "application/json" },
+					}),
+				);
+			});
+			await settle(
+				() =>
+					env.container.querySelectorAll(".env-table .spinner").length === 0,
+			);
+			// The failed class lands only on the saved row; the error line shows.
+			const failed = [
+				...env.container.querySelectorAll(".env-table button.failed"),
+			];
+			expect(failed.length).toBe(1);
+			expect(
+				env.rows[2]?.querySelector("button")?.classList.contains("failed"),
+			).toBe(true);
+			expect(
+				env.rows[0]?.querySelector("button")?.classList.contains("failed"),
+			).toBe(false);
+			expect(
+				env.rows[1]?.querySelector("button")?.classList.contains("failed"),
+			).toBe(false);
+			expect(env.container.querySelector(".auth-error")?.textContent).toContain(
+				"nope",
+			);
+		} finally {
+			await env.unmount();
+		}
+	});
+});
