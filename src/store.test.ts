@@ -851,6 +851,85 @@ describe("deriveTitle", () => {
 		expect(edited.task.title).toBe("second title");
 		await store.close();
 	});
+
+	test("a bare-tag lead titles from its claim line (OTTR-1164)", async () => {
+		const store = await open(join(root, "derive-title-lead"));
+		const claim = "The setup limiter keys on the first X-Forwarded-For entry.";
+		const task = await store.createTask(
+			`Needs validation\nFingerprint: fp-1\n## Claim\n${claim}\n\nEvidence.`,
+		);
+		expect(task.title).toBe(`Needs validation: ${claim}`);
+		await store.close();
+	});
+
+	test("an old-shape lead keeps its first-line title", async () => {
+		const store = await open(join(root, "derive-title-lead-old"));
+		const task = await store.createTask(
+			"Needs validation: Legacy-layout restore follows worker-planted symlinks",
+		);
+		expect(task.title).toBe(
+			"Needs validation: Legacy-layout restore follows worker-planted symlinks",
+		);
+		await store.close();
+	});
+});
+
+describe("bare lead retitle (OTTR-1164)", () => {
+	test("open retitles open bare-tag leads; renamed, done and cancelled keep theirs", async () => {
+		const dir = join(root, "lead-retitle");
+		const store = await open(dir);
+		const claim = "The setup limiter keys on the first X-Forwarded-For entry.";
+		const shape = (subject: string, fingerprint: string) =>
+			`Needs validation\nFingerprint: ${fingerprint}\n## Claim\n${subject}`;
+		const openLead = await store.createTask(shape(claim, "fp-open"));
+		const doneLead = await store.createTask(
+			shape("The probe starts Bun in the venv.", "fp-done"),
+		);
+		const cancelledLead = await store.createTask(
+			shape("Receive-pack buffers whole bodies.", "fp-cancel"),
+		);
+		const renamedLead = await store.createTask(
+			shape("Copy-out lacks byte budgets.", "fp-renamed"),
+		);
+		await store.updateTask(doneLead.id, { stage: "done", state: "idle" });
+		await store.updateTask(cancelledLead.id, {
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+			cancelledAt: Date.now(),
+		});
+		await store.close();
+		// Force the pre-fix titles back: every card then carries the bare tag,
+		// except the renamed one, which keeps a title the user wrote.
+		const raw = new Database(join(dir, ".tasks", "tasks.db"), {
+			create: true,
+		});
+		raw.run("UPDATE tasks SET title = 'Needs validation'");
+		raw.run("UPDATE tasks SET title = 'User renamed this lead' WHERE id = ?", [
+			renamedLead.id,
+		]);
+		raw.close();
+		const reopened = await open(dir);
+		expect((await reopened.getTask(openLead.id))!.title).toBe(
+			`Needs validation: ${claim}`,
+		);
+		expect((await reopened.getTask(renamedLead.id))!.title).toBe(
+			"User renamed this lead",
+		);
+		expect((await reopened.getTask(doneLead.id))!.title).toBe(
+			"Needs validation",
+		);
+		expect((await reopened.getTask(cancelledLead.id))!.title).toBe(
+			"Needs validation",
+		);
+		// A second open is a no-op: the new titles never match the bare tag again.
+		await reopened.close();
+		const again = await open(dir);
+		expect((await again.getTask(openLead.id))!.title).toBe(
+			`Needs validation: ${claim}`,
+		);
+		await again.close();
+	});
 });
 
 describe("asked", () => {

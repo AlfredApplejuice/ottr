@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { retitleBareLeadTitles } from "./auditLeads.ts";
 import {
 	getPostgresDatabase,
 	type PostgresDatabase,
@@ -223,7 +224,19 @@ export const projectMigrations: readonly PostgresMigration[] = [
 	async (db) => {
 		for (const statement of projectStepTwo) await db.exec(statement);
 	},
+	// OTTR-1164: retitle open lead cards that still carry the bare "Needs
+	// validation" tag as their whole title, from the stored prompt — the same
+	// step the SQLite convergence runs in ProjectStore.open. No-op on a fresh
+	// database (no rows yet); idempotent afterwards.
+	async (db) => {
+		await retitleBareLeadTitles(db);
+	},
 ];
+
+/** How many versioned steps the store's own project migrations carry. The PG
+ * tests probe rollback behavior on the next free version, so their probe steps
+ * never collide with a version the store already recorded. */
+export const projectMigrationCount = projectMigrations.length;
 
 export const projectStepTwo: readonly string[] = [
 	"ALTER TABLE pr_review ADD COLUMN posted_via text",

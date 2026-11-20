@@ -234,8 +234,17 @@ OTTR-980). A lead without the line falls back to the title dedupe below.
 A lead with no fingerprint match must not file a second card for a topic that an
 open lead card already holds (OTTR-929).
 
-- Title key: the first line of the prompt, lower case, each run of whitespace
-  changed to one space, trimmed.
+- Title (OTTR-1164): a lead whose line 1 is the bare tag `Needs validation`
+  takes `Needs validation: <subject>` as its card title. The subject is the
+  first content line of the `## Claim` section, else the first line that is not
+  the tag, a `Fingerprint:` line, a heading, or blank. shortTitle cuts the
+  prefixed title at 80 characters, like every other prompt-derived title. Any
+  other prompt keeps its first line as the title. On open, both store backends
+  retitle open cards (not done, not cancelled) whose title is exactly the bare
+  tag; a card the user renamed keeps its title.
+- Title key: that subject title for a bare-tag lead, else the first line of the
+  prompt, lower case, each run of whitespace changed to one space, trimmed. Two
+  fingerprint-less leads with different claims never share a key.
 - The index holds only open cards (not done, not cancelled) whose title key
   starts with `needs validation`. Done and cancelled cards never block a lead
   by title.
@@ -257,8 +266,10 @@ channel as every other recorded finding, and arrival persistence stores it
 before the run settles. The review prompt tells the reviewer to put the audit
 record's fingerprint on the prompt's second line, in the exact form
 `Fingerprint: <fingerprint>`, before any other text (the value comes from the
-audit run's `findings.json`). Line 1 is the lead tag, `Needs validation:
-<title>`, and line 2 is the board's fingerprint line: the strict reader takes
+audit run's `findings.json`). Line 1 is the lead tag — `Needs validation:
+<title>` on the older cards, the bare tag `Needs validation` alone under the
+current prompt wording (OTTR-1164) — and line 2 is the board's fingerprint
+line: the strict reader takes
 the first line that carries the exact prefix (an empty value reads as no
 fingerprint), so a forged line in the record body never wins.
 The board files the leads from the turn's recorded set, and the fingerprint

@@ -9,6 +9,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { leadCardTitle, retitleBareLeadTitles } from "./auditLeads.ts";
 import { mkdirBelow, writeBelow } from "./confine.ts";
 import {
 	closeLocked,
@@ -1308,10 +1309,15 @@ export function discoverProjects(
  * First non-empty trimmed line of the prompt, max 80 chars — the task's title. Skips section
  * labels (Markdown headings with a single word, e.g. "# Goal") and strips leading `#` marks,
  * so a heading like "# Set up agent rules" becomes the bare text. Overlong lines cut at a
- * word boundary (shortTitle), never mid-word. No code matches on the title text (card kind
+ * word boundary (shortTitle), never mid-word. A lead filed with the review prompt's bare tag
+ * line ("Needs validation" alone on line 1, OTTR-1164) titles from its claim instead, so
+ * leads stay tellable apart on the board. No code matches on the title text (card kind
  * is a trusted, server-set field, never derived from prompt text), so this is safe to change.
  */
 function deriveTitle(prompt: string): string {
+	// OTTR-1164: "Needs validation: <subject>" beats the bare tag as the title.
+	const lead = leadCardTitle(prompt);
+	if (lead !== null) return lead;
 	const lines = prompt.split("\n").map((line) => line.trim());
 	const isSectionLabel = (line: string) => /^#{1,6}\s+\S+$/.test(line);
 	const line =
@@ -2632,6 +2638,20 @@ export class ProjectStore {
 									ORDER BY e.at DESC, e.id DESC LIMIT 1) = 'backlog'
 						)
 				`);
+				// OTTR-1164: leads filed while the review prompt put only the bare tag on
+				// line 1 kept "Needs validation" as their whole title. Retitle the open
+				// cards that still carry the bare title from their stored prompt; a
+				// renamed card (any other title) and done or cancelled cards keep theirs.
+				// Guarded like the backfill above: a tasks table old enough to miss
+				// cancelled_at predates review findings entirely, so it holds no bare-tag
+				// leads. Idempotent: the new title names the claim, so the bare-title
+				// match never fires again.
+				if (
+					["title", "prompt", "stage", "cancelled_at"].every((c) =>
+						cols.includes(c),
+					)
+				)
+					await retitleBareLeadTitles(db);
 				// OTTR-1047: the validation stamp on a backlog lead — set when the validation
 				// settle applies a result to it. ALTER-only after every rebuild, like the
 				// columns above; the validation settle writes it through TaskPatch.

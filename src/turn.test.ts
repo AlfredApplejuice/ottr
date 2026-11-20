@@ -27609,6 +27609,43 @@ describe("stored review findings", () => {
 		expect(reviewAfter.details).toContain(`already open: #${old.id}`);
 	});
 
+	test("two bare-tag leads with different claims file two cards (OTTR-1164)", async () => {
+		const record = baseRecord();
+		const first = mkFinding(
+			"Needs validation\n## Claim\nThe limiter keys on the first entry.",
+		);
+		const second = mkFinding(
+			"Needs validation\n## Claim\nThe probe starts Bun in the venv.",
+		);
+		const { store, loop } = await storedReviewSetup(
+			record,
+			[mkFinding("Bug 1", 1), first, second],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+			}),
+			[verdicts([1, false, "not real"])],
+			{ maxTotalRuns: () => null },
+		);
+		const review = await reviewCard(store);
+
+		await loop.runTurn(store.name, review.id);
+
+		// Both leads are fingerprint-less; with the bare tag alone on line 1 they
+		// once shared one title key, so the second lead deduped the first one's
+		// card away. Their claims keep them apart. listTasks lists newest first,
+		// so the filed order sorts away.
+		const kids = await kidsOf(store, review.id);
+		expect(kids).toHaveLength(2);
+		expect(kids.map((k) => k.title).sort()).toEqual(
+			[
+				"Needs validation: The limiter keys on the first entry.",
+				"Needs validation: The probe starts Bun in the venv.",
+			].sort(),
+		);
+		const reviewAfter = (await store.getTask(review.id))!;
+		expect(reviewAfter.details).not.toContain("already open");
+	});
+
 	test("a title match on a done or cancelled lead card files the lead again", async () => {
 		const record = baseRecord();
 		const lead = mkFinding("Needs validation: flaky retry on push");
