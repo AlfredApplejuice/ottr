@@ -60,6 +60,7 @@ import {
 	type SessionEntry,
 	secretsEqual,
 	sessionCookie,
+	sessionCookieName,
 	sessionLabel,
 	signSession,
 	verifyAdminLogin,
@@ -1999,6 +2000,9 @@ export async function createApp(deps: AppDeps) {
 	}
 	let lastInputAt = now();
 	const prod = deps.prod === true;
+	// OTTR-983: the session cookie name carries the board port (see sessionCookieName), so
+	// the omp-stats proxy on its own port still consults the same board-port cookie.
+	const cookieName = sessionCookieName(deps.port);
 	const { sshDir, workersHome, keyscan } = createAppPathDefaults(deps);
 	const ambientHelpers = readAmbientHelpers();
 	// Boot reconcile (docs/specs/agent-layer-switch.md, "Record"): the stores' open turns
@@ -5028,7 +5032,7 @@ export async function createApp(deps: AppDeps) {
 		if (key !== null && apiKey !== null && secretsEqual(key, apiKey))
 			return true;
 		if (sessionSecret === null) return false;
-		const token = parseCookies(req.headers.get("cookie"))[SESSION_COOKIE];
+		const token = parseCookies(req.headers.get("cookie"))[cookieName];
 		if (token === undefined) return false;
 		const v = verifySession(sessionSecret, token);
 		if (v === null) return false;
@@ -7644,9 +7648,18 @@ export async function createApp(deps: AppDeps) {
 		await saveConfig();
 		applyGithubToken();
 		const secure = viaPublicHost(req);
+		// The second Set-Cookie header clears the legacy port-less name a browser may
+		// still hold from before the rename.
 		return withCookie(
-			json({ ok: true, apiKey }),
-			sessionCookie(signSession(sessionSecret, name, SESSION_MS, id), secure),
+			withCookie(
+				json({ ok: true, apiKey }),
+				sessionCookie(
+					cookieName,
+					signSession(sessionSecret, name, SESSION_MS, id),
+					secure,
+				),
+			),
+			clearSessionCookie(SESSION_COOKIE, secure),
 		);
 	}
 
@@ -7701,18 +7714,25 @@ export async function createApp(deps: AppDeps) {
 			exp: now + SESSION_MS,
 		});
 		await saveConfig();
+		const secure = viaPublicHost(req);
+		// The second Set-Cookie header clears the legacy port-less name a browser may
+		// still hold from before the rename.
 		return withCookie(
-			json({ ok: true }),
-			sessionCookie(
-				signSession(sessionSecret, name, SESSION_MS, id),
-				viaPublicHost(req),
-				remember,
+			withCookie(
+				json({ ok: true }),
+				sessionCookie(
+					cookieName,
+					signSession(sessionSecret, name, SESSION_MS, id),
+					secure,
+					remember,
+				),
 			),
+			clearSessionCookie(SESSION_COOKIE, secure),
 		);
 	}
 
 	async function logout(req: Request): Promise<Response> {
-		const token = parseCookies(req.headers.get("cookie"))[SESSION_COOKIE];
+		const token = parseCookies(req.headers.get("cookie"))[cookieName];
 		if (sessionSecret !== null && token !== undefined) {
 			const v = verifySession(sessionSecret, token);
 			if (v !== null && v.id !== null && sessions.some((s) => s.id === v.id)) {
@@ -7720,9 +7740,12 @@ export async function createApp(deps: AppDeps) {
 				await saveConfig();
 			}
 		}
+		const secure = viaPublicHost(req);
+		// The second Set-Cookie header clears the legacy port-less name a browser may
+		// still hold from before the rename.
 		return withCookie(
-			json({ ok: true }),
-			clearSessionCookie(viaPublicHost(req)),
+			withCookie(json({ ok: true }), clearSessionCookie(cookieName, secure)),
+			clearSessionCookie(SESSION_COOKIE, secure),
 		);
 	}
 
@@ -9995,7 +10018,7 @@ export async function createApp(deps: AppDeps) {
 			sessions = live;
 			await saveConfig();
 		}
-		const token = parseCookies(req.headers.get("cookie"))[SESSION_COOKIE];
+		const token = parseCookies(req.headers.get("cookie"))[cookieName];
 		const currentId =
 			sessionSecret !== null && token !== undefined
 				? (verifySession(sessionSecret, token)?.id ?? null)

@@ -587,6 +587,9 @@ services:
       # config (the entry script never copies from it), so the pin removes only the
       # plant vector.
       GIT_CONFIG_GLOBAL: /dev/null
+    # The dashboard shares the cookie host with the board on 127.0.0.1. Open it on
+    # http://localhost:4570 instead: browser cookies ignore ports, so a cookie
+    # scoped to the board's hostname rides along to the same hostname on this port.
     ports:
       - "127.0.0.1:4570:4570"
 

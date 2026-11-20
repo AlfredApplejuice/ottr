@@ -49,6 +49,7 @@ import {
 import {
 	hashPassword,
 	SESSION_COOKIE,
+	sessionCookieName,
 	signIdentity,
 	signSession,
 } from "./auth.ts";
@@ -15670,7 +15671,7 @@ describe(
 				expect(login.status).toBe(200);
 				// Public host: the session cookie is Secure (HTTPS arrives via tailscale serve).
 				const setCookie = login.headers.get("set-cookie") ?? "";
-				expect(setCookie).toContain("ottr.session=");
+				expect(setCookie).toContain(`${sessionCookieName(0)}=`);
 				expect(setCookie).toContain("Secure");
 				const session = { cookie: setCookie.split(";")[0] ?? "" };
 				expect((await call("/api/state", session)).status).toBe(200);
@@ -15794,7 +15795,7 @@ describe("session registry (OTTR-387)", () => {
 				{ name: "ada", password: "correct horse" },
 			);
 			const cookie = (res.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
-			const parts = cookie.replace("ottr.session=", "").split(".");
+			const parts = cookie.replace(`${sessionCookieName(0)}=`, "").split(".");
 			// token = name.id.exp.mac, so the id sits third from the END.
 			return { res, cookie, id: parts[parts.length - 3] ?? "" };
 		};
@@ -15872,7 +15873,7 @@ describe("session registry (OTTR-387)", () => {
 	test("a legacy three-part token works until rotation kills it", async () => {
 		const { call } = await openBoard("g-sess-legacy");
 		const legacy = {
-			cookie: `ottr.session=${signSession("g-sess-legacy-secret", "ada", 60_000)}`,
+			cookie: `${sessionCookieName(0)}=${signSession("g-sess-legacy-secret", "ada", 60_000)}`,
 		};
 		expect((await call("/api/state", legacy)).status).toBe(200);
 		// Legacy tokens are not listed and cannot be revoked one by one.
@@ -16344,7 +16345,7 @@ describe("update cycle control (OTTR-752)", () => {
 		const token = crypto.randomUUID();
 		const key = crypto.randomUUID();
 		const sessionSecret = crypto.randomUUID();
-		const cookie = `ottr.session=${signSession(sessionSecret, "ada", 60_000)}`;
+		const cookie = `${sessionCookieName(0)}=${signSession(sessionSecret, "ada", 60_000)}`;
 		const g = await GlobalStore.open(join(root, `cycle-auth-${fixture++}`));
 		mountStores.push(g);
 		await g.set("config", { apiKey: key, sessionSecret });
@@ -16363,13 +16364,26 @@ describe("update cycle control (OTTR-752)", () => {
 				"x-api-key": key,
 			},
 			{ "x-board-token": token },
-			{ cookie: "ottr.session=untrusted" },
+			{ cookie: `${sessionCookieName(0)}=untrusted` },
 			{ cookie },
 		];
 		for (const headers of refusedHeaders)
 			expect(
 				(await m.call("/api/update/host", heartbeat(), headers)).status,
 			).toBe(403);
+		// OTTR-983: the cookie name carries the board port, so the same valid token
+		// fails the auth wall under the legacy bare name (401) and passes it under the
+		// derived one. This fixture has no updater, so past the wall the update control
+		// answers its own 409 instead of 202.
+		const wallCookie = (name: string) => ({
+			Host: "board.example",
+			Origin: "https://board.example",
+			cookie: `${name}=${signSession(sessionSecret, "ada", 60_000)}`,
+		});
+		const legacyWall = wallCookie(SESSION_COOKIE);
+		const derivedWall = wallCookie(sessionCookieName(0));
+		expect((await m.call("/api/update", {}, legacyWall)).status).toBe(401);
+		expect((await m.call("/api/update", {}, derivedWall)).status).toBe(409);
 		expect(
 			(
 				await m.call("/api/update/host", heartbeat(), {
@@ -23198,7 +23212,9 @@ describe(
 			test("a walled request without a session gets 401 with the board sign-in link", async () => {
 				const peer = fromGateway();
 				try {
-					const res = await call("/", { cookie: "ottr.session=forged.1.x" });
+					const res = await call("/", {
+						cookie: `${sessionCookieName(0)}=forged.1.x`,
+					});
 					expect(res.status).toBe(401);
 					expect(res.headers.get("content-type")).toContain("text/html");
 					expect(await res.text()).toContain('href="http://127.0.0.1:0/"');
@@ -23227,7 +23243,9 @@ describe(
 						apiKey: null,
 					});
 					const token = signSession("stats-secret", "ada", Date.now() + 60_000);
-					const signed = await call("/s", { cookie: `ottr.session=${token}` });
+					const signed = await call("/s", {
+						cookie: `${sessionCookieName(0)}=${token}`,
+					});
 					expect(signed.status).toBe(200);
 					expect(await signed.json()).toMatchObject({
 						path: "/s",
@@ -23290,7 +23308,7 @@ describe(
 
 			test("an authorized GET reaches the child with path and query, without the cookie", async () => {
 				const res = await call("/api/stats/models?range=24h&x=a%20b", {
-					cookie: "ottr.session=whatever; other=1",
+					cookie: `${sessionCookieName(0)}=whatever; other=1`,
 				});
 				expect(res.status).toBe(200);
 				expect(await res.json()).toEqual({
@@ -24723,7 +24741,7 @@ describe("service quota runtime integration", () => {
 			(
 				await m.call("/api/state", undefined, {
 					Host: "board.example",
-					Cookie: `${SESSION_COOKIE}=${cookie}`,
+					Cookie: `${sessionCookieName(0)}=${cookie}`,
 				})
 			).status,
 		).toBe(200);

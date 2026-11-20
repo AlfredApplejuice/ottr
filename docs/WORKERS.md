@@ -825,7 +825,9 @@ real podman.
 - The `alate` profile runs a bundled Alate server next to the stack:
   `docker compose --profile alate up -d` (or `COMPOSE_PROFILES=alate` in the
   env file). The service serves its dashboard on `127.0.0.1:4570` on the host
-  and `http://alate:4570` on the compose network. Its state lives on the
+  and `http://alate:4570` on the compose network. Open the dashboard at
+  `http://localhost:4570` when the board runs at `127.0.0.1`, because the
+  browser sends a host's cookies to every port on that host. Its state lives on the
   `alate-state` volume, and it provisions the workers through the shared
   `home` volume, as layers under `/root/.alate`
   ([The agent layers](#the-agent-layers)). `ALATE_URL` and `ALATE_API_KEY` pair the board with it: the
