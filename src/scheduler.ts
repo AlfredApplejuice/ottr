@@ -892,14 +892,16 @@ function routeCheck(
 	const vendor = workVendor ?? "unknown";
 	const rule = settings.rules.find((r) => r.vendor === vendor);
 	if (rule !== undefined) {
-		if (roles[rule.role] !== undefined) return { role: rule.role, note: null };
+		// hasOwn, not a bare member read: a rule may name "constructor", which must
+		// stay an unconfigured role (default rule + note), not Object.prototype's.
+		if (Object.hasOwn(roles, rule.role)) return { role: rule.role, note: null };
 		return {
 			role: def,
 			note: `check routing: rule ${rule.vendor} -> ${rule.role} names no configured role, using the default rule`,
 		};
 	}
 	if (settings.fallback !== "") {
-		if (roles[settings.fallback] !== undefined)
+		if (Object.hasOwn(roles, settings.fallback))
 			return { role: settings.fallback, note: null };
 		return {
 			role: def,

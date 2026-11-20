@@ -1943,6 +1943,16 @@ describe("review check policy", () => {
 		expect(checkRoutingNote(fb, roles, "anthropic/claude-opus-5-5")).toBe(
 			"check routing: fallback reviewer names no configured role, using the default rule",
 		);
+		// hasOwn, not a bare member read: a rule naming an inherited member
+		// ("constructor") stays an unconfigured role — default rule + note.
+		const trap = {
+			rules: [{ vendor: "zai", role: "constructor" }],
+			fallback: "",
+		};
+		expect(checkRoleFor(trap, roles, "zai/glm-5.3-flash")).toBe("critic");
+		expect(checkRoutingNote(trap, roles, "zai/glm-5.3-flash")).toBe(
+			"check routing: rule zai -> constructor names no configured role, using the default rule",
+		);
 	});
 
 	test("the unknown vendor rule matches a model with no known vendor", () => {
