@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { NonceCache, verifyIdentity } from "./auth.ts";
 import {
+	type CreditBalance,
 	controlPlaneHooks,
 	DEFAULT_CREDIT_REASON,
 	type HostedConfig,
@@ -100,6 +101,48 @@ describe("controlPlaneHooks", () => {
 		expect(
 			await fake(() => Response.json({ ok: false })).hooks.creditOk(),
 		).toBe(false);
+	});
+
+	test("creditOk records a finite balance into the opts.credit cell", async () => {
+		const cell: CreditBalance = { balance: null };
+		const hooks = controlPlaneHooks(cfg, {
+			credit: cell,
+			fetch: async () => Response.json({ ok: true, balance: 12.5 }),
+		});
+		expect(await hooks.creditOk()).toBe(true);
+		expect(cell).toEqual({ balance: 12.5 });
+	});
+
+	test("creditOk records a zero balance also on an ok:false answer", async () => {
+		const cell: CreditBalance = { balance: null };
+		const hooks = controlPlaneHooks(cfg, {
+			credit: cell,
+			fetch: async () => Response.json({ ok: false, balance: 0 }),
+		});
+		expect(await hooks.creditOk()).toBe(false);
+		expect(cell.balance).toBe(0);
+	});
+
+	test("creditOk keeps the cell when the answer carries no finite balance", async () => {
+		// 1e999 parses to Infinity, so this body carries a non-finite balance.
+		const cases: unknown[] = [
+			{ ok: true },
+			{ ok: true, balance: null },
+			{ ok: true, balance: "12.5" },
+			new Response('{"ok":true,"balance":1e999}', {
+				headers: { "content-type": "application/json" },
+			}),
+		];
+		for (const answer of cases) {
+			const cell: CreditBalance = { balance: 4 };
+			const hooks = controlPlaneHooks(cfg, {
+				credit: cell,
+				fetch: async () =>
+					answer instanceof Response ? answer : Response.json(answer),
+			});
+			await hooks.creditOk();
+			expect(cell.balance).toBe(4);
+		}
 	});
 
 	test("reportUsage posts the record; failures log and never throw", async () => {

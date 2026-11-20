@@ -2037,6 +2037,13 @@ export async function createApp(deps: AppDeps) {
 	const { gh, latestReleaseOf, githubAppFetch, rerunFetch } =
 		createAppNetworkDefaults(deps);
 	const { now, slowApiMs } = createAppClockDefaults(deps);
+	// The hosted credits chip's link (docs/specs/hosted-mode.md section 7). Computed once:
+	// the state frame reads it each time, and controlUrl is boot-validated without a
+	// trailing slash.
+	const accountUrl =
+		deps.hosted === undefined
+			? ""
+			: new URL("/account", `${deps.hosted.config.controlUrl}/`).toString();
 	let closing = false;
 	let closePromise: Promise<void> | null = null;
 	const internalWork = new Set<Promise<unknown>>();
@@ -5957,7 +5964,15 @@ export async function createApp(deps: AppDeps) {
 				serviceQuotas: serviceQuotas?.getState() ?? [],
 			}),
 			// Absent on self-hosted boards, so their payload stays as before.
-			...(deps.hosted !== undefined && { hosted: true }),
+			...(deps.hosted !== undefined && {
+				hosted: true,
+				// Hosted credits chip: the control plane's account page plus the balance the
+				// credit gate last saw (docs/specs/hosted-mode.md section 7).
+				credits: {
+					balance: deps.hosted.creditBalance.balance,
+					accountUrl,
+				},
+			}),
 			// Hosted mode has no admin login: the proxy authenticates, so setup never opens.
 			onboarding: deps.hosted === undefined && admin === null,
 			user: admin?.name ?? null,

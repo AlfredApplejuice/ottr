@@ -51,6 +51,7 @@ globalThis.sessionStorage = {
 } as Storage;
 // A static import cannot work: ESM hoists it, so the modules evaluate before the stub above exists.
 const {
+	App,
 	UpdateRowLine,
 	visibleUpdateRows,
 	LaneCol,
@@ -101,6 +102,7 @@ const {
 	AppInboxBell,
 	AppInboxPanel,
 	HoldResumeButton,
+	CreditsChip,
 	SystemBar,
 } = await import("./app.tsx");
 const {
@@ -17259,3 +17261,271 @@ describe("HoldResumeButton refusal surface (client)", () => {
 		container.remove();
 	});
 });
+describe("CreditsChip", () => {
+	const account = "https://cp.example/account";
+
+	test("a positive balance shows the balance and links to the account page", () => {
+		const html = renderToStaticMarkup(
+			<CreditsChip credits={{ balance: 12.5, accountUrl: account }} />,
+		);
+		expect(html).toContain(`href="https://cp.example/account"`);
+		expect(html).toContain(`target="_blank"`);
+		expect(html).toContain(`rel="noopener noreferrer"`);
+		expect(html).toContain(">12.5 credits</a>");
+		expect(html).not.toContain("data-empty");
+		expect(html).toContain('title="Credits balance — opens the account page"');
+	});
+
+	test("a zero balance names the hard stop with the short-label spans", () => {
+		const html = renderToStaticMarkup(
+			<CreditsChip credits={{ balance: 0, accountUrl: account }} />,
+		);
+		expect(html).toContain('data-empty=""');
+		expect(html).toContain("Out of credit — work stopped");
+		expect(html).toContain(
+			'<span class="credits-full">Out of credit — work stopped</span>',
+		);
+		expect(html).toContain('<span class="credits-short">Out of credit</span>');
+		expect(html).toContain(
+			'title="Out of credit — top up on the account page"',
+		);
+	});
+
+	test("a negative balance names the hard stop too", () => {
+		const html = renderToStaticMarkup(
+			<CreditsChip credits={{ balance: -1.5, accountUrl: account }} />,
+		);
+		expect(html).toContain('data-empty=""');
+		expect(html).toContain("Out of credit — work stopped");
+	});
+
+	test("an unknown balance renders nothing", () => {
+		expect(
+			renderToStaticMarkup(
+				<CreditsChip credits={{ balance: null, accountUrl: account }} />,
+			),
+		).toBe("");
+	});
+});
+
+describe("credits chip in the board bar", () => {
+	// The full board mount needs the same globals as settings.hosted.test.tsx's harness:
+	// a happy-dom Window swapped in beforeAll and restored in afterAll, plus a fetch stub
+	// that answers the boot conversation and fails every other load with its 503 line.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const originals = new Map<string, unknown>();
+
+	beforeAll(() => {
+		for (const [key, value] of Object.entries({
+			window,
+			document: window.document,
+			navigator: window.navigator,
+			location: window.location,
+			history: window.history,
+			HTMLElement: window.HTMLElement,
+			HTMLDialogElement: window.HTMLDialogElement,
+			HTMLInputElement: window.HTMLInputElement,
+			HTMLTextAreaElement: window.HTMLTextAreaElement,
+			Node: window.Node,
+			getComputedStyle: window.getComputedStyle,
+			requestAnimationFrame: window.requestAnimationFrame,
+			cancelAnimationFrame: window.cancelAnimationFrame,
+			CSS: (window as unknown as Record<string, unknown>).CSS,
+			IS_REACT_ACT_ENVIRONMENT: true,
+		})) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+		originals.set("fetch", host.fetch);
+		originals.set("sessionStorage", host.sessionStorage);
+		host.sessionStorage = window.sessionStorage;
+		originals.set("localStorage", host.localStorage);
+		host.localStorage = window.localStorage;
+		// happy-dom implements no popover attribute yet; the menus call hidePopover().
+		const proto = window.HTMLElement.prototype as unknown as Record<
+			string,
+			unknown
+		>;
+		proto.showPopover ??= () => {};
+		proto.hidePopover ??= () => {};
+	});
+
+	afterAll(() => {
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	/** The board state with the fields App reads at boot; `extra` carries the credits. */
+	const stateBody = (extra: Record<string, unknown>): unknown => ({
+		projects: [],
+		tasks: [],
+		maxTotal: null,
+		reviewCheck: false,
+		workCheck: false,
+		idleReviews: false,
+		trendingScan: true,
+		trendingStatus: { lastRunAt: null, lastError: null, running: false },
+		serverVersion: "vtest",
+		quota: null,
+		onboarding: false,
+		user: "alice",
+		seenAnswers: [],
+		seenDoneSince: 0,
+		inboxSeen: [],
+		orphans: [],
+		orphansError: null,
+		keptWorktrees: { held: 0, stale: 0 },
+		drainUntil: null,
+		drainCommits: null,
+		warnings: [],
+		updates: null,
+		alatePendingSince: null,
+		deadSignIns: [],
+		...extra,
+	});
+
+	/** The server as the board sees it: boot and state answer, every other load 503s. */
+	const serverFor = (
+		hosted: boolean,
+		state: Record<string, unknown>,
+		requested: string[],
+	): typeof fetch =>
+		(async (input: RequestInfo | URL) => {
+			const url = String(input);
+			requested.push(url);
+			let body: unknown = { error: "not in this test" };
+			let status = 503;
+			if (url === "/api/boot") {
+				body = {
+					onboarding: false,
+					version: "vtest",
+					live: false,
+					...(hosted ? { hosted: true } : {}),
+				};
+				status = 200;
+			} else if (url === "/api/state") {
+				body = stateBody(state);
+				status = 200;
+			} else if (url === "/api/update") {
+				body = { behind: 0, commits: [] };
+				status = 200;
+			} else if (url === "/api/system") {
+				body = {
+					at: 1,
+					containers: [],
+					vm: {
+						cpuPct: null,
+						cpus: 4,
+						load1: null,
+						memAvailable: null,
+						memTotal: null,
+						history: [],
+					},
+					holds: {
+						drainUntil: null,
+						drainCommits: null,
+						maxTotal: null,
+						running: 0,
+						queued: 0,
+						oldestQueuedAt: null,
+					},
+				};
+				status = 200;
+			}
+			return new Response(JSON.stringify(body), {
+				status,
+				headers: { "Content-Type": "application/json" },
+			});
+		}) as typeof fetch;
+
+	/** Flushes fetch-fed state frames and effects until `pred` holds. */
+	async function waitFor(pred: () => boolean): Promise<void> {
+		for (let i = 0; i < 200; i++) {
+			if (pred()) return;
+			await act(async () => {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setTimeout(resolve, 5);
+				await promise;
+			});
+		}
+		throw new Error(
+			`condition not reached; body: ${document.body.innerHTML.slice(0, 1200)}`,
+		);
+	}
+
+	const boardLoaded = (): boolean => {
+		const main = document.querySelector("main.main");
+		return main !== null && !(main.textContent ?? "").includes("Loading board");
+	};
+
+	/** Mounts App against the server, runs `check`, unmounts; reports every fetched URL. */
+	async function withApp(
+		hosted: boolean,
+		state: Record<string, unknown>,
+		check: () => void,
+	): Promise<string[]> {
+		const requested: string[] = [];
+		host.fetch = serverFor(hosted, state, requested);
+		window.history.replaceState(null, "", "/");
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(<App />);
+			});
+			await waitFor(boardLoaded);
+			check();
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+		}
+		return requested;
+	}
+
+	test("hosted: the bar links the balance to the account page", async () => {
+		await withApp(
+			true,
+			{ credits: { balance: 12.5, accountUrl: "https://cp.example/account" } },
+			() => {
+				const chip = document.querySelector("header.bar a.credits-chip");
+				expect(chip).not.toBeNull();
+				expect(chip?.getAttribute("href")).toBe("https://cp.example/account");
+				expect(chip?.getAttribute("target")).toBe("_blank");
+				expect(chip?.getAttribute("rel")).toBe("noopener noreferrer");
+				expect(chip?.hasAttribute("data-empty")).toBe(false);
+				expect(chip?.textContent).toContain("12.5 credits");
+				expect(
+					document.querySelectorAll("header.bar a.credits-chip"),
+				).toHaveLength(1);
+			},
+		);
+	});
+
+	test("hosted: a null balance hides the chip", async () => {
+		await withApp(
+			true,
+			{ credits: { balance: null, accountUrl: "https://cp.example/account" } },
+			() => {
+				expect(document.querySelector(".credits-chip")).toBeNull();
+			},
+		);
+	});
+
+	test("flag off: a payload without credits means no chip and no fetch for one", async () => {
+		const requested = await withApp(false, {}, () => {
+			expect(document.querySelector(".credits-chip")).toBeNull();
+			expect(document.body.innerHTML).not.toContain("credits-chip");
+		});
+		// The chip fetches nothing; the recorded loads are the board's own boot calls.
+		expect(requested.every((url) => !url.includes("credit"))).toBe(true);
+	});
+});
+

@@ -53,6 +53,7 @@ import {
 	askAnswerLine,
 	doneReadKey,
 	type GhStatus,
+	type HostedCreditsView,
 	type KeptChoice,
 	MERGE_HOLD_MISMATCH_REASON,
 	newestLanded,
@@ -17221,6 +17222,38 @@ function AppRailToggle({
 	);
 }
 
+/** Hosted mode's credits chip (docs/specs/hosted-mode.md section 7): the balance,
+ * linking to the control plane's account page; at zero it names the hard stop. */
+export function CreditsChip({ credits }: { credits: HostedCreditsView }) {
+	if (credits.balance === null) return null;
+	const empty = credits.balance <= 0;
+	return (
+		<a
+			className="credits-chip"
+			href={credits.accountUrl}
+			target="_blank"
+			rel="noopener noreferrer"
+			data-empty={empty ? "" : undefined}
+			title={
+				empty
+					? "Out of credit — top up on the account page"
+					: "Credits balance — opens the account page"
+			}
+		>
+			{empty ? (
+				<>
+					{/* The 380px tier hides the full sentence and shows the short form,
+					    so the bar never overflows on a 375px phone. */}
+					<span className="credits-full">Out of credit — work stopped</span>
+					<span className="credits-short">Out of credit</span>
+				</>
+			) : (
+				`${credits.balance.toFixed(1)} credits`
+			)}
+		</a>
+	);
+}
+
 /** The account menu (rail chip on phones, bar button everywhere): identity, settings
  * link, theme radios, sign out. */
 function AppUserMenu({
@@ -18800,6 +18833,13 @@ export function App() {
 					setError={setError}
 					setNotice={setNotice}
 				/>
+				{/* The payload carries credits only in hosted mode; a self-hosted board's
+				    payload lacks the field, so nothing renders and its DOM stays
+				    byte-identical. The chip fetches nothing: the anchor navigates only
+				    on a click. */}
+				{state?.credits !== undefined && state.credits.balance !== null && (
+					<CreditsChip credits={state.credits} />
+				)}
 				{/* Desktop keeps theme in the bar; phones reach it through the account menu. */}
 				<button
 					type="button"

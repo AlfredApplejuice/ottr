@@ -1372,6 +1372,14 @@ export interface OrphanProcess {
 	kind: string | null;
 }
 
+/** Hosted mode's credits chip data (docs/specs/hosted-mode.md section 7): present only in hosted mode. */
+export interface HostedCreditsView {
+	/** Last balance the credit gate saw, in credits; null until a /credit answer carried one. */
+	balance: number | null;
+	/** Absolute control-plane account page (the chip's link; at zero it is the top-up path). */
+	accountUrl: string;
+}
+
 export interface StateResponse {
 	projects: ProjectView[];
 	/** Every project's open cards plus its Done window (OTTR-965): the newest DONE_PAGE
@@ -1404,6 +1412,8 @@ export interface StateResponse {
 	serviceQuotas?: readonly ServiceQuotaSourceState[];
 	/** Hosted mode (docs/specs/hosted-mode.md): the UI hides host-level panels and identity surfaces. Absent or false on every self-hosted board. */
 	hosted?: boolean;
+	/** Hosted mode's credits chip data: present only in hosted mode. */
+	credits?: HostedCreditsView;
 	/** True until the single admin exists (/api/setup); the UI shows the setup dialog then. */
 	onboarding: boolean;
 	/** Admin name for the top-bar user chip; null until /api/setup. */

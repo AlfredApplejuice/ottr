@@ -129,6 +129,7 @@ import {
 	UPDATE_HOLD_REASON,
 } from "./turn.ts";
 import type {
+	HostedCreditsView,
 	QuotaLimit,
 	QuotaState,
 	ServiceQuotaAdapterDefinition,
@@ -17660,6 +17661,7 @@ describe("update cycle control (OTTR-752)", () => {
 					creditOk: async () => true,
 					gitToken: async () => null,
 				},
+				creditBalance: { balance: 12.5 },
 			},
 		});
 		for (const path of ["/api/update", "/api/update/host"]) {
@@ -17676,8 +17678,15 @@ describe("update cycle control (OTTR-752)", () => {
 			await m.call("/api/state", undefined, {
 				"x-ottr-identity": signIdentity(secret, "acme", "owner"),
 			})
-		).json()) as { updateCycle: UpdateCycleView | null };
+		).json()) as {
+			updateCycle: UpdateCycleView | null;
+			credits?: HostedCreditsView;
+		};
 		expect(state.updateCycle).toBeNull();
+		expect(state.credits).toEqual({
+			balance: 12.5,
+			accountUrl: "http://127.0.0.1:9/account",
+		});
 	});
 
 	test("the real build-commit reader wins and only sha versions provide a fallback", async () => {
@@ -26427,6 +26436,7 @@ describe("service quota runtime integration", () => {
 					creditOk: async () => true,
 					gitToken: async () => null,
 				},
+				creditBalance: { balance: null },
 			},
 		});
 		m.app.checkServiceQuotas();
@@ -26436,7 +26446,13 @@ describe("service quota runtime integration", () => {
 		expect((await m.call("/api/state")).status).toBe(401);
 		const response = await m.call("/api/state", undefined, headers);
 		expect(response.status).toBe(200);
-		expect(await response.json()).not.toHaveProperty("serviceQuotas");
+		const payload = (await response.json()) as StateResponse;
+		expect(payload).not.toHaveProperty("serviceQuotas");
+		// Unknown balance: the chip data ships with a null balance.
+		expect(payload.credits).toEqual({
+			balance: null,
+			accountUrl: "http://127.0.0.1:9/account",
+		});
 		const ws = socketState(m.server, {
 			"x-ottr-identity": signIdentity(secret, "service-test", "owner"),
 		});
@@ -26537,7 +26553,10 @@ describe("service quota runtime integration", () => {
 	test("an empty self-hosted configuration publishes an empty source list", async () => {
 		const m = await mount();
 		m.app.checkServiceQuotas();
-		expect((await rawState(m)).serviceQuotas).toEqual([]);
+		const plain = await rawState(m);
+		expect(plain.serviceQuotas).toEqual([]);
+		// No hosted flag: no credits chip data, the self-hosted payload keeps its shape.
+		expect(plain).not.toHaveProperty("credits");
 	});
 
 	test("closing the app aborts an active source and prevents future reads", async () => {

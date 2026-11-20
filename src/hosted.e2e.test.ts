@@ -23,6 +23,7 @@ import { type App, createApp, type Entry } from "./app.ts";
 import { NonceCache, signIdentity, verifyIdentity } from "./auth.ts";
 import { GlobalStore } from "./globalStore.ts";
 import {
+	type CreditBalance,
 	controlPlaneHooks,
 	DEFAULT_CREDIT_REASON,
 	type Hosted,
@@ -132,6 +133,8 @@ interface ControlPlane {
 interface ControlPolicy {
 	/** The credit answer for the `calls`-th check (1-based). */
 	credit(calls: number): boolean | Promise<boolean>;
+	/** The credits balance the answers carry; undefined: the answer carries none. */
+	creditBalance?: () => number;
 	onMetering?(record: MeteringRecord): void;
 }
 
@@ -187,8 +190,10 @@ function startControlPlane(
 				cp.creditCalls += 1;
 				trace.push(`credit#${cp.creditCalls}`);
 				const ok = await policy.credit(cp.creditCalls);
+				const balance = policy.creditBalance?.();
 				queueMicrotask(wake);
-				return Response.json({ ok });
+				// An undefined balance drops the key, like today's control plane.
+				return Response.json({ ok, balance });
 			}
 			if (req.method === "POST" && path === `${base}/metering`) {
 				const record = (await req.json()) as MeteringRecord;
@@ -753,9 +758,14 @@ beforeAll(async () => {
 	});
 	if (config === null) throw new Error("hosted config did not parse");
 	const hookLogs: string[] = [];
+	const creditBalance: CreditBalance = { balance: null };
 	board = await mountBoard({
 		config,
-		hooks: controlPlaneHooks(config, { log: (m) => hookLogs.push(m) }),
+		hooks: controlPlaneHooks(config, {
+			log: (m) => hookLogs.push(m),
+			credit: creditBalance,
+		}),
+		creditBalance,
 	});
 	board.logs = hookLogs;
 });
@@ -1135,6 +1145,8 @@ describe("hosted credit stop and release end to end", () => {
 			// turn parks in the merge column, as in the first scenario.
 			credit: async () =>
 				balance() > 0 && !(await board2.store.listTasks()).some(mergeClaimed),
+			// A constant credits balance, so the chip data in the state frame is deterministic.
+			creditBalance: () => 37,
 			onMetering: (r) => {
 				const key = JSON.stringify(runKey(r));
 				spent.set(key, Math.max(spent.get(key) ?? 0, r.usage.cost));
@@ -1156,10 +1168,15 @@ describe("hosted credit stop and release end to end", () => {
 		});
 		if (config === null) throw new Error("hosted config did not parse");
 		const hookLogs: string[] = [];
+		const creditBalance: CreditBalance = { balance: null };
 		board2 = await mountBoard(
 			{
 				config,
-				hooks: controlPlaneHooks(config, { log: (m) => hookLogs.push(m) }),
+				hooks: controlPlaneHooks(config, {
+					log: (m) => hookLogs.push(m),
+					credit: creditBalance,
+				}),
+				creditBalance,
 			},
 			{
 				name: "credit",
@@ -1209,6 +1226,18 @@ describe("hosted credit stop and release end to end", () => {
 		expect(runningAtStop).toBe(1);
 		expect(kills).toEqual([stopChildren[0]!]);
 		expect(liveStopRuns.size).toBe(0);
+
+		// The gate's answer carried the stub's balance; the state frame ships it with
+		// the control plane's account page.
+		const state = await proxyFetch("/api/state", { to: board2 });
+		expect(state.status).toBe(200);
+		const payload = (await state.json()) as {
+			credits?: { balance: number | null; accountUrl: string };
+		};
+		expect(payload.credits).toEqual({
+			balance: 37,
+			accountUrl: new URL("/account", `${cp2.url}/`).toString(),
+		});
 
 		await eventually(
 			"card A to park",

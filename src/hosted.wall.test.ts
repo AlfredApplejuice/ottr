@@ -195,6 +195,7 @@ const hosted: Hosted = {
 		creditOk: async () => true,
 		gitToken: async () => null,
 	},
+	creditBalance: { balance: null },
 };
 
 /** What the proxy forwards: the tenant's public Host and Origin, plus a fresh signed header. */

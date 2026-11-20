@@ -944,6 +944,52 @@ textarea {
 		gap: 6px;
 	}
 }
+/* Hosted credits chip in the bar: the tenant's balance, a link to the control plane's
+   account page; at zero it names the hard stop (docs/specs/hosted-mode.md section 7).
+   Contrast holds AA 4.5:1 in both themes: --text on the bar's --chrome gives 9.5:1
+   (dark) and 9.6:1 (light); the empty pair reuses the .state-chip.warn tones at 6.7:1
+   and 4.7:1. The word change, not hue alone, carries the empty state. The global
+   :focus-visible steel ring stays; no rule here touches outlines. */
+.credits-chip {
+	display: inline-flex;
+	align-items: center;
+	flex: none;
+	max-width: 220px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 12px;
+	font-weight: 600;
+	padding: 3px 10px;
+	border-radius: 999px;
+	border: 1px solid var(--line-soft);
+	color: var(--text);
+	text-decoration: none;
+}
+.credits-chip:hover {
+	border-color: var(--line);
+}
+.credits-chip[data-empty] {
+	color: var(--alarm);
+	background: var(--alarm-bg);
+	border-color: var(--alarm-line);
+}
+.credits-chip .credits-short {
+	display: none;
+}
+/* The shortest phones swap the full sentence for the short label, so a 375px bar
+   never overflows. The title attribute always carries the full sentence. */
+@media (max-width: 380px) {
+	.credits-chip {
+		max-width: 40vw;
+	}
+	.credits-chip .credits-full {
+		display: none;
+	}
+	.credits-chip .credits-short {
+		display: inline;
+	}
+}
 .sb-twin .t {
 	position: relative;
 	height: 2px;

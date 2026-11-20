@@ -287,6 +287,7 @@ function fakeHosted(
 			},
 			gitToken: async () => null,
 		},
+		creditBalance: { balance: null },
 	};
 	return { hosted, reports, creditCalls: () => creditCalls };
 }

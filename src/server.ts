@@ -28,7 +28,12 @@ import { syncWorktreeTo } from "./gitHttp.ts";
 import { githubHost } from "./githubHost.ts";
 import type { CommitIdentity } from "./gitIdentity.ts";
 import { GlobalStore } from "./globalStore.ts";
-import { controlPlaneHooks, type Hosted, takeHostedConfig } from "./hosted.ts";
+import {
+	type CreditBalance,
+	controlPlaneHooks,
+	type Hosted,
+	takeHostedConfig,
+} from "./hosted.ts";
 import { startLlmGateway } from "./llmGateway.ts";
 import { agentDir, boardOmpEnv, boardOmpHome, turnListHome } from "./login.ts";
 import {
@@ -156,10 +161,16 @@ const PUBLIC_HOSTS = publicHosts();
  * exists. A half-set hosted env throws here and stops the boot.
  */
 const HOSTED = takeHostedConfig();
+/** The credits cell the credit gate records into, and the state payload reads per frame. */
+const creditBalance: CreditBalance = { balance: null };
 const hosted: Hosted | undefined =
 	HOSTED === null
 		? undefined
-		: { config: HOSTED, hooks: controlPlaneHooks(HOSTED) };
+		: {
+				config: HOSTED,
+				hooks: controlPlaneHooks(HOSTED, { credit: creditBalance }),
+				creditBalance,
+			};
 /** Production mode: the board is static (no WebSocket); UI bundles/minifies via Bun. */
 const PROD = process.env.NODE_ENV === "production";
 // Refuse an invalid OTTR_GITHUB_HOST at boot: every GitHub feature would otherwise aim at

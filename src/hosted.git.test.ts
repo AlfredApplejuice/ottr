@@ -521,6 +521,7 @@ describe("createApp network git credential", () => {
 				},
 			},
 			hooks,
+			creditBalance: { balance: null },
 		});
 		await withEnv("GH_TOKEN", GLOBAL, async () => {
 			await b.fetch();
@@ -568,6 +569,7 @@ const hostedCfg = (hooks: HostedHooks): Hosted => ({
 		},
 	},
 	hooks,
+	creditBalance: { balance: null },
 });
 
 /** A fetch stub that records each request's Authorization header and answers 404. */

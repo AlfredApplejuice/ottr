@@ -75,9 +75,11 @@ Session cookies and `X-API-Key` give no access in hosted mode. Provider sign-ins
 are off, and the board lends no provider OAuth token to turns (`LENT_ENV`): hosted model access
 uses API keys only.
 
-The state payload carries `hosted: true`, and `onboarding` is always false. The `/api/boot`
-payload also carries `hosted: true`, so the UI knows the mode before the first state frame.
-When the flag is off, the `/api/boot` payload has no `hosted` key.
+The state payload carries `hosted: true`, and `onboarding` is always false. It also carries
+`credits` (`{ balance, accountUrl }`), and `balance` is null until a `/credit` answer carried
+one. The `/api/boot` payload also carries `hosted: true`, so the UI knows the mode before the
+first state frame. When the flag is off, the `/api/boot` payload has no `hosted` key, and a
+state payload has no `credits` key.
 
 ## 4. Control-plane calls (tenant to control plane)
 
@@ -89,8 +91,13 @@ status. Thus the signed header and the body go to the configured origin only.
 | Call | Body | Answer | Use |
 |---|---|---|---|
 | `POST /metering` | `MeteringRecord` (JSON) | any 2xx | The cumulative usage of one agent run: interim records while the run is active, then one final record at turn settle. Fire-and-forget: a failure is logged and never blocks the run or the settle. The board does not retry. |
-| `GET /credit` | — | `{"ok": boolean}` | The pre-claim credit gate. |
+| `GET /credit` | — | `{"ok": boolean, "balance"?: number}` | The pre-claim credit gate. |
 | `POST /git-token` | `{"project": string, "remote": string}` | `{"token": string, "expiresAt": ISO-8601}`, or 404 when the project has no token | The per-project git credential (section 6). |
+
+The `/credit` answer may carry `balance`, the tenant's remaining credits. The field is a
+contract extension that waits on a matching ottr-cloud card, so today's control plane sends
+none and the chip stays hidden until it lands. A finite number records the new balance. Any
+other value keeps the last balance.
 
 `MeteringRecord`:
 
@@ -247,6 +254,17 @@ Details:
 - A lost session shows the offline banner, not the login page. The account menu has no
   "Signed in as" line and no Sign out.
 
+### Credits chip
+
+In hosted mode the top bar shows a credits chip. It shows the balance with one decimal, or
+"Out of credit — work stopped" at zero or below. The chip links to the control plane's
+`/account` page. The page URL comes from `OTTR_HOSTED_CONTROL_URL`, with no new env var.
+
+The balance updates when the credit gate answers `GET /credit`. The value reaches the chip on
+the state refresh the board already does, so the board adds no polling of its own. The chip
+renders only when a balance is known. With the flag off, the payload has no `credits` key, no
+chip DOM exists, and the board sends no new request (self-hosted stays byte-identical).
+
 ## 8. Forwarded GitHub events
 
 The control plane calls `POST /api/hosted/github-event` on the tenant when GitHub wakes it with
@@ -289,7 +307,8 @@ Watches:
 ## 9. Non-goals
 
 - No change to `src/prompts.ts`.
-- No credit ledger, prices, or balance display in ottr: the control plane owns them (M6).
+- No credit ledger or prices in ottr: the control plane owns them (M6). The credits chip
+  (section 7) shows the balance the control plane reports; ottr never computes one.
 - No GitHub App install flow: the control plane mints the tokens (M4).
 - No change to the boot-token and per-turn VM token paths.
 - No payload slimming or event filtering beyond `repository.full_name` — the control plane
