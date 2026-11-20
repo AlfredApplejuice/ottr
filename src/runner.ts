@@ -46,6 +46,7 @@ import { LOST_SESSION } from "./prompts.ts";
 import { requirementsListPath } from "./python.ts";
 import { PROGRESS_EVENT, watchProgress } from "./stryker.ts";
 import { formatBytes } from "./tmpsweep.ts";
+import { CARD_ENV_NOTE_NAME } from "./tokens.ts";
 import { toolsListPath } from "./tools.ts";
 import { projectTrustedLists } from "./trustedLists.ts";
 import type {
@@ -1619,7 +1620,8 @@ const VM_DENIED_ENV = /^(ANTHROPIC_|OPENAI_|GH_|GITHUB_|HINDSIGHT_)/;
 
 /** True when the env entry must not reach a microVM guest: denied names, lent names, git
  * auth names, secret values, the guest's own PATH/home/agent dir, the board-config pointer
- * the guest mounts no file for (OTTR-693), and OTTR_ names outside the turn flags. */
+ * the guest mounts no file for (OTTR-693), and OTTR_ names outside the turn flags and the
+ * card-env note (OTTR-1099). */
 function vmEnvDenied(
 	k: string,
 	v: string | undefined,
@@ -1638,7 +1640,8 @@ function vmEnvDenied(
 	if (k === "GIT_CONFIG_GLOBAL") return true;
 	if (
 		k.startsWith("OTTR_") &&
-		!/^OTTR_(RETRO|REVIEW|TRENDING|TEST_PG_URL|REQUIRE_PG_TESTS)$/.test(k)
+		!/^OTTR_(RETRO|REVIEW|TRENDING|TEST_PG_URL|REQUIRE_PG_TESTS)$/.test(k) &&
+		k !== CARD_ENV_NOTE_NAME
 	)
 		return true;
 	return false;

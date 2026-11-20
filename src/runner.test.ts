@@ -53,6 +53,7 @@ import {
 	workerTurnLists,
 } from "./runner.ts";
 import fc from "./test/properties.ts";
+import { CARD_ENV_NOTE } from "./tokens.ts";
 import type {
 	GitFacts,
 	Next,
@@ -5865,6 +5866,7 @@ describe("vmEnv", () => {
 			env: {
 				FOO: "bar",
 				OTTR_REVIEW: "1",
+				OTTR_CARD_ENV_NOTE: CARD_ENV_NOTE,
 				ANTHROPIC_API_KEY: "sk-ant",
 				ANTHROPIC_OAUTH_TOKEN: "lent-oauth",
 				ZAI_API_KEY: "zai-lent",
@@ -5889,6 +5891,7 @@ describe("vmEnv", () => {
 		expect(env).toEqual({
 			FOO: "bar",
 			OTTR_REVIEW: "1",
+			OTTR_CARD_ENV_NOTE: CARD_ENV_NOTE,
 			OTTR_SESSION_NAME: "Fix it",
 			OTTR_BOARD_URL: "http://ottr:8080",
 			OTTR_BOARD_TOKEN: "vm-token",
@@ -5911,6 +5914,23 @@ describe("vmEnv", () => {
 		});
 		expect(env).toEqual({
 			KEEP_ME: "1",
+			OTTR_BOARD_URL: "http://ottr:8080",
+			OTTR_BOARD_TOKEN: "vm-token",
+			OTTR_PROJECT: "p",
+			OTTR_TASK_ID: "P-1",
+		});
+	});
+
+	test("the card-env note rides to the guest; any other OTTR_ name stays out", () => {
+		const env = vmEnv({
+			env: { OTTR_CARD_ENV_NOTE: CARD_ENV_NOTE, OTTR_UNLISTED: "x" },
+			board,
+			boardUrl: "http://ottr:8080",
+			token: "vm-token",
+			layerEnv: null,
+		});
+		expect(env).toEqual({
+			OTTR_CARD_ENV_NOTE: CARD_ENV_NOTE,
 			OTTR_BOARD_URL: "http://ottr:8080",
 			OTTR_BOARD_TOKEN: "vm-token",
 			OTTR_PROJECT: "p",

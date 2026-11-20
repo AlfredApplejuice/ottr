@@ -12,6 +12,7 @@ Status: accepted 2026-11-12.
 - The board stores plain values in the config row as plain text (`envPlain`), apart from the sealed secrets (`envValues`).
 - A plain value is not redacted from logs. Secret values stay redacted as before.
 - A turn receives every listed name that has a value, plain or secret, as an environment variable. Missing names still go into the card log, as before.
+- A turn whose listed names have values also gets `OTTR_CARD_ENV_NOTE`. Its value tells the agent that eval cells cannot read the listed names (omp filters the eval kernel env) and that a value must come from a script run through bash. A bash child inherits the full turn env, so a script run through bash reaches every listed value.
 
 ## Boundaries and errors
 
@@ -28,6 +29,7 @@ Status: accepted 2026-11-12.
 - GET `/api/settings/env` returns `plain` for each row and `value` for a set plain row, never for a secret row.
 - POST of a plain name stores it in `envPlain`, and the value is not in the redaction list.
 - A turn of a project that lists a plain name gets it in its env.
+- A turn whose env.txt lists a name with a value gets `OTTR_CARD_ENV_NOTE` in its env; a project that lists no name gets none. A bash child of the turn reads the listed name's value.
 
 ## Non-goals
 
