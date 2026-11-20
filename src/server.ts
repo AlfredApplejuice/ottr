@@ -911,7 +911,7 @@ const loop = createTurnLoop(projects, {
 	// merge turn must not read a worker-plantable apt.txt from there
 	// (docs/specs/worker-list-isolation.md).
 	ensurePackages: (project) => ensureProjectPackages(project, turnListHome()),
-	turnEnv: (project, model) =>
+	turnEnv: (project, model, opts) =>
 		turnEnv(
 			project,
 			model,
@@ -924,6 +924,8 @@ const loop = createTurnLoop(projects, {
 				home: workersHome,
 				// Hosted model access is API keys only: no provider OAuth token is lent to turns.
 				lend: hosted === undefined,
+				// A scout omits the Settings values (OTTR-1028); every other turn gets them.
+				values: opts?.values,
 			},
 		),
 	// R5-1: a server-local turn reads tools.json and requirements.txt and installs under the

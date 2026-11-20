@@ -262,6 +262,8 @@ async function refreshedLent(
  * wins over a Settings value of the same name). A lending error stops the turn (fail closed).
  * `secrets` holds the lent values, which the run redacts from its log. `lend: false` (hosted
  * mode, docs/specs/hosted-mode.md section 3) lends no provider token: model access uses API keys.
+ * `values: false` (a trending scout, OTTR-1028) omits the Settings values: the scout reads
+ * third-party repository text and its env carries the lent provider token only.
  */
 export async function turnEnv(
 	project: string,
@@ -270,6 +272,7 @@ export async function turnEnv(
 	opts: Parameters<typeof lentProviderEnv>[1] & {
 		home?: string;
 		lend?: boolean;
+		values?: boolean;
 	} = {},
 ): Promise<{
 	env: Record<string, string>;
@@ -281,7 +284,10 @@ export async function turnEnv(
 	badModel?: string;
 	secrets: string[];
 }> {
-	const base = turnEnvValues(project, envValues, opts.home);
+	const base =
+		opts.values === false
+			? { env: {}, missing: [] }
+			: turnEnvValues(project, envValues, opts.home);
 	const lent: Lent =
 		opts.lend === false
 			? { env: {}, error: null }

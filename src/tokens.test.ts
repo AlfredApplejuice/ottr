@@ -556,4 +556,27 @@ describe("turnEnv", () => {
 			secrets: [],
 		});
 	});
+
+	test("values: false (a scout) lends the token but omits every Settings value", async () => {
+		const path = store();
+		addRow(path, "anthropic", {
+			access: "access-1",
+			refresh: "refresh-1",
+			expires: NOW + 8 * HOUR,
+		});
+		const h = home(path, ["ANTHROPIC_OAUTH_TOKEN", "SHARED", "ABSENT"]);
+		expect(
+			await turnEnv(
+				"proj",
+				"anthropic/claude-opus-5-5",
+				{ ANTHROPIC_OAUTH_TOKEN: "settings-value", SHARED: "s" },
+				{ dbPath: path, now: NOW, command, home: h, values: false },
+			),
+		).toEqual({
+			env: { ANTHROPIC_OAUTH_TOKEN: "access-1" },
+			missing: [],
+			credentialError: null,
+			secrets: ["access-1"],
+		});
+	});
 });

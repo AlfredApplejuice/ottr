@@ -162,6 +162,7 @@ interface Recorded {
 		sessionName?: string | null;
 		env?: Record<string, string>;
 		secrets?: readonly string[];
+		githubReadEnv?: Record<string, string>;
 		stripBoard?: boolean;
 		stripGithubToken?: boolean;
 		tools?: string | null;
@@ -417,6 +418,8 @@ function fakeOps(record: Recorded, overrides: FixtureOps = {}): TurnOps {
 			cwd: string;
 			prompt: string;
 			env?: Record<string, string>;
+			secrets?: readonly string[];
+			githubReadEnv?: Record<string, string>;
 			stripBoard?: boolean;
 			stripGithubToken?: boolean;
 			tools?: string | null;
@@ -817,6 +820,68 @@ describe("turn loop", () => {
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.branch).toBeNull();
+	});
+
+	test("a trending scout gets no served GitHub token and no Settings env values (OTTR-1028)", async () => {
+		const { store, record, loop } = await setup({
+			holdFollowUps: true,
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			// The harness turnEnv honors the values flag like the server's wiring: a scout
+			// asks for the lent token only, a work turn gets the Settings values too.
+			turnEnv: async (
+				_project: string,
+				_model: string | null,
+				opts?: { values?: boolean },
+			): Promise<{
+				env: Record<string, string>;
+				missing: string[];
+				secrets: string[];
+			}> =>
+				opts?.values === false
+					? { env: { LENT_TOKEN: "lent-1" }, missing: [], secrets: ["lent-1"] }
+					: {
+							env: { SETTINGS_SECRET: "s3cret", LENT_TOKEN: "lent-1" },
+							missing: ["ABSENT"],
+							secrets: ["lent-1"],
+						},
+			turnReadToken: async () => ({ host: "github.com", token: "read-tok" }),
+		});
+		const task = await store.createTask(
+			"Trending scout for demo\nread the bundle",
+			null,
+			"trending",
+		);
+
+		await loop.runTurn(store.name, task.id);
+
+		const run = record.runs[0]!;
+		// The lent provider token and the mark ride; no Settings value does.
+		expect(run.env).toEqual({ OTTR_TRENDING: "1", LENT_TOKEN: "lent-1" });
+		// The served read-only token stays on the server: no delivery field, no redaction
+		// entry (it is never delivered, so the run log cannot leak it).
+		expect(run.githubReadEnv).toBeUndefined();
+		expect(run.secrets).toEqual(["lent-1"]);
+	});
+
+	test("a work turn still gets the served token as githubReadEnv and its Settings values", async () => {
+		const { store, record, loop } = await setup({
+			holdFollowUps: true,
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			turnEnv: async () => ({
+				env: { SETTINGS_SECRET: "s3cret" },
+				missing: [],
+				secrets: [],
+			}),
+			turnReadToken: async () => ({ host: "github.com", token: "read-tok" }),
+		});
+		const task = await store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+
+		const run = record.runs[0]!;
+		expect(run.env?.SETTINGS_SECRET).toBe("s3cret");
+		expect(run.githubReadEnv).toEqual({ GH_TOKEN: "read-tok" });
+		expect(run.secrets).toEqual(["read-tok"]);
 	});
 
 	test("a retro proposal names its source card once by id and title", async () => {

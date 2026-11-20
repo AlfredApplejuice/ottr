@@ -1065,10 +1065,13 @@ export interface TurnOps {
 	 * The turn's env values and listed-but-valueless names (Settings values + env.txt lists): every
 	 * turn, worker dispatched or not. `model` is the worker turn's execution model (null for a
 	 * local run): its provider's sign-in token is lent. A `credentialError` stops the turn.
+	 * `values: false` (the trending scout) omits the Settings values: the scout's env carries
+	 * the lent provider token only (OTTR-1028).
 	 */
 	turnEnv?: (
 		project: string,
 		model: string | null,
+		opts?: { values?: boolean },
 	) => Promise<{
 		env: Record<string, string>;
 		missing: string[];
@@ -5493,6 +5496,9 @@ export function createTurnLoop(
 			id,
 			picked.vmTurn,
 			execModel,
+			// OTTR-1028: the scout reads third-party repository text, so it never sees
+			// the project's Settings env values.
+			!idn.scout,
 			log,
 		);
 		if (turnEnv === null) return null;
@@ -5724,17 +5730,23 @@ export function createTurnLoop(
 	/** The env values ride the run env into a worker too (the runner forwards them with the
 	 * rest of the child env), so every turn gets them and every card log names a listed name
 	 * that has no value. A microVM turn is lent nothing: its providers go through the board's
-	 * /llm proxy, so no provider token may ride its env (a null model lends none). Null: a
-	 * credential fault parked the card — fail closed, an empty error message included. */
+	 * /llm proxy, so no provider token may ride its env (a null model lends none).
+	 * `values: false` (the trending scout) omits the Settings values — the scout reads
+	 * third-party text and gets the lent token only — so the missing-names log line drops
+	 * with them. Null: a credential fault parked the card — fail closed, an empty error
+	 * message included. */
 	async function gateTurnEnv(
 		name: string,
 		store: ProjectStore,
 		id: string,
 		vmTurn: boolean,
 		execModel: string | null,
+		values: boolean,
 		log: (line: string) => void | Promise<void>,
 	): Promise<TurnEnvValues | null> {
-		const turnEnv = (await ops.turnEnv?.(name, vmTurn ? null : execModel)) ?? {
+		const turnEnv = (await ops.turnEnv?.(name, vmTurn ? null : execModel, {
+			values,
+		})) ?? {
 			env: {},
 			missing: [],
 		};
@@ -5919,7 +5931,9 @@ export function createTurnLoop(
 		// OTTR-876: the served read-only token joins the run's redaction secrets and, on
 		// worker/VM dispatch, rides githubReadEnv (applied after the strips on the target);
 		// a local run ignores it (docs/specs/turn-read-token.md).
-		const turnRead = (await ops.turnReadToken?.()) ?? null;
+		// OTTR-1028: a scout reads third-party repository text, so it gets no served token
+		// at all — its GitHub reads are the unauthenticated public ones the prompt names.
+		const turnRead = idn.scout ? null : ((await ops.turnReadToken?.()) ?? null);
 		return {
 			meter: ops.hosted !== undefined,
 			auditProvisioned: (sinceMs, rulesAtStart) =>
