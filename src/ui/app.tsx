@@ -131,6 +131,8 @@ import {
 	Mark,
 	Meter,
 	Modal,
+	type ModelPace,
+	modelPace,
 	ProjectLogo,
 	ProjectTag,
 	post,
@@ -2356,11 +2358,14 @@ function QuotaTwin({ limit }: { limit: QuotaState["limits"][number] }) {
 	);
 }
 
-/** The model field's quota chip: every window as a twin bar with its used percent; only a
- *  window past the band turns amber, a critical one red. */
+/** The model field's quota chip: every window as a twin bar with its used percent (only a
+ *  window past the band turns amber, a critical one red), then the model's pace pill: the
+ *  model menu's own note ("1d 13h ahead", "limit · back in 28m") for the window that stops
+ *  agents first, so a glance says whether the pick is good to go. */
 function modelQuotaChip(
 	limits: QuotaState["limits"],
 	worst: QuotaState["limits"][number] | null,
+	pace: ModelPace | null,
 ): ReactNode {
 	if (worst === null) return null;
 	return (
@@ -2374,6 +2379,11 @@ function modelQuotaChip(
 					</span>
 				</span>
 			))}
+			{pace !== null && (
+				<span className="model-pace qt-pace pace-pill" data-pace={pace.pace}>
+					{pace.label}
+				</span>
+			)}
 		</span>
 	);
 }
@@ -2505,12 +2515,15 @@ function ModelField({
 			: `Model: ${model}`;
 	const quota = useQuota();
 	// The budget of the model that would actually run: the pick, else the catalog default.
-	const limits = forModel(
-		quota?.limits ?? [],
-		base || catalog?.defaultModel || null,
-	);
+	const runSelector = base || catalog?.defaultModel || null;
+	const limits = forModel(quota?.limits ?? [], runSelector);
 	// The chip's color tracks the window that runs out first.
 	const worst = tightest(limits);
+	// The pace pill reads every limit: usageReset finds the binding reset across them.
+	const pace =
+		runSelector === null
+			? null
+			: modelPace(quota?.limits ?? [], runSelector, Date.now());
 	const pickModel = (selector: string): void => {
 		setModel(selector);
 		menu.close();
@@ -2536,7 +2549,7 @@ function ModelField({
 						<span className="field-head-name">Model</span>
 						{/* Every window as the top bar's twin bar (time gone over quota used) plus its used
 						    percent; only a window past the band turns amber, a critical one red. */}
-						{modelQuotaChip(limits, worst)}
+						{modelQuotaChip(limits, worst, pace)}
 					</span>
 					<ModelMenuTrigger menu={menu} label={fullLabel}>
 						<span className="model-name">
@@ -3963,11 +3976,15 @@ function laneColumnData(
 	return { col };
 }
 
-/** The project head's overflow menu: review, release, diagrams and settings, plus the popover trigger. */
+/** The project head's New task split button: New task, plus a chevron that opens the menu of
+ * review, release, diagrams, settings and Add draft. A gitless project cannot file tasks, so it
+ * keeps only a square trigger for the menu. */
 function ProjectMenu(p: {
 	project: ProjectView;
 	/** The provisioned user layer; null before the first provisioning answer. */
 	userLayer: ProvisioningResponse["userLayer"] | null;
+	compose: () => void;
+	composeDraft: () => void;
 	startReview: () => void;
 	showRelease: () => void;
 	showDiagrams: () => void;
@@ -3976,15 +3993,39 @@ function ProjectMenu(p: {
 	const reviewNote = skillGapNote(p.userLayer, "review");
 	return (
 		<>
-			<button
-				type="button"
-				className="project-more"
-				popoverTarget="project-more"
-				aria-label="More project actions"
-				title="More project actions"
-			>
-				<Icon name="more" />
-			</button>
+			{project.gitless ? (
+				<button
+					type="button"
+					className="project-more"
+					popoverTarget="project-more"
+					aria-label="More project actions"
+					title="More project actions"
+				>
+					<Icon name="more" />
+				</button>
+			) : (
+				<span className="new-split">
+					<button
+						type="button"
+						className="primary"
+						onClick={p.compose}
+						title="New task (N)"
+					>
+						<Icon name="plus" />
+						New task
+						<kbd>N</kbd>
+					</button>
+					<button
+						type="button"
+						className="primary project-more"
+						popoverTarget="project-more"
+						aria-label="More project actions"
+						title="More project actions"
+					>
+						<Icon name="chevron-down" size={14} />
+					</button>
+				</span>
+			)}
 			{/* biome-ignore lint/a11y/useKeyWithClickEvents lint/a11y/noStaticElementInteractions: the items are buttons; a click on one runs it, then this closes the menu */}
 			<div
 				id="project-more"
@@ -4058,16 +4099,46 @@ function ProjectMenu(p: {
 					<Icon name="gear" />
 					Project settings
 				</a>
+				{!project.gitless && (
+					<>
+						<hr />
+						<button
+							type="button"
+							className="ghost"
+							onClick={p.composeDraft}
+							title="Park an idea in the backlog (B)"
+						>
+							<Icon name="edit" />
+							Add draft
+							<kbd>B</kbd>
+						</button>
+					</>
+				)}
 			</div>
 		</>
 	);
 }
 
-/** The review state chip in the project meta line. */
+/** The review state chip in the project meta line; a running review links to its card. */
 function ReviewStateChip(p: {
 	review: ProjectView["archReview"];
 	target: string | null;
+	project: string;
+	open: (id: string) => void;
 }) {
+	const cardId = p.review?.runningCardId ?? null;
+	if (cardId !== null)
+		return (
+			<a
+				className="arch-live"
+				href={taskPath(p.project, cardId)}
+				title={`Open review card ${cardId}: a review is queued or running, or its findings are still open`}
+				onClick={(e) => navClick(e, () => p.open(cardId))}
+			>
+				Review in progress
+				<Icon name="chevron-right" size={13} />
+			</a>
+		);
 	return (
 		<span
 			className={p.review?.running ? "arch-live" : "arch-due"}
@@ -4089,7 +4160,7 @@ function ReviewStateChip(p: {
 }
 
 /** The project head's meta line: latest release, latest image, review state, open PRs, repo link. */
-function ProjectMeta(p: { project: ProjectView }) {
+function ProjectMeta(p: { project: ProjectView; open: (id: string) => void }) {
 	const project = p.project;
 	return (
 		<p className="project-meta">
@@ -4132,7 +4203,12 @@ function ProjectMeta(p: { project: ProjectView }) {
 				</a>
 			)}
 			{(project.archReview?.due || project.archReview?.running) && (
-				<ReviewStateChip review={project.archReview} target={project.target} />
+				<ReviewStateChip
+					review={project.archReview}
+					target={project.target}
+					project={project.name}
+					open={p.open}
+				/>
 			)}
 			{/* More than three open PRs collapse to one count link, mirroring prs.ts's PR_CHIP_MAX. */}
 			{project.openPrs != null &&
@@ -4550,7 +4626,7 @@ export function ProjectBoard({
 					<ProjectLogo project={project} />
 					<div className="project-id-text">
 						<h1 id="project-title">{projectLabel(project)}</h1>
-						<ProjectMeta project={project} />
+						<ProjectMeta project={project} open={open} />
 					</div>
 				</div>
 				<div className="project-actions">
@@ -4591,27 +4667,17 @@ export function ProjectBoard({
 						project={project}
 						onOpen={() => setShowJira(true)}
 					/>
-					{/* Project settings now lives in the menu, so every project gets the menu;
-					    review, release and diagrams stay conditional inside it. */}
+					{/* New task and the project menu form one split button; a gitless project
+					    keeps only the square menu trigger. */}
 					<ProjectMenu
 						project={project}
 						userLayer={userLayer ?? null}
+						compose={compose}
+						composeDraft={composeDraft}
 						startReview={() => setShowReview(true)}
 						showRelease={() => setShowRelease(true)}
 						showDiagrams={() => setShowDiagrams(true)}
 					/>
-					{!project.gitless && (
-						<button
-							type="button"
-							className="primary"
-							onClick={compose}
-							title="New task (N)"
-						>
-							<Icon name="plus" />
-							New task
-							<kbd>N</kbd>
-						</button>
-					)}
 				</div>
 			</header>
 			<ReleaseDialog
@@ -4819,7 +4885,6 @@ export function ProjectBoard({
 								parkedTotal={
 									c.key === "todo" ? counts.backlog.total : undefined
 								}
-								onAddDraft={c.key === "todo" ? composeDraft : undefined}
 								projectTasks={tasks}
 								foreignDeps={foreignDeps}
 								onRerelease={rerelease}
@@ -6191,7 +6256,6 @@ export function LaneCol({
 	draining,
 	parked,
 	parkedTotal,
-	onAddDraft,
 	more = 0,
 	onMore,
 	moreBusy = false,
@@ -6206,8 +6270,6 @@ export function LaneCol({
 	parked?: TaskCard[];
 	/** All parked (idle) backlog cards, ignoring the filter: the label count next to the Backlog label. */
 	parkedTotal?: number;
-	/** Todo lane only: opens the draft mask from the backlog row's Add draft button. */
-	onAddDraft?: () => void;
 	/** Done lane only: cards hidden behind the "Show more" button; 0 renders no button. */
 	more?: number;
 	onMore?: () => void;
@@ -6517,19 +6579,9 @@ export function LaneCol({
 						{parkedTotal !== undefined && (
 							<span className="backlog-count">{parkedTotal}</span>
 						)}
-						{onAddDraft && (
-							<button
-								type="button"
-								className="lane-add"
-								onClick={onAddDraft}
-								title="Park an idea in the backlog (B)"
-							>
-								<Icon name="plus" size={12} />
-								Add draft
-								<kbd>B</kbd>
-							</button>
-						)}
 					</p>
+					{/* Backlog empty (not just filtered away). */}
+					{parkedTotal === 0 && <p className="stage-empty">No drafts yet.</p>}
 				</>
 			)}
 			{parked?.map(card)}

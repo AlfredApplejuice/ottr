@@ -59,7 +59,7 @@ import {
 import { cachedRepoHomepage } from "./repoHomepage.ts";
 import { publicHosts } from "./requestGuards.ts";
 import { startRun, vmRunnerFromEnv, workerFromEnv } from "./runner.ts";
-import { archReviewView, lastFullReview, reviewBlocked } from "./scheduler.ts";
+import { archReviewView, blockingReview, lastFullReview } from "./scheduler.ts";
 import { loadSecretBox, type SecretBox } from "./secretBox.ts";
 import {
 	type AdoptResult,
@@ -466,12 +466,13 @@ async function refreshArchReview(e: Entry): Promise<void> {
 		e.target,
 		last === null ? null : last.base,
 	).catch(() => null);
-	const { cap, running } = await e.store.transaction(async () => ({
+	const { cap, runningCardId } = await e.store.transaction(async () => ({
 		cap: (await getSettingsLogged(e)).archReviewCap,
 		// Running: a review is queued or running, or its findings are still landing.
-		running: reviewBlocked(await e.store.listTasks()) !== null,
+		runningCardId: blockingReview(await e.store.listTasks())?.id ?? null,
 	}));
-	e.archReview = a === null ? null : archReviewView(last, a, cap, running);
+	e.archReview =
+		a === null ? null : archReviewView(last, a, cap, runningCardId);
 }
 
 /** Open-PR header chips re-probe gh at most this often; a PR opened between probes waits out the TTL. */

@@ -12,6 +12,7 @@ import { ARCH_REVIEW_MARKER, RULES_INTERVIEW_MARKER } from "./prompts.ts";
 import {
 	applyCheckVerdicts,
 	archReviewView,
+	blockingReview,
 	checkModelWarning,
 	checkRoleFor,
 	type DepIndex,
@@ -1458,6 +1459,8 @@ describe("reviewBlocked", () => {
 		expect(reviewBlocked([review, finding])).toBe(
 			"The last review's findings are not done yet.",
 		);
+		// The chip links to the review card, not the finding, while findings keep it open.
+		expect(blockingReview([review, finding])?.id).toBe(review.id);
 		const fixed = {
 			...finding,
 			stage: "done" as const,
@@ -1585,7 +1588,7 @@ describe("archReviewView", () => {
 			anchor,
 		});
 		expect(
-			archReviewView(lastFullReview([review]), delta("aaa"), 30, false),
+			archReviewView(lastFullReview([review]), delta("aaa"), 30, null),
 		).toEqual({
 			delta: 12,
 			reviewed: true,
@@ -1594,6 +1597,7 @@ describe("archReviewView", () => {
 			cap: 30,
 			due: false,
 			running: false,
+			runningCardId: null,
 		});
 		// The release ran after the full review, so it froze a newer base — but only a full
 		// review resets the counter: base and card id still name the full review.
@@ -1609,7 +1613,7 @@ describe("archReviewView", () => {
 			lastFullReview([review, release]),
 			delta("aaa"),
 			30,
-			false,
+			null,
 		);
 		expect(view.base).toBe("aaa");
 		expect(view.reviewCardId).toBe(review.id);
@@ -1629,7 +1633,7 @@ describe("archReviewView", () => {
 				lastFullReview([review]),
 				{ delta: 1, reviewed: true, anchor: "zzz" },
 				30,
-				false,
+				null,
 			),
 		).toEqual({
 			delta: 1,
@@ -1639,6 +1643,7 @@ describe("archReviewView", () => {
 			cap: 30,
 			due: false,
 			running: false,
+			runningCardId: null,
 		});
 	});
 
@@ -1648,7 +1653,7 @@ describe("archReviewView", () => {
 				lastFullReview([]),
 				{ delta: 9, reviewed: false, anchor: "" },
 				30,
-				false,
+				null,
 			),
 		).toEqual({
 			delta: 9,
@@ -1659,6 +1664,7 @@ describe("archReviewView", () => {
 			// An un-reviewed project is always due, whatever its history size.
 			due: true,
 			running: false,
+			runningCardId: null,
 		});
 	});
 });

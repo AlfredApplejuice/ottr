@@ -6520,6 +6520,7 @@ describe("idle auto review tick", () => {
 			cap: 1,
 			due: true,
 			running: false,
+			runningCardId: null,
 		};
 		opened.push(e);
 		return { m, e, dir, projects };

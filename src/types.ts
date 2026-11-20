@@ -991,6 +991,8 @@ export interface ArchReview {
 	due: boolean;
 	/** A live architecture-review task exists (queued or running): the due chip says so and Start review disables. */
 	running: boolean;
+	/** The review card that keeps `running` true (queued, running, or with open findings); null when nothing runs. */
+	runningCardId: string | null;
 }
 
 /** The repo's public ghcr.io container image, as shown in the project header chip. */

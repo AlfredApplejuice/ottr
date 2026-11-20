@@ -967,6 +967,12 @@ export function windowPace(
 	return { label: `${duration(Math.abs(lead))} ${pace}`, pace };
 }
 
+/** A model's quota note: the label and the pace class the pace colors key on. */
+export interface ModelPace {
+	label: string;
+	pace: "ahead" | "behind" | "on" | "full";
+}
+
 /** The quota note a model picker row shows for the model's provider: "limit · back in 2h 5m"
  *  while a window is used up (usageReset's binding reset), else the pace of the window that
  *  runs furthest ahead of its clock, the one that stops agents first. Null without windows. */
@@ -974,7 +980,7 @@ export function modelPace(
 	limits: QuotaLimit[],
 	selector: string,
 	now: number,
-): { label: string; pace: "ahead" | "behind" | "on" | "full" } | null {
+): ModelPace | null {
 	const mine = forModel(limits, selector);
 	if (mine.some((l) => l.usedPct >= 100)) {
 		const back = usageReset(limits, selector, now);

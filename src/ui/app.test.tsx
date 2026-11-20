@@ -799,22 +799,23 @@ describe("LaneCol backlog divider", () => {
 		expect(html).toContain("lane-divider");
 		expect(html).toContain("Backlog");
 		expect(html).not.toContain("Nothing waiting.");
+		expect(html).not.toContain("No drafts yet.");
 	});
 
-	test("an empty todo lane still shows the backlog row", () => {
+	test("an empty backlog shows a placeholder", () => {
 		const html = renderToStaticMarkup(
-			<LaneCol
-				{...base}
-				stage="todo"
-				tasks={[]}
-				parked={[]}
-				parkedTotal={0}
-				onAddDraft={() => {}}
-			/>,
+			<LaneCol {...base} stage="todo" tasks={[]} parked={[]} parkedTotal={0} />,
 		);
 		expect(html).toContain("Backlog");
-		expect(html).toContain("Add draft");
+		expect(html).toContain("No drafts yet.");
 		expect(html).toContain("Nothing waiting.");
+	});
+
+	test("a backlog filtered to nothing shows no empty placeholder", () => {
+		const html = renderToStaticMarkup(
+			<LaneCol {...base} stage="todo" tasks={[]} parked={[]} parkedTotal={3} />,
+		);
+		expect(html).not.toContain("No drafts yet.");
 	});
 
 	test("a non-todo lane with no cards stays stage-empty", () => {
@@ -8126,6 +8127,7 @@ describe("ProjectBoard skill-gap markers", () => {
 		cap: 3,
 		due: false,
 		running: false,
+		runningCardId: null as string | null,
 	};
 	const project = {
 		name: "proj",
@@ -8151,6 +8153,8 @@ describe("ProjectBoard skill-gap markers", () => {
 	async function mountBoard(
 		userLayer: UserLayer,
 		due = false,
+		runningCardId: string | null = null,
+		open: (id: string) => void = () => {},
 	): Promise<{
 		container: HTMLDivElement;
 		unmount: () => Promise<void>;
@@ -8160,14 +8164,22 @@ describe("ProjectBoard skill-gap markers", () => {
 		) as unknown as HTMLDivElement;
 		window.document.body.appendChild(container as unknown as HappyNode);
 		const root = createRoot(container);
-		const boardProject = { ...project, archReview: { ...archReview, due } };
+		const boardProject = {
+			...project,
+			archReview: {
+				...archReview,
+				due,
+				running: runningCardId !== null,
+				runningCardId,
+			},
+		};
 		await act(async () => {
 			root.render(
 				<ProjectBoard
 					project={boardProject}
 					tasks={[]}
 					deltas={new Map()}
-					open={() => {}}
+					open={open}
 					seenAnswers={new Set()}
 					seenDoneSince={0}
 					compose={() => {}}
@@ -8200,6 +8212,32 @@ describe("ProjectBoard skill-gap markers", () => {
 		if (b === undefined) throw new Error(`no "${text}" button`);
 		return b;
 	};
+
+	test("a running review's chip links to its card and opens it in place", async () => {
+		const opened: string[] = [];
+		const { container, unmount } = await mountBoard(
+			{ skills: [], plugins: [], rules: [], mcp: [] },
+			false,
+			"R-7",
+			(id) => opened.push(id),
+		);
+		try {
+			const chip = container.querySelector(".project-meta a.arch-live");
+			if (chip === null) throw new Error("no review chip link");
+			expect(chip.textContent).toBe("Review in progress");
+			expect(chip.getAttribute("href")).toBe("/projects/proj/tasks/R-7");
+			await act(async () => {
+				onClickOf(chip)({
+					button: 0,
+					preventDefault() {},
+					currentTarget: { pathname: "/projects/proj/tasks/R-7" },
+				});
+			});
+			expect(opened).toEqual(["R-7"]);
+		} finally {
+			await unmount();
+		}
+	});
 
 	test("an incomplete layer appends the note to the review and release titles and shows the marks", async () => {
 		const { container, unmount } = await mountBoard({

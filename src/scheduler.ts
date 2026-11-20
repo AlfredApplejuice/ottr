@@ -359,20 +359,30 @@ export function findingsSettledAt(
 	return at ?? review.doneAt;
 }
 
-/** Why a new review (Review button or Create release) cannot start, else null. One review at a
- * time, and a review stays open until its findings are done: two open reviews would hold each
- * other's findings and deadlock. */
-export function reviewBlocked(tasks: readonly ReviewTask[]): string | null {
+/** The review card that stops a new review (Review button or Create release), with the reason,
+ * else null. One review at a time, and a review stays open until its findings are done: two open
+ * reviews would hold each other's findings and deadlock. */
+export function blockingReview(
+	tasks: readonly ReviewTask[],
+): { id: string; reason: string } | null {
 	for (const r of tasks) {
 		if (r.cancelledAt !== null || !isReview(r)) continue;
 		if (r.releaseVersion !== null && r.stage !== "done")
-			return "A release is already in progress.";
+			return { id: r.id, reason: "A release is already in progress." };
 		if (r.stage === "todo" || r.stage === "in_progress")
-			return "A review is already in progress.";
+			return { id: r.id, reason: "A review is already in progress." };
 		if (r.stage === "merging" || findingsOpen(tasks, r))
-			return "The last review's findings are not done yet.";
+			return {
+				id: r.id,
+				reason: "The last review's findings are not done yet.",
+			};
 	}
 	return null;
+}
+
+/** Why a new review cannot start, else null; see blockingReview. */
+export function reviewBlocked(tasks: readonly ReviewTask[]): string | null {
+	return blockingReview(tasks)?.reason ?? null;
 }
 
 /** The commit the newest finished review saw (its frozen base), else null: the watermark that the
@@ -456,7 +466,7 @@ export function archReviewView(
 	last: { id: string; base: string } | null,
 	a: { delta: number; reviewed: boolean; anchor: string },
 	cap: number,
-	running: boolean,
+	runningCardId: string | null,
 ): ArchReview {
 	return {
 		delta: a.delta,
@@ -465,7 +475,8 @@ export function archReviewView(
 		reviewCardId: last !== null && last.base === a.anchor ? last.id : null,
 		cap,
 		due: archReviewDue(a.delta, cap, a.reviewed),
-		running,
+		running: runningCardId !== null,
+		runningCardId,
 	};
 }
 
