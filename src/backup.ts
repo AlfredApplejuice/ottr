@@ -468,7 +468,12 @@ function removeCopyIn(d: Dir, copyName: string): void {
 		rmSync(d.at(name), { force: true });
 }
 
-function moveAsideIn(
+/** Moves an existing target, and its -wal and -shm files, aside in the held dir `d`. Both
+ * renames run through `d.at`, so they resolve no parent again: a parent dir that a worker
+ * swapped for a symlink after the walk receives nothing, the aside name is taken only in
+ * the held dir, and a planted symlink at a name is renamed itself, never followed.
+ * Exported for the restore tests. */
+export function moveAsideIn(
 	d: Dir,
 	name: string,
 	now: Date,
