@@ -834,7 +834,12 @@ real podman.
   for example `ALATE_URL=http://alate:4570` and a random `ALATE_API_KEY` (32
   hex bytes); the alate container itself requires the same key. The board
   never logs the key, and the runner strips it from every turn's env, since
-  no turn calls alate. A user whose Alate server already runs on another host
+  no turn calls alate. The service pins `GIT_CONFIG_GLOBAL` to `/dev/null`. The
+  workers share the `home` volume and can plant `/root/.gitconfig` there. A
+  planted credential helper, `insteadOf` redirect or protocol allowance must
+  not run in the container that holds `ALATE_API_KEY`. The home holds no
+  legitimate git config (the entry script never copies from it), so the pin
+  removes only the plant vector. A user whose Alate server already runs on another host
   omits the profile and saves the URL and key under **Settings -> Alate**.
   The service also mounts the stack's `workspace` volume at `/workspace`
   (`workspace:/workspace` in `docker-compose.yml`), the same volume the board

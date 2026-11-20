@@ -580,6 +580,13 @@ services:
       ALATE_API_KEY: ${ALATE_API_KEY:-}
       # Layer mode on (docs/specs/agent-layer-switch.md): layers with an atomic switch, not the flat home.
       ALATE_LAYER: "1"
+      # R5-1: the workers share the home volume and can plant /root/.gitconfig. This
+      # service holds ALATE_API_KEY, which the board strips from every turn's env
+      # (src/runner.ts, src/workers.ts), so a planted credential helper, insteadOf
+      # redirect or protocol allowance must not run here. The home holds no legit git
+      # config (the entry script never copies from it), so the pin removes only the
+      # plant vector.
+      GIT_CONFIG_GLOBAL: /dev/null
     ports:
       - "127.0.0.1:4570:4570"
 
