@@ -8124,6 +8124,382 @@ describe("ProjectBoard done lane time view", () => {
 		}
 	});
 
+	/** A React onChange picks up programmatic edits only through the native value setter (see settings.test.tsx). */
+	const typeInto = (el: HTMLInputElement, value: string): void => {
+		const setter = Object.getOwnPropertyDescriptor(
+			window.HTMLInputElement.prototype,
+			"value",
+		)?.set;
+		if (setter === undefined) throw new Error("value setter missing");
+		setter.call(el, value);
+	};
+
+	/** Dispatched input events never reach React's ChangeEventPlugin: call the production onChange. */
+	const onChangeOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onChange?: (e: unknown) => void;
+		};
+		if (props.onChange === undefined) throw new Error("node has no onChange");
+		return props.onChange;
+	};
+
+	test("a search query fetches the server's matching Done cards", async () => {
+		// The state holds only the Done window (OTTR-965): 20 held cards here, none
+		// matching, while the one card that matches "prompt" lives only on the
+		// server's page for the query. Typing must fetch it, the head and the search
+		// count must read the server's total, and clearing must restore the held
+		// window with no fetch for the empty query.
+		const held = Array.from({ length: 20 }, (_, j) =>
+			cardFixture({
+				id: `d${j}`,
+				title: "plain j",
+				stage: "done",
+				state: "idle",
+				doneAt: j + 1,
+			}),
+		);
+		const found = cardFixture({
+			id: "o0",
+			title: "fix the prompt flow",
+			sessionTitle: "fix the prompt flow",
+			stage: "done",
+			state: "idle",
+			doneAt: -50,
+		});
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const project = {
+			name: "proj",
+			hasRules: true,
+			github: null,
+			gitless: false,
+			dirty: false,
+			archReview: null,
+			latestRelease: null,
+			latestImage: null,
+			doneTotal: 61,
+			settings: { setupChecklist: false },
+			sessionsDir: "/tmp/s",
+		} as unknown as ProjectView;
+		const realFetch = globalThis.fetch;
+		const fetches: string[] = [];
+		globalThis.fetch = (async (url: RequestInfo | URL) => {
+			const u = String(url);
+			if (u === "/api/projects/proj/done?page=1&q=prompt") {
+				fetches.push(u);
+				return new Response(JSON.stringify({ tasks: [found], total: 1 }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectBoard
+						project={project}
+						tasks={held}
+						deltas={new Map()}
+						open={() => {}}
+						seenAnswers={new Set()}
+						seenDoneSince={0}
+						compose={() => {}}
+						composeDraft={() => {}}
+						act={async () => true}
+						onNotice={() => {}}
+						draining={false}
+					/>,
+				);
+			});
+			const lane = container.querySelector('[data-stage="done"]');
+			expect(lane).not.toBeNull();
+			const ids = (): string[] =>
+				[...lane!.querySelectorAll("[data-task-id]")].map(
+					(el) => el.getAttribute("data-task-id") ?? "",
+				);
+			const input = container.querySelector(
+				'input[aria-label="Search tasks"]',
+			) as HTMLInputElement;
+			// Before typing: no search fetch, the held window and the plain "Show more".
+			expect(fetches).toEqual([]);
+			expect(ids()).toEqual([...held].sort(newestLanded).map((t) => t.id));
+			expect(lane!.querySelector("button.lane-more")).not.toBeNull();
+			await act(async () => {
+				typeInto(input, "prompt");
+				onChangeOf(input)({ target: { value: "prompt" } });
+			});
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS + 100);
+			});
+			// The query fetched the server's page, and the only matching card renders
+			// below the held window's absence: the lane reads the server answer.
+			expect(fetches).toEqual(["/api/projects/proj/done?page=1&q=prompt"]);
+			expect(ids()).toEqual(["o0"]);
+			expect(lane!.querySelector(".count")?.textContent).toBe("1/1");
+			expect(container.querySelector(".search-count")?.textContent).toBe(
+				"1/61",
+			);
+			// Clearing the box brings the held window back, with no fetch for the
+			// empty query.
+			await act(async () => {
+				typeInto(input, "");
+				onChangeOf(input)({ target: { value: "" } });
+			});
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS + 100);
+			});
+			expect(fetches).toEqual(["/api/projects/proj/done?page=1&q=prompt"]);
+			expect(ids()).toEqual([...held].sort(newestLanded).map((t) => t.id));
+			expect(lane!.querySelector("button.lane-more")).not.toBeNull();
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("a late answer for an old query is dropped", async () => {
+		// The "prompt" answer resolves only after the query moved on to "other": the
+		// newer query owns the lane, so the stale answer must not render its card.
+		const held = Array.from({ length: 20 }, (_, j) =>
+			cardFixture({
+				id: `d${j}`,
+				title: "plain j",
+				stage: "done",
+				state: "idle",
+				doneAt: j + 1,
+			}),
+		);
+		const promptCard = cardFixture({
+			id: "o0",
+			title: "fix the prompt flow",
+			sessionTitle: "fix the prompt flow",
+			stage: "done",
+			state: "idle",
+			doneAt: -50,
+		});
+		const otherCard = cardFixture({
+			id: "o1",
+			title: "other thing",
+			sessionTitle: "other thing",
+			stage: "done",
+			state: "idle",
+			doneAt: -60,
+		});
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const project = {
+			name: "proj",
+			hasRules: true,
+			github: null,
+			gitless: false,
+			dirty: false,
+			archReview: null,
+			latestRelease: null,
+			latestImage: null,
+			doneTotal: 61,
+			settings: { setupChecklist: false },
+			sessionsDir: "/tmp/s",
+		} as unknown as ProjectView;
+		const realFetch = globalThis.fetch;
+		const fetches: string[] = [];
+		const promptPage = Promise.withResolvers<Response>();
+		globalThis.fetch = (async (url: RequestInfo | URL) => {
+			const u = String(url);
+			if (u === "/api/projects/proj/done?page=1&q=prompt") {
+				fetches.push(u);
+				return promptPage.promise;
+			}
+			if (u === "/api/projects/proj/done?page=1&q=other") {
+				fetches.push(u);
+				return new Response(JSON.stringify({ tasks: [otherCard], total: 1 }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectBoard
+						project={project}
+						tasks={held}
+						deltas={new Map()}
+						open={() => {}}
+						seenAnswers={new Set()}
+						seenDoneSince={0}
+						compose={() => {}}
+						composeDraft={() => {}}
+						act={async () => true}
+						onNotice={() => {}}
+						draining={false}
+					/>,
+				);
+			});
+			const lane = container.querySelector('[data-stage="done"]');
+			const ids = (): string[] =>
+				[...lane!.querySelectorAll("[data-task-id]")].map(
+					(el) => el.getAttribute("data-task-id") ?? "",
+				);
+			const input = container.querySelector(
+				'input[aria-label="Search tasks"]',
+			) as HTMLInputElement;
+			await act(async () => {
+				typeInto(input, "prompt");
+				onChangeOf(input)({ target: { value: "prompt" } });
+			});
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS + 100);
+			});
+			// The prompt fetch went out and is still waiting for its answer.
+			expect(fetches).toEqual(["/api/projects/proj/done?page=1&q=prompt"]);
+			// The query moves on; "other" answers at once while prompt stays pending.
+			await act(async () => {
+				typeInto(input, "other");
+				onChangeOf(input)({ target: { value: "other" } });
+			});
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS + 100);
+			});
+			expect(fetches).toEqual([
+				"/api/projects/proj/done?page=1&q=prompt",
+				"/api/projects/proj/done?page=1&q=other",
+			]);
+			expect(ids()).toEqual(["o1"]);
+			// The stale prompt answer lands late: the newer query discards it.
+			await act(async () => {
+				promptPage.resolve(
+					new Response(JSON.stringify({ tasks: [promptCard], total: 1 }), {
+						status: 200,
+						headers: { "content-type": "application/json" },
+					}),
+				);
+				await Bun.sleep(50);
+			});
+			expect(ids()).toEqual(["o1"]);
+			expect(lane!.querySelector(".count")?.textContent).toBe("1/1");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("a failed search fetch shows the retry line and Retry refetches", async () => {
+		// A rejected fetch (server down, blocked request) fails the lane the same way
+		// a non-ok answer does: the short error shows, the held window stays, and the
+		// Retry button refetches page 1 of the query that still stands.
+		const held = Array.from({ length: 4 }, (_, j) =>
+			cardFixture({
+				id: `d${j}`,
+				title: "plain j",
+				sessionTitle: "plain j",
+				stage: "done",
+				state: "idle",
+				doneAt: j + 1,
+			}),
+		);
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const project = {
+			name: "proj",
+			hasRules: true,
+			github: null,
+			gitless: false,
+			dirty: false,
+			archReview: null,
+			latestRelease: null,
+			latestImage: null,
+			doneTotal: 4,
+			settings: { setupChecklist: false },
+			sessionsDir: "/tmp/s",
+		} as unknown as ProjectView;
+		const realFetch = globalThis.fetch;
+		const fetches: string[] = [];
+		globalThis.fetch = (async (url: RequestInfo | URL) => {
+			const u = String(url);
+			if (u === "/api/projects/proj/done?page=1&q=prompt") {
+				fetches.push(u);
+				throw new Error("blocked");
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectBoard
+						project={project}
+						tasks={held}
+						deltas={new Map()}
+						open={() => {}}
+						seenAnswers={new Set()}
+						seenDoneSince={0}
+						compose={() => {}}
+						composeDraft={() => {}}
+						act={async () => true}
+						onNotice={() => {}}
+						draining={false}
+					/>,
+				);
+			});
+			const lane = container.querySelector('[data-stage="done"]');
+			expect(lane).not.toBeNull();
+			const input = container.querySelector(
+				'input[aria-label="Search tasks"]',
+			) as HTMLInputElement;
+			await act(async () => {
+				typeInto(input, "prompt");
+				onChangeOf(input)({ target: { value: "prompt" } });
+			});
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS + 100);
+			});
+			// The rejection shows the short error with its retry control. The lane reads
+			// the server answer only: with the page failed and no answer, it holds no
+			// cards and never poses the empty lane as a complete result.
+			expect(fetches).toEqual(["/api/projects/proj/done?page=1&q=prompt"]);
+			expect(container.textContent).toContain("Search failed");
+			expect(lane!.querySelector("button.lane-retry")).not.toBeNull();
+			expect(lane!.textContent).toContain("No matches.");
+			expect(lane!.querySelectorAll("[data-task-id]")).toHaveLength(0);
+			// Retry refetches the same page 1 of the standing query.
+			const retry = lane!.querySelector<HTMLButtonElement>("button.lane-retry");
+			await act(async () => {
+				retry!.click();
+			});
+			await act(async () => {});
+			expect(fetches).toEqual([
+				"/api/projects/proj/done?page=1&q=prompt",
+				"/api/projects/proj/done?page=1&q=prompt",
+			]);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
 	test("the Starred section stays collapsible in the time view", async () => {
 		const doneCards = [
 			cardFixture({ id: "d0", stage: "done", state: "idle", doneAt: 1 }),

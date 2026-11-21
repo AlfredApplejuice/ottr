@@ -3912,6 +3912,27 @@ a.pr-link:hover {
 	border-style: solid;
 	color: var(--text);
 }
+/* Done lane search status: the server-side search's "Searching…" line and the
+   failed-page retry; both sit where "Show more" renders. */
+.lane-status {
+	margin: 2px 0 0;
+	font-size: 11px;
+	color: var(--dim);
+}
+.lane-retry {
+	margin-left: 6px;
+	padding: 2px 8px;
+	font-size: 11px;
+	color: var(--dim);
+	background: transparent;
+	border: 1px dashed var(--line-soft);
+	border-radius: 4px;
+	cursor: pointer;
+}
+.lane-retry:hover {
+	border-style: solid;
+	color: var(--text);
+}
 /* Boundary between pinned groups (unread, starred, backlog) and the rest: space, not a
    rule. The group labels already name each block, so the extra gap against the 6px
    card gap is enough separation. */

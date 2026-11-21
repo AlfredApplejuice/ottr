@@ -15900,6 +15900,65 @@ describe("slim state and done pages (OTTR-965)", () => {
 		expect((await m.call("/api/projects/nope/done?page=1")).status).toBe(404);
 	});
 
+	test("the done endpoint filters by the search query q", async () => {
+		const { st, projects } = await slimBoard("slim-search");
+		const m = await mount({ projects });
+		const base = Date.now();
+		// The three matches land oldest, so the unfiltered page 1 cannot contain
+		// them: only a server-side filter over the whole lane can find them.
+		const prompt1 = await seedDone(st, "fix the prompt handling", base);
+		const prompt2 = await seedDone(st, "prompt drain check", base + 1);
+		const prompt3 = await seedDone(st, "second prompt fix", base + 2);
+		for (let i = 0; i < 57; i++) await seedDone(st, `done ${i}`, base + 10 + i);
+		const matched = new Set([prompt1, prompt2, prompt3]);
+		const promptLanded = (await st.listTasks())
+			.filter((t) => matched.has(t.id))
+			.sort((a, b) => newestLanded(a, b))
+			.map((t) => t.id);
+
+		const hit = (await (
+			await m.call("/api/projects/slim-search/done?q=prompt&page=1")
+		).json()) as { tasks: Array<{ id: string }>; total: number };
+		expect(hit.total).toBe(3);
+		expect(hit.tasks.map((t) => t.id)).toEqual(promptLanded);
+
+		// matchesQuery trims and lowercases, so the raw input finds the same cards.
+		const loose = (await (
+			await m.call(
+				`/api/projects/slim-search/done?q=${encodeURIComponent("  PROMPT  ")}&page=1`,
+			)
+		).json()) as { tasks: Array<{ id: string }>; total: number };
+		expect(loose.total).toBe(3);
+		expect(loose.tasks.map((t) => t.id)).toEqual(promptLanded);
+
+		// An empty q behaves as today: the unfiltered lane with its settled total.
+		const empty = (await (
+			await m.call("/api/projects/slim-search/done?q=&page=2")
+		).json()) as { tasks: Array<{ id: string }>; total: number };
+		const landed = (await st.listTasks())
+			.sort((a, b) => newestLanded(a, b))
+			.map((t) => t.id);
+		expect(empty.total).toBe(60);
+		expect(empty.tasks.map((t) => t.id)).toEqual(
+			landed.slice(DONE_PAGE, 2 * DONE_PAGE),
+		);
+	});
+
+	test("the done endpoint rejects a bad q", async () => {
+		const { st, projects } = await slimBoard("slim-bad-q");
+		const m = await mount({ projects });
+		await seedDone(st, "one done card", Date.now());
+		// Two q values are not one string, and 201 characters is past the query
+		// bound: both answer 400 before the page reads the store.
+		expect((await m.call("/api/projects/slim-bad-q/done?q=a&q=b")).status).toBe(
+			400,
+		);
+		expect(
+			(await m.call(`/api/projects/slim-bad-q/done?q=${"a".repeat(201)}`))
+				.status,
+		).toBe(400);
+	});
+
 	test("the project view carries doneTotal, the settled count", async () => {
 		const { st, projects } = await slimBoard("slim-total");
 		const base = Date.now();

@@ -271,6 +271,7 @@ import {
 	releasePrompt,
 	reviewPrompt,
 	rulesInterviewPrompt,
+	shortTitle,
 	WORK_CHECK_MAX_SENDBACKS,
 	workCheckSendBack,
 	workCheckSendBackDirection,
@@ -343,7 +344,7 @@ import {
 	createServiceQuotaCoordinator,
 	type ServiceQuotaCoordinatorOptions,
 } from "./serviceQuotas.ts";
-import { sessionContext } from "./session.ts";
+import { cleanTitle, sessionContext } from "./session.ts";
 import {
 	type AskDraft,
 	type BoardTurnFacts,
@@ -428,7 +429,7 @@ import {
 	VERSION_RE,
 } from "./types.ts";
 import board from "./ui/index.html";
-import { SLOT_STAGES, slotUse } from "./ui/queue.ts";
+import { matchesQuery, SLOT_STAGES, slotUse } from "./ui/queue.ts";
 import {
 	isUpdateCommit,
 	parseUpdateHostHeartbeat,
@@ -5810,18 +5811,49 @@ export async function createApp(deps: AppDeps) {
 	/** One page of the project's done and cancelled cards, newest landed first (OTTR-965):
 	 * the same slim cards and landed order the state's Done window ships. `total` is the
 	 * project's whole settled count, so the board's "Show more" knows what stays hidden.
-	 * A page past the end answers an empty list. */
+	 * A non-empty `q` filters the lane first (OTTR-1135), so `total` then counts the
+	 * matches and "Show more" keeps its meaning. A page past the end answers an empty
+	 * list. */
 	async function donePage(
 		e: Entry,
 		page: number,
+		q = "",
 	): Promise<{ tasks: TaskCard[]; total: number }> {
-		const settled = (await e.store.listTasks()).filter(
+		let settled = (await e.store.listTasks()).filter(
 			(t) => t.stage === "done" || t.cancelledAt !== null,
 		);
+		// The board search reads the whole lane, not only the state window's newest
+		// cards: the filter runs before the total and the slice (OTTR-1135). It
+		// matches the card's own display name — the stored title, else the short
+		// prompt line, exactly what frozenTitleFrom resolves for a done card without
+		// its per-card store queries — so the server finds what the lane's client
+		// filter would keep, and a fetched match survives the board's re-filter.
+		const searchCtx = q === "" ? null : await projectCardCtx(e);
+		if (searchCtx !== null) {
+			const matched: ListedTask[] = [];
+			let scanned = 0;
+			for (const t of settled) {
+				const stored = searchCtx.facts.titles.get(t.id) ?? null;
+				if (
+					matchesQuery(
+						{
+							id: t.id,
+							sessionTitle:
+								stored !== null ? cleanTitle(stored) : shortTitle(t.title),
+							title: t.title,
+						},
+						q,
+					)
+				)
+					matched.push(t);
+				if (++scanned % 100 === 0) await yieldLoop();
+			}
+			settled = matched;
+		}
 		const total = settled.length;
 		settled.sort((a, b) => newestLanded(a, b));
 		const slice = settled.slice((page - 1) * DONE_PAGE, page * DONE_PAGE);
-		const ctx = await projectCardCtx(e);
+		const ctx = searchCtx ?? (await projectCardCtx(e));
 		const tasks: TaskCard[] = [];
 		let built = 0;
 		for (const t of slice) {
@@ -8853,7 +8885,16 @@ export async function createApp(deps: AppDeps) {
 		const page = raw === null ? 1 : Number(raw);
 		if (page < 1)
 			return json({ error: "page must be a positive integer" }, 400);
-		return json(await donePage(e, page));
+		// One q, at most 200 characters: anything else is not a query the board
+		// search could run server-side (OTTR-1135).
+		const values = new URL(req.url).searchParams.getAll("q");
+		const q = values[0] ?? "";
+		if (values.length > 1 || q.length > 200)
+			return json(
+				{ error: "q must be a string of at most 200 characters" },
+				400,
+			);
+		return json(await donePage(e, page, q));
 	}
 
 	async function handlePOSTProjectsReleaseSummaryByProject(

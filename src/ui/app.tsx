@@ -4621,6 +4621,20 @@ export function ProjectBoard({
 	// cards the state already carries, so counting the held cards stalls the number
 	// and "Show more" repeats one page forever. Each successful fetch advances it.
 	const [nextDonePage, setNextDonePage] = useState(2);
+	// The server-side Done search (OTTR-1135): the state holds only a slice, so a
+	// query reads the server's matching pages instead of filtering the loaded
+	// window. null = no active search; the query-change effect fills it.
+	const [searched, setSearched] = useState<{
+		q: string;
+		tasks: TaskCard[];
+		total: number;
+		page: number;
+	} | null>(null);
+	const [searchBusy, setSearchBusy] = useState(false);
+	const [searchFailed, setSearchFailed] = useState(false);
+	// The query this render applied; the search fetch reads it to drop a late
+	// answer for a query that is no longer in the box.
+	const appliedRef = useRef("");
 	// The flat view's pinned Starred section: one collapse toggle, default expanded.
 	const [starredCollapsed, setStarredCollapsed] = useState(false);
 	// The setup wizard, opened from the checklist's Open setup button.
@@ -4635,6 +4649,7 @@ export function ProjectBoard({
 			refreshState();
 		});
 	const q = applied.trim().toLowerCase();
+	appliedRef.current = q;
 	// The target branch name without the origin/ prefix; the project's default branch.
 	const short = project.target?.startsWith("origin/")
 		? project.target.slice(7)
@@ -4678,10 +4693,20 @@ export function ProjectBoard({
 	const heldDoneCount = tasks.filter((t) => laneStage(t) === "done").length;
 	const heldIds = new Set(tasks.map((t) => t.id));
 	const olderCount = older.filter((t) => !heldIds.has(t.id)).length;
-	const doneHidden = Math.max(
-		0,
-		project.doneTotal - heldDoneCount - olderCount,
-	);
+	// With a query applied the done lane reads the server search, not the state
+	// window: the shown done cards and the fetched ones the state lacks drive the
+	// hidden count and the search count against the server's matching total.
+	const shownDoneCount = shown.filter((t) => laneStage(t) === "done").length;
+	const fetchedNotHeld =
+		searched === null
+			? 0
+			: searched.tasks.filter((t) => !heldIds.has(t.id)).length;
+	const doneHidden =
+		q === ""
+			? Math.max(0, project.doneTotal - heldDoneCount - olderCount)
+			: searched === null
+				? 0
+				: Math.max(0, searched.total - shownDoneCount - fetchedNotHeld);
 	// The search count matches the lanes: a retro off the board is no task to count,
 	// and the done cards behind the state window still belong to the project's size.
 	const boardTotal =
@@ -4710,6 +4735,75 @@ export function ProjectBoard({
 			.catch(() => undefined)
 			.finally(() => setOlderBusy(false));
 	};
+	/** One server-side Done-search page fetch (OTTR-1135): page 1 replaces the
+	 * result, a later page appends to the previous one (the render dedupes against
+	 * the held cards, so pages store their raw tasks). Every success advances the
+	 * page counter, even when the page adds no new card (OTTR-975). A late answer
+	 * for a query that is no longer applied does nothing, so a newer query discards
+	 * the earlier one's pages and answers. A non-ok page keeps the loaded cards and
+	 * flags the retry line, with no notice. */
+	const runSearchFetch = useCallback(
+		(qAt: string, page: number): void => {
+			setSearchBusy(true);
+			setSearchFailed(false);
+			fetch(
+				`/api/projects/${encodeURIComponent(project.name)}/done?page=${page}&q=${encodeURIComponent(qAt)}`,
+			)
+				.then(async (res) =>
+					res.ok ? ((await res.json()) as DonePageResponse) : null,
+				)
+				.then((next) => {
+					// First drop a late answer: the newer query owns the lane.
+					if (appliedRef.current !== qAt) return;
+					if (next === null) {
+						setSearchFailed(true);
+						return;
+					}
+					if (page === 1) {
+						setSearched({
+							q: qAt,
+							tasks: next.tasks,
+							total: next.total,
+							page: 1,
+						});
+						return;
+					}
+					setSearched((prev) =>
+						prev !== null && prev.q === qAt
+							? {
+									q: qAt,
+									tasks: [...prev.tasks, ...next.tasks],
+									total: next.total,
+									page,
+								}
+							: prev,
+					);
+				})
+				.catch(() => {
+					// A rejected fetch (server down, blocked request) fails the lane the
+					// same way a non-ok answer does; the loaded cards stay.
+					if (appliedRef.current === qAt) setSearchFailed(true);
+				})
+				.finally(() => {
+					if (appliedRef.current === qAt) setSearchBusy(false);
+				});
+		},
+		[project.name],
+	);
+	// A query swap moves the done lane to the server search: drop the previous
+	// result, then fetch the matching page 1. An empty query clears the search and
+	// returns to the normal view with no fetch. The SEARCH_APPLY_MS debounce on
+	// applied is the delay, so no timer here.
+	useEffect(() => {
+		if (q === "") {
+			setSearched(null);
+			setSearchBusy(false);
+			setSearchFailed(false);
+			return;
+		}
+		setSearched(null);
+		runSearchFetch(q, 1);
+	}, [q, project.name, runSearchFetch]);
 	return (
 		<section className="project" aria-labelledby="project-title">
 			<header className="project-head">
@@ -4738,7 +4832,14 @@ export function ProjectBoard({
 								q === "" ? "Tasks in this project" : "Matching of total tasks"
 							}
 						>
-							{q === "" ? boardTotal : `${shown.length}/${boardTotal}`}
+							{q === ""
+								? boardTotal
+								: // Once the server answers, the numerator counts every matching
+									// done card, not only the ones the loaded window holds.
+									`${
+										shown.filter((t) => laneStage(t) !== "done").length +
+										(searched !== null ? searched.total : shownDoneCount)
+									}/${boardTotal}`}
 						</span>
 					</span>
 					{/* Only an overdue review stays out, as the grey nudge; every other action waits in the menu. */}
@@ -4912,7 +5013,15 @@ export function ProjectBoard({
 				}}
 			>
 				{COLUMNS.map((c) => {
-					const { col } = laneColumnData(c.key, shown, q, older);
+					// With a query applied the done lane merges the server search's pages
+					// instead of the fetched older ones; laneColumnData dedupes against
+					// the held cards and re-applies the query, so raw pages need no merge.
+					const { col } = laneColumnData(
+						c.key,
+						shown,
+						q,
+						q === "" ? older : (searched?.tasks ?? []),
+					);
 					const count = counts[c.key];
 					const unread = (t: TaskCard): boolean =>
 						isUnread(t, seenAnswers, seenDoneSince);
@@ -4946,11 +5055,18 @@ export function ProjectBoard({
 								)}
 								<span className={q === "" ? "count" : "count filtered"}>
 									{c.key === "done"
-										? // The state holds only the Done window (OTTR-965): the head and
-											// the search variant read the project's true done+cancelled total.
+										? // The state holds only the Done window (OTTR-965): the head reads
+											// the project's true done+cancelled total, and the search variant
+											// reads the server's matching total once its answer landed.
 											q === ""
 											? fmtNum(project.doneTotal)
-											: `${fmtNum(col.length)}/${fmtNum(project.doneTotal)}`
+											: searched !== null
+												? `${fmtNum(col.length)}/${fmtNum(searched.total)}`
+												: searchBusy
+													? "Searching…"
+													: // The server answer never landed: the count names the state
+														// window's matches and marks the total unknown.
+														`${fmtNum(shownDoneCount)}/—`
 										: q === ""
 											? fmtNum(col.length)
 											: `${fmtNum(col.length)}/${fmtNum(count.total)}`}
@@ -4960,8 +5076,32 @@ export function ProjectBoard({
 								stage={c.key}
 								tasks={col}
 								more={c.key === "done" ? doneHidden : 0}
-								onMore={fetchOlderDone}
-								moreBusy={olderBusy}
+								// With a query applied "Show more" pages the server search instead
+								// of the older-pages fetch.
+								onMore={
+									q === ""
+										? fetchOlderDone
+										: () => {
+												if (searched !== null)
+													runSearchFetch(q, searched.page + 1);
+											}
+								}
+								moreBusy={q === "" ? olderBusy : searchBusy}
+								searching={
+									c.key === "done" &&
+									q !== "" &&
+									searchBusy &&
+									searched === null
+								}
+								searchFailed={c.key === "done" && q !== "" && searchFailed}
+								onSearchRetry={
+									c.key === "done" && q !== ""
+										? () => {
+												if (searched === null) runSearchFetch(q, 1);
+												else runSearchFetch(q, searched.page + 1);
+											}
+										: undefined
+								}
 								starredCollapsed={starredCollapsed}
 								onStarredToggle={() => setStarredCollapsed((c) => !c)}
 								// Idle backlog cards park under the todo lane, below a divider; started ones
@@ -6144,6 +6284,32 @@ function queueTarget(
 }
 
 /** A lane's card content: the empty state, the pinned Inbox and Starred groups, the flat list, then the "Show more" button. */
+/** The done lane's server-search status lines: the "Searching…" note while the first
+ * page fetches, and the failed-page line with its retry. Both render at the lane's
+ * tail, where "Show more" sits, and in the empty lane's early return (LaneCol), so a
+ * failed first page still offers the retry on a lane with no cards (OTTR-1135). */
+function LaneSearchStatus(p: {
+	searching: boolean;
+	searchFailed: boolean;
+	onSearchRetry: (() => void) | undefined;
+}) {
+	if (!p.searching && !p.searchFailed) return null;
+	if (p.searching)
+		return (
+			<p className="lane-status" role="status">
+				Searching…
+			</p>
+		);
+	return (
+		<p className="lane-status">
+			Search failed
+			<button type="button" className="lane-retry" onClick={p.onSearchRetry}>
+				Retry
+			</button>
+		</p>
+	);
+}
+
 function LaneCards(p: {
 	stage: Stage;
 	filtering: boolean;
@@ -6157,6 +6323,12 @@ function LaneCards(p: {
 	onMore: (() => void) | undefined;
 	/** True while the older-pages fetch runs; the button disables until it settles. */
 	moreBusy?: boolean;
+	/** Done lane only: the server search is fetching its first page and the lane holds no result yet. */
+	searching?: boolean;
+	/** Done lane only: a search page fetch failed; the loaded cards stay and the line offers a retry. */
+	searchFailed?: boolean;
+	/** Done lane only: refetches the failed page — page 1 with no result yet, the next page with one. */
+	onSearchRetry?: () => void;
 	/** LaneCol's useId value: names the Starred body for aria-controls. */
 	uid: string;
 	starredCollapsed: boolean;
@@ -6174,6 +6346,9 @@ function LaneCards(p: {
 		more,
 		onMore,
 		moreBusy = false,
+		searching = false,
+		searchFailed = false,
+		onSearchRetry,
 		showMore,
 		card,
 	} = p;
@@ -6230,6 +6405,11 @@ function LaneCards(p: {
 					)
 					.map(card)
 			}
+			<LaneSearchStatus
+				searching={searching}
+				searchFailed={searchFailed}
+				onSearchRetry={onSearchRetry}
+			/>
 			{more > 0 && onMore && (
 				<button
 					type="button"
@@ -6348,6 +6528,9 @@ export function LaneCol({
 	more = 0,
 	onMore,
 	moreBusy = false,
+	searching = false,
+	searchFailed = false,
+	onSearchRetry,
 	starredCollapsed = false,
 	onStarredToggle,
 	onRerelease,
@@ -6364,6 +6547,12 @@ export function LaneCol({
 	onMore?: () => void;
 	/** Done lane only: an older-pages fetch is in flight; the button disables until it settles. */
 	moreBusy?: boolean;
+	/** Done lane only: the server search is fetching its first page and the lane holds no result yet. */
+	searching?: boolean;
+	/** Done lane only: a search page fetch failed; the loaded cards stay and the line offers a retry. */
+	searchFailed?: boolean;
+	/** Done lane only: refetches the failed page — page 1 with no result yet, the next page with one. */
+	onSearchRetry?: () => void;
 	/** Done lane only: the pinned Starred section starts collapsed when true. */
 	starredCollapsed?: boolean;
 	/** Done lane only: flips the Starred section's collapse state. */
@@ -6534,9 +6723,18 @@ export function LaneCol({
 
 	if (!hasTasks && !showBacklogRow)
 		return (
-			<p className="stage-empty">
-				{filtering ? "No matches." : EMPTY_STAGE[stage]}
-			</p>
+			<>
+				<p className="stage-empty">
+					{filtering ? "No matches." : EMPTY_STAGE[stage]}
+				</p>
+				{/* A failed search page never reads as complete: the empty lane still
+				    names the gap and offers the retry (OTTR-1135). */}
+				<LaneSearchStatus
+					searching={searching}
+					searchFailed={searchFailed}
+					onSearchRetry={onSearchRetry}
+				/>
+			</>
 		);
 
 	// --- Queue drag & drop (native HTML5) -------------------------------------
@@ -6657,6 +6855,9 @@ export function LaneCol({
 				more={more}
 				onMore={onMore}
 				moreBusy={moreBusy}
+				searching={searching}
+				searchFailed={searchFailed}
+				onSearchRetry={onSearchRetry}
 				uid={uid}
 				starredCollapsed={starredCollapsed}
 				onStarredToggle={onStarredToggle}
