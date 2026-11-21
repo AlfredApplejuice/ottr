@@ -40,6 +40,7 @@ import {
 	type DepIndex,
 	type DepProject,
 	findDep,
+	isReview,
 	liveCardOf,
 	queueOrder,
 	waitingOn,
@@ -12939,8 +12940,10 @@ function DrawerActions(p: {
 			    starts empty and stays required: the board tracks no sandbox-fix time
 			    to preset it with (a future preset would fill the input from a known
 			    sandbox-fix time). Like the re-run lines below, the group and its
-			    inline lines render full width under the actions row. */}
-			{task.kind === "review" && task.stage === "done" && !cancelled && (
+			    inline lines render full width under the actions row. OTTR-1166: a
+			    done release card offers the same control — isReview is the same
+			    review-or-release rule the validate route itself gates on. */}
+			{isReview(task) && task.stage === "done" && !cancelled && (
 				<div className="reply-form">
 					<label htmlFor="validate-again-before">
 						Validate blocked leads again
@@ -12963,7 +12966,7 @@ function DrawerActions(p: {
 					</div>
 				</div>
 			)}
-			{task.kind === "review" &&
+			{isReview(task) &&
 				task.stage === "done" &&
 				!cancelled &&
 				validateAgainError !== null && (
@@ -12971,7 +12974,7 @@ function DrawerActions(p: {
 						{validateAgainError}
 					</p>
 				)}
-			{task.kind === "review" &&
+			{isReview(task) &&
 				task.stage === "done" &&
 				!cancelled &&
 				validateAgainDone &&
@@ -14069,7 +14072,8 @@ export function Drawer({
 		}
 	};
 	// OTTR-1129: a done review card can clear the blocked results its leads got
-	// before a chosen time and file a fresh validation run for them. The datetime
+	// before a chosen time and file a fresh validation run for them (OTTR-1166:
+	// a done release card offers the same control through isReview). The datetime
 	// starts empty and stays required: the board tracks no sandbox-fix time to
 	// preset it with (a future preset would fill the input from a known
 	// sandbox-fix time). A new card's drawer starts without the last card's

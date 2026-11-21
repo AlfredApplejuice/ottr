@@ -13951,6 +13951,21 @@ describe("Drawer validate blocked leads again action", () => {
 			prompt: "Review the quota changes",
 		}) as TaskCard;
 
+	// OTTR-1166: a done release card is kind "work" with a non-null
+	// releaseVersion; isReview includes it, so the drawer offers the same
+	// control. releaseNotes stays null so the notes section renders its empty
+	// line instead of Markdown over a missing field.
+	const doneReleaseCard = (): TaskCard =>
+		cardFixture({
+			...drawerFields,
+			kind: "work",
+			releaseVersion: "v0.44.0",
+			releaseNotes: null,
+			stage: "done",
+			state: "idle",
+			prompt: "Release v0.44.0",
+		}) as TaskCard;
+
 	/** Renders a drawer for `card` under a fetch stub; the stub records the
 	 * validate POSTs and answers them with `respond`, everything else with 404. */
 	const withRoot = async (
@@ -14134,6 +14149,130 @@ describe("Drawer validate blocked leads again action", () => {
 				);
 			},
 		);
+	});
+
+	test("a done release card renders the datetime and the button too (OTTR-1166)", async () => {
+		await withRoot(
+			doneReleaseCard(),
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ container }) => {
+				const input = validateInput(container);
+				const button = validateButton(container);
+				const label = container.querySelector(
+					'label[for="validate-again-before"]',
+				);
+				expect(label?.textContent).toContain("Validate blocked leads again");
+				expect(input.getAttribute("required")).not.toBeNull();
+				expect((button as HTMLButtonElement).disabled).toBe(true);
+			},
+		);
+	});
+
+	test("a done release card's retry POSTs the validate route with the again body (OTTR-1166)", async () => {
+		await withRoot(
+			doneReleaseCard(),
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ posts, container }) => {
+				await act(async () => {
+					typeInto(validateInput(container), "2026-11-05T09:30");
+				});
+				await act(async () => {
+					onClickOf(validateButton(container))({});
+				});
+				await act(async () => {});
+				const post = posts.at(-1);
+				expect(post?.url.endsWith("/tasks/t1/validate")).toBe(true);
+				expect(post?.body).toEqual({
+					again: "blocked",
+					before: new Date("2026-11-05T09:30").toISOString(),
+				});
+				const statuses = [...container.querySelectorAll('p[role="status"]')];
+				expect(
+					statuses.some((s) =>
+						s.textContent?.includes("Validation run filed."),
+					),
+				).toBe(true);
+			},
+		);
+	});
+
+	test("a failed validate POST on a release card surfaces the inline alert (OTTR-1166)", async () => {
+		await withRoot(
+			doneReleaseCard(),
+			{
+				status: 409,
+				body: { error: "a validation run is already in flight" },
+			},
+			async ({ posts, container }) => {
+				await act(async () => {
+					typeInto(validateInput(container), "2026-11-05T09:30");
+				});
+				await act(async () => {
+					onClickOf(validateButton(container))({});
+				});
+				await act(async () => {});
+				expect(posts).toHaveLength(1);
+				const alerts = [...container.querySelectorAll('p[role="alert"]')];
+				expect(
+					alerts.some((a) =>
+						a.textContent?.includes("a validation run is already in flight"),
+					),
+				).toBe(true);
+				expect(container.textContent).not.toContain("Validation run filed.");
+			},
+		);
+	});
+
+	test("an ordinary done work card renders no validate control (OTTR-1166)", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			kind: "work",
+			stage: "done",
+			state: "idle",
+			prompt: "Fix the widget",
+		}) as TaskCard;
+		await withRoot(
+			card,
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ container }) => {
+				expect(container.textContent).not.toContain(
+					"Validate blocked leads again",
+				);
+			},
+		);
+	});
+
+	test("an unfinished or cancelled release card renders no validate control (OTTR-1166)", async () => {
+		const unfinished = cardFixture({
+			...drawerFields,
+			kind: "work",
+			releaseVersion: "v0.44.0",
+			releaseNotes: null,
+			stage: "merging",
+			state: "running",
+			prompt: "Release v0.44.0",
+		}) as TaskCard;
+		const cancelledDone = cardFixture({
+			...drawerFields,
+			kind: "work",
+			releaseVersion: "v0.44.0",
+			releaseNotes: null,
+			stage: "done",
+			state: "idle",
+			cancelledAt: 1,
+			prompt: "Release v0.44.0",
+		}) as TaskCard;
+		for (const card of [unfinished, cancelledDone]) {
+			await withRoot(
+				card,
+				{ status: 200, body: { id: "v1", reset: [] } },
+				async ({ container }) => {
+					expect(container.textContent).not.toContain(
+						"Validate blocked leads again",
+					);
+				},
+			);
+		}
 	});
 });
 
