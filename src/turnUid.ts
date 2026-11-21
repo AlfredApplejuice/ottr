@@ -31,6 +31,7 @@ import {
 	resolve,
 	sep,
 } from "node:path";
+import { holdLock } from "./layerLeaseLock.ts";
 
 /**
  * Per-project turn identity for classic workers (OTTR-994,
@@ -195,22 +196,29 @@ const LAYER_STALE_MS = 24 * 60 * 60 * 1000;
  * so the name is a contract between the workers on the shared volume. */
 const LAYER_INUSE_SUFFIX = ".inuse";
 
+/** The decision lock beside the copies: the marker refresh, the prune's
+ * read-decide-delete and the reuse check all hold it, so a start on one
+ * worker never interleaves with a deletion on the other. The same SQLite
+ * POSIX lock the lease ledger uses; the kernel drops it when a holder dies. */
+const LAYERS_LOCK_NAME = "in-use.lock";
+
+/** How long a start waits for the other worker's decision section before it
+ * fails closed. The sections hold only stats and rm's; only a wedged volume
+ * exhausts this. */
+const LAYERS_LOCK_WAIT_MS = 10_000;
+
 /**
  * Mark one layer id in use for the stale window: a fresh mtime keeps the
  * copy's prune away while a started turn runs on it. The marker lives in the
- * root-owned layers dir, so a turn uid can neither forge nor drop it. Best
- * effort: without a marker the copy falls back to the prunable behavior from
- * before OTTR-1179, and hygiene never fails a run.
+ * root-owned layers dir, so a turn uid can neither forge nor drop it. Throws
+ * when the marker cannot be written: an unprotected turn must not start,
+ * because the next prune could delete its live copy (OTTR-1179).
  */
 function markLayerInUse(layersDir: string, id: string): void {
-	try {
-		writeFileSync(
-			join(layersDir, id + LAYER_INUSE_SUFFIX),
-			`${new Date().toISOString()}\n`,
-		);
-	} catch {
-		// The next turn start retries; a lost marker only re-opens the old race.
-	}
+	writeFileSync(
+		join(layersDir, id + LAYER_INUSE_SUFFIX),
+		`${new Date().toISOString()}\n`,
+	);
 }
 
 /**
@@ -220,21 +228,37 @@ function markLayerInUse(layersDir: string, id: string): void {
  * touch the temp or the final dir; symlinks are copied as links, so the
  * shared-state links keep pointing at the flat shared home. An existing
  * final dir is reused (a layer id is never rewritten), including the
- * concurrent-winner case where our own rename loses the race. Every start
- * marks its id in use before the prune runs, so a copy a started turn still
- * runs on survives a later start whose worker home no longer holds that
- * layer (OTTR-1179; both workers share this volume).
+ * concurrent-winner case where our own rename loses the race.
+ *
+ * Every start first takes the per-project decision lock (`in-use.lock`,
+ * `lockWaitMs` budget), then marks its id in use, prunes, and checks for a
+ * reusable copy inside that section, so a start on one worker can never
+ * interleave with a deletion decision on the other (OTTR-1179; both workers
+ * share this volume). A marker that cannot be written, or a lock that stays
+ * busy, fails the start closed before anything is deleted — the same rule as
+ * a lease acquisition failure. The layer cp runs outside the section; its
+ * rename race stays safe on its own.
  */
 export function ensureLayerCopy(
 	layerDir: string,
 	turnHome: TurnHome,
 	workerHome: string,
 	ids: TurnIdentity,
+	lockWaitMs: number = LAYERS_LOCK_WAIT_MS,
 ): string {
-	markLayerInUse(turnHome.layers, basename(layerDir));
-	pruneLayerCopies(layerDir, turnHome);
-	const final = join(turnHome.layers, basename(layerDir));
-	if (existsSync(final)) return final;
+	const id = basename(layerDir);
+	const final = join(turnHome.layers, id);
+	const lock = holdLock(
+		join(realpathSync(turnHome.layers), LAYERS_LOCK_NAME),
+		lockWaitMs,
+	);
+	try {
+		markLayerInUse(turnHome.layers, id);
+		pruneLayerCopies(layerDir, turnHome);
+		if (existsSync(final)) return final;
+	} finally {
+		lock.release();
+	}
 	const tmp = join(
 		turnHome.layers,
 		`.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}`,
@@ -263,7 +287,9 @@ export function ensureLayerCopy(
  * Stale layer copies: temp dirs older than a day, and final copies whose
  * source layer alate deleted — unless a fresh in-use marker says a started
  * turn still runs on the copy (OTTR-1179); the current pin is never pruned.
- * Markers whose copy is long gone age out the same way. Best effort.
+ * Markers whose copy is long gone age out the same way. Runs inside the
+ * caller's decision lock, so every read-decide-delete below is atomic across
+ * the workers and re-reads the current marker state. Best effort.
  */
 function pruneLayerCopies(layerDir: string, turnHome: TurnHome): void {
 	const sharedLayers = dirname(layerDir);
@@ -276,6 +302,7 @@ function pruneLayerCopies(layerDir: string, turnHome: TurnHome): void {
 	}
 	for (const entry of entries) {
 		const path = join(turnHome.layers, entry.name);
+		if (entry.name === LAYERS_LOCK_NAME) continue;
 		if (entry.name.startsWith(".tmp-")) {
 			try {
 				const st = statOf(path);

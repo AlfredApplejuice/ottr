@@ -122,12 +122,18 @@ Instead the daemon materializes a per-project copy:
   is treated as unpinned (planted-pointer refuse, as `pinTarget` does).
 - Every start marks its pinned id in use (`<id>.inuse` beside the copy, in
   the root-owned layers dir; the marker's mtime is the signal both workers
-  read on the shared volume). Copies whose source layer alate deleted, and
-  temp dirs older than a day, are pruned on the next copy for that project;
-  the currently pinned id is never pruned, and a copy whose marker is fresh
-  (a started turn still runs on it) is never pruned either. The marker and
-  a ghost marker without its copy age out after the same day, so retention
-  stays bounded (OTTR-1179).
+  read on the shared volume). The mark, the prune's read-decide-delete, and
+  the reuse check run under the same shared layers lock the lease ledger
+  uses (`in-use.lock`, SQLite POSIX locks, dropped on holder death), so a
+  refresh on one worker can never interleave with a deletion on the other.
+  The mark is fail closed: a start whose marker cannot be written fails
+  before the spawn, and that start deletes nothing. A start that cannot
+  take the lock within its budget fails the same way. Copies whose source
+  layer alate deleted, and temp dirs older than a day, are pruned on the
+  next copy for that project; the currently pinned id is never pruned, and
+  a copy whose marker is fresh (a started turn still runs on it) is never
+  pruned either. The marker and a ghost marker without its copy age out
+  after the same day, so retention stays bounded (OTTR-1179).
 
 ### Project on the request
 
@@ -243,9 +249,11 @@ their repo's owner and need nothing.
   dir and prunes copies of deleted layers. A copy whose source is gone from
   the starting worker's home survives when a fresh `<id>.inuse` marker says
   a started turn still runs on it (worker homes disjoint from the pinned
-  id), and the copy's omp state stays readable; once the marker ages out a
-  day, the next copy reclaims the copy and its marker, so retention stays
-  bounded.
+  id), and the copy's omp state stays writable through its link mid-run;
+  once the marker ages out a day, the next copy reclaims the copy and its
+  marker under the decision lock, so retention stays bounded. A start whose
+  marker cannot be written, or whose decision lock stays busy, fails closed
+  and deletes nothing.
 - `bun run check` and `bun test` pass.
 
 ## Alternatives considered

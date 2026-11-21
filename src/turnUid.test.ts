@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import {
 	chmodSync,
@@ -19,6 +20,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
+import { holdLock } from "./layerLeaseLock.ts";
 import {
 	applyTurnHomeEnv,
 	assertProjectSegment,
@@ -339,7 +341,10 @@ test("OTTR-1179: a started turn's pinned copy survives another turn's prune from
 	const turnHome = prepareTurnHome(freshDir("homes"), "prune-live", ids);
 	const layerX = join(workerA, ".alate", "layers", "693b38b5b400-127");
 	mkdirSync(join(layerX, ".omp", "agent"), { recursive: true });
-	writeFileSync(join(layerX, ".omp", "agent", "agent.db"), "store");
+	const seed = new Database(join(layerX, ".omp", "agent", "agent.db"));
+	seed.run("CREATE TABLE memories (id TEXT PRIMARY KEY, body TEXT)");
+	seed.run("INSERT INTO memories VALUES ('m1', 'seed')");
+	seed.close();
 
 	// Turn 1 starts pinned to X: HOME moves to the shared copy.
 	const env1: Record<string, string | undefined> = { HOME: layerX };
@@ -379,9 +384,14 @@ test("OTTR-1179: a started turn's pinned copy survives another turn's prune from
 	// fresh ghost keeps waiting for its rename, and the prune did its job
 	// on the unprotected victim.
 	expect(existsSync(copyX)).toBe(true);
-	expect(readFileSync(join(copyX, ".omp", "agent", "agent.db"), "utf8")).toBe(
-		"store",
-	);
+	// The running turn's store stays writable mid-run, through the copy's
+	// state link: a memory written now lands in the flat home database.
+	const store = new Database(join(copyX, ".omp", "agent", "agent.db"));
+	store.run("INSERT INTO memories VALUES ('m2', 'written mid-run')");
+	expect(
+		store.query("SELECT body FROM memories WHERE id = 'm2'").get(),
+	).toEqual({ body: "written mid-run" });
+	store.close();
 	expect(existsSync(freshGhost)).toBe(true);
 	expect(existsSync(victim)).toBe(false);
 });
@@ -453,6 +463,84 @@ test("OTTR-1179: a pinned copy survives concurrent ensures with disjoint worker 
 	expect(existsSync(copyX)).toBe(true);
 	expect(readFileSync(join(copyX, ".omp", "agent", "agent.db"), "utf8")).toBe(
 		"store",
+	);
+});
+
+test("OTTR-1179: a turn start fails closed when the marker cannot be written", () => {
+	const workerA = freshDir("worker-fail");
+	const ids = selfIds();
+	const turnHome = prepareTurnHome(freshDir("homes"), "prune-failclosed", ids);
+	const layerX = join(workerA, ".alate", "layers", "693b38b5b400-127");
+	mkdirSync(join(layerX, ".omp", "agent"), { recursive: true });
+	writeFileSync(join(layerX, ".omp", "agent", "agent.db"), "store");
+	applyTurnHomeEnv({ HOME: layerX }, { workerHome: workerA, turnHome, ids });
+	const copyX = join(turnHome.layers, "693b38b5b400-127");
+	// An unprotected victim rides along: a running prune would delete it.
+	const victim = join(turnHome.layers, "693b38b5b400-130");
+	mkdirSync(victim, { recursive: true });
+	// The next start's marker write cannot land (as on a full volume): the
+	// marker path is a directory. The start must fail, not run unprotected.
+	const workerB = freshDir("worker-fail2");
+	const layerY = join(workerB, ".alate", "layers", "693b38b5b400-131");
+	mkdirSync(layerY, { recursive: true });
+	mkdirSync(join(turnHome.layers, "693b38b5b400-131.inuse"), {
+		recursive: true,
+	});
+	expect(() => ensureLayerCopy(layerY, turnHome, workerB, ids, 50)).toThrow();
+	// The failed start deleted nothing: its prune never ran.
+	expect(existsSync(copyX)).toBe(true);
+	expect(existsSync(victim)).toBe(true);
+	// With the marker writable again, the start succeeds and the healthy
+	// prune reclaims the unprotected victim while the fresh marker keeps X.
+	rmSync(join(turnHome.layers, "693b38b5b400-131.inuse"), {
+		recursive: true,
+		force: true,
+	});
+	expect(ensureLayerCopy(layerY, turnHome, workerB, ids, 50)).toBe(
+		join(turnHome.layers, "693b38b5b400-131"),
+	);
+	expect(existsSync(victim)).toBe(false);
+	expect(existsSync(copyX)).toBe(true);
+});
+
+test("OTTR-1179: a prune decision waits for the layers lock and re-reads state under it", () => {
+	const workerA = freshDir("worker-locka");
+	const ids = selfIds();
+	const turnHome = prepareTurnHome(freshDir("homes"), "prune-lock", ids);
+	const layerX = join(workerA, ".alate", "layers", "693b38b5b400-127");
+	mkdirSync(join(layerX, ".omp", "agent"), { recursive: true });
+	writeFileSync(join(layerX, ".omp", "agent", "agent.db"), "store");
+	ensureLayerCopy(layerX, turnHome, workerA, ids, 50);
+	const copyX = join(turnHome.layers, "693b38b5b400-127");
+	// Age the marker: the next decision would delete the copy and the marker.
+	touchMtime(
+		join(turnHome.layers, "693b38b5b400-127.inuse"),
+		Date.now() - 25 * 60 * 60 * 1000,
+	);
+	// Worker B holds the decision lock mid-section. A disjoint-home start
+	// must fail closed on its wait budget rather than run its decision, so
+	// nothing is deleted and no refreshed marker is dropped behind B's back.
+	const held = holdLock(join(turnHome.layers, "in-use.lock"), 0);
+	try {
+		const workerB = freshDir("worker-lockb");
+		const layerY = join(workerB, ".alate", "layers", "693b38b5b400-134");
+		mkdirSync(layerY, { recursive: true });
+		expect(() => ensureLayerCopy(layerY, turnHome, workerB, ids, 30)).toThrow();
+		expect(existsSync(copyX)).toBe(true);
+	} finally {
+		held.release();
+	}
+	// With the lock free, the decision runs and re-reads the CURRENT state:
+	// the aged marker's copy and marker go, the wave's own copy lands.
+	const workerB = freshDir("worker-lockb2");
+	const layerY = join(workerB, ".alate", "layers", "693b38b5b400-134");
+	mkdirSync(layerY, { recursive: true });
+	expect(ensureLayerCopy(layerY, turnHome, workerB, ids, 50)).toBe(
+		join(turnHome.layers, "693b38b5b400-134"),
+	);
+	expect(existsSync(copyX)).toBe(false);
+	expect(existsSync(join(turnHome.layers, "693b38b5b400-134.inuse"))).toBe(
+		true,
 	);
 });
 
