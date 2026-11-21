@@ -271,7 +271,6 @@ import {
 	releasePrompt,
 	reviewPrompt,
 	rulesInterviewPrompt,
-	shortTitle,
 	WORK_CHECK_MAX_SENDBACKS,
 	workCheckSendBack,
 	workCheckSendBackDirection,
@@ -344,7 +343,7 @@ import {
 	createServiceQuotaCoordinator,
 	type ServiceQuotaCoordinatorOptions,
 } from "./serviceQuotas.ts";
-import { cleanTitle, sessionContext } from "./session.ts";
+import { sessionContext } from "./session.ts";
 import {
 	type AskDraft,
 	type BoardTurnFacts,
@@ -5824,22 +5823,23 @@ export async function createApp(deps: AppDeps) {
 		);
 		// The board search reads the whole lane, not only the state window's newest
 		// cards: the filter runs before the total and the slice (OTTR-1135). It
-		// matches the card's own display name — the stored title, else the short
-		// prompt line, exactly what frozenTitleFrom resolves for a done card without
-		// its per-card store queries — so the server finds what the lane's client
-		// filter would keep, and a fetched match survives the board's re-filter.
+		// resolves each card's display name exactly like the card build does
+		// (frozenTitleFrom: stored title, else the transcript's first title, else the
+		// short prompt line), so a search answers the same on a cold store and after
+		// any page read, and a fetched match survives the board's re-filter.
 		const searchCtx = q === "" ? null : await projectCardCtx(e);
 		if (searchCtx !== null) {
 			const matched: ListedTask[] = [];
 			let scanned = 0;
 			for (const t of settled) {
-				const stored = searchCtx.facts.titles.get(t.id) ?? null;
 				if (
 					matchesQuery(
 						{
 							id: t.id,
-							sessionTitle:
-								stored !== null ? cleanTitle(stored) : shortTitle(t.title),
+							sessionTitle: await e.store.frozenTitleFrom(
+								t,
+								searchCtx.facts.titles.get(t.id) ?? null,
+							),
 							title: t.title,
 						},
 						q,

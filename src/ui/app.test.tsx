@@ -7827,11 +7827,13 @@ describe("ProjectBoard search delay", () => {
 			});
 			expect(count()).toBe("3");
 			expect(cards().sort()).toEqual(["t1", "t2", "t3"]);
-			// Past the deadline, one card matches and the count box says so.
+			// Past the deadline, one card matches. The board's fetch carries no mock
+			// here, so the done search fails: the count marks the done matches
+			// unknown instead of posing the window's count as the whole result.
 			await act(async () => {
 				await Bun.sleep(SEARCH_APPLY_MS + 60);
 			});
-			expect(count()).toBe("1/3");
+			expect(count()).toBe("—/3");
 			expect(cards()).toEqual(["t2"]);
 			// Clearing waits the same way, then brings every card back.
 			await act(async () => {
@@ -7841,7 +7843,7 @@ describe("ProjectBoard search delay", () => {
 			await act(async () => {
 				await Bun.sleep(SEARCH_APPLY_MS - 100);
 			});
-			expect(count()).toBe("1/3");
+			expect(count()).toBe("—/3");
 			await act(async () => {
 				await Bun.sleep(SEARCH_APPLY_MS + 60);
 			});
@@ -8296,6 +8298,14 @@ describe("ProjectBoard done lane time view", () => {
 			state: "idle",
 			doneAt: -60,
 		});
+		const freshPromptCard = cardFixture({
+			id: "o2",
+			title: "fresh prompt answer",
+			sessionTitle: "fresh prompt answer",
+			stage: "done",
+			state: "idle",
+			doneAt: -70,
+		});
 		const container = window.document.createElement(
 			"div",
 		) as unknown as HTMLDivElement;
@@ -8317,11 +8327,19 @@ describe("ProjectBoard done lane time view", () => {
 		const realFetch = globalThis.fetch;
 		const fetches: string[] = [];
 		const promptPage = Promise.withResolvers<Response>();
+		// The first prompt request stays deferred; the same URL typed again answers
+		// at once with the fresh card, so the late answer must not win.
+		let promptCalls = 0;
 		globalThis.fetch = (async (url: RequestInfo | URL) => {
 			const u = String(url);
 			if (u === "/api/projects/proj/done?page=1&q=prompt") {
 				fetches.push(u);
-				return promptPage.promise;
+				promptCalls += 1;
+				if (promptCalls === 1) return promptPage.promise;
+				return new Response(
+					JSON.stringify({ tasks: [freshPromptCard], total: 1 }),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
 			}
 			if (u === "/api/projects/proj/done?page=1&q=other") {
 				fetches.push(u);
@@ -8380,7 +8398,24 @@ describe("ProjectBoard done lane time view", () => {
 				"/api/projects/proj/done?page=1&q=other",
 			]);
 			expect(ids()).toEqual(["o1"]);
-			// The stale prompt answer lands late: the newer query discards it.
+			// The query comes back: the same text, a new generation. The fresh answer
+			// renders at once while the first prompt request still waits.
+			await act(async () => {
+				typeInto(input, "prompt");
+				onChangeOf(input)({ target: { value: "prompt" } });
+			});
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS + 100);
+			});
+			expect(fetches).toEqual([
+				"/api/projects/proj/done?page=1&q=prompt",
+				"/api/projects/proj/done?page=1&q=other",
+				"/api/projects/proj/done?page=1&q=prompt",
+			]);
+			expect(ids()).toEqual(["o2"]);
+			expect(lane!.querySelector(".count")?.textContent).toBe("1/1");
+			// The first prompt answer lands last: its generation is long gone, so the
+			// same-text re-entry's result stays.
 			await act(async () => {
 				promptPage.resolve(
 					new Response(JSON.stringify({ tasks: [promptCard], total: 1 }), {
@@ -8390,7 +8425,7 @@ describe("ProjectBoard done lane time view", () => {
 				);
 				await Bun.sleep(50);
 			});
-			expect(ids()).toEqual(["o1"]);
+			expect(ids()).toEqual(["o2"]);
 			expect(lane!.querySelector(".count")?.textContent).toBe("1/1");
 		} finally {
 			await act(async () => {
@@ -8478,6 +8513,9 @@ describe("ProjectBoard done lane time view", () => {
 			// cards and never poses the empty lane as a complete result.
 			expect(fetches).toEqual(["/api/projects/proj/done?page=1&q=prompt"]);
 			expect(container.textContent).toContain("Search failed");
+			// The header count marks the done matches unknown instead of repeating
+			// the state window's count as the whole result.
+			expect(container.querySelector(".search-count")?.textContent).toBe("—/4");
 			expect(lane!.querySelector("button.lane-retry")).not.toBeNull();
 			expect(lane!.textContent).toContain("No matches.");
 			expect(lane!.querySelectorAll("[data-task-id]")).toHaveLength(0);
@@ -8491,6 +8529,153 @@ describe("ProjectBoard done lane time view", () => {
 				"/api/projects/proj/done?page=1&q=prompt",
 				"/api/projects/proj/done?page=1&q=prompt",
 			]);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("a Done-lane data change refetches the standing search", async () => {
+		// The cached matching total describes a snapshot. When the lane's own data
+		// moves (another matching card settles), the search restarts at page 1, so
+		// the lane head and the search count keep describing the cards instead of
+		// drifting apart ("2/1" beside a cached total of 1).
+		const held = Array.from({ length: 20 }, (_, j) =>
+			cardFixture({
+				id: `d${j}`,
+				title: "plain j",
+				sessionTitle: "plain j",
+				stage: "done",
+				state: "idle",
+				doneAt: j + 1,
+			}),
+		);
+		const firstMatch = cardFixture({
+			id: "o0",
+			title: "fix the prompt flow",
+			sessionTitle: "fix the prompt flow",
+			stage: "done",
+			state: "idle",
+			doneAt: -50,
+		});
+		const landedMatch = cardFixture({
+			id: "m0",
+			title: "more prompt work",
+			sessionTitle: "more prompt work",
+			stage: "done",
+			state: "idle",
+			doneAt: 100,
+		});
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const project = {
+			name: "proj",
+			hasRules: true,
+			github: null,
+			gitless: false,
+			dirty: false,
+			archReview: null,
+			latestRelease: null,
+			latestImage: null,
+			doneTotal: 61,
+			settings: { setupChecklist: false },
+			sessionsDir: "/tmp/s",
+		} as unknown as ProjectView;
+		const realFetch = globalThis.fetch;
+		const fetches: string[] = [];
+		let searchCalls = 0;
+		globalThis.fetch = (async (url: RequestInfo | URL) => {
+			const u = String(url);
+			if (u === "/api/projects/proj/done?page=1&q=prompt") {
+				fetches.push(u);
+				searchCalls += 1;
+				// The settled card rides page 1 too: it is a settled matching card of
+				// the lane, newest landed first.
+				const tasks =
+					searchCalls === 1 ? [firstMatch] : [landedMatch, firstMatch];
+				return new Response(JSON.stringify({ tasks, total: searchCalls }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectBoard
+						project={project}
+						tasks={held}
+						deltas={new Map()}
+						open={() => {}}
+						seenAnswers={new Set()}
+						seenDoneSince={0}
+						compose={() => {}}
+						composeDraft={() => {}}
+						act={async () => true}
+						onNotice={() => {}}
+						draining={false}
+					/>,
+				);
+			});
+			const lane = container.querySelector('[data-stage="done"]');
+			const ids = (): string[] =>
+				[...lane!.querySelectorAll("[data-task-id]")].map(
+					(el) => el.getAttribute("data-task-id") ?? "",
+				);
+			const input = container.querySelector(
+				'input[aria-label="Search tasks"]',
+			) as HTMLInputElement;
+			await act(async () => {
+				typeInto(input, "prompt");
+				onChangeOf(input)({ target: { value: "prompt" } });
+			});
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS + 100);
+			});
+			expect(ids()).toEqual(["o0"]);
+			expect(lane!.querySelector(".count")?.textContent).toBe("1/1");
+			expect(container.querySelector(".search-count")?.textContent).toBe(
+				"1/61",
+			);
+			// Another matching card settles: the state window and the project's
+			// doneTotal move. The search restarts at page 1 and the answer carries
+			// the new total, so every count describes the lane again.
+			await act(async () => {
+				root.render(
+					<ProjectBoard
+						project={{ ...project, doneTotal: 62 }}
+						tasks={[...held, landedMatch]}
+						deltas={new Map()}
+						open={() => {}}
+						seenAnswers={new Set()}
+						seenDoneSince={0}
+						compose={() => {}}
+						composeDraft={() => {}}
+						act={async () => true}
+						onNotice={() => {}}
+						draining={false}
+					/>,
+				);
+			});
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS + 100);
+			});
+			expect(fetches).toEqual([
+				"/api/projects/proj/done?page=1&q=prompt",
+				"/api/projects/proj/done?page=1&q=prompt",
+			]);
+			expect(ids()).toEqual(["m0", "o0"]);
+			expect(lane!.querySelector(".count")?.textContent).toBe("2/2");
+			expect(container.querySelector(".search-count")?.textContent).toBe(
+				"2/62",
+			);
 		} finally {
 			await act(async () => {
 				root.unmount();

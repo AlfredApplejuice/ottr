@@ -4632,9 +4632,11 @@ export function ProjectBoard({
 	} | null>(null);
 	const [searchBusy, setSearchBusy] = useState(false);
 	const [searchFailed, setSearchFailed] = useState(false);
-	// The query this render applied; the search fetch reads it to drop a late
-	// answer for a query that is no longer in the box.
-	const appliedRef = useRef("");
+	// The search's generation: every query change, project switch and Done-lane
+	// data change bumps it, so an answer applies only when its own generation is
+	// still the current one — a late answer for a text-equal older query cannot
+	// replace the newest result.
+	const searchGenRef = useRef(0);
 	// The flat view's pinned Starred section: one collapse toggle, default expanded.
 	const [starredCollapsed, setStarredCollapsed] = useState(false);
 	// The setup wizard, opened from the checklist's Open setup button.
@@ -4649,7 +4651,6 @@ export function ProjectBoard({
 			refreshState();
 		});
 	const q = applied.trim().toLowerCase();
-	appliedRef.current = q;
 	// The target branch name without the origin/ prefix; the project's default branch.
 	const short = project.target?.startsWith("origin/")
 		? project.target.slice(7)
@@ -4738,12 +4739,12 @@ export function ProjectBoard({
 	/** One server-side Done-search page fetch (OTTR-1135): page 1 replaces the
 	 * result, a later page appends to the previous one (the render dedupes against
 	 * the held cards, so pages store their raw tasks). Every success advances the
-	 * page counter, even when the page adds no new card (OTTR-975). A late answer
-	 * for a query that is no longer applied does nothing, so a newer query discards
-	 * the earlier one's pages and answers. A non-ok page keeps the loaded cards and
-	 * flags the retry line, with no notice. */
+	 * page counter, even when the page adds no new card (OTTR-975). An answer whose
+	 * generation is no longer current does nothing, so a newer query — or the same
+	 * query re-entered later — discards the earlier request's pages and answers. A
+	 * non-ok page keeps the loaded cards and flags the retry line, with no notice. */
 	const runSearchFetch = useCallback(
-		(qAt: string, page: number): void => {
+		(qAt: string, page: number, gen: number): void => {
 			setSearchBusy(true);
 			setSearchFailed(false);
 			fetch(
@@ -4753,8 +4754,11 @@ export function ProjectBoard({
 					res.ok ? ((await res.json()) as DonePageResponse) : null,
 				)
 				.then((next) => {
-					// First drop a late answer: the newer query owns the lane.
-					if (appliedRef.current !== qAt) return;
+					// First drop a stale answer: only the answer of the current search
+					// generation may touch the lane. A query that left and came back
+					// gets a new generation, so the first response cannot replace the
+					// newest result.
+					if (searchGenRef.current !== gen) return;
 					if (next === null) {
 						setSearchFailed(true);
 						return;
@@ -4782,10 +4786,10 @@ export function ProjectBoard({
 				.catch(() => {
 					// A rejected fetch (server down, blocked request) fails the lane the
 					// same way a non-ok answer does; the loaded cards stay.
-					if (appliedRef.current === qAt) setSearchFailed(true);
+					if (searchGenRef.current === gen) setSearchFailed(true);
 				})
 				.finally(() => {
-					if (appliedRef.current === qAt) setSearchBusy(false);
+					if (searchGenRef.current === gen) setSearchBusy(false);
 				});
 		},
 		[project.name],
@@ -4793,8 +4797,12 @@ export function ProjectBoard({
 	// A query swap moves the done lane to the server search: drop the previous
 	// result, then fetch the matching page 1. An empty query clears the search and
 	// returns to the normal view with no fetch. The SEARCH_APPLY_MS debounce on
-	// applied is the delay, so no timer here.
+	// applied is the delay, so no timer here. A changed doneTotal means the lane's
+	// own data moved (a card settled or left): the cached matching total and the
+	// page cursor no longer describe the lane, so the search restarts at page 1
+	// under a fresh generation.
 	useEffect(() => {
+		const gen = ++searchGenRef.current;
 		if (q === "") {
 			setSearched(null);
 			setSearchBusy(false);
@@ -4802,8 +4810,8 @@ export function ProjectBoard({
 			return;
 		}
 		setSearched(null);
-		runSearchFetch(q, 1);
-	}, [q, project.name, runSearchFetch]);
+		runSearchFetch(q, 1, gen);
+	}, [q, project.name, project.doneTotal, runSearchFetch]);
 	return (
 		<section className="project" aria-labelledby="project-title">
 			<header className="project-head">
@@ -4834,12 +4842,21 @@ export function ProjectBoard({
 						>
 							{q === ""
 								? boardTotal
-								: // Once the server answers, the numerator counts every matching
-									// done card, not only the ones the loaded window holds.
-									`${
-										shown.filter((t) => laneStage(t) !== "done").length +
-										(searched !== null ? searched.total : shownDoneCount)
-									}/${boardTotal}`}
+								: searched !== null
+									? // Once the server answers, the numerator counts every matching
+										// done card, not only the ones the loaded window holds.
+										`${
+											shown.filter((t) => laneStage(t) !== "done").length +
+											searched.total
+										}/${boardTotal}`
+									: searchBusy || searchFailed
+										? // No server answer yet: the done matches are unknown, and the
+											// state window's matches must not pose as the whole count.
+											`—/${boardTotal}`
+										: `${
+												shown.filter((t) => laneStage(t) !== "done").length +
+												shownDoneCount
+											}/${boardTotal}`}
 						</span>
 					</span>
 					{/* Only an overdue review stays out, as the grey nudge; every other action waits in the menu. */}
@@ -5083,7 +5100,11 @@ export function ProjectBoard({
 										? fetchOlderDone
 										: () => {
 												if (searched !== null)
-													runSearchFetch(q, searched.page + 1);
+													runSearchFetch(
+														q,
+														searched.page + 1,
+														searchGenRef.current,
+													);
 											}
 								}
 								moreBusy={q === "" ? olderBusy : searchBusy}
@@ -5097,8 +5118,14 @@ export function ProjectBoard({
 								onSearchRetry={
 									c.key === "done" && q !== ""
 										? () => {
-												if (searched === null) runSearchFetch(q, 1);
-												else runSearchFetch(q, searched.page + 1);
+												if (searched === null)
+													runSearchFetch(q, 1, ++searchGenRef.current);
+												else
+													runSearchFetch(
+														q,
+														searched.page + 1,
+														searchGenRef.current,
+													);
 											}
 										: undefined
 								}

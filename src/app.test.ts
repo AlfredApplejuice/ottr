@@ -15944,6 +15944,41 @@ describe("slim state and done pages (OTTR-965)", () => {
 		);
 	});
 
+	test("the done search matches a transcript title before any page read persists it", async () => {
+		// The card's display name lives only in its session transcript until a card
+		// build persists it. The search must resolve that name itself, so the same
+		// query answers the same before and after any unfiltered page read
+		// (OTTR-1135): results may not depend on prior reads.
+		const { st, projects } = await slimBoard("slim-q-transcript");
+		const sid = "bbbb0000-0000-0000-0000-0000000003a1";
+		const matched = await seedDone(st, "plan the release", Date.now(), {
+			sessionId: sid,
+		});
+		await seedDone(st, "another done card", Date.now() + 1);
+		mkdirSync(st.sessionsDir, { recursive: true });
+		writeFileSync(
+			join(st.sessionsDir, `2026-01-01T00-00-00-000Z_${sid}.jsonl`),
+			'{"type":"title","v":1,"title":"Repair prompt search"}\n{"type":"session"}\n{"type":"title_change","title":"Repair prompt search"}\n',
+		);
+		const m = await mount({ projects });
+
+		// The search runs first: nothing has read the card, so nothing persisted
+		// the transcript title yet, and the display name must still match.
+		const hit = (await (
+			await m.call("/api/projects/slim-q-transcript/done?q=prompt&page=1")
+		).json()) as { tasks: Array<{ id: string }>; total: number };
+		expect(hit.total).toBe(1);
+		expect(hit.tasks.map((t) => t.id)).toEqual([matched]);
+
+		// An unfiltered read lands between the searches; the answer stays the same.
+		await m.call("/api/projects/slim-q-transcript/done?page=1");
+		const again = (await (
+			await m.call("/api/projects/slim-q-transcript/done?q=prompt&page=1")
+		).json()) as { tasks: Array<{ id: string }>; total: number };
+		expect(again.total).toBe(1);
+		expect(again.tasks.map((t) => t.id)).toEqual([matched]);
+	});
+
 	test("the done endpoint rejects a bad q", async () => {
 		const { st, projects } = await slimBoard("slim-bad-q");
 		const m = await mount({ projects });
