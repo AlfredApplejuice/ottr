@@ -144,6 +144,11 @@ describe("the board probe under an injected HTTP_PROXY", () => {
 
 	test("the sourced bypass list keeps the probe off the proxy", async () => {
 		const proxy = fakeProxy();
+		// OTTR-1162: the probe writes the shared vmState singleton (health and the
+		// OTTR-1142 pool gate). Restore both, or a later test file's dispatch reads a
+		// pool max this container's real vm-runner answered with.
+		const savedHealth = vmState.health;
+		const savedPool = vmState.pool;
 		try {
 			await withProxyEnv({ HTTP_PROXY: proxy.url }, async () => {
 				// The env the entry script leaves behind after sourcing docker/no-proxy.sh.
@@ -162,6 +167,8 @@ describe("the board probe under an injected HTTP_PROXY", () => {
 			// the proxy, which is what this test watches.
 			expect(vmState.health.configured).toBe(true);
 		} finally {
+			vmState.health = savedHealth;
+			vmState.pool = savedPool;
 			proxy.stop();
 		}
 	});
@@ -195,6 +202,10 @@ describe("the board probe under an injected HTTP_PROXY", () => {
 
 	test("proxy: false keeps the probe direct even where the bypass list misses", async () => {
 		const proxy = fakeProxy();
+		// OTTR-1162: restore the shared singleton the probe wrote (health and the
+		// OTTR-1142 pool gate), like the first probe test does.
+		const savedHealth = vmState.health;
+		const savedPool = vmState.pool;
 		try {
 			await withProxyEnv(
 				{
@@ -213,6 +224,8 @@ describe("the board probe under an injected HTTP_PROXY", () => {
 			expect(vmState.health.configured).toBe(true);
 			expect(vmState.health.ok).toBe(false);
 		} finally {
+			vmState.health = savedHealth;
+			vmState.pool = savedPool;
 			proxy.stop();
 		}
 	});

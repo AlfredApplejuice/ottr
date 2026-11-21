@@ -109,6 +109,30 @@ test("the shim refuses redirected writes aimed at a fixture repository (OTTR-116
 	expect(read.status).toBe(0);
 	expect(read.stdout.trim()).toBe(realpathSync(join(watched, ".git")));
 
+	// `git config --file` writes exactly the named file: outside the watched repo it is
+	// allowed (an entry script seeds its own gitconfig this way), inside it is refused.
+	const cfgOutside = spawnSync(
+		"git",
+		["config", "--file", join(outside, "outside.gitconfig"), "probe.key", "v"],
+		{
+			cwd: outside,
+			env: envOf({ GIT_DIR: join(watched, ".git") }),
+			encoding: "utf8",
+		},
+	);
+	expect(cfgOutside.status).toBe(0);
+	const cfgInside = spawnSync(
+		"git",
+		["config", "--file", join(watched, ".git", "config"), "probe.key", "v"],
+		{
+			cwd: outside,
+			env: envOf({ GIT_DIR: join(watched, ".git") }),
+			encoding: "utf8",
+		},
+	);
+	expect(cfgInside.status).toBe(126);
+	expect(cfgInside.stderr).toContain("board-repo guard");
+
 	// The watched fixture repo holds nothing the drills could have written.
 	const refs = spawnSync("git", ["for-each-ref", "refs/heads"], {
 		cwd: watched,

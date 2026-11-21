@@ -140,6 +140,29 @@ const SHIM_TEMPLATE = [
 	"    done",
 	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash expansion, not a TS template
 	'    case " ${args[*]:$((i+1))} " in',
+	'      *" --global "*|*" --system "*) ;;',
+	'      *" --file "*|*" -f "*)',
+	"        j=$((i+1))",
+	'        while [ "$j" -lt "$n" ]; do',
+	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash expansion, not a TS template
+	'        case "${args[$j]}" in --file|-f)',
+	'          if [ $((j+1)) -lt "$n" ]; then',
+	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash expansion, not a TS template
+	'            f="${args[$((j+1))]}"',
+	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash expansion, not a TS template
+	'            case "$f" in /*) fp="$f";; *) fp="$PWD/$f";; esac',
+	'            fd="$(dirname "$fp" 2>/dev/null)" || fd=""',
+	'            fr="$(cd "$fd" 2>/dev/null && pwd -P)" || fr=""',
+	'            if [ -n "$fr" ]; then',
+	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash expansion, not a TS template
+	'              case "$fr/" in "$repodir"/*) write=1;; esac',
+	"            fi",
+	"          fi",
+	"        ;;",
+	"        esac",
+	"        j=$((j+1))",
+	"        done",
+	"      ;;",
 	'      *" --get "*|*" --get-all "*|*" --get-regexp "*|*" --list "*|*" -l "*|*" --show-origin "*|*" --show-scope "*|*" --get-urlmatch "*|*" --name-only "*) ;;',
 	'      *" --unset "*|*" --unset-all "*|*" --replace-all "*|*" --rename-section "*|*" --remove-section "*|*" --edit "*|*" -e "*) write=1;;',
 	'      *) [ "$vals" -ge 2 ] && write=1;;',
