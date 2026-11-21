@@ -421,6 +421,7 @@ export function prepareRunWorkspace(
 	cwd: string,
 	ids: TurnIdentity,
 	workspaceRoot: string,
+	project?: string,
 ): void {
 	const rel = relative(workspaceRoot, cwd);
 	if (rel === "" || isAbsolute(rel) || rel.startsWith(".."))
@@ -437,6 +438,13 @@ export function prepareRunWorkspace(
 	)
 		throw new Error(
 			`turn-uid: run cwd ${cwd} does not name a project under ${workspaceRoot}`,
+		);
+	// The identity comes from the request's project; a mismatched cwd/project
+	// pair would hand one project's chown to the other's uid. Hardening: the
+	// board always sends the matching pair (uids hold no /run token).
+	if (project !== undefined && firstSegment !== project)
+		throw new Error(
+			`turn-uid: run cwd ${cwd} does not belong to project ${project}`,
 		);
 	const rootFd = openPinned(workspaceRoot);
 	try {

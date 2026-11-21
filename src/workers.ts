@@ -495,7 +495,7 @@ export function serveWorker(opts: {
 					});
 					for (const root of turnUid.dataRoots)
 						closeProjectDir(join(root, project), ids);
-					prepareRunWorkspace(body.cwd, ids, turnUid.workspaceRoot);
+					prepareRunWorkspace(body.cwd, ids, turnUid.workspaceRoot, project);
 				} catch (err) {
 					return new Response(`turn-uid: ${String(err)}`, { status: 500 });
 				}

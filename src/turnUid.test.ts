@@ -592,3 +592,19 @@ test("isolationEnabled matches the process uid", () => {
 		typeof process.getuid === "function" && process.getuid() === 0,
 	);
 });
+
+rootTest("a cwd naming another project fails the run", () => {
+	const ws = freshDir("mismatch-ws");
+	const ids = projectTurnUid("mismatch-proj");
+	const main = join(ws, "main");
+	mkdirSync(join(main, ".git"), { recursive: true });
+	mkdirSync(join(main, ".worktrees", "card-1"), { recursive: true });
+	expect(() =>
+		prepareRunWorkspace(
+			join(main, ".worktrees", "card-1"),
+			ids,
+			ws,
+			"other-project",
+		),
+	).toThrow(/does not belong to project/);
+});
