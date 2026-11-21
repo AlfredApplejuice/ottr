@@ -7,6 +7,7 @@ import {
 	buildUserMessage,
 	defaultSpawn,
 	hasCredentialShape,
+	PROMPT_CHAR_BUDGET,
 	parseAnalysis,
 	proposalPrompt,
 	redactSecrets,
@@ -384,33 +385,12 @@ describe("buildUserMessage", () => {
 		expect(msg).toContain('password = "[REDACTED]"');
 		expect(msg).not.toContain("abcdefghijklmnop");
 	});
-	test("caps a raw patch before cleaning so a huge one cannot stall (OTTR-997)", () => {
-		const r = range({
-			commits: [
-				{
-					sha: SHA1,
-					subject: "s",
-					files: 1,
-					plus: 1,
-					minus: 0,
-					patch: "eyJ".repeat(333_334),
-					branches: [],
-				},
-			],
-			merges: [],
-		});
-		const t0 = performance.now();
-		expect(() => buildUserMessage(r, { titles: [], declines: [] })).toThrow(
-			RangeError,
-		);
-		expect(performance.now() - t0).toBeLessThan(1000);
-	});
 	test("a token straddling the raw cut still redacts (OTTR-997)", () => {
 		const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4";
-		// Two commits -> per-patch cap 200_000, raw cut at 216_384. The token
-		// straddles the cap and sits fully inside the cleaned region, so it
-		// redacts; the marker beyond the raw cut is dropped with the tail zone.
-		const patch = `${"a".repeat(199_990)}${jwt}${"b".repeat(20_000)}ZZTAILZZ`;
+		// Two commits -> per-patch cap 200_000, raw cut at 216_384. The patch goes
+		// over the cut, the token sits well inside the cleaned region before the
+		// dropped tail zone, and the marker beyond the raw cut goes with the tail.
+		const patch = `${"a".repeat(150_000)}${jwt}${"b".repeat(70_000)}ZZTAILZZ`;
 		const r = range({
 			commits: [
 				{
@@ -538,8 +518,19 @@ describe("buildUserMessage", () => {
 		expect(msg).toContain("[REDACTED]");
 		expect(msg).not.toContain("eyJ");
 	});
-	test("throws RangeError when oversized patches bust the budget", () => {
-		const big = "x".repeat(600_000);
+	test("redaction shrink ahead of the cut cannot expose a cut token (OTTR-997)", () => {
+		// Two commits -> cap 200_000, raw cut at 216_384. Three redacted blocks
+		// shrink the cleaned text by ~18 KiB, so a kept-cleaned-length cut would
+		// reach past the raw cut into the last block's body. The dropped cleaned
+		// tail zone must cover the shrinkage gap.
+		const block = (body: number) =>
+			`-----BEGIN RSA PRIVATE KEY-----\n${"X".repeat(body)}\n-----END RSA PRIVATE KEY-----`;
+		const patch1 =
+			"a".repeat(1000) +
+			block(6000).repeat(3) +
+			"a".repeat(191_814) +
+			block(6000) +
+			"b".repeat(500);
 		const r = range({
 			commits: [
 				{
@@ -548,12 +539,90 @@ describe("buildUserMessage", () => {
 					files: 1,
 					plus: 1,
 					minus: 0,
-					patch: big,
+					patch: patch1,
+					branches: [],
+				},
+				{
+					sha: SHA2,
+					subject: "t",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "+x",
 					branches: [],
 				},
 			],
 			merges: [],
 		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("[REDACTED]");
+		expect(msg).not.toContain("XXXXXXXXXX");
+		expect(msg).not.toContain("BEGIN RSA");
+	});
+	test("invisible-char shrink ahead of the cut cannot expose a cut token (OTTR-997)", () => {
+		// 20 000 zero-width spaces shrink the cleaned text by 20 KiB; the raw cut
+		// lands inside the last block's body and its prefix must stay dropped.
+		const patch1 =
+			"\u200C".repeat(20_000) +
+			"a".repeat(191_814) +
+			"-----BEGIN RSA PRIVATE KEY-----\n" +
+			`${"X".repeat(6000)}\n-----END RSA PRIVATE KEY-----${"b".repeat(500)}`;
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: patch1,
+					branches: [],
+				},
+				{
+					sha: SHA2,
+					subject: "t",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "+x",
+					branches: [],
+				},
+			],
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).not.toContain("XXXXXXXXXX");
+		expect(msg).not.toContain("BEGIN RSA");
+		expect(msg).toContain("aaaa");
+	});
+	test("truncates a huge patch in budget instead of stalling (OTTR-997)", () => {
+		// Before the fix this input cleaned the whole 1 MB patch for 81 s and
+		// then threw; now the pre-cut and the tail drop bound it into budget.
+		const patch = `${"eyJ".repeat(131_666)}ZZENDZZ${"eyJ".repeat(201_667)}`;
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch,
+					branches: [],
+				},
+			],
+			merges: [],
+		});
+		const t0 = performance.now();
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(performance.now() - t0).toBeLessThan(1000);
+		expect(msg.length).toBeLessThan(PROMPT_CHAR_BUDGET);
+		// The tail zone dropped at the raw cut removes the marker with it.
+		expect(msg).not.toContain("ZZENDZZ");
+		expect(msg).toContain("COMMITS");
+	});
+	test("throws RangeError when non-patch sections bust the budget", () => {
+		const r = range({ upstreamDocs: "y".repeat(500_000) });
 		expect(() => buildUserMessage(r, { titles: [], declines: [] })).toThrow(
 			RangeError,
 		);

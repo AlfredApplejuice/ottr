@@ -161,6 +161,16 @@ function patchCap(commitCount: number): number {
  * cleaned region (OTTR-997). */
 const MAX_TOKEN_LEN = 16_384;
 
+/** clean() does not map cleaned positions back to raw positions: it shrinks
+ * text (each redaction replaces a longer span, stripInvisible deletes chars)
+ * and grows it (a 1-char stored token becomes [REDACTED], a 7-char fence
+ * marker becomes a 22-char replacement). The unredacted prefix a raw cut
+ * leaves behind therefore sits in a variable cleaned-position tail zone; its
+ * cleaned length is bounded by the longest accepted span (~8.3 KiB) times the
+ * worst growth (22/7), so dropping this many cleaned chars removes it wherever
+ * shrinkage put it (OTTR-997). */
+const CLEAN_TAIL_DROP = 32_768;
+
 /** All labelled blocks after stripInvisible + redactSecrets, before budget capping. */
 function cleanBlocks(
 	range: ForkRange,
@@ -180,15 +190,14 @@ function cleanBlocks(
 			`owner/name: ${range.fork.owner}/${range.fork.name}\n` +
 				range.heads.map((h) => `${h.branch}: ${h.head}`).join("\n"),
 		),
-		patches: [...range.commits, ...range.merges].map((c) =>
-			c.patch.length > precap
-				? // OTTR-997: bound clean()'s input, then keep at most cap cleaned chars.
-					// The dropped tail zone before the cut can hold the prefix of a token
-					// whose rest lies beyond the cut; capPatches would not trim it when
-					// the range stays in budget, so it must never reach the prompt.
-					clean(c.patch.slice(0, precap)).slice(0, cap)
-				: clean(c.patch),
-		),
+		patches: [...range.commits, ...range.merges].map((c) => {
+			if (c.patch.length <= precap) return clean(c.patch);
+			// OTTR-997: bound clean()'s input. The raw cut can split a token; its
+			// unredacted prefix lands in the cleaned tail zone, so drop that zone
+			// by cleaned length, then keep the rest within cap.
+			const cleaned = clean(c.patch.slice(0, precap));
+			return cleaned.slice(0, Math.min(cleaned.length - CLEAN_TAIL_DROP, cap));
+		}),
 		upstreamCommits: clean(range.upstreamCommits.join("\n")),
 		upstreamFiles: clean(range.upstreamFiles.join("\n")),
 		upstreamDocs: clean(range.upstreamDocs),
