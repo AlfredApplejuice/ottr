@@ -5565,10 +5565,10 @@ describe("pr review store methods", () => {
 		// A person's post never stamps.
 		await store.setPrPostedUrl(12, url, "ottr[bot]", "COMMENT", "user");
 		expect((await store.boardCardFacts()).pr.get("T-9")?.posted).toBeNull();
-		// The board's own post, still current: stamped with the PR number.
+		// The board's own post, still current: stamped with the PR number and head.
 		await store.setPrPostedUrl(12, url, "ottr[bot]", "COMMENT", "auto");
 		expect((await store.boardCardFacts()).pr.get("T-9")).toMatchObject({
-			posted: 12,
+			posted: { number: 12, head: "h1" },
 		});
 		// A newer reviewed head ends the currency: the stamp clears.
 		await store.savePrReview({

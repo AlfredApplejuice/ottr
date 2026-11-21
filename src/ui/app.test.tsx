@@ -15721,6 +15721,7 @@ describe("Inbox panel ack footer", () => {
 });
 
 describe("PR review activity posted rows", () => {
+	const POSTED_HEAD = "a".repeat(40);
 	const postedCard = cardFixture({
 		id: "pr1",
 		kind: "pr_review",
@@ -15729,7 +15730,11 @@ describe("PR review activity posted rows", () => {
 		prOccurrence: {
 			draft: 3,
 			comments: null,
-			posted: { url: "https://github.com/acme/widget/pull/7", number: 7 },
+			posted: {
+				head: POSTED_HEAD,
+				url: "https://github.com/acme/widget/pull/7",
+				number: 7,
+			},
 		},
 	});
 	const panel = (prActivity: TaskCard[], prPosted: TaskCard[]) => {
@@ -15766,9 +15771,11 @@ describe("PR review activity posted rows", () => {
 		const { meta, document } = panel([], [postedCard]);
 		// The posted key joins the inbox entries: the badge counts it and the seen
 		// prune keeps it only while the stamp is current.
-		expect(meta.entries.map((e) => e.key)).toEqual(["pr:pr1:posted"]);
+		expect(meta.entries.map((e) => e.key)).toEqual([
+			`pr:pr1:posted:${POSTED_HEAD}`,
+		]);
 		const link = document.querySelector(
-			'#inbox [data-inbox-key="pr:pr1:posted"] a.alarm-link',
+			`#inbox [data-inbox-key="pr:pr1:posted:${POSTED_HEAD}"] a.alarm-link`,
 		) as HTMLAnchorElement | null;
 		expect(link).not.toBeNull();
 		// An external link to the PR, not a drawer link.
@@ -15795,7 +15802,7 @@ describe("PR review activity posted rows", () => {
 		});
 		const { meta, document } = panel([manual], []);
 		expect(meta.entries.map((e) => e.key)).toEqual(["pr:pr2:5"]);
-		expect(document.querySelector('[data-inbox-key$=":posted"]')).toBeNull();
+		expect(document.querySelector('[data-inbox-key*=":posted:"]')).toBeNull();
 		expect(document.body.innerHTML).not.toContain(
 			"Ottr posted the review on GitHub",
 		);
@@ -15823,7 +15830,11 @@ describe("bell PR rows in quiet projects", () => {
 			prOccurrence: {
 				draft: 1,
 				comments: null,
-				posted: { url: "https://github.com/acme/widget/pull/7", number: 7 },
+				posted: {
+					head: "a".repeat(40),
+					url: "https://github.com/acme/widget/pull/7",
+					number: 7,
+				},
 			},
 		});
 		const commented = card("pr2", { prOccurrence: { draft: 1, comments: 4 } });
@@ -15844,7 +15855,11 @@ describe("bell PR rows in quiet projects", () => {
 			prOccurrence: {
 				draft: 3,
 				comments: null,
-				posted: { url: "https://github.com/acme/widget/pull/7", number: 7 },
+				posted: {
+					head: "a".repeat(40),
+					url: "https://github.com/acme/widget/pull/7",
+					number: 7,
+				},
 			},
 		});
 		const commented = card("pr2", { prOccurrence: { draft: 3, comments: 4 } });

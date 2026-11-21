@@ -2368,6 +2368,7 @@ export async function createApp(deps: AppDeps) {
 					prDraft: t.prOccurrence?.draft ?? null,
 					prComments: t.prOccurrence?.comments ?? null,
 					prPosted: t.prOccurrence?.posted?.url ?? null,
+					prPostedHead: t.prOccurrence?.posted?.head ?? null,
 					cancelled: t.cancelledAt !== null,
 				};
 			}),
@@ -2389,16 +2390,21 @@ export async function createApp(deps: AppDeps) {
 			byId.set(c.id, c);
 			if (c.state === "needs_you") entryKeys.add(taskEntryKey(c));
 		}
-		/** Whether a `pr:<id>:<stamp>` key is still live: the card's unseen comment
-		 * wave, or its board-posted stamp while that stamp is current. */
+		/** Whether a `pr:<id>:...` key is still live: the card's unseen comment
+		 * wave, or its board-posted occurrence while that exact head is current
+		 * (docs/specs/pr-review-auto-post.md). */
 		function prKeyLive(k: string): boolean {
 			const rest = k.slice("pr:".length);
+			const postedAt = rest.indexOf(":posted:");
+			if (postedAt > 0) {
+				const c = byId.get(rest.slice(0, postedAt));
+				if (c === undefined) return false;
+				return rest.slice(postedAt + ":posted:".length) === c.prPostedHead;
+			}
 			const cut = rest.lastIndexOf(":");
 			if (cut <= 0) return false;
 			const c = byId.get(rest.slice(0, cut));
 			if (c === undefined) return false;
-			const stamp = rest.slice(cut + 1);
-			if (stamp === "posted") return c.prPosted !== null;
 			return c.prComments !== null && k === `pr:${c.id}:${c.prComments}`;
 		}
 		/** Whether a seen key still has its occurrence live: a `task:` key a current needs_you
@@ -5514,14 +5520,24 @@ export async function createApp(deps: AppDeps) {
 	 * one (docs/specs/pr-review-auto-post.md). */
 	function prOccurrenceOf(
 		e: Entry,
-		f: { draft: number | null; comments: number | null; posted: number | null },
+		f: {
+			draft: number | null;
+			comments: number | null;
+			posted: { number: number; head: string } | null;
+		},
 	): NonNullable<TaskCard["prOccurrence"]> {
 		const repo = e.github === null ? null : (ownerRepo(e.github) ?? e.github);
 		return {
 			draft: f.draft,
 			comments: f.comments,
 			...(f.posted !== null && repo !== null
-				? { posted: { url: prUrl(repo, f.posted), number: f.posted } }
+				? {
+						posted: {
+							url: prUrl(repo, f.posted.number),
+							number: f.posted.number,
+							head: f.posted.head,
+						},
+					}
 				: {}),
 		};
 	}
@@ -5540,7 +5556,7 @@ export async function createApp(deps: AppDeps) {
 					{
 						draft: number | null;
 						comments: number | null;
-						posted: number | null;
+						posted: { number: number; head: string } | null;
 					}
 				>;
 			};

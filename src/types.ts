@@ -1116,11 +1116,11 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	savedFiles?: { name: string; size: number }[];
 	/** Set only for kind "pr_review". */
 	prReview?: PrReviewView;
-	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and the unseen comment stamp that key the bell occurrences, plus the board-posted stamp (docs/specs/pr-review-auto-post.md). */
+	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and the unseen comment stamp that key the bell occurrences, plus the board-posted stamp (docs/specs/pr-review-auto-post.md). The head keys the posted occurrence. */
 	prOccurrence?: {
 		draft: number | null;
 		comments: number | null;
-		posted?: { url: string; number: number } | null;
+		posted?: { url: string; number: number; head: string } | null;
 	};
 	/** OTTR-1073: set only for kind "pr_review". The watcher's last draft run; its start and end change the board row, so an open drawer refetches the detail and the composer's run status moves. */
 	prRun?: PrRunState | null;
@@ -1204,12 +1204,12 @@ export type TaskCard = Omit<
 	 * <version>"); present on release cards only, and only when the list is non-empty. */
 	heldMerges?: string[];
 	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and
-	 * the unseen comment stamp that key the bell occurrences (board build and event diff), plus
-	 * the board-posted stamp (docs/specs/pr-review-auto-post.md). */
+	 * the unseen comment stamp that key the bell occurrences, plus the board-posted stamp
+	 * (docs/specs/pr-review-auto-post.md). The head keys the posted occurrence. */
 	prOccurrence?: {
 		draft: number | null;
 		comments: number | null;
-		posted?: { url: string; number: number } | null;
+		posted?: { url: string; number: number; head: string } | null;
 	};
 	/** OTTR-506: stamped on queued merges the push hold parks while local main has commits
 	 * origin lacks (a rejected server push); the board shows the hold reason — the browser

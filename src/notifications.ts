@@ -71,6 +71,10 @@ export interface AlertCardInput {
 	 * the row's last post is the board's and still current); null otherwise, so a manual Post
 	 * keeps null. */
 	prPosted: string | null;
+	/** The head prPosted's occurrence is bound to: the posted head of the board's own post.
+	 * The URL serves every head of the PR, so only the head witnesses a later automatic
+	 * post between two frames. */
+	prPostedHead: string | null;
 	asked: AskQuestion[] | null;
 	answered: boolean;
 	needsReason: string | null;
@@ -191,9 +195,7 @@ function prCommentsEvent(t: AlertCardInput, old: AlertCardInput | undefined) {
 	);
 }
 
-/** The complete event when the card newly finished or was answered; null when there is none.
- * A review the board posted by itself says so and opens the pull request; a manual Post keeps
- * the card title and the drawer. */
+/** The complete event when the card newly finished or was answered; null when there is none. */
 function completeEvent(t: AlertCardInput, old: AlertCardInput | undefined) {
 	if (
 		old === undefined ||
@@ -203,24 +205,37 @@ function completeEvent(t: AlertCardInput, old: AlertCardInput | undefined) {
 		)
 	)
 		return null;
-	const body =
-		t.prPosted !== null
-			? "Ottr posted the review on GitHub"
-			: t.answered
-				? (t.summary ?? "Answered; open the card to read it")
-				: `${t.title} was done`;
+	const body = t.answered
+		? (t.summary ?? "Answered; open the card to read it")
+		: `${t.title} was done`;
+	return alertEvent(t, "complete", `done:${t.id}`, body);
+}
+
+/** The complete event of the board's own post, keyed by the posted head; null when
+ * there is none. The head is the occurrence: it fires for a brand-new card whose
+ * first frame already carries the stamp, and for a later head posted between two
+ * frames whose card sits at done in both — a stage change cannot witness either. The
+ * PR URL stays the same across heads, so only the head detects the new post. */
+function prPostedEvent(t: AlertCardInput, old: AlertCardInput | undefined) {
+	if (
+		t.prPosted === null ||
+		t.prPostedHead === null ||
+		t.prPostedHead === (old?.prPostedHead ?? null)
+	)
+		return null;
 	return alertEvent(
 		t,
 		"complete",
-		`done:${t.id}`,
-		body,
-		t.prPosted ?? undefined,
+		`pr:${t.id}:posted:${t.prPostedHead}`,
+		"Ottr posted the review on GitHub",
+		t.prPosted,
 	);
 }
 
 /**
  * Events for cards that changed between two frames: at most one per card, precedence
- * error > request > complete. An error that leaves the card in needs_you takes the needs_you
+ * error > request > complete, where the board's own post outranks the plain done event.
+ * An error that leaves the card in needs_you takes the needs_you
  * entry key, so the inbox entry and the push are one occurrence instead of two.
  * null prev = first frame after server start: silent. Retro cards never alert.
  */
@@ -238,6 +253,7 @@ export function diffEvents(
 			errorEvent(t, old) ??
 			requestEvent(t, old) ??
 			prCommentsEvent(t, old) ??
+			prPostedEvent(t, old) ??
 			completeEvent(t, old);
 		if (ev !== null) out.push(ev);
 	}
@@ -314,7 +330,12 @@ export function clearedAlerts(
 		if (a.key.startsWith("task:"))
 			return t.state !== "needs_you" || taskEntryKey(t) !== a.key;
 		if (a.key.startsWith("pr:")) {
-			if (a.key === `pr:${t.id}:posted`) return t.prPosted === null;
+			// The board's own post is an occurrence keyed by the posted head: it stays
+			// live while that exact head is current and clears for a different head
+			// or a cleared stamp (docs/specs/pr-review-auto-post.md).
+			const postedAt = a.key.indexOf(":posted:");
+			if (postedAt > 0)
+				return a.key.slice(postedAt + ":posted:".length) !== t.prPostedHead;
 			return a.key !== `pr:${t.id}:${t.prComments}`;
 		}
 		if (a.key.startsWith("done:")) {

@@ -4992,11 +4992,16 @@ export class ProjectStore {
 		turns: Map<string, BoardTurnFacts>;
 		/** Raw stored session_title per task id; frozenTitleFrom applies the cleaning. */
 		titles: Map<string, string | null>;
-		/** Per pr_review card: the draft run stamp, the unseen comment stamp, and the board-posted
-		 * PR number while the board's own post is still the current one. */
+		/** Per pr_review card: the draft run stamp, the unseen comment stamp, and the
+		 * board-posted PR number and head while the board's own post is still the current
+		 * one. The head keys the posted occurrence: the same PR URL serves every head. */
 		pr: Map<
 			string,
-			{ draft: number | null; comments: number | null; posted: number | null }
+			{
+				draft: number | null;
+				comments: number | null;
+				posted: { number: number; head: string } | null;
+			}
 		>;
 	}> {
 		return this.queue.run(async () => {
@@ -5081,13 +5086,21 @@ export class ProjectStore {
 	private async boardPrFacts(): Promise<
 		Map<
 			string,
-			{ draft: number | null; comments: number | null; posted: number | null }
+			{
+				draft: number | null;
+				comments: number | null;
+				posted: { number: number; head: string } | null;
+			}
 		>
 	> {
 		return this.queue.run(async () => {
 			const pr = new Map<
 				string,
-				{ draft: number | null; comments: number | null; posted: number | null }
+				{
+					draft: number | null;
+					comments: number | null;
+					posted: { number: number; head: string } | null;
+				}
 			>();
 			const runs = new Map<number, number>();
 			for (const r of await this.db
@@ -5105,14 +5118,15 @@ export class ProjectStore {
 							? row.commentsAt
 							: null,
 					// The board's own post, while it is still the current one: the bell row
-					// and the auto-post complete event read it
-					// (docs/specs/pr-review-auto-post.md). Null otherwise.
+					// and the auto-post occurrence read it
+					// (docs/specs/pr-review-auto-post.md). The posted head keys the
+					// occurrence: the PR URL serves every head, the head does not.
 					posted:
 						row.postedVia === "auto" &&
 						row.postedHead !== null &&
 						row.postedHead === row.reviewedHead &&
 						row.state === "open"
-							? row.number
+							? { number: row.number, head: row.postedHead }
 							: null,
 				});
 			}

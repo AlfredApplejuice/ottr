@@ -16180,7 +16180,7 @@ export function appInboxMeta(
 			level: "needs" as const,
 		})),
 		...prPosted.map((t) => ({
-			key: `pr:${t.id}:posted`,
+			key: `pr:${t.id}:posted:${t.prOccurrence?.posted?.head}`,
 			level: "needs" as const,
 		})),
 		...askCards.map((t) => ({ key: taskEntryKey(t), level: "asked" as const })),
@@ -16459,7 +16459,7 @@ export function AppInboxPanel(p: {
 										const owner = projects.find((p) => p.name === t.project);
 										// The filter guarantees the stamp; the optional chain keeps TS honest.
 										const posted = t.prOccurrence?.posted;
-										const key = `pr:${t.id}:posted`;
+										const key = `pr:${t.id}:posted:${posted?.head}`;
 										return (
 											<li key={t.id} data-inbox-key={key}>
 												<a
