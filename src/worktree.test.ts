@@ -4134,17 +4134,27 @@ describe("git", () => {
 		expect(existsSync(marker)).toBe(false);
 	}, 60_000);
 
-	test("never rewrites a planted http.cookieFile jar on a board fetch (R5-1)", async () => {
-		if (process.platform === "win32") return; // the TLS fixture cert needs openssl
+	/**
+	 * Loopback dumb-HTTPS origin and a repo whose config plants the cookie jar at
+	 * <main>/server-only.db. Runs the control fetch first: plain git's libcurl must
+	 * rewrite the planted file, or the plant is dead and the caller's assertions mean
+	 * nothing. https because gitAuthEnv allows https:ssh:file only; sslVerify=false is
+	 * this fixture's self-signed cert. Async control spawn on purpose: must()'s
+	 * spawnSync blocks this process's event loop, and the Bun.serve fixture above
+	 * shares it — the fetch's HTTP client would starve waiting for a response the
+	 * blocked loop never sends.
+	 */
+	async function plantedCookieJar(): Promise<{
+		main: string;
+		jar: string;
+		bytes: string;
+		stop: () => void;
+	}> {
 		const main = repo();
 		await must(main, "init", "-q", "-b", "main");
 		writeFileSync(join(main, "f.txt"), "one\n");
 		await must(main, "add", "-A");
 		await must(main, "commit", "-q", "-m", "init");
-		// Dumb-HTTPS origin on loopback: a successful fetch reaches libcurl, whose
-		// cleanup rewrites http.cookieFile as a Netscape jar — the sink the board
-		// git must not let a planted config reach. https because gitAuthEnv allows
-		// https:ssh:file only; sslVerify=false is this fixture's self-signed cert.
 		const bare = repo();
 		await must(main, "init", "-q", "--bare", "-b", "main", bare);
 		await must(main, "push", "-q", bare, "main");
@@ -4194,53 +4204,111 @@ describe("git", () => {
 				}
 			},
 		});
+		const jar = join(main, "server-only.db");
+		const bytes = "SERVER-ONLY-DATA\n";
+		writeFileSync(jar, bytes);
+		await must(
+			main,
+			"config",
+			"remote.origin.url",
+			`https://127.0.0.1:${server.port}/`,
+		);
+		await must(main, "config", "http.cookieFile", jar);
+		await must(main, "config", "http.saveCookies", "true");
+		// Control: the plant is live — plain git's libcurl rewrites the file as a jar.
+		const control = Bun.spawn(
+			[gitExe(), "-c", "http.sslVerify=false", "fetch", "--quiet", "origin"],
+			{
+				cwd: main,
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "pipe",
+				windowsHide: true,
+			},
+		);
+		const controlErr = await new Response(control.stderr).text();
+		if ((await control.exited) !== 0)
+			throw new Error(`control git fetch: ${controlErr}`);
+		expect(readFileSync(jar, "utf8")).not.toBe(bytes);
+		return { main, jar, bytes, stop: () => server.stop(true) };
+	}
+
+	test("never rewrites a planted http.cookieFile jar on a board fetch (R5-1)", async () => {
+		if (process.platform === "win32") return; // the TLS fixture cert needs openssl
+		const f = await plantedCookieJar();
 		try {
-			const url = `https://127.0.0.1:${server.port}/`;
-			await must(main, "config", "remote.origin.url", url);
-			// The plant: a file a board-side git must never let libcurl rewrite, holding
-			// server-only bytes (the board databases sit under /app/.tasks in compose).
-			const jar = join(main, "server-only.db");
-			const bytes = "SERVER-ONLY-DATA\n";
-			writeFileSync(jar, bytes);
-			await must(main, "config", "http.cookieFile", jar);
-			await must(main, "config", "http.saveCookies", "true");
-			// Control: the plant is live — plain git's libcurl rewrites the file as a jar.
-			// Async spawn on purpose: must()'s spawnSync blocks this process's event loop,
-			// and the Bun.serve fixture above shares it — the fetch's HTTP client would
-			// starve waiting for a response the blocked loop never sends.
-			const control = Bun.spawn(
+			// Production shape: git() argv overrides and the gitAuthEnv env config together
+			// (pinnedFetch passes the auth env of the project). The per-layer tests below
+			// pin each half on its own, so a deletion in one layer fails its own test.
+			writeFileSync(f.jar, f.bytes);
+			const before = statSync(f.jar);
+			const r = await git(
+				["-c", "http.sslVerify=false", "fetch", "origin"],
+				f.main,
+				30_000,
+				gitAuthEnv({ tokens: [], key: null, knownHosts: "/nonexistent" }),
+			);
+			expect(r.code).toBe(0);
+			expect(readFileSync(f.jar, "utf8")).toBe(f.bytes);
+			expect(statSync(f.jar).ino).toBe(before.ino);
+		} finally {
+			f.stop();
+		}
+	}, 60_000);
+
+	test("the git() cookie overrides alone keep a planted http.cookieFile intact (R5-1)", async () => {
+		if (process.platform === "win32") return; // the TLS fixture cert needs openssl
+		const f = await plantedCookieJar();
+		try {
+			// No authEnv: git() resolves networkGitAuth(cwd), which carries no cookie keys
+			// here — the argv -c pair is this fetch's only cookie protection.
+			writeFileSync(f.jar, f.bytes);
+			const before = statSync(f.jar);
+			const r = await git(
+				["-c", "http.sslVerify=false", "fetch", "origin"],
+				f.main,
+				30_000,
+			);
+			expect(r.code).toBe(0);
+			expect(readFileSync(f.jar, "utf8")).toBe(f.bytes);
+			expect(statSync(f.jar).ino).toBe(before.ino);
+		} finally {
+			f.stop();
+		}
+	}, 60_000);
+
+	test("the gitAuthEnv cookie entries alone keep a planted http.cookieFile intact (R5-1)", async () => {
+		if (process.platform === "win32") return; // the TLS fixture cert needs openssl
+		const f = await plantedCookieJar();
+		try {
+			// Plain git, not the git() under test: the env config is this fetch's only
+			// cookie protection.
+			writeFileSync(f.jar, f.bytes);
+			const before = statSync(f.jar);
+			const r = Bun.spawn(
 				[gitExe(), "-c", "http.sslVerify=false", "fetch", "--quiet", "origin"],
 				{
-					cwd: main,
+					cwd: f.main,
 					stdin: "ignore",
 					stdout: "ignore",
 					stderr: "pipe",
 					windowsHide: true,
+					env: {
+						...process.env,
+						...gitAuthEnv({
+							tokens: [],
+							key: null,
+							knownHosts: "/nonexistent",
+						}),
+					},
 				},
 			);
-			const controlErr = await new Response(control.stderr).text();
-			if ((await control.exited) !== 0)
-				throw new Error(`control git fetch: ${controlErr}`);
-			expect(readFileSync(jar, "utf8")).not.toBe(bytes);
-			// Board git with the auth env: the planted path keeps its bytes and inode.
-			writeFileSync(jar, bytes);
-			const before = statSync(jar);
-			const auth = gitAuthEnv({
-				tokens: [],
-				key: null,
-				knownHosts: "/nonexistent",
-			});
-			const r = await git(
-				["-c", "http.sslVerify=false", "fetch", "origin"],
-				main,
-				30_000,
-				auth,
-			);
-			expect(r.code).toBe(0);
-			expect(readFileSync(jar, "utf8")).toBe(bytes);
-			expect(statSync(jar).ino).toBe(before.ino);
+			const err = await new Response(r.stderr).text();
+			if ((await r.exited) !== 0) throw new Error(`git fetch: ${err}`);
+			expect(readFileSync(f.jar, "utf8")).toBe(f.bytes);
+			expect(statSync(f.jar).ino).toBe(before.ino);
 		} finally {
-			server.stop(true);
+			f.stop();
 		}
 	}, 60_000);
 
