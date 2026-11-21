@@ -743,9 +743,13 @@ function lfsBoardHref(url: URL, project: string, oid: string): string {
 /**
  * Belt before the board fetches a download href: a literal-IP host must not be loopback,
  * private (RFC1918), link-local, CGNAT, unique-local or 0.0.0.0 — an upstream must not
- * point the board into its own network. Residual: a href may target the pinned origin's
- * own host even when private; name-based hosts are not resolved; the pinned origin is
- * admin-set.
+ * point the board into its own network. IPv6 literals arrive bracketed from URL.hostname
+ * (WHATWG keeps the brackets), so both sides normalize before any comparison, and an IPv6
+ * literal is classified by its expanded groups: the IPv4-mapped (::ffff:0:0/96),
+ * IPv4-compatible (::/96 with a v4 tail) and translated (64:ff9b::/96) forms are judged by
+ * their embedded IPv4 address, so no hex-spelled form escapes. Residual: a href may target
+ * the pinned origin's own host even when private; name-based hosts are not resolved; the
+ * pinned origin is admin-set.
  */
 function hrefRefusal(href: string, originHostname: string): string | null {
 	let u: URL;
@@ -756,34 +760,111 @@ function hrefRefusal(href: string, originHostname: string): string | null {
 	}
 	if (u.protocol !== "http:" && u.protocol !== "https:")
 		return `href is ${u.protocol.slice(0, -1)}, not http(s)`;
-	const host = u.hostname.toLowerCase();
-	const originHost = originHostname.toLowerCase(); // no port: hrefs may use another port on the same host
-	// WHATWG canonicalizes IPv4-mapped loopback to hex (::ffff:7f00:1); both forms refuse.
+	const hostName = u.hostname.toLowerCase();
+	// IPv6 literals keep their brackets in URL.hostname; normalize both sides first.
+	const host =
+		hostName.startsWith("[") && hostName.endsWith("]")
+			? hostName.slice(1, -1)
+			: hostName;
+	const originName = originHostname.toLowerCase();
+	const originHost =
+		originName.startsWith("[") && originName.endsWith("]")
+			? originName.slice(1, -1)
+			: originName; // no port: hrefs may use another port on the same host
+	if (host === originHost) return null; // the pinned origin's own host is exempt
 	if (host.includes(":")) {
-		if (host === originHost) return null; // the pinned origin's own host is exempt
-		const v6 =
-			host === "::1" ||
-			/^::ffff:(127\.|7f00:)/.test(host) ||
-			/^fe[89ab]/.test(host) || // link-local fe80::/10
-			/^f[cd]/.test(host); // unique-local fc00::/7
-		return v6 ? "href points at a reserved IPv6 address" : null;
+		const groups = ipv6Groups(host);
+		// Anything with a colon in the hostname is an IP literal, not a name: a form that
+		// does not expand (IPvFuture, garbage) is refused, not passed.
+		if (groups === null) return "href host is not a valid IPv6 address";
+		const [g0 = 0, g1 = 0, g2 = 0, g3 = 0, g4 = 0, g5 = 0, g6 = 0, g7 = 0] =
+			groups;
+		const zero = (x: number) => x === 0;
+		if (
+			[g0, g1, g2, g3, g4, g5, g6, g7].every(zero) ||
+			([g0, g1, g2, g3, g4, g5, g6].every(zero) && g7 === 1)
+		)
+			// the unspecified address, and the loopback ::1.
+			return "href points at a reserved IPv6 address";
+		// unique-local fc00::/7, link-local fe80::/10, multicast ff00::/8.
+		if (((g0 >> 8) & 0xfe) === 0xfc || g0 >> 6 === 0x3fa || g0 >> 8 === 0xff)
+			return "href points at a reserved IPv6 address";
+		// An embedded IPv4 tail is judged as IPv4: IPv4-mapped ::ffff:0:0/96,
+		// IPv4-compatible ::/96 (the mapped ones WHATWG may spell in hex), and NAT64
+		// 64:ff9b::/96.
+		let embedded: [number, number] | null = null;
+		if ([g0, g1, g2, g3, g4].every(zero) && (g5 === 0 || g5 === 0xffff))
+			embedded = [g6, g7];
+		if (g0 === 0x64 && g1 === 0xff9b && [g2, g3, g4, g5].every(zero))
+			embedded = [g6, g7];
+		if (embedded !== null) {
+			const [hi, lo] = embedded;
+			const a = hi >> 8;
+			const b = hi & 0xff;
+			if (ipv4Reserved(a, b, lo >> 8, lo & 0xff))
+				return "href points at a reserved IPv4 address";
+		}
+		return null;
 	}
 	const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
 	if (v4 === null) return null; // a name-based host is not resolved here
 	if ([v4[1], v4[2], v4[3], v4[4]].some((p) => Number(p) > 255))
 		return "href host is not a valid IPv4 address";
-	const a = Number(v4[1]);
-	const b = Number(v4[2]);
-	if (host === originHost) return null; // the pinned origin's own host is exempt
-	const reserved =
+	if (ipv4Reserved(Number(v4[1]), Number(v4[2]), Number(v4[3]), Number(v4[4])))
+		return "href points at a reserved IPv4 address";
+	return null;
+}
+
+/** The reserved IPv4 ranges the belt refuses: 0/8, loopback, RFC1918, link-local, CGNAT. */
+function ipv4Reserved(a: number, b: number, c: number, d: number): boolean {
+	return (
 		a === 0 || // 0.0.0.0/8, 0.0.0.0 included
 		a === 127 || // loopback
 		a === 10 || // RFC1918
 		(a === 172 && b >= 16 && b <= 31) || // RFC1918
 		(a === 192 && b === 168) || // RFC1918
 		(a === 169 && b === 254) || // link-local
-		(a === 100 && b >= 64 && b <= 127); // CGNAT
-	return reserved ? "href points at a reserved IPv4 address" : null;
+		(a === 100 && b >= 64 && b <= 127) || // CGNAT
+		(a === 255 && b === 255 && c === 255 && d === 255) // broadcast
+	);
+}
+
+/** Expands an IPv6 literal into its 8 groups (0..0xffff), or null when it is not one.
+ * Handles :: compression and a dotted-quad tail; hex groups stay as written. */
+function ipv6Groups(raw: string): number[] | null {
+	const parts = raw.split("::");
+	if (parts.length > 2) return null;
+	const head = parts[0] ?? "";
+	const tail = parts[1] ?? "";
+	const left = head === "" ? [] : head.split(":");
+	const right = tail === "" ? [] : tail.split(":");
+	const groups: number[] = [];
+	for (const part of [...left, ...right]) {
+		if (part.includes(".")) {
+			// A dotted-quad tail is only valid at the very end (the last 32 bits), and its
+			// four dot-separated parts must each be an octet.
+			const parts = part.split(".");
+			if (parts.length !== 4 || groups.length + right.length > 6) return null;
+			const [a = 0, b = 0, c = 0, d = 0] = parts.map((x) => Number(x));
+			if ([a, b, c, d].some((x) => !Number.isInteger(x) || x < 0 || x > 255))
+				return null;
+			groups.push((a << 8) | b, (c << 8) | d);
+			continue;
+		}
+		if (!/^[0-9a-f]{1,4}$/.test(part)) return null;
+		groups.push(Number.parseInt(part, 16));
+	}
+	if (parts.length === 2) {
+		if (groups.length > 8) return null;
+		const fill = 8 - groups.length;
+		const mid = groups.length - right.length;
+		return [
+			...groups.slice(0, mid),
+			...Array<number>(fill).fill(0),
+			...groups.slice(mid),
+		];
+	}
+	return groups.length === 8 ? groups : null;
 }
 
 /**
@@ -864,13 +945,35 @@ async function lfsObjectGet(
 		o.log(`${grant.project}/${grant.taskId}: LFS href refused: ${refused}`);
 		return plain(`LFS download ${refused}`, 502);
 	}
+	const signal = AbortSignal.any([AbortSignal.timeout(600_000), req.signal]);
+	// Follows redirects by hand: default redirect-following would skip the belt, so a
+	// hostile href could 302 the board into its own network and stream the answer to the
+	// VM. Every hop passes hrefRefusal; three hops bound the loop.
+	let target = obj.href;
 	let res: Response;
-	try {
-		res = await fetch(obj.href, {
-			signal: AbortSignal.any([AbortSignal.timeout(600_000), req.signal]),
-		});
-	} catch {
-		return plain("LFS object download failed", 502);
+	for (let hops = 0; ; hops++) {
+		try {
+			res = await fetch(target, { redirect: "manual", signal });
+		} catch {
+			return plain("LFS object download failed", 502);
+		}
+		const location =
+			res.status >= 300 && res.status < 400
+				? res.headers.get("Location")
+				: null;
+		if (location === null) break;
+		void res.body?.cancel();
+		if (hops === 3)
+			return plain("LFS object download followed too many redirects", 502);
+		const next = new URL(location, target).toString();
+		const hopRefused = hrefRefusal(next, up.originHostname);
+		if (hopRefused !== null) {
+			o.log(
+				`${grant.project}/${grant.taskId}: LFS redirect refused: ${hopRefused}`,
+			);
+			return plain(`LFS download ${hopRefused}`, 502);
+		}
+		target = next;
 	}
 	o.log(
 		`${grant.project}/${grant.taskId}: LFS object ${oid} streamed from ${up.host} (status ${res.status})`,

@@ -91,6 +91,9 @@ const pointerText = () =>
 	`version https://git-lfs.github.com/spec/v1\noid sha256:${LFS_OID}\nsize 64\n`;
 
 const BRANCH = "ott/alp-1-x";
+/** Fixture-only oids that drill the storage route's belt (never real objects). */
+const POISON_OID = "a".repeat(64);
+const REDIRECT_OID = "b".repeat(64);
 /** The one credential the fixture upstream accepts on a batch call: the board's own. */
 const LFS_USER = "ott";
 const LFS_TOKEN = "lfs-fixture-token";
@@ -109,6 +112,17 @@ const upstreamBatches: { operation: unknown; oids: unknown[] }[] = [];
 const storageGets: string[] = [];
 /** Upstream batch calls that arrived with a missing or wrong board credential. */
 const upstreamAuthRejections: string[] = [];
+
+/** The hrefs the fixture upstream hands out per oid. Built per request, so it reads the
+ * servers' current ports. POISON_OID drills the belt: its href names a bracketed
+ * IPv4-mapped loopback literal (the bypass form the security review found), which the
+ * belt must refuse before the board fetches anything. REDIRECT_OID drills redirect
+ * handling: its storage hop answers 302 with a Location on the board's own loopback. */
+const fixtureHrefs = (): Record<string, string> => ({
+	[LFS_OID]: `${upstreamBase}/storage/${LFS_OID}`,
+	[POISON_OID]: `http://[::ffff:127.0.0.1]:${upstream.port}/storage/${POISON_OID}`,
+	[REDIRECT_OID]: `${upstreamBase}/storage/${REDIRECT_OID}`,
+});
 
 let main = "";
 let worktree = "";
@@ -141,17 +155,20 @@ beforeAll(async () => {
 						? body.objects.map((o) => o?.oid)
 						: [],
 				});
-				const objects = (Array.isArray(body.objects) ? body.objects : [])
-					.filter((o) => o?.oid === LFS_OID)
-					.map(() => ({
-						oid: LFS_OID,
-						size: LFS_CONTENT.length,
-						actions: {
-							download: {
-								href: `${upstreamBase}/storage/${LFS_OID}`,
-							},
-						},
-					}));
+				const hrefs = fixtureHrefs();
+				const objects = (
+					Array.isArray(body.objects) ? body.objects : []
+				).flatMap((o) =>
+					typeof o?.oid === "string" && o.oid in hrefs
+						? [
+								{
+									oid: o.oid,
+									size: LFS_CONTENT.length,
+									actions: { download: { href: hrefs[o.oid] } },
+								},
+							]
+						: [],
+				);
 				if (objects.length === 0)
 					return new Response("not found", { status: 404 });
 				return new Response(JSON.stringify({ transfer: "basic", objects }), {
@@ -161,6 +178,12 @@ beforeAll(async () => {
 			if (req.method === "GET" && url.pathname.startsWith("/storage/")) {
 				const oid = url.pathname.slice("/storage/".length);
 				storageGets.push(oid);
+				// The redirect drill: this hop hands the board a Location the belt must refuse.
+				if (oid === REDIRECT_OID)
+					return new Response(null, {
+						status: 302,
+						headers: { location: `http://127.0.0.1:${board.port}/api/boot` },
+					});
 				if (oid !== LFS_OID) return new Response("not found", { status: 404 });
 				return new Response(LFS_CONTENT, {
 					headers: {
@@ -335,6 +358,31 @@ describe("handleGit LFS proxy", () => {
 		},
 		60_000,
 	);
+
+	test("a poisoned href on a bracketed IPv4-mapped loopback literal is refused", async () => {
+		// The review's bypass: URL.hostname keeps the brackets, so an unnormalized
+		// comparison never matches the reserved ranges. The board must refuse before it
+		// fetches anything.
+		const res = await fetch(`${url()}/info/lfs/objects/${POISON_OID}`, {
+			headers: { authorization: `Bearer ${token}` },
+		});
+		expect(res.status).toBe(502);
+		expect(await res.text()).toContain("reserved");
+		// Refused before the fetch: the fixture never served the bytes.
+		expect(storageGets).not.toContain(POISON_OID);
+		expect(upstreamAuthRejections).toEqual([]);
+	});
+
+	test("a redirect hop to a literal loopback address is refused", async () => {
+		// The review's bypass: redirect-following skipped the belt entirely, so a 302 from
+		// an allowed host could hand the board's own loopback body to the VM.
+		const res = await fetch(`${url()}/info/lfs/objects/${REDIRECT_OID}`, {
+			headers: { authorization: `Bearer ${token}` },
+		});
+		expect(res.status).toBe(502);
+		expect(await res.text()).toContain("reserved");
+		expect(upstreamAuthRejections).toEqual([]);
+	});
 
 	test("a token of another project cannot read this project's LFS objects", async () => {
 		const before = upstreamBatches.length;
