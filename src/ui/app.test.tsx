@@ -8685,6 +8685,132 @@ describe("ProjectBoard done lane time view", () => {
 		}
 	});
 
+	test("a matching retro the lane cannot render keeps Show more honest", async () => {
+		// Retro cards hide in Done (onBoard), but the server's matching total and
+		// the fetched pages still carry them. The hidden count reads the merged
+		// result's real IDs minus such never-rendering cards, so "Show more"
+		// disappears when every renderable match is on the board instead of
+		// paging through empty pages forever.
+		const held = [
+			...Array.from({ length: 19 }, (_, j) =>
+				cardFixture({
+					id: `d${j}`,
+					title: "plain j",
+					sessionTitle: "plain j",
+					stage: "done",
+					state: "idle",
+					doneAt: j + 1,
+				}),
+			),
+			cardFixture({
+				id: "r0",
+				kind: "retro",
+				title: "Retro of the heatmap work",
+				sessionTitle: "Retro of the heatmap work",
+				stage: "done",
+				state: "idle",
+				doneAt: 0,
+			}),
+		];
+		const fetched = [
+			cardFixture({
+				id: "o0",
+				title: "add a room presence heatmap",
+				sessionTitle: "add a room presence heatmap",
+				stage: "done",
+				state: "idle",
+				doneAt: -1,
+			}),
+			cardFixture({
+				id: "o1",
+				title: "heatmap legend contrast",
+				sessionTitle: "heatmap legend contrast",
+				stage: "done",
+				state: "idle",
+				doneAt: -2,
+			}),
+		];
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const project = {
+			name: "proj",
+			hasRules: true,
+			github: null,
+			gitless: false,
+			dirty: false,
+			archReview: null,
+			latestRelease: null,
+			latestImage: null,
+			doneTotal: 21,
+			settings: { setupChecklist: false },
+			sessionsDir: "/tmp/s",
+		} as unknown as ProjectView;
+		const realFetch = globalThis.fetch;
+		const fetches: string[] = [];
+		globalThis.fetch = (async (url: RequestInfo | URL) => {
+			const u = String(url);
+			if (u === "/api/projects/proj/done?page=1&q=heatmap") {
+				fetches.push(u);
+				return new Response(JSON.stringify({ tasks: fetched, total: 3 }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectBoard
+						project={project}
+						tasks={held}
+						deltas={new Map()}
+						open={() => {}}
+						seenAnswers={new Set()}
+						seenDoneSince={0}
+						compose={() => {}}
+						composeDraft={() => {}}
+						act={async () => true}
+						onNotice={() => {}}
+						draining={false}
+					/>,
+				);
+			});
+			const lane = container.querySelector('[data-stage="done"]');
+			const ids = (): string[] =>
+				[...lane!.querySelectorAll("[data-task-id]")].map(
+					(el) => el.getAttribute("data-task-id") ?? "",
+				);
+			const input = container.querySelector(
+				'input[aria-label="Search tasks"]',
+			) as HTMLInputElement;
+			await act(async () => {
+				typeInto(input, "heatmap");
+				onChangeOf(input)({ target: { value: "heatmap" } });
+			});
+			await act(async () => {
+				await Bun.sleep(SEARCH_APPLY_MS + 100);
+			});
+			// Three matches: the two fetched work cards render; the window's retro
+			// match hides by design and stays out of the hidden count. Every
+			// renderable match is on the board, so "Show more" is gone and the head
+			// reads the two rendered of the three matches.
+			expect(fetches).toEqual(["/api/projects/proj/done?page=1&q=heatmap"]);
+			expect(ids()).toEqual(["o0", "o1"]);
+			expect(lane!.querySelector(".count")?.textContent).toBe("2/3");
+			expect(lane!.querySelector("button.lane-more")).toBeNull();
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
 	test("the Starred section stays collapsible in the time view", async () => {
 		const doneCards = [
 			cardFixture({ id: "d0", stage: "done", state: "idle", doneAt: 1 }),

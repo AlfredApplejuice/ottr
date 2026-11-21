@@ -4689,25 +4689,40 @@ export function ProjectBoard({
 		seenAnswers,
 		seenDoneSince,
 	);
-	// The done-lane cards the state holds (the window and the pinned ones) and the
-	// fetched older pages, so the hidden count stays true when a page lands.
+	// The done-lane cards the state holds (the window and the pinned ones).
 	const heldDoneCount = tasks.filter((t) => laneStage(t) === "done").length;
 	const heldIds = new Set(tasks.map((t) => t.id));
-	const olderCount = older.filter((t) => !heldIds.has(t.id)).length;
 	// With a query applied the done lane reads the server search, not the state
 	// window: the shown done cards and the fetched ones the state lacks drive the
-	// hidden count and the search count against the server's matching total.
+	// search count against the server's matching total.
 	const shownDoneCount = shown.filter((t) => laneStage(t) === "done").length;
-	const fetchedNotHeld =
-		searched === null
-			? 0
-			: searched.tasks.filter((t) => !heldIds.has(t.id)).length;
+	// The lane's merged done list, computed once: the held matched cards plus the
+	// fetched ones the state lacks, sorted for landing. The head count and the
+	// hidden count read these real IDs, so a card the lane renders can never sit
+	// behind "Show more" at the same time.
+	const doneCol = laneColumnData(
+		"done",
+		shown,
+		q,
+		q === "" ? older : (searched?.tasks ?? []),
+	).col;
+	// Retro cards hide in Done (onBoard) unless they need the user, but the
+	// settled total and the fetched pages still carry them. The hidden count
+	// excludes them, or a match the lane can never render would keep "Show more"
+	// alive through empty pages.
+	const heldHiddenDone = tasks.filter(
+		(t) =>
+			laneStage(t) === "done" &&
+			t.kind === "retro" &&
+			t.state !== "needs_you" &&
+			(q === "" || matchesQuery(t, q)),
+	).length;
 	const doneHidden =
 		q === ""
-			? Math.max(0, project.doneTotal - heldDoneCount - olderCount)
+			? Math.max(0, project.doneTotal - doneCol.length - heldHiddenDone)
 			: searched === null
 				? 0
-				: Math.max(0, searched.total - shownDoneCount - fetchedNotHeld);
+				: Math.max(0, searched.total - doneCol.length - heldHiddenDone);
 	// The search count matches the lanes: a retro off the board is no task to count,
 	// and the done cards behind the state window still belong to the project's size.
 	const boardTotal =
@@ -5030,15 +5045,12 @@ export function ProjectBoard({
 				}}
 			>
 				{COLUMNS.map((c) => {
-					// With a query applied the done lane merges the server search's pages
-					// instead of the fetched older ones; laneColumnData dedupes against
-					// the held cards and re-applies the query, so raw pages need no merge.
-					const { col } = laneColumnData(
-						c.key,
-						shown,
-						q,
-						q === "" ? older : (searched?.tasks ?? []),
-					);
+					// The done column is the merged list computed above; the other lanes
+					// order per column.
+					const col =
+						c.key === "done"
+							? doneCol
+							: laneColumnData(c.key, shown, q, []).col;
 					const count = counts[c.key];
 					const unread = (t: TaskCard): boolean =>
 						isUnread(t, seenAnswers, seenDoneSince);
