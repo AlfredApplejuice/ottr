@@ -33,7 +33,6 @@ import {
 	createRunSink,
 	findHttp400Rejection,
 	hitUsageLimit,
-	localGitPinEnv,
 	NO_DISCOVERY_CONFIG,
 	NO_FETCH_CONFIG,
 	newEventState,
@@ -3469,75 +3468,6 @@ describe("startRun", () => {
 		}
 	});
 
-	test("a local run's env pins the shell git the way the board's own git() does", () => {
-		// withoutGitAuth strips GIT_CONFIG_* as credential names, so the pins must ride
-		// fresh after it: env config sits in git's command-line scope, above the
-		// worker-writable common gitdir's repo config and hooks.
-		expect(localGitPinEnv()).toEqual({
-			GIT_CONFIG_COUNT: "9",
-			GIT_CONFIG_KEY_0: "core.fsmonitor",
-			GIT_CONFIG_VALUE_0: "false",
-			GIT_CONFIG_KEY_1: "core.hooksPath",
-			GIT_CONFIG_VALUE_1: "/dev/null",
-			GIT_CONFIG_KEY_2: "commit.gpgSign",
-			GIT_CONFIG_VALUE_2: "false",
-			GIT_CONFIG_KEY_3: "tag.gpgSign",
-			GIT_CONFIG_VALUE_3: "false",
-			GIT_CONFIG_KEY_4: "gpg.program",
-			GIT_CONFIG_VALUE_4: "false",
-			GIT_CONFIG_KEY_5: "gpg.x509.program",
-			GIT_CONFIG_VALUE_5: "false",
-			GIT_CONFIG_KEY_6: "gpg.ssh.program",
-			GIT_CONFIG_VALUE_6: "false",
-			GIT_CONFIG_KEY_7: "gc.auto",
-			GIT_CONFIG_VALUE_7: "0",
-			GIT_CONFIG_KEY_8: "maintenance.auto",
-			GIT_CONFIG_VALUE_8: "false",
-		});
-	});
-
-	test("a local run keeps GH_TOKEN and replaces stripped GIT_CONFIG_* with the git pins", async () => {
-		// The merge turn's push needs GH_TOKEN (D6 keeps it locally), while an operator
-		// GIT_CONFIG_* entry must not survive the strip: the run's pins own that namespace.
-		const dir = mkdtempSync(join(tmpdir(), "ottr-gitpins-"));
-		try {
-			let seen: Record<string, string | undefined> | undefined;
-			const launcher: RunLauncher = (_c, _a, options) => {
-				seen = options.env;
-				const fake = new FakeOmp();
-				queueMicrotask(() => fake.emit("close", 0));
-				return fake as unknown as ChildProcess;
-			};
-			const handle = await startRun({
-				cwd: dir,
-				prompt: "do the thing",
-				sessionDir: join(dir, "sessions"),
-				extensionPath: null,
-				resumeId: null,
-				logPath: join(dir, "run.log"),
-				dataRoot: dir,
-				launcher,
-				env: {
-					GH_TOKEN: "merge-turn-token",
-					GIT_CONFIG_COUNT: "1",
-					GIT_CONFIG_KEY_0: "core.pager",
-					GIT_CONFIG_VALUE_0: "cat",
-				},
-			});
-			await handle.done;
-			const env = seen!;
-			expect(env.GH_TOKEN).toBe("merge-turn-token");
-			expect(env.GIT_CONFIG_COUNT).toBe("9");
-			expect(env.GIT_CONFIG_KEY_0).toBe("core.fsmonitor");
-			expect(env.GIT_CONFIG_KEY_1).toBe("core.hooksPath");
-			expect(env.GIT_CONFIG_VALUE_1).toBe("/dev/null");
-			expect(env.GIT_CONFIG_KEY_8).toBe("maintenance.auto");
-			expect(env).toMatchObject(localGitPinEnv());
-		} finally {
-			rmSync(dir, { recursive: true, force: true });
-		}
-	});
-
 	test("a local run always passes --no-extensions, --no-lsp and the no-discovery overlay", async () => {
 		// The worktree cwd is worker-writable, so even a run with no explicit extension
 		// (a review check) must carry the hardening: the audit's vector rides in the cwd.
@@ -4826,21 +4756,7 @@ describe("arch-review changed-line coverage", () => {
 				},
 			});
 			await handle.done;
-			// localGitPinEnv owns the GIT_CONFIG_* namespace after the strip: the planted
-			// values never reach the child, and the names carry only the board's pins.
-			const env = seen[0]!.env!;
-			expect(env.GIT_CONFIG_COUNT).toBe("9");
-			expect(env.GIT_CONFIG_KEY_0).toBe("core.fsmonitor");
-			expect(env.GIT_CONFIG_VALUE_0).toBe("false");
-			expect(env.GIT_CONFIG_KEY_1).toBe("core.hooksPath");
-			for (const n of names)
-				expect(Object.values(env)).not.toContain(`planted-${n}`);
-			for (const n of [
-				"GIT_SSH_COMMAND",
-				"OTTR_GIT_TOKEN_0",
-				"OTTR_GIT_USER_0",
-			])
-				expect(env).not.toHaveProperty(n);
+			for (const n of names) expect(seen[0]!.env).not.toHaveProperty(n);
 		} finally {
 			for (const n of names) delete process.env[n];
 			rmSync(dir, { recursive: true, force: true });
@@ -6558,6 +6474,11 @@ describe("startRun commit identity env", () => {
 
 	test("a fully configured git identity injects nothing", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-ident-set-"));
+		// A turn env may carry ident vars of its own (the board's default identity rides
+		// the resumed turn's env); "injects nothing" must decide on startRun's own effect,
+		// so the ambient names sit out for the run.
+		const saved = IDENT_VARS.map((k) => [k, process.env[k]] as const);
+		for (const k of IDENT_VARS) delete process.env[k];
 		try {
 			const seen: Parameters<RunLauncher>[2][] = [];
 			const handle = await startRun({
@@ -6574,6 +6495,10 @@ describe("startRun commit identity env", () => {
 			await handle.done;
 			for (const k of IDENT_VARS) expect(seen[0]!.env).not.toHaveProperty(k);
 		} finally {
+			for (const [k, v] of saved) {
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});

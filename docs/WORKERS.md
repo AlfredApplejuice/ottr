@@ -1433,11 +1433,13 @@ remote name, only the server-pinned origin URL (docs/specs/pinned-origin-url.md)
 board git call also sets
 `commit.gpgSign=false` and `tag.gpgSign=false`, and sets `gpg.program`, `gpg.x509.program`
 and `gpg.ssh.program` to `false`. Thus a planted signing or `log.showSignature` setting
-cannot run a program. Local agent runs (a merge turn, a work turn with no worker, a
-retro, a check) carry the same overrides as `GIT_CONFIG_*` env config (`localGitPinEnv`
-in `src/runner.ts`): the shell git that such a run's verification drives reads the
-worker-writable common gitdir, so its hooks, fsmonitor and signing paths stay pinned the
-same way.
+cannot run a program. The target's fast-forward runs on the server too (OTTR-987): the
+merge prompt no longer drives the agent's `git merge --ff-only` in the main checkout,
+because the agent's shell git reads the worker-writable common gitdir and env config
+pins cannot be scoped to git alone — every child of the turn, the project's `bun test`
+included, would inherit them and break suites whose control tests plant hooks or an
+fsmonitor and require them to fire. `serverMergePush` fast-forwards the target through
+git()'s pinned argv after the turn reports integrated, then pushes.
 
 Filter drivers (`filter.<driver>.clean`, `smudge`, `process`) need one more step. The
 driver name comes from attributes, so no `-c` can clear the driver. Also, git reads
@@ -1706,14 +1708,18 @@ writes, ref updates), so no read-only mount can wall the config off without brea
 inside the worktrees, and projects are onboarded at run time, so compose cannot pre-mount
 each config. The board's network subcommands still read `credential.helper`,
 `core.sshCommand` and `url.*.insteadOf` from that file. Turn processes run shell git with
-whatever the turn's env holds; a server-side turn (a merge turn, a work turn with no
-worker, a retro, a check) now carries the same overrides as env config
-(`localGitPinEnv` in `src/runner.ts`, `GIT_CONFIG_*` names), so its shell git reads no
-hooks, fsmonitor command, or signing program from the worker-writable gitdir. The
-remaining server-side residual: a merge turn re-runs the project's verification —
-worker-written test and build code — in the server container, by design of the merge
-prompt (`mergePrompt` in `src/prompts.ts`); the env pins close its git execution paths,
-not its direct process spawns. Closing the board's repo-config reads fully is code-side
+whatever the turn's env holds: no env-scope git pin exists, because a pin cannot be
+scoped to the turn's git alone — the project's `bun test` inherits it, and suites whose
+control tests plant hooks or an fsmonitor and require them to fire go red. The
+integration git is the server's instead: after a merge turn reports integrated,
+`serverMergePush` fast-forwards the target through git()'s pinned argv (OTTR-987) and
+pushes, so the merge prompt's old `git merge --ff-only` in the main checkout — the one
+shell git that read planted hooks as root — is gone. The remaining server-side residual:
+a merge turn still re-runs the project's verification and any git inside its card
+worktree in the server container, by design of the merge prompt (`mergePrompt` in
+`src/prompts.ts`); worker-written test and build code runs as root there, and the docs
+accept that for the gates the merge turn must re-run. Closing the board's repo-config
+reads fully is code-side
 work in `src/worktree.ts` (per-call `-c` overrides and the `sealedGit` stub gitdir), not
 topology. The stub copies only these probed keys from the repo config:
 `core.filemode`, `symlinks`, `ignorecase`, `precomposeunicode`, `autocrlf` and `eol`. These

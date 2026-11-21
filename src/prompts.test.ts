@@ -116,11 +116,13 @@ describe("mergePrompt PR variant", () => {
 		);
 	});
 
-	test("the default path (pr falsy) still names the ff-merge", () => {
+	test("the default path names the server-side integration, not an agent merge", () => {
 		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
 		expect(p).not.toContain("opens the pull request");
 		expect(p).not.toContain("prBody");
-		expect(p).toContain("git merge --ff-only ott/x");
+		expect(p).toContain("Do not run git in the main checkout");
+		expect(p).toContain("the server fast-forwards main to the head of ott/x");
+		expect(p).not.toContain("git merge --ff-only");
 	});
 });
 
@@ -138,37 +140,46 @@ describe("summary requirement", () => {
 	});
 });
 
-describe("mergePrompt fast-forward step", () => {
-	test("names the ff-merge of the branch in the main checkout", () => {
+describe("mergePrompt server-side fast-forward step", () => {
+	test("hands the target fast-forward to the server, not the agent", () => {
 		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
-		expect(p).toContain("git merge --ff-only ott/x");
-		expect(p).toContain("main checkout");
+		expect(p).toContain("Do not run git in the main checkout");
+		expect(p).toContain("the server fast-forwards main to the head of ott/x");
+		expect(p).toContain("with its own pinned git");
+		expect(p).not.toContain("git merge --ff-only");
 	});
 
 	test("derives the checkout branch from a non-main target", () => {
 		const p = mergePrompt({ branch: "ott/x", target: "origin/develop" });
-		expect(p).toContain("fast-forward develop to origin/develop");
-		expect(p).toContain("so develop holds the head of ott/x");
+		expect(p).toContain(
+			"the server fast-forwards develop to the head of ott/x",
+		);
 	});
 
 	test("keeps the origin/main text byte-identical to the literal-main wording", () => {
 		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
-		expect(p).toContain("fast-forward main to origin/main");
-		expect(p).toContain("so main holds the head of ott/x");
+		expect(p).toContain("the server fast-forwards main to the head of ott/x");
 	});
 
 	test("passes an unprefixed target through as the checkout branch", () => {
 		const p = mergePrompt({ branch: "ott/x", target: "main" });
-		expect(p).toContain("fast-forward main to main");
+		expect(p).toContain("the server fast-forwards main to the head of ott/x");
+	});
+
+	test("supersedes project AGENTS.md integration rules", () => {
+		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
+		expect(p).toContain(
+			"An AGENTS.md rule that names different integration commands is superseded by this step",
+		);
 	});
 });
 
 describe("security and cleanup steps", () => {
-	test("the merge turn runs diff-security-review before it integrates", () => {
+	test("the merge turn runs diff-security-review before the server integrates", () => {
 		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
 		expect(p.indexOf("diff-security-review")).toBeGreaterThan(-1);
 		expect(p.indexOf("diff-security-review")).toBeLessThan(
-			p.indexOf("git merge --ff-only"),
+			p.indexOf("Do not run git in the main checkout"),
 		);
 	});
 

@@ -98,9 +98,9 @@ sequenceDiagram
   turnLoop->>turnLoop: pickRunnable selects one merge for the project
   turnLoop->>runner: startRun(mergePrompt), merge turn
   runner->>agent: omp -p in the same worktree
-  agent->>git: rebase, run checks, git merge --ff-only
+  agent->>git: rebase, run checks (no git in the main checkout)
   agent-->>runner: report_outcome integrated
-  turnLoop->>git: serverMergePush (proof, then push to origin)
+  turnLoop->>git: serverMergePush (fast-forward target, proof, push to origin)
   turnLoop->>store: done, idle (done_at)
   app-->>ui: board frame over /api/ws, or the next /api/state poll
 ```

@@ -1635,36 +1635,6 @@ export function withoutGitAuth(
 	return out;
 }
 
-/**
- * Env config for every local (server-side) agent run: the same overrides the board's own
- * git() passes as `-c` (src/worktree.ts), carried as GIT_CONFIG_* entries because the
- * run's shell git takes no board argv. A local run's cwd is a worker-writable worktree
- * whose common gitdir holds `.git/config` and hooks, so a merge turn's
- * `git merge --ff-only` (or any local turn's git) would otherwise run a planted hook,
- * fsmonitor command, or signing program in the server container. Env config sits in
- * git's command-line scope, which outranks repo and global config; the count name is set
- * fresh because withoutGitAuth strips every GIT_CONFIG_* name from the base env first.
- */
-export function localGitPinEnv(): Record<string, string> {
-	const pins: ReadonlyArray<readonly [string, string]> = [
-		["core.fsmonitor", "false"],
-		["core.hooksPath", "/dev/null"],
-		["commit.gpgSign", "false"],
-		["tag.gpgSign", "false"],
-		["gpg.program", "false"],
-		["gpg.x509.program", "false"],
-		["gpg.ssh.program", "false"],
-		["gc.auto", "0"],
-		["maintenance.auto", "false"],
-	];
-	const env: Record<string, string> = { GIT_CONFIG_COUNT: String(pins.length) };
-	pins.forEach(([key, value], i) => {
-		env[`GIT_CONFIG_KEY_${i}`] = key;
-		env[`GIT_CONFIG_VALUE_${i}`] = value;
-	});
-	return env;
-}
-
 /** Opens the busy reason; classify never sees it (runTurn requeues a busy dispatch first). */
 export const WORKER_BUSY = "every microVM was busy";
 

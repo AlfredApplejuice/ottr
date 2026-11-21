@@ -301,25 +301,78 @@ describe("serverMergePush", () => {
 		}
 	});
 
-	test("no push without proof of the local merge", async () => {
+	test("the server fast-forwards the target itself; planted hooks never run", async () => {
+		// OTTR-987: mergePrompt no longer drives the agent's `git merge --ff-only` in the
+		// main checkout — the agent's shell git would run planted hooks from the
+		// worker-writable common gitdir as root. The fixture plants the hooks and skips
+		// the merge (fixture(false)), the way an agent obeying the new prompt reports.
+		const f = fixture(false);
+		try {
+			const hooks = join(f.main, ".git", "hooks");
+			const marker = join(f.dir, "MARKER");
+			for (const name of [
+				"reference-transaction",
+				"post-merge",
+				"pre-merge-commit",
+			]) {
+				const p = join(hooks, name);
+				writeFileSync(
+					p,
+					`#!/bin/sh\necho "${name} ran uid=$(id -u)" >> ${marker}\n`,
+				);
+				chmodSync(p, 0o755);
+			}
+			const workTip = run(f.wt, "rev-parse", "HEAD");
+			expect(
+				(
+					await serverMergePush(
+						f.main,
+						f.wt,
+						"origin/main",
+						"ott/x",
+						null,
+						f.bare,
+					)
+				).status,
+			).toBe("pushed");
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(workTip);
+			expect(run(f.bare, "rev-parse", "main")).toBe(workTip);
+			// No hook fired: the fast-forward ran under git()'s argv pins.
+			expect(existsSync(marker)).toBe(false);
+			// Control: plain shell git in the same gitdir does run the hooks, so the
+			// absence above means the pins held, not a dead fixture.
+			run(f.main, "tag", "control-ref");
+			expect(readFileSync(marker, "utf8")).toContain(
+				"reference-transaction ran",
+			);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a worktree head the target cannot fast-forward to parks the push with the reason", async () => {
 		const f = fixture(false);
 		try {
 			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
-			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "other");
+			// The target moved while the branch sat on the old base: the server's
+			// fast-forward is not possible, and the push parks with git's reason.
+			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "divergent");
 			const before = run(f.bare, "rev-parse", "main");
-			expect(
-				await serverMergePush(
-					f.main,
-					f.wt,
-					"origin/main",
-					"ott/x",
-					null,
-					f.bare,
-				),
-			).toEqual({
-				status: "skipped",
-			});
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.bare,
+			);
+			if (r.status !== "failed")
+				throw new Error(`expected failed, got ${r.status}`);
+			expect(r.error).toMatch(/[Ff]ast-forward/);
 			expect(run(f.bare, "rev-parse", "main")).toBe(before);
+			expect(run(f.main, "rev-parse", "refs/heads/main")).not.toBe(
+				run(f.wt, "rev-parse", "HEAD"),
+			);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
@@ -470,6 +523,16 @@ describe("serverMergePush", () => {
 
 	test("rebaseTargetBranch replays commits with the identity the board pins", async () => {
 		const f = fixture();
+		// Ident env vars beat `-c` config by git's precedence, and a turn env may carry
+		// the board's default identity; the pinned identity must decide on its own.
+		const identVars = [
+			"GIT_AUTHOR_NAME",
+			"GIT_AUTHOR_EMAIL",
+			"GIT_COMMITTER_NAME",
+			"GIT_COMMITTER_EMAIL",
+		] as const;
+		const savedIdent = identVars.map((k) => [k, process.env[k]] as const);
+		for (const k of identVars) delete process.env[k];
 		try {
 			// The Settings identity reaches the automatic push retry: the replayed local
 			// commit carries its committer, even though the fixture repo has no gitconfig.
@@ -499,6 +562,10 @@ describe("serverMergePush", () => {
 			);
 			expect(who).toBe("Board Bot board@ottr.dev");
 		} finally {
+			for (const [k, v] of savedIdent) {
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
 			rmSync(f.dir, { recursive: true, force: true });
 		}
 	});
@@ -705,19 +772,24 @@ describe("serverMergePush", () => {
 			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "other");
 			run(f.main, "worktree", "remove", f.wt);
 			const before = run(f.bare, "rev-parse", "main");
-			expect(
-				await serverMergePush(
-					f.main,
-					f.wt,
-					"origin/main",
-					"ott/x",
-					null,
-					f.bare,
-				),
-			).toEqual({
-				status: "skipped",
-			});
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.bare,
+			);
+			// OTTR-987: the server fast-forwards the target itself, so the unmerged kept
+			// branch is no longer a silent skip — the impossible fast-forward parks the
+			// push with git's reason instead.
+			if (r.status !== "failed")
+				throw new Error(`expected failed, got ${r.status}`);
+			expect(r.error).toMatch(/[Ff]ast-forward/);
 			expect(run(f.bare, "rev-parse", "main")).toBe(before);
+			expect(run(f.main, "rev-parse", "refs/heads/main")).not.toBe(
+				run(f.bare, "rev-parse", "main"),
+			);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}

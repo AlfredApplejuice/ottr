@@ -1694,11 +1694,14 @@ function cappedPushOutput(text: string): string | undefined {
 }
 
 /**
- * The server's merge push (no agent holds git host credentials; the merge prompt tells the
- * agent not to push). Pushes the local target branch to the pinned origin when origin lacks
- * its tip and the main repo proves the local merge. The proof is the worktree's HEAD, else the task branch,
- * in the local branch. A merge agent may remove both before it reports (a project's AGENTS.md
- * can say so). Then the local branch ahead of origin is the proof: only merge turns move it.
+ * The server's merge push (no agent holds git host credentials; the merge prompt tells
+ * the agent not to push and not to run git in the main checkout). Fast-forwards the
+ * local target branch to the integration head first (serverFastForward, OTTR-987), then
+ * pushes the local target branch to the pinned origin when origin lacks its tip and the
+ * main repo proves the local merge. The proof is the worktree's HEAD, else the task branch,
+ * in the local branch. A merge agent may remove both before it reports (a project's
+ * AGENTS.md can say so). Then the local branch ahead of origin is the proof: only the
+ * board moves it (the server's fast-forward, then this push).
  * git() adds the host auth: per-host tokens or the ssh key, and GH_TOKEN for GitHub. The local
  * tip is refs/heads/<branch>: `origin/<branch>` names the remote-tracking ref, which only this
  * push moves. A hold-approved merge passes `leaseTip` (OTTR-274): the audited origin tip the
@@ -1740,6 +1743,62 @@ async function integrationHead(
 ): Promise<string | null> {
 	if (await worktreeLinked(worktreePath)) return sha("HEAD", worktreePath);
 	return taskBranch === "" ? null : sha(`refs/heads/${taskBranch}`);
+}
+
+/**
+ * The server's fast-forward of the local target branch (OTTR-987). mergePrompt no longer
+ * tells the agent to run `git merge --ff-only` in the main checkout: the agent's shell
+ * git reads the worker-writable common gitdir, and a planted post-merge or
+ * reference-transaction hook would run as root in the server container. The board runs
+ * the fast-forward through git() instead, whose argv pins outrank the planted config,
+ * from the same integration head the push's proof reads. `done` covers both the ran and
+ * the no-op case (the local target already holds the head — an agent that still merges
+ * per its project's AGENTS.md, or a re-merge); `output` then carries the merge output
+ * for the card log, or "" for a no-op. A fast-forward git refuses (the branch is not
+ * ahead of the target, an unconcluded merge in the main checkout) returns `failed` with
+ * git's reason and full output — the same parking shape as a failed push.
+ */
+async function serverFastForward(
+	mainPath: string,
+	worktreePath: string,
+	target: string,
+	taskBranch: string,
+): Promise<
+	| { status: "done"; output: string }
+	| { status: "failed"; error: string; output?: string }
+> {
+	if (!target.startsWith("origin/")) return { status: "done", output: "" };
+	const branch = target.slice("origin/".length);
+	const sha = async (ref: string, cwd = mainPath) => {
+		const r = await git(
+			["rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
+			cwd,
+		);
+		return r.code === 0 ? r.stdout.trim() : null;
+	};
+	const head = await integrationHead(worktreePath, taskBranch, sha);
+	if (head === null) return { status: "done", output: "" };
+	const local = await sha(`refs/heads/${branch}`);
+	if (local === null || local === head) return { status: "done", output: "" };
+	const holds = await git(
+		["merge-base", "--is-ancestor", head, local],
+		mainPath,
+	);
+	if (holds.code === 0) return { status: "done", output: "" };
+	const r = await git(["merge", "--ff-only", head], mainPath);
+	if (r.code !== 0) {
+		return {
+			status: "failed",
+			error: redactUrlCredentials(
+				r.stderr.trim().split("\n").filter(Boolean).pop() ??
+					`git merge --ff-only exited ${r.code}`,
+			),
+			output: cappedPushOutput(
+				redactUrlCredentials(`${r.stdout}${r.stderr}`).trim(),
+			),
+		};
+	}
+	return { status: "done", output: `${r.stdout}${r.stderr}`.trim() };
 }
 
 /** Result of serverMergePush and its helpers. */
@@ -1862,6 +1921,26 @@ export async function serverMergePush(
 	| { status: "failed"; error: string; output?: string }
 	| { status: "rejected"; error: string; output?: string }
 > {
+	// The board fast-forwards the local target itself (OTTR-987): the merge prompt no
+	// longer drives the agent's `git merge --ff-only` in the main checkout, whose shell
+	// git would run planted hooks from the worker-writable common gitdir as root.
+	// The hold gate runs first: a held merge must not carry commits beyond the audited
+	// tip into the local target before the gate reads it (OTTR-274).
+	if (leaseTip !== null && target.startsWith("origin/")) {
+		const gate = await holdGate(
+			mainPath,
+			leaseTip,
+			target.slice("origin/".length),
+		);
+		if (gate !== null) return gate;
+	}
+	const ff = await serverFastForward(
+		mainPath,
+		worktreePath,
+		target,
+		taskBranch,
+	);
+	if (ff.status === "failed") return ff;
 	const pre = await mergePushPreflight(
 		mainPath,
 		worktreePath,
@@ -1904,7 +1983,11 @@ export async function serverMergePush(
 		// derivation came from origin/HEAD loses nothing), so origin/<branch> stays the
 		// resolved target after "Push to origin".
 		await recordLandedPush(mainPath, branch, local);
-		return { status: "pushed", output: `${r.stdout}${r.stderr}`.trim() };
+		const pushOut = `${r.stdout}${r.stderr}`.trim();
+		return {
+			status: "pushed",
+			output: ff.output === "" ? pushOut : `${ff.output}\n${pushOut}`.trim(),
+		};
 	}
 	// OTTR-465: the card log gets git's complete output (URL credentials redacted), and
 	// needsReason keeps every reason line — "! [rejected]", "remote:", "fatal:" and the

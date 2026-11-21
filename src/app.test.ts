@@ -3564,6 +3564,17 @@ describe("settings routes", () => {
 		}) => {
 			const oldGlobal = process.env.GIT_CONFIG_GLOBAL;
 			const oldSystem = process.env.GIT_CONFIG_SYSTEM;
+			// A turn env may carry the board's default identity as ident env vars; they beat
+			// every config scope, so the assertions need them out of the way.
+			const oldIdent = (
+				[
+					"GIT_AUTHOR_NAME",
+					"GIT_AUTHOR_EMAIL",
+					"GIT_COMMITTER_NAME",
+					"GIT_COMMITTER_EMAIL",
+				] as const
+			).map((k) => [k, process.env[k]] as const);
+			for (const [k] of oldIdent) delete process.env[k];
 			process.env.GIT_CONFIG_GLOBAL = o.global;
 			if (o.system === undefined) delete process.env.GIT_CONFIG_SYSTEM;
 			else process.env.GIT_CONFIG_SYSTEM = o.system;
@@ -3593,6 +3604,10 @@ describe("settings routes", () => {
 				else process.env.GIT_CONFIG_GLOBAL = oldGlobal;
 				if (oldSystem === undefined) delete process.env.GIT_CONFIG_SYSTEM;
 				else process.env.GIT_CONFIG_SYSTEM = oldSystem;
+				for (const [k, v] of oldIdent) {
+					if (v === undefined) delete process.env[k];
+					else process.env[k] = v;
+				}
 			}
 		};
 		const hosty = "[user]\n\tname = Hosty\n\temail = hosty@example.invalid\n";
