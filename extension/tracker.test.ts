@@ -21,6 +21,7 @@ import {
 } from "../src/prompts.ts";
 import { applyEvent, newEventState } from "../src/runner.ts";
 import { ProjectStore } from "../src/store.ts";
+import { CARD_ENV_NOTE } from "../src/tokens.ts";
 import { VM_VALIDATE } from "../src/vmValidateShared.ts";
 import createTracker, { hasAcceptanceSection } from "./tracker.ts";
 
@@ -56,6 +57,8 @@ let runtimeReady = true;
 const stopHandlers: Array<(...args: unknown[]) => unknown> = [];
 // tool_result handlers: the session-file redaction of git host secrets.
 const resultHandlers: Array<(...args: unknown[]) => unknown> = [];
+// before_agent_start handlers: the card-env guidance injected into the system prompt.
+const startHandlers: Array<(...args: unknown[]) => unknown> = [];
 
 function fakePi(
 	tracker: typeof createTracker = createTracker,
@@ -89,6 +92,7 @@ function fakePi(
 		on: (event: string, handler: (...args: unknown[]) => unknown) => {
 			if (event === "session_stop") stopHandlers.push(handler);
 			if (event === "tool_result") resultHandlers.push(handler);
+			if (event === "before_agent_start") startHandlers.push(handler);
 		},
 		getSessionName: async () => {
 			if (!runtimeReady)
@@ -127,6 +131,7 @@ const envKeys = [
 	"OTTR_TRENDING",
 	"OTTR_MODELS",
 	"OTTR_VM_RUNNER_URL",
+	"OTTR_CARD_ENV_NOTE",
 ] as const;
 function setEnv(v: Partial<Record<(typeof envKeys)[number], string>>) {
 	for (const k of envKeys) if (v[k] !== undefined) process.env[k] = v[k];
@@ -143,6 +148,7 @@ afterEach(() => {
 	runtimeReady = true;
 	stopHandlers.length = 0;
 	resultHandlers.length = 0;
+	startHandlers.length = 0;
 });
 
 // The sandbox staging signature: <project>/validate-jobs/<id>. The belt root may
@@ -1827,5 +1833,49 @@ describe("sandbox_run tool", () => {
 		});
 		const headers = seen!.init.headers as Record<string, string>;
 		expect(headers["x-board-token"]).toBeUndefined();
+	});
+});
+
+// The card-env guidance must reach the model, not only the process env: turnEnv sets
+// OTTR_CARD_ENV_NOTE and the extension's before_agent_start handler puts the guidance
+// into the session system prompt on its presence (OTTR-1099).
+describe("before_agent_start card-env guidance", () => {
+	const event = (systemPrompt: string[]) => ({
+		type: "before_agent_start",
+		reason: "prompt",
+		prompt: "do the task",
+		systemPrompt,
+	});
+
+	test("a turn env that carries the note injects the guidance into the system prompt", () => {
+		fakePi();
+		expect(startHandlers.length).toBe(1);
+		process.env.OTTR_CARD_ENV_NOTE = CARD_ENV_NOTE;
+		const out = startHandlers[0]?.(event(["base prompt"])) as
+			| { systemPrompt?: string[] }
+			| undefined;
+		expect(out).not.toBeUndefined();
+		expect(out?.systemPrompt).toEqual([
+			"base prompt",
+			expect.stringContaining("eval kernel env"),
+		]);
+		// The guidance names the documented path an eval cell must take.
+		expect(out?.systemPrompt?.[1]).toContain("bash tool");
+	});
+
+	test("no note in the env injects nothing", () => {
+		fakePi();
+		expect(startHandlers[0]?.(event(["base prompt"]))).toBeUndefined();
+	});
+
+	test("the injection appends to omp's chained prompt, it never replaces it", () => {
+		fakePi();
+		process.env.OTTR_CARD_ENV_NOTE = CARD_ENV_NOTE;
+		const base = ["first block", "second block"];
+		const out = startHandlers[0]?.(event(base)) as
+			| { systemPrompt?: string[] }
+			| undefined;
+		expect(out?.systemPrompt?.slice(0, 2)).toEqual(base);
+		expect(out?.systemPrompt).toHaveLength(3);
 	});
 });

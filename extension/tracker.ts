@@ -574,6 +574,25 @@ export default function (pi: Pi) {
 		return { content, details };
 	});
 
+	// OTTR-1099: omp filters the eval kernel env, so a card env value (Settings, env.txt)
+	// never reaches an eval cell's os.environ while bash children see it. An agent that
+	// hits the KeyError there can report a set value as missing, so the guidance must be
+	// in front of the model from the first prompt, not only in a variable it may never
+	// print. turnEnv sets OTTR_CARD_ENV_NOTE when the project lists values; this handler
+	// surfaces a fixed text on its presence, so no env value flows into the prompt.
+	// omp chains handler results per prompt and resets at the next preparation, so the
+	// note is injected once per request, not cumulatively.
+	pi.on("before_agent_start", (event: unknown) => {
+		if ((process.env.OTTR_CARD_ENV_NOTE ?? "").trim() === "") return undefined;
+		const e = event as { systemPrompt?: string[] }; // omp's BeforeAgentStartEvent
+		return {
+			systemPrompt: [
+				...(Array.isArray(e.systemPrompt) ? e.systemPrompt : []),
+				"Eval cells cannot read the card env values (the names the project lists under Settings, Env): omp filters the eval kernel env, so os.environ misses them and a KeyError there is not a missing value. Read a card env value from a script run through the bash tool instead; a bash child inherits the full turn env.",
+			],
+		};
+	});
+
 	// Proactive naming: name a fresh session before the agent runs; a named session keeps its name.
 	// omp throws "Extension runtime not initialized" when an action method is called during
 	// extension load — and a synchronous throw escapes the .catch below, aborting the whole
