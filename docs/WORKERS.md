@@ -814,7 +814,10 @@ the run, so a run never falls back to a root turn.
 
 The server's own git (merge, release, review) runs as root inside the
 uid-owned worktrees, so the board gitconfig that the entry script seeds
-carries `[safe] directory = *`, added idempotently on every boot. Host-side
+carries `[safe] directory = *`, added idempotently on every boot. Every git
+spawn of the board also pins `safe.directory = *` on the command line, so a
+read of a uid-owned checkout survives a roll that recreates the server
+before the new boot seeds the gitconfig (OTTR-1176). Host-side
 tools see the turn uid numbers on the volume files; backups run on the
 server as root and stay unaffected.
 

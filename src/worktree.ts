@@ -332,6 +332,14 @@ export async function git(
 			"gc.auto=0",
 			"-c",
 			"maintenance.auto=false",
+			// OTTR-1176: main checkouts are turn-uid-owned (OTTR-994 chowns them for a
+			// run) and an image roll recreated the server while the ownership was mid
+			// change, so a branch read died with "detected dubious ownership" before the
+			// new boot seeded the board gitconfig. Command-line config is protected
+			// config for safe.directory, so the trust rides every spawn and survives a
+			// missing, empty or stale GIT_CONFIG_GLOBAL file.
+			"-c",
+			"safe.directory=*",
 			...args.slice(0, at + 1),
 			...(PINNED_ARGS[sub] ?? []),
 			...args.slice(at + 1),
@@ -1993,20 +2001,24 @@ export async function lfsPointerOids(
  * candidates x LFS_POINTER_MAX_BYTES no matter how big the range's other blobs are. A
  * plain --batch names no config-driven program — filters run only behind
  * --filters/--textconv, and cat-file runs no hook and no fsmonitor — so the
- * planted-config pins git() carries do not apply here.
+ * planted-config pins git() carries do not apply here. The safe.directory pin
+ * (OTTR-1176) still rides this spawn: the main checkout can be turn-uid-owned.
  */
 async function catFileBatch(
 	mainPath: string,
 	shas: readonly string[],
 ): Promise<Buffer> {
-	const proc = Bun.spawn([gitExe(), "cat-file", "--batch"], {
-		cwd: mainPath,
-		env: gitEnv(["cat-file", "--batch"]),
-		stdin: "pipe",
-		stdout: "pipe",
-		stderr: "pipe",
-		windowsHide: true,
-	});
+	const proc = Bun.spawn(
+		[gitExe(), "-c", "safe.directory=*", "cat-file", "--batch"],
+		{
+			cwd: mainPath,
+			env: gitEnv(["cat-file", "--batch"]),
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+			windowsHide: true,
+		},
+	);
 	// Chunked writes keep the pipe moving while git streams the answer back.
 	for (let i = 0; i < shas.length; i += 256) {
 		proc.stdin.write(`${shas.slice(i, i + 256).join("\n")}\n`);

@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import {
 	appendFileSync,
 	chmodSync,
+	chownSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
@@ -88,6 +89,10 @@ import {
 	worktreeHusk,
 	worktreeLinked,
 } from "./worktree.ts";
+
+// chown needs root; the ownership-mismatch test below runs only where it can.
+const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+const rootTest = isRoot ? test : test.skip;
 
 describe("gitExe", () => {
 	test("resolves scoop shims and wrapper installs to the native binary", () => {
@@ -2341,6 +2346,68 @@ describe("against real repos", () => {
 			warning: null,
 		});
 	}, 60_000);
+
+	rootTest(
+		"resolveTarget reads a main checkout a foreign uid owns (OTTR-1176)",
+		async () => {
+			// OTTR-994 chowns a project's main checkout to the project's turn uid for
+			// a run; an image roll that recreated the server mid-change failed every
+			// branch read with "detected dubious ownership" until the new boot seeded
+			// the board gitconfig. The pinned safe.directory must carry the trust by
+			// itself, with no global or system config file on the path.
+			const root = mkdtempSync(join(tmpdir(), "ottr-1176-"));
+			const main = join(root, "checkout");
+			try {
+				mkdirSync(main, { recursive: true });
+				await must(main, "init", "-q", "-b", "main");
+				await must(main, "commit", "--allow-empty", "-q", "-m", "m");
+				chownSync(main, 65537, 65537);
+				chownSync(join(main, ".git"), 65537, 65537);
+				// Control: the same spawn without the pin fails, so the fixture repo
+				// really is foreign-owned and no ambient config masks the mismatch.
+				const raw = spawnSync(
+					gitExe(),
+					["symbolic-ref", "--quiet", "--short", "HEAD"],
+					{
+						cwd: main,
+						env: {
+							...fixtureGitEnv(),
+							GIT_CONFIG_GLOBAL: "/dev/null",
+							GIT_CONFIG_SYSTEM: "/dev/null",
+						},
+						stdio: ["ignore", "pipe", "pipe"],
+						windowsHide: true,
+					},
+				);
+				expect(raw.status).not.toBe(0);
+				expect(raw.stderr.toString()).toContain("dubious ownership");
+				// The board helper reads the branch anyway: the pinned -c alone carries
+				// the trust here, with both config scopes empty. The spawn env parameter
+				// strips the scopes per call, so no ambient process.env changes.
+				const pinned = await git(
+					["symbolic-ref", "--quiet", "--short", "HEAD"],
+					main,
+					10_000,
+					undefined,
+					{
+						GIT_CONFIG_GLOBAL: "/dev/null",
+						GIT_CONFIG_SYSTEM: "/dev/null",
+					},
+				);
+				expect(pinned.code).toBe(0);
+				expect(pinned.stdout.trim()).toBe("main");
+				// The incident's API reads the same checkout under the ambient env: the
+				// pin rides every child, so the branch resolves with no env games.
+				expect(await resolveTarget(main)).toMatchObject({
+					target: "main",
+					warning: null,
+				});
+			} finally {
+				rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+			}
+		},
+		60_000,
+	);
 
 	test("resolveTarget stops on an upstream missing from origin instead of using the local branch", async () => {
 		await must(main, "config", "branch.main.merge", "refs/heads/gone");

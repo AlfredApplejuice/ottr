@@ -193,7 +193,14 @@ return await worktree.lfsPointerOids(root, "main", null);
 `);
 			expect(result).toEqual(["b".repeat(64)]);
 			expectFiltered(observations, 3);
-			expect(observations[2]?.args).toEqual(["cat-file", "--batch"]);
+			// OTTR-1176: the raw child keeps its bare subcommand and carries the same
+			// safe.directory pin every board git spawn carries.
+			expect(observations[2]?.args).toEqual([
+				"-c",
+				"safe.directory=*",
+				"cat-file",
+				"--batch",
+			]);
 		});
 
 		test("Git helper discovery and SSH probes use explicit filtered environments", async () => {
