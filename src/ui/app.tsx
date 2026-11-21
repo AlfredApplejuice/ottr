@@ -12608,7 +12608,12 @@ export function HoldResumeButton({
 }) {
 	const runs = model === "" ? (catalog?.defaultModel ?? "") : model;
 	const held = providerOf(runs) === task.holdProvider;
-	const [problem, setProblem] = useState<string | null>(null);
+	// The refusal names the model it was asked for: a response that lands after a new
+	// pick describes the old pick, so the render guard keeps it off the surface.
+	const [problem, setProblem] = useState<{
+		model: string;
+		message: string;
+	} | null>(null);
 	// A different pick invalidates the shown refusal: drop it so the line names only
 	// the model the user chose last.
 	useEffect(() => {
@@ -12624,22 +12629,25 @@ export function HoldResumeButton({
 						: "End the usage-limit hold and start the task now with this model"
 				}
 				run={() =>
-					act(async () => {
-						await post(
-							`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/model`,
-							{ model, resume: true },
-						);
-						setProblem(null);
-					}, setProblem)
+					act(
+						async () => {
+							await post(
+								`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/model`,
+								{ model, resume: true },
+							);
+							setProblem(null);
+						},
+						(message) => setProblem({ model, message }),
+					)
 				}
 			>
 				<Icon name="play" />
 				Resume
 			</BusyButton>
-			{problem !== null && (
+			{problem !== null && problem.model === model && (
 				<p className="resume-problem" role="alert">
 					<Mark kind="crit" />
-					<span>{problem}</span>
+					<span>{problem.message}</span>
 					<button
 						type="button"
 						className="icon"

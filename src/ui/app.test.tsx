@@ -16347,6 +16347,26 @@ describe("HoldResumeButton refusal surface (client)", () => {
 		return true;
 	};
 
+	/** An act whose refusal parks until the test releases it: reproduces a slow
+	 *  server's 409 landing after the view changed. */
+	const parkedRefusal = (): {
+		act: Act;
+		release: (message: string) => void;
+	} => {
+		const { promise, resolve } = Promise.withResolvers<boolean>();
+		let deliver: ((message: string) => void) | null = null;
+		return {
+			act: (_fn, onError) => {
+				deliver = (message: string) => {
+					onError?.(message);
+					resolve(false);
+				};
+				return promise;
+			},
+			release: (message) => deliver?.(message),
+		};
+	};
+
 	const click = (): Event =>
 		new window.Event("click", { bubbles: true }) as unknown as Event;
 
@@ -16448,6 +16468,76 @@ describe("HoldResumeButton refusal surface (client)", () => {
 			);
 		});
 		expect(problemLine(container)).toBeNull();
+		await act(async () => {
+			root.unmount();
+		});
+		container.remove();
+	});
+
+	test("a 409 that lands after a different pick never names the old model", async () => {
+		// The response stays in flight until the test releases it, so the pick
+		// races it the way a slow server does.
+		const late = parkedRefusal();
+		const { container, root } = await mount(late.act);
+		await act(async () => {
+			resumeButton(container).dispatchEvent(click());
+			// Only the click starts; the response is parked.
+			await Promise.resolve();
+		});
+		// The user picks another model while the anthropic request is in flight.
+		await act(async () => {
+			root.render(
+				<HoldResumeButton
+					task={task}
+					catalog={null}
+					model="zai/glm-5.3-flash"
+					act={refusedAct()}
+				/>,
+			);
+		});
+		// The parked anthropic 409 lands now: it names the old pick, so the line
+		// must not show it under the zai selection.
+		await act(async () => {
+			late.release(MESSAGE);
+			await Promise.resolve();
+		});
+		expect(problemLine(container)).toBeNull();
+		// Picking the old model back stays clean too: the parked refusal was dropped
+		// by the pick away, not parked for a later resurrection.
+		await act(async () => {
+			root.render(
+				<HoldResumeButton
+					task={task}
+					catalog={null}
+					model="anthropic/claude-sonnet-5-5"
+					act={refusedAct()}
+				/>,
+			);
+		});
+		expect(problemLine(container)).toBeNull();
+		await act(async () => {
+			root.unmount();
+		});
+		container.remove();
+	});
+
+	test("a delayed 409 for the still-selected model shows", async () => {
+		// The guard must only drop responses for a superseded pick: a slow server's
+		// refusal for the pick that stayed shows like any other.
+		const late = parkedRefusal();
+		const { container, root } = await mount(late.act);
+		await act(async () => {
+			resumeButton(container).dispatchEvent(click());
+			await Promise.resolve();
+		});
+		expect(problemLine(container)).toBeNull();
+		await act(async () => {
+			late.release(MESSAGE);
+			await Promise.resolve();
+		});
+		const line = problemLine(container);
+		expect(line?.getAttribute("role")).toBe("alert");
+		expect(line?.textContent).toContain(MESSAGE);
 		await act(async () => {
 			root.unmount();
 		});
