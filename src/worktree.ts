@@ -2816,6 +2816,7 @@ export async function treesEqual(
 export async function unsavedWork(
 	worktreePath: string,
 	target: string,
+	opts: { ignoreCommits?: boolean } = {},
 ): Promise<string | null> {
 	// An unlinked husk holds no checkout: nothing to lose, so the delete check must pass and
 	// the tracker can remove the empty folder. Only an unlinked dir WITH files stays suspect.
@@ -2825,8 +2826,12 @@ export async function unsavedWork(
 	try {
 		const lost: string[] = [];
 		if (!(await isClean(worktreePath))) lost.push("uncommitted changes");
-		const n = await commitsAhead(worktreePath, target);
-		if (n > 0) lost.push(`${n} commit${n === 1 ? "" : "s"} not on ${target}`);
+		// ignoreCommits: a superseded close's branch commits are the work the outcome
+		// discards, so they must not keep the tree; only uncommitted changes still do.
+		if (!opts.ignoreCommits) {
+			const n = await commitsAhead(worktreePath, target);
+			if (n > 0) lost.push(`${n} commit${n === 1 ? "" : "s"} not on ${target}`);
+		}
 		return lost.length > 0 ? lost.join(" and ") : null;
 	} catch (err) {
 		return `cannot check it: ${err instanceof Error ? err.message : String(err)}`;

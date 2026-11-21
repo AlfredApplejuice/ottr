@@ -8422,26 +8422,39 @@ export function createTurnLoop(
 
 	/** True when the named card exists and points at this task (followUpOf): in this
 	 * store, or across a project border (create_task filed the gap card into another
-	 * project). A store read failure reads as no card — fail closed. */
+	 * project). Task ids are project-local, so a link counts only when the card's
+	 * followUpOfProject names this board (null = the card's own board) — a same-named
+	 * task in another project never authorizes the close. Every board is scanned, so an
+	 * unrelated card that shares the id never shadows a linked one. A store read failure
+	 * reads as no card — fail closed. */
 	async function supersededFollowUpLinked(
 		st: TurnSettle,
 		id: string,
 	): Promise<boolean> {
-		const local = await st.store.getTask(id).catch(() => null);
-		if (local !== null) return local.followUpOf === st.id;
+		const boards: ProjectStore[] = [st.store];
 		for (const p of projects.values()) {
-			if (p.store === st.store) continue;
-			const t = await p.store.getTask(id).catch(() => null);
-			if (t !== null) return t.followUpOf === st.id;
+			if (p.store !== st.store) boards.push(p.store);
+		}
+		for (const board of boards) {
+			const t = await board.getTask(id).catch(() => null);
+			if (t === null) continue;
+			if (
+				t.followUpOf === st.id &&
+				(t.followUpOfProject ?? st.store.name) === st.store.name
+			)
+				return true;
 		}
 		return false;
 	}
 
 	/** The superseded close's proof: the outcome's followUp names a card linked to this
 	 * task, and the local target branch tip equals the upstream tip (a merge turn that
-	 * left commits on the target claimed an integration it did not report). Non-origin
-	 * targets skip the tip compare — the board never pushes them (serverMergePush
-	 * preflight skips too). */
+	 * left commits on the target claimed an integration it did not report). The upstream
+	 * tip reads the fully qualified remote-tracking ref refs/remotes/origin/<short>: a
+	 * bare origin/<short> would let a local branch named origin/<short> shadow the
+	 * remote ref and pass this guard with unpushed commits still on the target.
+	 * Non-origin targets skip the tip compare — the board never pushes them
+	 * (serverMergePush preflight skips too). */
 	async function verifySupersededClose(
 		st: TurnSettle,
 		next: Next,
@@ -8458,7 +8471,9 @@ export function createTurnLoop(
 		if (st.header.target.startsWith("origin/")) {
 			const [local, origin] = await Promise.all([
 				ops.targetSha(st.e.path, `refs/heads/${short}`).catch(() => null),
-				ops.targetSha(st.e.path, st.header.target).catch(() => null),
+				ops
+					.targetSha(st.e.path, `refs/remotes/origin/${short}`)
+					.catch(() => null),
 			]);
 			if (local === null || local !== origin)
 				return supersededPark(
@@ -9679,7 +9694,12 @@ export function createTurnLoop(
 			!st.idn.interview &&
 			!st.idn.scout &&
 			!st.research
-				? await ops.unsavedWork(st.loc.wt, st.header.target)
+				? await ops.unsavedWork(st.loc.wt, st.header.target, {
+						// A superseded close discards the branch's unmerged commits by
+						// definition (the outcome says main's flow covers them), so only
+						// uncommitted changes still keep the tree.
+						ignoreCommits: st.result.outcome?.status === "superseded",
+					})
 				: null;
 	}
 

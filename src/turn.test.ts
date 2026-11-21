@@ -128,6 +128,7 @@ import { VmTokens } from "./vmTokens.ts";
 import type { DetachedRun, WorkerTarget } from "./workers.ts";
 import {
 	isClean as gitIsClean,
+	commitsAhead as realCommitsAhead,
 	PUSH_LANDED_BEFORE_ATTEMPT,
 	pushBranch as pushBranchReal,
 	checkoutState as realCheckoutState,
@@ -5407,6 +5408,294 @@ describe("turn merge outcomes", () => {
 		);
 		// The park keeps the worktree: nothing was cleaned, nothing integrated.
 		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	/** A superseded close whose follow-up id names no linked card parks, even when
+	 * every board holds a same-id card whose link names another project: task ids are
+	 * project-local, so `followUpOfProject` must name this board (blockers 2, 3, 5). */
+	test("a superseded close skips same-id cards whose followUpOfProject names another board", async () => {
+		const record = baseRecord();
+		const store = await freshStore();
+		const other = await freshStore();
+		const third = await freshStore();
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		// Local card: right parent id, foreign board — a local follow-up may name a
+		// foreign parent, so this link never points at this task.
+		const local = await store.createTask("local shadow", null, "work", "ZZ-1");
+		await store.updateTask(local.id, {
+			followUpOf: task.id,
+			followUpOfProject: other.name,
+		});
+		// Foreign cards: the same id, right parent id, every board but this one.
+		const inOther = await other.createTask("foreign shadow", null, "work", "ZZ-1");
+		await other.updateTask(inOther.id, {
+			followUpOf: task.id,
+			followUpOfProject: third.name,
+		});
+		const inThird = await third.createTask("third shadow", null, "work", "ZZ-1");
+		await third.updateTask(inThird.id, {
+			followUpOf: task.id,
+			followUpOfProject: other.name,
+		});
+		const loop = holdFollowUps(
+			new Map([
+				[store.name, fakeProject(store)],
+				[other.name, fakeProject(other)],
+				[third.name, fakeProject(third)],
+			]),
+			fakeOps(record, {
+				targetSha: syncedTips("sha-main", "sha-main"),
+				startRun: supersededRun(record, () => "ZZ-1"),
+			}),
+		);
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain(
+			"no card ZZ-1 is linked to this task (followUpOf)",
+		);
+		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	/** A valid linked follow-up in another project closes the card even when an
+	 * unrelated same-id card sits on this board and a mismatched same-id card sits
+	 * on a board scanned first: every board is scanned, none shadows the linked one
+	 * (blockers 4, 5). */
+	test("a superseded close finds the linked follow-up across boards despite same-id cards", async () => {
+		const record = baseRecord();
+		const store = await freshStore();
+		const other = await freshStore();
+		const third = await freshStore();
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		// This board: same id, points elsewhere.
+		const noise = await store.createTask("unrelated card", null, "work", "ZZ-1");
+		await store.updateTask(noise.id, { followUpOf: noise.id });
+		// Scanned before the linked one: same id, wrong board named.
+		const mismatch = await third.createTask("mismatch", null, "work", "ZZ-1");
+		await third.updateTask(mismatch.id, {
+			followUpOf: task.id,
+			followUpOfProject: other.name,
+		});
+		// The valid follow-up: another project's board, link names this one.
+		const gap = await other.createTask("cover the gap", null, "work", "ZZ-1");
+		await other.updateTask(gap.id, {
+			followUpOf: task.id,
+			followUpOfProject: store.name,
+		});
+		const loop = holdFollowUps(
+			new Map([
+				[store.name, fakeProject(store)],
+				[other.name, fakeProject(other)],
+				[third.name, fakeProject(third)],
+			]),
+			fakeOps(record, {
+				targetSha: syncedTips("sha-main", "sha-main"),
+				startRun: supersededRun(record, () => "ZZ-1"),
+			}),
+		);
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect((await other.getTask(gap.id))!.followUpOf).toBe(task.id);
+	});
+
+	/** Real git readers for the superseded regressions: the settle reads the same
+	 * production helpers (target resolution, unsaved-tree check, ref tips, worktree
+	 * removal) against a real repo, so the close proves itself on live git state. */
+	function supersededRealLoop(
+		record: Recorded,
+		store: ProjectStore,
+		startRun: NonNullable<FixtureOps["startRun"]>,
+	) {
+		const realTargetSha = async (mainPath: string, ref: string) => {
+			const r = Bun.spawnSync(
+				["git", "rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
+				{ cwd: mainPath, stdout: "pipe", stderr: "pipe", env: fixtureGitEnv() },
+			);
+			return r.exitCode === 0 ? r.stdout.toString().trim() : null;
+		};
+		const pushes: unknown[] = [];
+		const loop = holdFollowUps(
+			new Map([[store.name, fakeProject(store)]]),
+			fakeOps(record, {
+				resolveTarget: realResolveTarget,
+				targetSha: realTargetSha,
+				unsavedWork: realUnsavedWork,
+				commitsAhead: realCommitsAhead,
+				isClean: gitIsClean,
+				statusFiles: realStatusFiles,
+				targetCommits: realTargetCommits,
+				targetContains: realTargetContains,
+				removeWorktree: async (
+					o: Parameters<TurnOps["removeWorktree"]>[0],
+				) => {
+					await realRemoveWorktree(o);
+					record.removeWorktree.push(o);
+				},
+				serverMergePush: async (
+					...args: Parameters<TurnOps["serverMergePush"]>
+				) => {
+					pushes.push(args);
+					return { status: "skipped" as const };
+				},
+				startRun,
+			}),
+		);
+		return { loop, pushes };
+	}
+
+	/** A clean superseded branch whose commits never reached main: real git, real
+	 * unsaved-tree read. The kept-tree check must not count the branch's own
+	 * unmerged commits (the outcome is the discard decision), so the close frees
+	 * the worktree and the branch, and nothing pushes. */
+	test("a real superseded close frees a clean branch whose commits never reached main", async () => {
+		const run = (cwd: string, ...args: string[]): string => {
+			const r = Bun.spawnSync(["git", ...args], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: fixtureGitEnv(),
+			});
+			if (r.exitCode !== 0)
+				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+			return r.stdout.toString().trim();
+		};
+		const refAlive = (cwd: string, ref: string): boolean =>
+			Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", ref], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: fixtureGitEnv(),
+			}).exitCode === 0;
+		const store = await freshStore();
+		const dir = store.path;
+		const origin = mkdtempSync(join(tmpdir(), "turn-test-origin-"));
+		dirs.push(origin);
+		run(origin, "init", "-q", "--bare", "-b", "main");
+		run(dir, "init", "-q", "-b", "main");
+		run(dir, "config", "user.email", "t@t");
+		run(dir, "config", "user.name", "t");
+		run(dir, "commit", "-q", "--allow-empty", "-m", "seed");
+		run(dir, "remote", "add", "origin", origin);
+		run(dir, "push", "-q", "origin", "main:main");
+		const task = await store.createTask("merge please");
+		await store.setSettings({ originUrl: origin, targetBranch: "main" });
+		const wt = join(dir, "wt-card");
+		run(dir, "branch", "ott/m");
+		run(dir, "worktree", "add", "-q", wt, "ott/m");
+		// The card's work: one commit origin/main lacks; the tree stays clean.
+		run(wt, "commit", "-q", "--allow-empty", "-m", "the card's work");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: wt,
+			branch: "ott/m",
+		});
+		const gap = await store.createTask("cover the superseded flow's gap");
+		await store.updateTask(gap.id, { followUpOf: task.id });
+		// The precondition: one commit on the branch that origin/main lacks.
+		expect(run(wt, "rev-list", "--count", "origin/main..HEAD")).toBe("1");
+		const record = baseRecord();
+		const { loop, pushes } = supersededRealLoop(
+			record,
+			store,
+			supersededRun(record, () => gap.id),
+		);
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		// The branch's commit never reached main, and the close still landed.
+		expect(run(dir, "rev-parse", "refs/remotes/origin/main")).toBe(
+			run(dir, "rev-parse", "refs/heads/main"),
+		);
+		// The cleanup ran for real: worktree and branch are gone, nothing pushed.
+		expect(existsSync(wt)).toBe(false);
+		expect(refAlive(dir, "refs/heads/ott/m")).toBe(false);
+		expect(record.removeWorktree).toHaveLength(1);
+		expect(pushes).toHaveLength(0);
+		expect((await store.getTask(gap.id))!.followUpOf).toBe(task.id);
+		expect(await logText(store, task.id)).toContain(
+			`superseded close verified: follow-up ${gap.id} linked`,
+		);
+	});
+
+	/** A local branch named origin/main at the local target's tip must not shadow the
+	 * remote-tracking ref the guard compares: the bare name would read the shadow and
+	 * pass while main still holds unpushed commits. The qualified ref parks the close. */
+	test("a local origin/main branch cannot shadow the unpushed-tip guard", async () => {
+		const run = (cwd: string, ...args: string[]): string => {
+			const r = Bun.spawnSync(["git", ...args], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: fixtureGitEnv(),
+			});
+			if (r.exitCode !== 0)
+				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+			return r.stdout.toString().trim();
+		};
+		const store = await freshStore();
+		const dir = store.path;
+		const origin = mkdtempSync(join(tmpdir(), "turn-test-origin-"));
+		dirs.push(origin);
+		run(origin, "init", "-q", "--bare", "-b", "main");
+		run(dir, "init", "-q", "-b", "main");
+		run(dir, "config", "user.email", "t@t");
+		run(dir, "config", "user.name", "t");
+		run(dir, "commit", "-q", "--allow-empty", "-m", "seed");
+		run(dir, "remote", "add", "origin", origin);
+		run(dir, "push", "-q", "origin", "main:main");
+		const task = await store.createTask("merge please");
+		await store.setSettings({ originUrl: origin, targetBranch: "main" });
+		const wt = join(dir, "wt-card");
+		run(dir, "branch", "ott/m");
+		run(dir, "worktree", "add", "-q", wt, "ott/m");
+		run(wt, "commit", "-q", "--allow-empty", "-m", "the card's work");
+		// The turn left main one commit ahead of origin, and a branch named
+		// origin/main sits exactly at main's tip: the shadow the guard must ignore.
+		run(dir, "commit", "-q", "--allow-empty", "-m", "unpushed main work");
+		run(dir, "branch", "origin/main", "main");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: wt,
+			branch: "ott/m",
+		});
+		const gap = await store.createTask("cover the superseded flow's gap");
+		await store.updateTask(gap.id, { followUpOf: task.id });
+		const record = baseRecord();
+		const { loop, pushes } = supersededRealLoop(
+			record,
+			store,
+			supersededRun(record, () => gap.id),
+		);
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Reported superseded, but the local main branch does not match origin/main (or git could not read the tips), so the turn may hold an integration it did not report. File the gap card with create_task, sync the main checkout with origin/main when it differs, then reply and pass the card id in followUp.",
+		);
+		// The park keeps the worktree and the branch, and pushes nothing.
+		expect(existsSync(wt)).toBe(true);
+		expect(record.removeWorktree).toHaveLength(0);
+		expect(pushes).toHaveLength(0);
 	});
 
 	test("a superseded close whose follow-up id names no linked card parks", async () => {
