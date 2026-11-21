@@ -25247,6 +25247,10 @@ describe("microVM dispatch (OTTR-532)", () => {
 	const savedHealth = vmState.health;
 	afterEach(() => {
 		vmState.health = savedHealth;
+		// OTTR-1162: a test file that ran earlier (scripts/no-proxy.test.ts probes a
+		// runner this container can really resolve) leaves a pool max that gates every
+		// dispatch here; each test starts with the pool unknown, like a fresh boot.
+		vmState.pool = { busy: 0, max: 0 };
 		vmState.busy.clear();
 		setSystemTime();
 	});
@@ -25256,6 +25260,9 @@ describe("microVM dispatch (OTTR-532)", () => {
 	/** A microVM project whose fake vm-runner answers with `answer` (mutable per test). */
 	async function vmSetup(overrides: FixtureOps = {}, microVm = true) {
 		vmState.health = { configured: true, ok: true, reason: null };
+		// OTTR-1162: the pool gate reads the shared singleton; reset it with the health
+		// so a leak from an earlier test file cannot hold this describe's dispatches.
+		vmState.pool = { busy: 0, max: 0 };
 		const calls: RunOpts[] = [];
 		const envModels: (string | null)[] = [];
 		const synced: [string, string][] = [];
