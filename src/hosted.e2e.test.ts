@@ -1003,7 +1003,11 @@ describe("hosted mode end to end", () => {
 			};
 		};
 		const board3 = await mountBoard(
-			{ config, hooks: controlPlaneHooks(config, { log: () => {} }) },
+			{
+				config,
+				hooks: controlPlaneHooks(config, { log: () => {} }),
+				creditBalance: { balance: null },
+			},
 			{
 				name: "slots",
 				maxTotalRuns: 1,
