@@ -401,9 +401,51 @@ rootTest("prepareRunWorkspace chowns cwd and the project git dir", () => {
 	const noGit = join(ws, "no-git-proj");
 	mkdirSync(join(noGit, "wt"), { recursive: true });
 	expect(() => prepareRunWorkspace(join(noGit, "wt"), ids, ws)).toThrow(
-		/no git dir/,
+		/missing workspace entry/,
 	);
 });
+
+rootTest(
+	"a planted .worktrees symlink fails the run and is never chowned",
+	() => {
+		const ws = freshDir("plant-ws");
+		const ids = projectTurnUid("plant-proj");
+		// The project tree after a first takeover: uid-owned project dir and
+		// worktree; a victim tree outside the project stays root-owned.
+		const main = join(ws, "main");
+		const wt = join(main, ".worktrees", "card-1");
+		mkdirSync(join(main, ".git"), { recursive: true });
+		mkdirSync(wt, { recursive: true });
+		chownTree(ws, ids);
+		chmodSync(main, 0o700);
+		const outside = freshDir("plant-outside");
+		const victim = join(outside, "victim.txt");
+		writeFileSync(victim, "v\n");
+		chmodSync(victim, 0o644);
+		// The uid swaps `.worktrees` for a symlink into a world-traversable dir.
+		renameSync(join(main, ".worktrees"), join(main, ".worktrees-real"));
+		mkdirSync(join(main, ".worktrees-real", "card-1", "deeper"), {
+			recursive: true,
+		});
+		symlinkSync(outside, join(main, ".worktrees"));
+
+		// The run fails closed before any chown.
+		expect(() =>
+			prepareRunWorkspace(
+				join(main, ".worktrees", "card-1", "deeper"),
+				ids,
+				ws,
+			),
+		).toThrow(/planted entry/);
+		// The victim outside the project was never touched.
+		expect(statSync(victim).uid).not.toBe(ids.uid);
+		// A planted `.git` symlink is refused the same way.
+		renameSync(join(main, ".git"), join(main, ".git-real"));
+		symlinkSync(outside, join(main, ".git"));
+		expect(() => prepareRunWorkspace(main, ids, ws)).toThrow(/planted entry/);
+		expect(statSync(victim).uid).not.toBe(ids.uid);
+	},
+);
 
 rootTest("chownTree leaves symlink targets untouched", () => {
 	const tree = freshDir("chown-tree");

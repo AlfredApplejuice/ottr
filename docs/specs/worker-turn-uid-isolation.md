@@ -64,6 +64,17 @@ the turn uid by construction:
 - The daemon creates no file below the uid-owned `home` after handoff. The
   per-project cache dirs the layer copy's links name (`<home>/.cache` and
   friends) the turn creates itself, through the link, as its own uid.
+- The run's cwd resolves per component from a pinned workspace-root fd with
+  `O_NOFOLLOW|O_DIRECTORY`: after a project's first run its project dir is
+  uid-owned, so the uid could rename an intermediate dir (`.worktrees`) and
+  plant a symlink whose middle part a plain-path open would follow with root
+  privilege — handing the root-privileged chown and the run's cwd to another
+  project's tree. A symlink or non-dir at any component below the workspace
+  root fails the run before any chown; the git dir is anchored the same way.
+  Residual: a swap landed after the resolve and before the spawn's `chdir`
+  redirects the run only to a directory the uid can already traverse (every
+  other project's tree is closed by the same uid and mode rules), so no
+  boundary is crossed.
 - The pinned layer copy is materialized into a root-owned temp dir beside
   the final name and moved in with one atomic rename, so a half-written or
   attacker-shaped copy can never appear under the final path. The final dir
@@ -220,6 +231,9 @@ their repo's owner and need nothing.
   symlink as the walked root fails the run. A path-based walk (the old
   `readdirSync(path)`/`join` form) fails this test because it chowns the
   first impostor's files.
+- A planted `.worktrees` or `.git` symlink below the workspace root fails
+  the run before any chown, and a victim tree outside the project stays
+  untouched.
 - The turn home shell is root-owned; the layer copy reuses an existing final
   dir and prunes copies of deleted layers.
 - `bun run check` and `bun test` pass.

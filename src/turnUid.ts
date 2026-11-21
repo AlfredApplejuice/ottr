@@ -406,11 +406,16 @@ export function chownTreeFd(rootFd: number, ids: TurnIdentity): void {
 /**
  * Per-run workspace handoff: the run's cwd tree and the project's git dir
  * become the project uid's, and their top dirs go to mode 0700, so a turn of
- * another project cannot traverse into this project's checkout. The git dir
- * is derived structurally (`<workspaceRoot>/<project>/.git`, the board's own
- * layout), never from the worktree's planted `.git` pointer: a root chown
- * through that pointer could hand the daemon another project's repo. Any
- * step that cannot be proven fails the run.
+ * another project cannot traverse into this project's checkout. Every path
+ * below the workspace root is resolved per component from a pinned root fd
+ * with O_NOFOLLOW|O_DIRECTORY: after a project's first run its project dir is
+ * uid-owned, so the uid could rename an intermediate dir (`.worktrees`) and
+ * plant a symlink whose middle part a plain-path open would follow — handing
+ * the root-privileged chown another project's tree. A symlink or non-dir
+ * component below the workspace root fails the run instead. The git dir is
+ * derived structurally (`<workspaceRoot>/<project>/.git`, the board's own
+ * layout), never from the worktree's planted `.git` pointer. Any step that
+ * cannot be proven fails the run.
  */
 export function prepareRunWorkspace(
 	cwd: string,
@@ -422,7 +427,8 @@ export function prepareRunWorkspace(
 		throw new Error(
 			`turn-uid: run cwd ${cwd} is not under the workspace root ${workspaceRoot}`,
 		);
-	const firstSegment = rel.split(sep)[0];
+	const segments = rel.split(sep);
+	const firstSegment = segments[0];
 	if (
 		firstSegment === undefined ||
 		firstSegment === "" ||
@@ -432,16 +438,70 @@ export function prepareRunWorkspace(
 		throw new Error(
 			`turn-uid: run cwd ${cwd} does not name a project under ${workspaceRoot}`,
 		);
-	const projectDir = join(workspaceRoot, firstSegment);
-	const gitDir = join(projectDir, ".git");
-	const st = statOf(gitDir);
-	if (st === null || !st.isDirectory())
-		throw new Error(`turn-uid: no git dir at ${gitDir} for cwd ${cwd}`);
-	chownTree(cwd, ids);
-	chmodSync(cwd, 0o700);
-	chownSameDir(gitDir, ids);
-	chownSync(projectDir, ids.uid, ids.gid);
-	chmodSync(projectDir, 0o700);
+	const rootFd = openPinned(workspaceRoot);
+	try {
+		// The cwd tree, resolved component by component below the pinned root:
+		// a planted symlink or a non-dir at any level fails the run before any
+		// chown happens.
+		const cwdFd = pinUnder(rootFd, segments);
+		try {
+			chownSync(`/proc/self/fd/${cwdFd}`, ids.uid, ids.gid);
+			chownTreeFd(cwdFd, ids);
+			chmodSync(`/proc/self/fd/${cwdFd}`, 0o700);
+		} finally {
+			closeSync(cwdFd);
+		}
+		// The project dir and its git dir, anchored the same way (the git dir
+		// must be a real directory; a planted `.git` symlink is refused).
+		const projectFd = pinUnder(rootFd, [firstSegment]);
+		try {
+			const gitFd = pinUnder(projectFd, [".git"]);
+			try {
+				chownSync(`/proc/self/fd/${gitFd}`, ids.uid, ids.gid);
+				chownTreeFd(gitFd, ids);
+				chmodSync(`/proc/self/fd/${gitFd}`, 0o700);
+			} finally {
+				closeSync(gitFd);
+			}
+			chownSync(`/proc/self/fd/${projectFd}`, ids.uid, ids.gid);
+			chmodSync(`/proc/self/fd/${projectFd}`, 0o700);
+		} finally {
+			closeSync(projectFd);
+		}
+	} finally {
+		closeSync(rootFd);
+	}
+}
+
+/** Open `name` below a pinned directory fd as a real directory, refusing
+ * symlinks and non-dirs (the anchored per-component resolve). */
+function pinChild(parentFd: number, name: string): number {
+	try {
+		return openSync(
+			`/proc/self/fd/${parentFd}/${name}`,
+			oPath | oNoFollow | fsConstants.O_DIRECTORY,
+		);
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException).code;
+		if (code === "ELOOP" || code === "ENOTDIR")
+			throw new Error(
+				`turn-uid: refusing planted entry "${name}" below the pinned workspace path (${code})`,
+			);
+		if (code === "ENOENT")
+			throw new Error(`turn-uid: missing workspace entry "${name}"`);
+		throw err;
+	}
+}
+
+/** Pin the directory at `segments` below a pinned root fd, per component. */
+function pinUnder(rootFd: number, segments: readonly string[]): number {
+	let fd = rootFd;
+	for (const name of segments) {
+		const child = pinChild(fd, name);
+		if (fd !== rootFd) closeSync(fd);
+		fd = child;
+	}
+	return fd;
 }
 
 /** chownTree anchored to the exact dir entry the caller stat'ed: a swap of the
