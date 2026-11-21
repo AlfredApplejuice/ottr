@@ -237,9 +237,12 @@ export function createCodeScanWatcher(deps: {
 		}
 		for (const list of byRule.values()) list.sort(bySeverityThenNumber);
 		// Rule order: worst severity first (each list's head is its worst), then rule id.
+		// Every key maps to a non-empty list by construction; the optional chain keeps
+		// the lint's no-non-null-assertion rule quiet without changing the order.
 		const ruleOrder = [...byRule.keys()].sort((x, y) => {
 			const d =
-				rank(byRule.get(x)![0]!.severity) - rank(byRule.get(y)![0]!.severity);
+				rank(byRule.get(x)?.[0]?.severity ?? "") -
+				rank(byRule.get(y)?.[0]?.severity ?? "");
 			if (d !== 0) return d;
 			return x < y ? -1 : x > y ? 1 : 0;
 		});
@@ -318,7 +321,9 @@ export function createCodeScanWatcher(deps: {
 				used++;
 			};
 			for (const rule of ruleOrder) {
-				const open = byRule.get(rule)!;
+				const open = byRule.get(rule);
+				// ruleOrder lists byRule's own keys, so the lookup always hits.
+				if (open === undefined) continue;
 				const cards = await store.codeScanRuleCards(rule);
 				let refile = false;
 				if (cards.length === 0) {
@@ -356,9 +361,10 @@ export function createCodeScanWatcher(deps: {
 				}
 				// The append target is the rule's tail card: the one whose rows filed
 				// last; later cards win ties, so the still-filling part takes new rows.
-				let tail = cards[0]!;
-				for (const c of cards.slice(1))
-					if (c.newestFiledAt >= tail.newestFiledAt) tail = c;
+				// Reached only with a non-empty cards list (the empty branch continues).
+				const tail = cards.reduce((last, c) =>
+					c.newestFiledAt >= last.newestFiledAt ? c : last,
+				);
 				if (tail.rows < CODE_SCAN_GATES.SPLIT) {
 					const batch = fresh.slice(0, CODE_SCAN_GATES.SPLIT - tail.rows);
 					await store.appendCodeScanAlerts({
