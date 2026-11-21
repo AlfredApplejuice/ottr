@@ -775,6 +775,25 @@ async function seedProject(
 		"chore: bootstrap",
 	);
 
+	// The boot sweep (src/server.ts) anchors a done release card on refs/tags/<version>^{commit}
+	// and strips releaseVersion when the tag does not resolve, so each release spec seeds its
+	// tag at HEAD. A resolved tag is a no-op, so a reseed never moves an existing one.
+	for (const t of spec.tasks) {
+		if (!t.release) continue;
+		const probe = Bun.spawnSync(
+			[
+				"git",
+				"rev-parse",
+				"--verify",
+				"--quiet",
+				`refs/tags/${t.release.version}^{commit}`,
+			],
+			{ cwd: dir },
+		);
+		if (probe.exitCode === 0) continue;
+		git(dir, "tag", t.release.version, "HEAD");
+	}
+
 	// Raw handle on purpose: pre-boot seeding, no ProjectStore lock held.
 	const db = new Database(join(dir, ".tasks", "tasks.db"));
 	try {
