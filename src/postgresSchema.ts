@@ -186,7 +186,9 @@ export function applicationSchemaDifferences(
 	return differences;
 }
 
-const projectMigrations: readonly PostgresMigration[] = [
+/** The project schema's numbered steps, in order; version = index + 1. Exported for
+ *  src/postgresSchema.test.ts, which runs them against a recording stub. */
+export const projectMigrations: readonly PostgresMigration[] = [
 	async (db) => {
 		for (const statement of projectStepOne) await db.exec(statement);
 		await db.run(

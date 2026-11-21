@@ -173,24 +173,28 @@ try {
     await assert.rejects(store.backupTo(snapshot));
     await assert.rejects(global.backupTo(snapshot));
     assert.equal(existsSync(join(root, 'must-not-exist')), false);
-    const projectDb = store.db;
-    const failure = new Error('failed migration step');
-    await assert.rejects(applyPostgresMigrations(projectDb, [async () => {}, async migrationDb => {
-      await migrationDb.exec('CREATE TABLE migration_rollback_probe (id bigint PRIMARY KEY)');
-      await migrationDb.run("UPDATE settings SET value = 'changed' WHERE key = 'task-insertion-ordinal'");
-      throw failure;
-    }]), error => error === failure);
-    assert.equal(await projectDb.query('SELECT version FROM schema_migrations WHERE version = 2').get(), null);
-    assert.equal(await projectDb.query('SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name = ?').get(projectDb.schema, 'migration_rollback_probe'), null);
-    assert.equal(await projectDb.query("SELECT value FROM settings WHERE key = 'task-insertion-ordinal'").get().then(row => row.value), String(afterOrdinal.insertion_ordinal));
-    await applyPostgresMigrations(projectDb, [async () => {}, async migrationDb => {
-      await migrationDb.exec('CREATE TABLE migration_success_probe (id bigint PRIMARY KEY)');
-      await migrationDb.run('INSERT INTO migration_success_probe (id) VALUES (?)', [77]);
-    }]);
-    assert.deepEqual(Array.from(await projectDb.query('SELECT id FROM migration_success_probe').all()), [{ id: 77 }]);
-    assert.deepEqual(await projectDb.query('SELECT version FROM schema_migrations WHERE version = 2').get(), { version: 2 });
-    assert.equal((await store.getTask(first.id)).prompt, first.prompt);
-    await applyPostgresMigrations(projectDb, [async () => { throw new Error('step one repeated'); }, async () => { throw new Error('step two repeated'); }]);
+	const projectDb = store.db;
+	// ProjectStore.init recorded versions 1 and 2 (the oracle step and the posted_via
+	// step), so the probes run at the first unused version: 3. Recorded versions skip
+	// their steps, and a skip never rejects.
+	const failure = new Error('failed migration step');
+	const noop = async () => {};
+	await assert.rejects(applyPostgresMigrations(projectDb, [noop, noop, async migrationDb => {
+		await migrationDb.exec('CREATE TABLE migration_rollback_probe (id bigint PRIMARY KEY)');
+		await migrationDb.run("UPDATE settings SET value = 'changed' WHERE key = 'task-insertion-ordinal'");
+		throw failure;
+	}]), error => error === failure);
+	assert.equal(await projectDb.query('SELECT version FROM schema_migrations WHERE version = 3').get(), null);
+	assert.equal(await projectDb.query('SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name = ?').get(projectDb.schema, 'migration_rollback_probe'), null);
+	assert.equal(await projectDb.query("SELECT value FROM settings WHERE key = 'task-insertion-ordinal'").get().then(row => row.value), String(afterOrdinal.insertion_ordinal));
+	await applyPostgresMigrations(projectDb, [noop, noop, async migrationDb => {
+		await migrationDb.exec('CREATE TABLE migration_success_probe (id bigint PRIMARY KEY)');
+		await migrationDb.run('INSERT INTO migration_success_probe (id) VALUES (?)', [77]);
+	}]);
+	assert.deepEqual(Array.from(await projectDb.query('SELECT id FROM migration_success_probe').all()), [{ id: 77 }]);
+	assert.deepEqual(await projectDb.query('SELECT version FROM schema_migrations WHERE version = 3').get(), { version: 3 });
+	assert.equal((await store.getTask(first.id)).prompt, first.prompt);
+	await applyPostgresMigrations(projectDb, [async () => { throw new Error('step one repeated'); }, async () => { throw new Error('step two repeated'); }, async () => { throw new Error('step three repeated'); }]);
     const globalDb = await getPostgresDatabase('ottr_global');
     try {
       const collisionName = 'registry collision';

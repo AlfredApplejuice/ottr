@@ -1,10 +1,17 @@
 // Guard for AGENTS.md hard stop 2's second half: a schema change that converges on
-// SQLite must also land on the PostgreSQL migration surface. The PG parity test
-// (src/postgresStore.test.ts) needs a real server and skips without a fixture, so a
-// SQLite-only column once passed every local gate; this test reads the two schemas'
-// DDL as data and fails in any container.
+// SQLite must also land on the PostgreSQL migration surface, and the numbered steps
+// must actually execute. The PG parity test (src/postgresStore.test.ts) needs a real
+// server and skips without a fixture, so a SQLite-only column once passed every local
+// gate; this file reads the two schemas' DDL as data and runs the real
+// applyPostgresMigrations over a recording database stub, in any container.
 import { describe, expect, test } from "bun:test";
-import { projectStepOne, projectStepTwo } from "./postgresSchema.ts";
+import type { PostgresDatabase } from "./postgresDriver.ts";
+import {
+	applyPostgresMigrations,
+	projectMigrations,
+	projectStepOne,
+	projectStepTwo,
+} from "./postgresSchema.ts";
 import { SCHEMA } from "./store.ts";
 
 /** Column names of one CREATE TABLE body, in order: the first token of each
@@ -41,9 +48,10 @@ function tableColumns(ddl: string, create: string): string[] {
 	return columnsOfDdl(ddl.slice(start, end + 2));
 }
 
-/** The ALTER TABLE pr_review ADD COLUMN names of every pure-SQL step list. A later
- *  migration step with only template SQL (schema-qualified functions) must extend
- *  this list or this test. */
+/** The pr_review column surface of the numbered steps: the step 1 CREATE TABLE plus
+ *  every ALTER TABLE pr_review ADD COLUMN of the later pure-SQL steps. A later step
+ *  with only template SQL (schema-qualified functions) must extend this list or the
+ *  convergence test below. */
 function migratedColumns(): Set<string> {
 	const columns = new Set<string>();
 	const create = projectStepOne.find((statement) =>
@@ -60,6 +68,52 @@ function migratedColumns(): Set<string> {
 	return columns;
 }
 
+/** A recording database: applyPostgresMigrations runs its real control flow against
+ *  this stub, so the test exercises the migration path, not only the DDL data. */
+class MigrationProbeDb {
+	readonly schema = "p_probe_000000000000";
+	readonly executed: string[] = [];
+	readonly applied = new Set<number>();
+
+	exec(statement: string): void {
+		this.executed.push(statement);
+	}
+
+	run(statement: string, args?: unknown[]): void {
+		this.executed.push(statement);
+		if (
+			statement.startsWith("INSERT INTO schema_migrations") &&
+			typeof args?.[0] === "number"
+		)
+			this.applied.add(args[0]);
+	}
+
+	query(_: string): {
+		get: (...params: unknown[]) => Promise<unknown>;
+		all: () => Promise<unknown[]>;
+	} {
+		return {
+			get: async (...params: unknown[]) => {
+				const version = params[0];
+				return typeof version === "number" && this.applied.has(version)
+					? { version }
+					: null;
+			},
+			all: async () => [],
+		};
+	}
+
+	createQueue(): {
+		transaction: (work: () => Promise<void>) => Promise<void>;
+	} {
+		return { transaction: (work) => work() };
+	}
+
+	asDatabase(): PostgresDatabase {
+		return this as unknown as PostgresDatabase;
+	}
+}
+
 describe("PostgreSQL migration surface", () => {
 	test("every SQLite pr_review column converges on the PostgreSQL steps", () => {
 		const expected = tableColumns(
@@ -72,10 +126,36 @@ describe("PostgreSQL migration surface", () => {
 		expect(missing).toEqual([]);
 	});
 
-	test("the step lists and the migration steps stay in lockstep", () => {
-		// Step 1's executor consumes projectStepOne and step 2's consumes
-		// projectStepTwo: the lists are the migration source of truth.
-		expect(projectStepOne.length).toBeGreaterThan(0);
-		expect(projectStepTwo.length).toBeGreaterThan(0);
+	test("the numbered steps execute their statements and record their versions", async () => {
+		const db = new MigrationProbeDb();
+		await applyPostgresMigrations(db.asDatabase(), projectMigrations);
+		// Step 2's ALTER really ran: a step that stops consuming its statement
+		// list restores the missing-column bug, and this fails.
+		expect(db.executed).toContain(
+			"ALTER TABLE pr_review ADD COLUMN posted_via text",
+		);
+		// Step 1's schema ran ahead of step 2's convergence.
+		const alter = db.executed.indexOf(
+			"ALTER TABLE pr_review ADD COLUMN posted_via text",
+		);
+		expect(alter).toBeGreaterThan(0);
+		expect(
+			db.executed
+				.slice(0, alter)
+				.some((statement) => statement.startsWith("CREATE TABLE pr_review")),
+		).toBe(true);
+		// Both versions carry their record.
+		expect([...db.applied].sort()).toEqual([1, 2]);
+		// A recorded version skips its step: the re-run only re-ensures the
+		// migrations table and executes no step statement.
+		db.executed.length = 0;
+		await applyPostgresMigrations(db.asDatabase(), projectMigrations);
+		expect(
+			db.executed.filter((statement) =>
+				/ALTER TABLE|CREATE TABLE pr_review|INSERT INTO settings/.test(
+					statement,
+				),
+			),
+		).toEqual([]);
 	});
 });
