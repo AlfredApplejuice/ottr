@@ -426,6 +426,9 @@ let branchRulesImpl: (url: string, init?: RequestInit) => Promise<Response> =
 		new Response(null, {
 			status: 404,
 		});
+// OTTR-1181: the model route's resume-gate quota report; tests swap it per case. Null
+// answers unknown, so an unset stub keeps every resume at the fail-open default.
+let quotaSnapshotImpl: (() => QuotaState | null) | null = null;
 const app = await createTestApp({
 	gstore,
 	secretBox: testBox(gstore),
@@ -436,6 +439,7 @@ const app = await createTestApp({
 	workersHome: root,
 	projects,
 	...loopStubs(),
+	quotaSnapshot: () => quotaSnapshotImpl?.() ?? null,
 	deepen: (prompt, model) => deepenImpl(prompt, model),
 	deepenCheck: (draft, rewrite, model) => {
 		if (!deepenCheckImpl)
@@ -8370,6 +8374,146 @@ describe("model switch route", () => {
 			resume: true,
 		});
 		expect((await store.getTask(edit.id))!.holdUntil).not.toBeNull();
+	});
+
+	// OTTR-1181: the resume gate reads the quota report through the quotaSnapshot seam;
+	// every case resets it so no later test inherits a blocked report.
+	afterEach(() => {
+		quotaSnapshotImpl = null;
+	});
+
+	test("resume refuses a pick whose provider is still out of quota; model and hold stay", async () => {
+		const resetsAt = Date.now() + 3_600_000;
+		quotaSnapshotImpl = () => ({
+			limits: [
+				{
+					provider: "anthropic",
+					label: "Claude 5 Hour",
+					window: "5h",
+					plan: null,
+					usedPct: 100,
+					resetsAt,
+				},
+			],
+			error: null,
+			at: Date.now(),
+		});
+		const hold = {
+			holdUntil: Date.now() + 3_600_000,
+			holdProvider: "openai-codex",
+			holdWindow: "7d",
+			holdSetAt: Date.now(),
+			needsReason: "The openai-codex usage limit is reached.",
+		};
+		const t = await store.createTask("held and blocked");
+		await store.updateTask(t.id, hold);
+		const before = (await store.getTask(t.id))!;
+		const res = await post(`/api/projects/p1/tasks/${t.id}/model`, {
+			model: "anthropic/claude-sonnet-5-5",
+			resume: true,
+		});
+		expect(res.status).toBe(409);
+		const stamp = new Date(resetsAt)
+			.toISOString()
+			.slice(0, 16)
+			.replace("T", " ");
+		expect(await errorOf(res)).toBe(
+			`anthropic is still out of quota; the limit resets at ${stamp} UTC. Pick another model.`,
+		);
+		const after = (await store.getTask(t.id))!;
+		expect(after.model).toBe(before.model);
+		expect(after.holdUntil).toBe(before.holdUntil);
+		expect(after.holdProvider).toBe("openai-codex");
+		expect(after.holdWindow).toBe("7d");
+		expect(after.holdSetAt).toBe(before.holdSetAt);
+		expect(after.needsReason).toBe(before.needsReason);
+	});
+
+	test("resume still clears the hold when the quota report is absent or stale", async () => {
+		const hold = {
+			holdUntil: Date.now() + 3_600_000,
+			holdProvider: "openai-codex",
+			holdWindow: "7d",
+			holdSetAt: Date.now(),
+			needsReason: "The openai-codex usage limit is reached.",
+		};
+		// No report at all: unknown counts as free, like the start gate's fail-open.
+		const absent = await store.createTask("held without a report");
+		await store.updateTask(absent.id, hold);
+		const res = await post(`/api/projects/p1/tasks/${absent.id}/model`, {
+			model: "anthropic/claude-sonnet-5-5",
+			resume: true,
+		});
+		expect(res.status).toBe(200);
+		expect(await store.getTask(absent.id)).toMatchObject({
+			model: "anthropic/claude-sonnet-5-5",
+			holdUntil: null,
+			holdProvider: null,
+			holdWindow: null,
+			holdSetAt: null,
+			needsReason: null,
+		});
+		// Older than the refresh loop's 300_000 ms window: unknown too.
+		quotaSnapshotImpl = () => ({
+			limits: [
+				{
+					provider: "anthropic",
+					label: "Claude 5 Hour",
+					window: "5h",
+					plan: null,
+					usedPct: 100,
+					resetsAt: Date.now() + 3_600_000,
+				},
+			],
+			error: null,
+			at: Date.now() - 300_001,
+		});
+		const stale = await store.createTask("held with a stale report");
+		await store.updateTask(stale.id, hold);
+		const staleRes = await post(`/api/projects/p1/tasks/${stale.id}/model`, {
+			model: "anthropic/claude-sonnet-5-5",
+			resume: true,
+		});
+		expect(staleRes.status).toBe(200);
+		expect(await store.getTask(stale.id)).toMatchObject({
+			model: "anthropic/claude-sonnet-5-5",
+			holdUntil: null,
+		});
+	});
+
+	test("resume answers 200 when the picked provider reports no limits", async () => {
+		quotaSnapshotImpl = () => ({
+			limits: [
+				{
+					provider: "openai-codex",
+					label: "Codex 5 Hour",
+					window: "5h",
+					plan: null,
+					usedPct: 100,
+					resetsAt: Date.now() + 3_600_000,
+				},
+			],
+			error: null,
+			at: Date.now(),
+		});
+		const t = await store.createTask("held, picking a free provider");
+		await store.updateTask(t.id, {
+			holdUntil: Date.now() + 3_600_000,
+			holdProvider: "openai-codex",
+			holdWindow: "5h",
+			holdSetAt: Date.now(),
+			needsReason: "The openai-codex usage limit is reached.",
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/model`, {
+			model: "zai/glm-5.3-flash",
+			resume: true,
+		});
+		expect(res.status).toBe(200);
+		expect(await store.getTask(t.id)).toMatchObject({
+			model: "zai/glm-5.3-flash",
+			holdUntil: null,
+			holdProvider: null,
+		});
 	});
 
 	test("absent or non-string model is 400", async () => {

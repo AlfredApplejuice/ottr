@@ -277,7 +277,12 @@ import {
 } from "./prompts.ts";
 import { createPrWatcher, PR_GATES, postedReviewId, prUrl } from "./prs.ts";
 import { requirementsListPath } from "./python.ts";
-import { fetchQuota, forProvider, providerBlocked } from "./quota.ts";
+import {
+	fetchQuota,
+	forProvider,
+	providerBlocked,
+	providerOf,
+} from "./quota.ts";
 import {
 	cachedLatestGhRelease,
 	includedTasks,
@@ -662,6 +667,11 @@ interface AppDeps {
 	 * grid), for the Settings watches row. Absent in narrow test mounts, so the
 	 * state payload then reports null. */
 	codeScanPollNextAt?: () => number | null;
+	/** OTTR-1181: the model route's resume gate reads the cached quota report through
+	 * this seam; unset reads the refresh loop's `quota` closure like production. Tests
+	 * inject a stub so no test spawns `omp usage`; a null answer counts as unknown and
+	 * the resume fails open. */
+	quotaSnapshot?: () => QuotaState | null;
 	serverVersion: string;
 	port: number;
 	publicHosts: string[];
@@ -8519,6 +8529,36 @@ export async function createApp(deps: AppDeps) {
 			task.state === "queued" &&
 			task.holdUntil !== null &&
 			task.holdProvider !== null;
+		// OTTR-1181: resuming into a provider that is itself out of quota only bounces —
+		// the start gate re-holds the card on the new provider, silently. When the cached
+		// quota report (the refresh loop's `quota`, same 300_000 ms window) is known and
+		// names a blocking window, refuse the pick and write nothing. Absent or stale
+		// counts as unknown and fails open, like the start gate when the report is silent.
+		if (resume) {
+			const provider = providerOf(model);
+			if (provider !== null) {
+				const snapshot = deps.quotaSnapshot ? deps.quotaSnapshot() : quota;
+				if (snapshot !== null && Date.now() - snapshot.at <= 300_000) {
+					const blocked = providerBlocked(
+						snapshot.limits,
+						provider,
+						Date.now(),
+					);
+					if (blocked?.resetsAt != null) {
+						const at = new Date(blocked.resetsAt)
+							.toISOString()
+							.slice(0, 16)
+							.replace("T", " ");
+						return json(
+							{
+								error: `${provider} is still out of quota; the limit resets at ${at} UTC. Pick another model.`,
+							},
+							409,
+						);
+					}
+				}
+			}
+		}
 		const res = await applyUserEdit(
 			e,
 			task,
