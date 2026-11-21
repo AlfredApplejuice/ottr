@@ -1992,6 +1992,56 @@ describe("classify", () => {
 		});
 	});
 
+	test("9a. merge superseded closes done with a follow-up id, parks without one", () => {
+		expect(
+			run(
+				"merge",
+				result({
+					outcome: outcome({
+						status: "superseded",
+						summary: "main's flow covers it",
+						followUp: "OTTR-1181",
+					}),
+				}),
+			),
+		).toEqual({ stage: "done", state: "idle", needsReason: null });
+		const without = run(
+			"merge",
+			result({ outcome: outcome({ status: "superseded", summary: "gone" }) }),
+		);
+		expect(without).toEqual({
+			stage: "merging",
+			state: "needs_you",
+			needsReason:
+				"Reported superseded, but the report carries no follow-up card id. File the gap card with create_task, then reply and pass its id in followUp.",
+		});
+		expect(
+			run(
+				"merge",
+				result({
+					outcome: outcome({
+						status: "superseded",
+						summary: "gone",
+						followUp: "   ",
+					}),
+				}),
+			),
+		).toEqual(without);
+	});
+
+	test("9b. a work turn's superseded report is rejected once", () => {
+		expect(
+			run(
+				"work",
+				result({ outcome: outcome({ status: "superseded", summary: "gone" }) }),
+			),
+		).toEqual({
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: "Work turns do not close as superseded; report ready.",
+		});
+	});
+
 	test("10. needs_you outcome prefers trimmed question, falls back to summary", () => {
 		expect(
 			run(

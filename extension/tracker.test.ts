@@ -1046,6 +1046,7 @@ describe("arch-review changed-line coverage", () => {
 			"shots",
 			"dependsOn",
 			"prBody",
+			"followUp",
 		]);
 	});
 
@@ -1187,7 +1188,7 @@ describe("arch-review changed-line coverage", () => {
 		]);
 	});
 
-	test("report_outcome status accepts exactly the four tracker statuses", () => {
+	test("report_outcome status accepts exactly the five tracker statuses", () => {
 		// The zod fake records the enum payload on the captured schema node.
 		const status = (fakePi().report_outcome?.parameters?.status ?? {}) as {
 			values?: string[];
@@ -1197,7 +1198,17 @@ describe("arch-review changed-line coverage", () => {
 			"answered",
 			"integrated",
 			"needs_you",
+			"superseded",
 		]);
+	});
+
+	test("followUp describes the superseded close's follow-up card id", () => {
+		const params = fakePi().report_outcome?.parameters ?? {};
+		expect(Object.keys(params)).toContain("followUp");
+		// unchecked cast: the fake schema shape is built in this file's harness, not external input
+		const followUp = params.followUp as { description?: string };
+		expect(followUp.description).toContain("Superseded merge turns only");
+		expect(followUp.description).toContain("parks the card instead of closing");
 	});
 
 	test("ask describes the option description field and the options array", () => {

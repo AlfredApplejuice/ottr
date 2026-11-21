@@ -904,6 +904,13 @@ const workOutcomeRule: ClassifyRule = (o, stage) => {
 	if (oc === null) return null;
 	if (oc.status === "ready") return workReadyNext(o, stage, o.git);
 	if (oc.status === "answered") return workAnsweredNext(o, stage, o.git);
+	// Only a merge turn closes as superseded: a work turn re-reports ready and the
+	// normal merge turn decides (the rejection rides the resumed turn's prompt).
+	if (oc.status === "superseded")
+		return needsAt(
+			stage,
+			"Work turns do not close as superseded; report ready.",
+		);
 	return null;
 };
 
@@ -913,6 +920,17 @@ const mergeOutcomeRule: ClassifyRule = (o, stage) => {
 	if (oc === null) return null;
 	if (oc.status === "ready" || oc.status === "answered")
 		return needsAt(stage, `Unexpected outcome "${oc.status}" in a merge turn.`);
+	// OTTR-1182: a merge turn whose branch main already superseded closes done, but
+	// only with the follow-up card id it filed for the gap. The settle verifies the
+	// link and the target's push state before the cleanup runs (verifySupersededClose);
+	// an unproven report parks with the worktree intact.
+	if (oc.status === "superseded")
+		return oc.followUp !== undefined && oc.followUp.trim() !== ""
+			? { stage: "done", state: "idle", needsReason: null }
+			: needsAt(
+					stage,
+					"Reported superseded, but the report carries no follow-up card id. File the gap card with create_task, then reply and pass its id in followUp.",
+				);
 	return null;
 };
 
@@ -975,7 +993,8 @@ function isOutcome(v: unknown): v is Outcome {
 		(o.dependsOn === undefined ||
 			(Array.isArray(o.dependsOn) &&
 				o.dependsOn.every((d: unknown) => typeof d === "string"))) &&
-		(o.prBody === undefined || typeof o.prBody === "string")
+		(o.prBody === undefined || typeof o.prBody === "string") &&
+		(o.followUp === undefined || typeof o.followUp === "string")
 	);
 }
 

@@ -7029,6 +7029,10 @@ export function createTurnLoop(
 			return;
 		}
 		if (st.kind !== "merge" || st.idn.grill || st.idn.releaseCard) return;
+		// OTTR-1182: a superseded report ships nothing — no merge-hold audit and no
+		// server push of the target. The branch's commits are superseded, so the push
+		// state the turn left behind is judged by verifySupersededClose, never shipped.
+		if (st.result.outcome?.status === "superseded") return;
 		if (st.header.settings.prMode === true) await shipPrCard(st);
 		else await auditMergeHold(st);
 	}
@@ -8390,10 +8394,82 @@ export function createTurnLoop(
 		// The PR-mode ship step owns the card's next state: it never lands, so the done
 		// write below (pushSha pinning, worktree removal, release stamping) is skipped.
 		if (st.prNext !== null) next = st.prNext;
+		// OTTR-1182: a superseded close settles done only when its claims verify — the
+		// follow-up card is linked to this task and the local target branch holds nothing
+		// unpushed. Every failed check parks fail-closed with the worktree intact.
+		if (
+			st.kind === "merge" &&
+			st.result.outcome?.status === "superseded" &&
+			next.stage === "done"
+		)
+			next = await verifySupersededClose(st, next);
 		return {
 			facts,
 			next: await stampReleaseLineHold(st, await stampUsageHold(st, next)),
 		};
+	}
+
+	/** A superseded merge close's park: needs_you at merging, the worktree and branch
+	 * intact, the reason naming the failed claim and the repair. */
+	async function supersededPark(st: TurnSettle, why: string): Promise<Next> {
+		await st.log(`! superseded close refused: ${why}`);
+		return {
+			stage: "merging",
+			state: "needs_you",
+			needsReason: `Reported superseded, but ${why}. File the gap card with create_task, sync the main checkout with ${st.header.target} when it differs, then reply and pass the card id in followUp.`,
+		};
+	}
+
+	/** True when the named card exists and points at this task (followUpOf): in this
+	 * store, or across a project border (create_task filed the gap card into another
+	 * project). A store read failure reads as no card — fail closed. */
+	async function supersededFollowUpLinked(
+		st: TurnSettle,
+		id: string,
+	): Promise<boolean> {
+		const local = await st.store.getTask(id).catch(() => null);
+		if (local !== null) return local.followUpOf === st.id;
+		for (const p of projects.values()) {
+			if (p.store === st.store) continue;
+			const t = await p.store.getTask(id).catch(() => null);
+			if (t !== null) return t.followUpOf === st.id;
+		}
+		return false;
+	}
+
+	/** The superseded close's proof: the outcome's followUp names a card linked to this
+	 * task, and the local target branch tip equals the upstream tip (a merge turn that
+	 * left commits on the target claimed an integration it did not report). Non-origin
+	 * targets skip the tip compare — the board never pushes them (serverMergePush
+	 * preflight skips too). */
+	async function verifySupersededClose(
+		st: TurnSettle,
+		next: Next,
+	): Promise<Next> {
+		const id = (st.result.outcome?.followUp ?? "").trim();
+		if (id === "")
+			return supersededPark(st, "the report carries no follow-up card id");
+		if (!(await supersededFollowUpLinked(st, id)))
+			return supersededPark(
+				st,
+				`no card ${id} is linked to this task (followUpOf)`,
+			);
+		const short = st.header.target.replace(/^origin\//, "");
+		if (st.header.target.startsWith("origin/")) {
+			const [local, origin] = await Promise.all([
+				ops.targetSha(st.e.path, `refs/heads/${short}`).catch(() => null),
+				ops.targetSha(st.e.path, st.header.target).catch(() => null),
+			]);
+			if (local === null || local !== origin)
+				return supersededPark(
+					st,
+					`the local ${short} branch does not match ${st.header.target} (or git could not read the tips), so the turn may hold an integration it did not report`,
+				);
+		}
+		await st.log(
+			`- superseded close verified: follow-up ${id} linked, nothing unpushed on ${st.header.target}`,
+		);
+		return next;
 	}
 
 	/** A run the provider stopped at its usage limit continues automatically (classify's
@@ -9685,18 +9761,17 @@ export function createTurnLoop(
 	/** The done settle's git reads (the settle reads are slow; a cancel landing inside them
 	 * owns the card — its kept path already wrote the final state, and the checks below only
 	 * finish the turn row). Kept files ride a kept or release card; a plain done card keeps
-	 * none (its worktree goes away). */
+	 * none (its worktree goes away). A superseded close merged nothing, so it stamps no
+	 * commit count and no merge head — those anchor release attribution to the card's merge. */
 	async function measureSettleGit(st: TurnSettle, next: Next): Promise<void> {
-		// Stamped with `commits`: the target head at Done anchors the release's late-commit
-		// attribution to this card's merge.
-		st.commits =
-			next.stage === "done"
-				? await ops.targetCommits(st.e.path, st.header.target)
-				: undefined;
-		st.mergeHead =
-			next.stage === "done"
-				? await ops.targetSha(st.e.path, st.header.target).catch(() => null)
-				: undefined;
+		const landed =
+			next.stage === "done" && st.result.outcome?.status !== "superseded";
+		st.commits = landed
+			? await ops.targetCommits(st.e.path, st.header.target)
+			: undefined;
+		st.mergeHead = landed
+			? await ops.targetSha(st.e.path, st.header.target).catch(() => null)
+			: undefined;
 		st.keptFiles =
 			!st.idn.releaseCard && next.stage === "done"
 				? []
@@ -11613,9 +11688,16 @@ export function createTurnLoop(
 	 * CI watch: pin the pushed sha only when origin's remote-tracking tip equals the local
 	 * target tip — a merge turn that skipped its push would otherwise pin an older run to
 	 * this card. ponytail: two merges landing between push and capture pin the newer run to
-	 * both cards. */
+	 * both cards. A superseded close merged nothing, so it pins no push sha: a CI failure
+	 * on the shared tip must not reopen a card whose commits never landed, and the release
+	 * stamp's attribution needs an integrated report (OTTR-1182). */
 	async function stampReleaseVersion(st: TurnSettle): Promise<void> {
-		const version = await readReleasedVersion(st);
+		const last = (await st.store.listTurns(st.id)).at(-1);
+		const superseded = last?.outcome === "superseded";
+		const version =
+			last?.outcome === "integrated"
+				? parseReleaseVersion(`${last.summary ?? ""}\n${last.details ?? ""}`)
+				: null;
 		const short = st.header.target.replace(/^origin\//, "");
 		const [local, pushed] = await Promise.all([
 			ops.targetSha(st.e.path, st.header.target).catch(() => null),
@@ -11635,6 +11717,10 @@ export function createTurnLoop(
 				`- no release stamp for ${version}: no tag on the pushed head`,
 			);
 		if (!onOrigin) await st.log("- CI watch skipped: merge push not on origin");
+		if (superseded)
+			await st.log(
+				"- superseded close: no CI-watch pin and no release stamp (nothing merged)",
+			);
 		await st.store.transaction(async () => {
 			const current = await st.store.getTask(st.id);
 			if (
@@ -11645,17 +11731,9 @@ export function createTurnLoop(
 				return;
 			if (version !== null && onOrigin && tagged === pushed)
 				await st.store.updateTask(st.id, { releaseVersion: version });
-			if (onOrigin) await st.store.updateTask(st.id, { pushSha: pushed });
+			if (!superseded && onOrigin)
+				await st.store.updateTask(st.id, { pushSha: pushed });
 		});
-	}
-
-	/** The version this merge turn released, parsed from the settled row's report prose
-	 * (null unless the run reported an integrated outcome). */
-	async function readReleasedVersion(st: TurnSettle): Promise<string | null> {
-		const last = (await st.store.listTurns(st.id)).at(-1);
-		return last?.outcome === "integrated"
-			? parseReleaseVersion(`${last.summary ?? ""}\n${last.details ?? ""}`)
-			: null;
 	}
 
 	/** An interview, grill or trending scout card runs in the main checkout: its worktree must

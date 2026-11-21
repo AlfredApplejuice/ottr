@@ -117,7 +117,7 @@ Notes:
 
 - The work check runs inside the same `runTurn`, with a fresh session and only `read,grep,glob`. It judges the card's work result: the ready report plus the branch diff; the transcript is evidence for claimed runs only (`docs/specs/work-check.md`). A blocker sends the card back to the agent, and every ready report after a send-back gets a fresh check — the check then also gets the original report, the sent-back blockers, and only the commits since its last head. After four send-backs, the card asks the user: **Send it back** or **Merge anyway** (`src/turn.ts`). The reply route does the chosen action (`src/app.ts`). Other reply text goes to the agent. When the loop diverges — the blocker count did not drop over two consecutive send-backs, or one bug class repeats in two consecutive checks — the board parks the card at once instead of sending it back again, with the blocker counts per check and the repeated classes: **Send back with a new approach** (a typed reply carries your new direction), **Merge anyway**, or **Cancel** (`src/scheduler.ts`). A send-back after a repeated class names the class and asks the agent to write down the premise its fixes share and replace the approach when the premise is wrong. The cap of four send-backs stays the outer bound. When a check run stops at a provider usage limit, the board does not try again at once. The card waits in the queue until the reset time from `omp usage` (`holdUntil`), then the check runs again. A queue reorder does not change this wait. A message to the card ends the wait. If the reset time is not known, the card asks the user.
 - Merge turns run local, never on a worker. The agent does not push. `serverMergePush` pushes with the server's git credentials (`src/worktree.ts`).
-- A `ready` report needs commits ahead of the base and a clean worktree. An `integrated` report needs the branch head on the upstream branch. Otherwise `classify` parks the card at `needs_you` (`src/runner.ts`).
+- A `ready` report needs commits ahead of the base and a clean worktree. An `integrated` report needs the branch head on the upstream branch. Otherwise `classify` parks the card at `needs_you` (`src/runner.ts`). A merge turn can also report `superseded`: main's own flow already covers the branch, so nothing merges and nothing pushes. The close only lands when the report's `followUp` id names a card linked to the task and the local target branch matches the upstream tip; every failed check parks the card with the worktree kept (`src/turn.ts`, `verifySupersededClose`).
 
 **Cross-project cards.** A card changes another project only by filing a card there: `create_task` with the `project` parameter files the card, and that card's own turns land the change. The work prompt still says that the agent never edits or commits in another project's checkout. After each work turn, the board compares that turn's window (turn start to turn end) with each change in every other project's main checkout. For a commit, the window overlaps the change when the commit time falls in the window. For a change with only files, the board uses the guard window. The board parks the card at `needs_you` only when this turn's window alone overlaps the change. It names the project, the commits and the files. When two or more turns overlap the change, no card parks: the board logs the change and shows one notice in the bell's Advisories section, with the commit and the running cards named.
 
@@ -149,7 +149,7 @@ stateDiagram-v2
 - `createTask` — `src/store.ts`
 - `POST /api/projects/<project>/tasks/<id>/backlog` — `src/app.ts`
 - Work session starts — `runTurn` `onSession` in `src/turn.ts`
-- Report checks (`ready`, `answered`, `integrated`) — `classify` in `src/runner.ts`
+- Report checks (`ready`, `answered`, `integrated`, `superseded`) — `classify` in `src/runner.ts`
 - Work check blockers — `runTurn` in `src/turn.ts`
 - Open review findings and failed release publish — `runTurn` and `settleReviews` in `src/turn.ts`
 
@@ -211,7 +211,7 @@ Scroll the tab strip to reach more stages.
 The strip keeps the active stage label in view after a tap, swipe, or keyboard change.
 The Ottr logo links to the home page and keeps its accessible name when the wordmark is hidden.
 
-Ottr checks every report against git: `ready` needs commits ahead of the base and a clean worktree; `answered` needs no commits; `integrated` needs the branch head on the upstream branch.
+Ottr checks every report against git: `ready` needs commits ahead of the base and a clean worktree; `answered` needs no commits; `integrated` needs the branch head on the upstream branch. A merge turn can close `superseded` instead: its report must name a follow-up card linked to the task, the target branch must hold nothing unpushed, and the board then frees the worktree and branch without a push.
 
 For an `answered` report, Ottr keeps the exact `summary` in the card and the turn record. A follow-up handoff includes the card summary under **Final outcome**. Call `report_outcome` directly, not through `eval`.
 

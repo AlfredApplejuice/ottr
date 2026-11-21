@@ -23,7 +23,12 @@ export type RunState =
 	| "idle";
 /** Turn 1 (and its replies) is `work`; the integrate turn (and its replies) is `merge`. */
 export type TurnKind = "work" | "merge";
-export type OutcomeStatus = "ready" | "answered" | "integrated" | "needs_you";
+export type OutcomeStatus =
+	| "ready"
+	| "answered"
+	| "integrated"
+	| "needs_you"
+	| "superseded";
 
 /** The fixed reply text that approves a parked merge hold; the drawer's approve button sends it. */
 export const APPROVE_REPLY = "approved";
@@ -33,6 +38,7 @@ export const OUTCOME_STATUSES: readonly OutcomeStatus[] = [
 	"answered",
 	"integrated",
 	"needs_you",
+	"superseded",
 ];
 
 /** One choice of an agent ask question. Used only inside this module. */
@@ -203,6 +209,8 @@ export interface Outcome {
 	dependsOn?: string[];
 	/** PR mode only: the pull request body the merge turn wrote for the PR the server opens; missing or blank = the PR body falls back to the report text. */
 	prBody?: string;
+	/** Superseded merge turns only: the id of the follow-up card this turn filed with create_task for the gap main's flow left. A superseded report without a linked follow-up parks instead of closing. */
+	followUp?: string;
 }
 
 /** Repo facts for the onboarding fork panel; built by forkSummary (src/forks.ts). */

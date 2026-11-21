@@ -627,12 +627,13 @@ export default function (pi: Pi) {
 			"status: ready = work committed on the task branch and needs integration; " +
 			"answered = question-only task, nothing to merge; " +
 			"integrated = merge turn finished and the branch is on the integration target; " +
+			"superseded = merge turn whose branch main's own flow already covers: merge nothing and push nothing, and put the follow-up card's id in followUp; " +
 			"needs_you = you need the user (put the exact question in question). " +
 			"summary: 1-3 lines for the board card. details: the full report shown on the card (answered: your complete answer; integrated: the integration output verbatim). " +
 			"dependsOn: ids of cards this turn waits for — a needs_you outcome with dependsOn requeues the card in its current stage, and the tracker restarts it when every id is done or cancelled.",
 		parameters: z.object({
 			status: z
-				.enum(["ready", "answered", "integrated", "needs_you"])
+				.enum(["ready", "answered", "integrated", "needs_you", "superseded"])
 				.describe("How the turn ended"),
 			summary: z.string().describe("1-3 lines for the board card"),
 			details: z
@@ -664,6 +665,13 @@ export default function (pi: Pi) {
 				.optional()
 				.describe(
 					"PR mode merge turns only: the pull request body for the pull request the server opens after this report. Write it from the repo's pull request template (.github/pull_request_template.md) when one exists; describe the change, never the push. Missing or blank: the pull request body falls back to this report's summary and details.",
+				),
+			// Superseded merge turns only: the id of the gap card the turn filed with create_task.
+			followUp: z
+				.string()
+				.optional()
+				.describe(
+					"Superseded merge turns only: the id of the follow-up card this turn filed with create_task for the gap main's flow left (create_task returns the id). A superseded report without a linked follow-up parks the card instead of closing it.",
 				),
 		}),
 		loadMode: "essential",

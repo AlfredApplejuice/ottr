@@ -104,7 +104,7 @@ Do not push: the server pushes ${o.branch}'s head with its stored credentials af
 ${RENAME}
 Call rename with a 3-8 word title before your first report_outcome.
 ${NO_DESTRUCTION}
-Call report_outcome: integrated (summary is one line; put the integration output, e.g. release stdout, verbatim in details) or needs_you with the exact question — call ask with it and its options first, then end.
+Call report_outcome: integrated (summary is one line; put the integration output, e.g. release stdout, verbatim in details), superseded (main's own flow already covers this branch: merge nothing, file the gap as a follow-up card with create_task, and pass the returned card id in followUp), or needs_you with the exact question — call ask with it and its options first, then end.
 Add a final line \`topic: <one or two words for the task's subject>\` to the report details — the board groups done tasks by it.
 ${ONE_SHOT}`;
 }
@@ -158,7 +158,7 @@ export function replyPrompt(o: {
 	const outcomes = o.release
 		? RELEASE_OUTCOMES
 		: o.kind === "merge"
-			? "integrated (summary is one line; integration output verbatim in details) or needs_you (with the exact question — call ask with it and its options first, then end)"
+			? "integrated (summary is one line; integration output verbatim in details), superseded (file the gap card with create_task and pass its id in followUp), or needs_you (with the exact question — call ask with it and its options first, then end)"
 			: WORK_OUTCOMES;
 	const rejected = o.rejected
 		? `The tracker rejected your last report_outcome: ${o.rejected}\n\n`

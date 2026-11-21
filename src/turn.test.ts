@@ -5284,6 +5284,184 @@ describe("turn merge outcomes", () => {
 			'Unexpected outcome "answered" in a merge turn.',
 		);
 	});
+
+	/** A superseded report whose claims hold: follow-up card linked, target tips equal.
+	 * `gapId` is a getter: the gap card is created after setup, before the turn runs. */
+	function supersededRun(record: Recorded, gapId: () => string) {
+		return async (o: {
+			prompt: string;
+			onSession?: (sid: string) => void;
+		}) => {
+			record.runs.push(o as never);
+			await o.onSession?.("sess-1");
+			return {
+				pid: 4242,
+				done: Promise.resolve(
+					runResult({
+						outcome: {
+							status: "superseded",
+							summary: "superseded by main's flow; gap filed",
+							followUp: gapId(),
+						} satisfies Outcome,
+					}),
+				),
+				kill: async () => {},
+			};
+		};
+	}
+
+	/** Tips the verification reads: both target refs at one sha unless the test splits them. */
+	function syncedTips(local: string, origin: string) {
+		return async (_path: string, ref: string): Promise<string | null> =>
+			ref === "refs/heads/main"
+				? local
+				: ref === "origin/main" || ref === "refs/remotes/origin/main"
+					? origin
+					: null;
+	}
+
+	test("a superseded merge turn closes done, frees the worktree and branch, keeps the follow-up linked", async () => {
+		const record = baseRecord();
+		const pushes: unknown[] = [];
+		let gapId = "";
+		const { store, loop } = await setupWith(record, {
+			targetSha: syncedTips("sha-main", "sha-main"),
+			serverMergePush: async (...args: unknown[]) => {
+				pushes.push(args);
+				return { status: "skipped" as const };
+			},
+			startRun: supersededRun(record, () => gapId),
+		});
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		// The follow-up card the merge turn filed before reporting: linked to this task.
+		const gap = await store.createTask("cover the superseded flow's gap");
+		await store.updateTask(gap.id, { followUpOf: task.id });
+		gapId = gap.id;
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		// Nothing merged: no integration attribution and no CI-watch pin.
+		expect(after.commits).toBeNull();
+		expect(after.mergeHead).toBeNull();
+		expect(after.pushSha).toBeNull();
+		expect(after.releaseVersion).toBeNull();
+		// The cleanup ran per the normal merge rules.
+		expect(record.removeWorktree).toHaveLength(1);
+		expect(record.removeWorktree[0]).toMatchObject({ branch: "ott/m" });
+		// The guard: the superseded close ships nothing.
+		expect(pushes).toHaveLength(0);
+		// The follow-up card stays linked.
+		expect((await store.getTask(gap.id))!.followUpOf).toBe(task.id);
+		// The turn row records the superseded outcome.
+		const turns = await store.listTurns(task.id);
+		expect(turns.at(-1)?.outcome).toBe("superseded");
+		expect(await logText(store, task.id)).toContain(
+			`superseded close verified: follow-up ${gap.id} linked`,
+		);
+	});
+
+	test("a superseded merge turn without a follow-up card parks with the worktree kept", async () => {
+		const record = baseRecord();
+		const { store, loop } = await setupWith(record, {
+			targetSha: syncedTips("sha-main", "sha-main"),
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
+				record.runs.push(o as never);
+				await o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "superseded",
+								summary: "superseded, no gap card",
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Reported superseded, but the report carries no follow-up card id. File the gap card with create_task, then reply and pass its id in followUp.",
+		);
+		// The park keeps the worktree: nothing was cleaned, nothing integrated.
+		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	test("a superseded close whose follow-up id names no linked card parks", async () => {
+		const record = baseRecord();
+		const { store, loop } = await setupWith(record, {
+			targetSha: syncedTips("sha-main", "sha-main"),
+			startRun: supersededRun(record, () => gap.id),
+		});
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		// The named card exists but links to another card: the claim does not verify.
+		const other = await store.createTask("another card");
+		const gap = await store.createTask("cover the superseded flow's gap");
+		await store.updateTask(gap.id, { followUpOf: other.id });
+
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			`Reported superseded, but no card ${gap.id} is linked to this task (followUpOf). File the gap card with create_task, sync the main checkout with origin/main when it differs, then reply and pass the card id in followUp.`,
+		);
+		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	test("a superseded close with unpushed commits on the target parks", async () => {
+		const record = baseRecord();
+		let gapId = "";
+		const { store, loop } = await setupWith(record, {
+			targetSha: syncedTips("sha-local", "sha-origin"),
+			startRun: supersededRun(record, () => gapId),
+		});
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		const gap = await store.createTask("cover the superseded flow's gap");
+		await store.updateTask(gap.id, { followUpOf: task.id });
+		gapId = gap.id;
+
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Reported superseded, but the local main branch does not match origin/main (or git could not read the tips), so the turn may hold an integration it did not report. File the gap card with create_task, sync the main checkout with origin/main when it differs, then reply and pass the card id in followUp.",
+		);
+		expect(record.removeWorktree).toHaveLength(0);
+	});
 });
 
 describe("turn survivor rounds", () => {
