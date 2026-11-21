@@ -20,6 +20,7 @@ import {
 	rmSync,
 	symlinkSync,
 	unlinkSync,
+	writeFileSync,
 } from "node:fs";
 import {
 	basename,
@@ -186,6 +187,32 @@ export function resolvePinnedLayer(
 	return dir;
 }
 
+/** Stale window shared by the layer temp dirs and the in-use markers: a day,
+ * matching the temp-dir rule and far longer than any turn on the volume. */
+const LAYER_STALE_MS = 24 * 60 * 60 * 1000;
+
+/** In-use marker beside a layer copy (`<id>.inuse`); only its mtime is read,
+ * so the name is a contract between the workers on the shared volume. */
+const LAYER_INUSE_SUFFIX = ".inuse";
+
+/**
+ * Mark one layer id in use for the stale window: a fresh mtime keeps the
+ * copy's prune away while a started turn runs on it. The marker lives in the
+ * root-owned layers dir, so a turn uid can neither forge nor drop it. Best
+ * effort: without a marker the copy falls back to the prunable behavior from
+ * before OTTR-1179, and hygiene never fails a run.
+ */
+function markLayerInUse(layersDir: string, id: string): void {
+	try {
+		writeFileSync(
+			join(layersDir, id + LAYER_INUSE_SUFFIX),
+			`${new Date().toISOString()}\n`,
+		);
+	} catch {
+		// The next turn start retries; a lost marker only re-opens the old race.
+	}
+}
+
 /**
  * One per-project copy of the pinned layer under `<turnHome>/layers/<id>`:
  * cp into a temp dir beside the final name, retarget the cache links, chown,
@@ -193,7 +220,10 @@ export function resolvePinnedLayer(
  * touch the temp or the final dir; symlinks are copied as links, so the
  * shared-state links keep pointing at the flat shared home. An existing
  * final dir is reused (a layer id is never rewritten), including the
- * concurrent-winner case where our own rename loses the race.
+ * concurrent-winner case where our own rename loses the race. Every start
+ * marks its id in use before the prune runs, so a copy a started turn still
+ * runs on survives a later start whose worker home no longer holds that
+ * layer (OTTR-1179; both workers share this volume).
  */
 export function ensureLayerCopy(
 	layerDir: string,
@@ -201,6 +231,7 @@ export function ensureLayerCopy(
 	workerHome: string,
 	ids: TurnIdentity,
 ): string {
+	markLayerInUse(turnHome.layers, basename(layerDir));
 	pruneLayerCopies(layerDir, turnHome);
 	const final = join(turnHome.layers, basename(layerDir));
 	if (existsSync(final)) return final;
@@ -230,11 +261,13 @@ export function ensureLayerCopy(
 
 /**
  * Stale layer copies: temp dirs older than a day, and final copies whose
- * source layer alate deleted (the current pin is never pruned). Best effort.
+ * source layer alate deleted — unless a fresh in-use marker says a started
+ * turn still runs on the copy (OTTR-1179); the current pin is never pruned.
+ * Markers whose copy is long gone age out the same way. Best effort.
  */
 function pruneLayerCopies(layerDir: string, turnHome: TurnHome): void {
 	const sharedLayers = dirname(layerDir);
-	const staleCutoff = Date.now() - 24 * 60 * 60 * 1000;
+	const staleCutoff = Date.now() - LAYER_STALE_MS;
 	let entries: Dirent[];
 	try {
 		entries = readdirSync(turnHome.layers, { withFileTypes: true });
@@ -253,10 +286,27 @@ function pruneLayerCopies(layerDir: string, turnHome: TurnHome): void {
 			}
 			continue;
 		}
+		if (entry.name.endsWith(LAYER_INUSE_SUFFIX)) {
+			// A marker outlives its copy only for the stale window: a fresh one
+			// may precede its rename or guard a copy another worker's live turn
+			// runs on; an aged one names nothing and goes.
+			try {
+				const st = statOf(path);
+				if (st !== null && st.mtimeMs < staleCutoff)
+					rmSync(path, { force: true });
+			} catch {
+				// A later run retries.
+			}
+			continue;
+		}
 		if (entry.name === basename(layerDir)) continue;
 		if (existsSync(join(sharedLayers, entry.name))) continue;
+		const markerPath = join(turnHome.layers, entry.name + LAYER_INUSE_SUFFIX);
+		const marker = statOf(markerPath);
+		if (marker !== null && marker.mtimeMs >= staleCutoff) continue;
 		try {
 			rmSync(path, { recursive: true, force: true });
+			if (marker !== null) rmSync(markerPath, { force: true });
 		} catch {
 			// Best effort; disk pressure stays bounded by alate's own clean-up.
 		}

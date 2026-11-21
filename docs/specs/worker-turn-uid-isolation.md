@@ -120,9 +120,14 @@ Instead the daemon materializes a per-project copy:
 - A pinned layer that vanished between dispatch and `/run` fails the run
   with a clear error. A `HOME` that does not resolve inside the layers tree
   is treated as unpinned (planted-pointer refuse, as `pinTarget` does).
-- Copies whose source layer alate deleted, and temp dirs older than a day,
-  are pruned on the next copy for that project; the currently pinned id is
-  never pruned.
+- Every start marks its pinned id in use (`<id>.inuse` beside the copy, in
+  the root-owned layers dir; the marker's mtime is the signal both workers
+  read on the shared volume). Copies whose source layer alate deleted, and
+  temp dirs older than a day, are pruned on the next copy for that project;
+  the currently pinned id is never pruned, and a copy whose marker is fresh
+  (a started turn still runs on it) is never pruned either. The marker and
+  a ghost marker without its copy age out after the same day, so retention
+  stays bounded (OTTR-1179).
 
 ### Project on the request
 
@@ -235,7 +240,12 @@ their repo's owner and need nothing.
   the run before any chown, and a victim tree outside the project stays
   untouched.
 - The turn home shell is root-owned; the layer copy reuses an existing final
-  dir and prunes copies of deleted layers.
+  dir and prunes copies of deleted layers. A copy whose source is gone from
+  the starting worker's home survives when a fresh `<id>.inuse` marker says
+  a started turn still runs on it (worker homes disjoint from the pinned
+  id), and the copy's omp state stays readable; once the marker ages out a
+  day, the next copy reclaims the copy and its marker, so retention stays
+  bounded.
 - `bun run check` and `bun test` pass.
 
 ## Alternatives considered

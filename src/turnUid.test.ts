@@ -35,6 +35,7 @@ import {
 	resolvePinnedLayer,
 	retargetCacheLinks,
 	type TurnHome,
+	type TurnIdentity,
 	uidCollisionNote,
 } from "./turnUid.ts";
 
@@ -55,6 +56,18 @@ function freshDir(prefix: string): string {
 /** A real turn home under a fresh homes root. */
 function freshTurnHome(project: string): TurnHome {
 	return prepareTurnHome(freshDir("homes"), project, projectTurnUid(project));
+}
+
+/**
+ * The current uid/gid as a TurnIdentity: chown-to-self needs no privilege, so
+ * the prune tests below run on every gate. The prune's decisions never read
+ * the ids; they only ride the copy calls' chowns.
+ */
+function selfIds(): TurnIdentity {
+	return {
+		uid: typeof process.getuid === "function" ? process.getuid() : 0,
+		gid: typeof process.getgid === "function" ? process.getgid() : 0,
+	};
 }
 
 describe("projectTurnUid", () => {
@@ -318,6 +331,129 @@ rootTest("a stale copy whose source layer is gone is pruned", () => {
 	expect(existsSync(goneCopy)).toBe(false);
 	expect(existsSync(staleTmp)).toBe(false);
 	expect(existsSync(copy)).toBe(true);
+});
+
+test("OTTR-1179: a started turn's pinned copy survives another turn's prune from a disjoint worker home", () => {
+	const workerA = freshDir("worker-live");
+	const ids = selfIds();
+	const turnHome = prepareTurnHome(freshDir("homes"), "prune-live", ids);
+	const layerX = join(workerA, ".alate", "layers", "693b38b5b400-127");
+	mkdirSync(join(layerX, ".omp", "agent"), { recursive: true });
+	writeFileSync(join(layerX, ".omp", "agent", "agent.db"), "store");
+
+	// Turn 1 starts pinned to X: HOME moves to the shared copy.
+	const env1: Record<string, string | undefined> = { HOME: layerX };
+	const first = applyTurnHomeEnv(env1, {
+		workerHome: workerA,
+		turnHome,
+		ids,
+	});
+	const copyX = join(turnHome.layers, "693b38b5b400-127");
+	expect(first).toEqual({ pinned: true, home: copyX });
+
+	// A fresh in-use marker may also precede its copy (a concurrent start
+	// between the mark and the rename); the prune must keep it.
+	const freshGhost = join(turnHome.layers, "693b38b5b400-132.inuse");
+	writeFileSync(freshGhost, "in-use\n");
+
+	// Turn 2 starts on the same project from a worker whose alate home
+	// never held X (the 2026-11-21 wave shape). An unmarked victim copy
+	// rides along to prove the prune still deletes what no live turn uses.
+	const victim = join(turnHome.layers, "693b38b5b400-130");
+	mkdirSync(victim, { recursive: true });
+	const workerB = freshDir("worker-wave");
+	const layerY = join(workerB, ".alate", "layers", "693b38b5b400-134");
+	mkdirSync(layerY, { recursive: true });
+	const env2: Record<string, string | undefined> = { HOME: layerY };
+	const second = applyTurnHomeEnv(env2, {
+		workerHome: workerB,
+		turnHome,
+		ids,
+	});
+	expect(second).toEqual({
+		pinned: true,
+		home: join(turnHome.layers, "693b38b5b400-134"),
+	});
+
+	// Turn 1's copy and its omp state link still resolve mid-run, the
+	// fresh ghost keeps waiting for its rename, and the prune did its job
+	// on the unprotected victim.
+	expect(existsSync(copyX)).toBe(true);
+	expect(readFileSync(join(copyX, ".omp", "agent", "agent.db"), "utf8")).toBe(
+		"store",
+	);
+	expect(existsSync(freshGhost)).toBe(true);
+	expect(existsSync(victim)).toBe(false);
+});
+
+test("OTTR-1179: an aged-out in-use marker stops protecting the copy", () => {
+	const workerA = freshDir("worker-live2");
+	const ids = selfIds();
+	const turnHome = prepareTurnHome(freshDir("homes"), "prune-aged", ids);
+	const layerX = join(workerA, ".alate", "layers", "693b38b5b400-128");
+	mkdirSync(join(layerX, ".omp", "agent"), { recursive: true });
+	writeFileSync(join(layerX, ".omp", "agent", "agent.db"), "store");
+	const env: Record<string, string | undefined> = { HOME: layerX };
+	applyTurnHomeEnv(env, { workerHome: workerA, turnHome, ids });
+	const copyX = join(turnHome.layers, "693b38b5b400-128");
+	const markerX = join(turnHome.layers, "693b38b5b400-128.inuse");
+	expect(existsSync(markerX)).toBe(true);
+
+	// The turn ends; a day passes. A ghost marker whose copy is long gone
+	// rides along at the same age. The next copy for the project from a
+	// disjoint home reclaims the copy, its marker and the ghost, so the
+	// volume still stays bounded.
+	const past = Date.now() - 25 * 60 * 60 * 1000;
+	touchMtime(markerX, past);
+	const ghost = join(turnHome.layers, "693b38b5b400-126.inuse");
+	writeFileSync(ghost, "in-use\n");
+	touchMtime(ghost, past);
+	const workerB = freshDir("worker-aged");
+	const layerY = join(workerB, ".alate", "layers", "693b38b5b400-133");
+	mkdirSync(layerY, { recursive: true });
+	const env2: Record<string, string | undefined> = { HOME: layerY };
+	applyTurnHomeEnv(env2, { workerHome: workerB, turnHome, ids });
+
+	expect(existsSync(copyX)).toBe(false);
+	expect(existsSync(markerX)).toBe(false);
+	expect(existsSync(ghost)).toBe(false);
+	// The wave's own copy landed.
+	expect(existsSync(join(turnHome.layers, "693b38b5b400-133"))).toBe(true);
+});
+
+test("OTTR-1179: a pinned copy survives concurrent ensures with disjoint worker homes", () => {
+	const ids = selfIds();
+	const turnHome = prepareTurnHome(freshDir("homes"), "prune-concurrent", ids);
+	const workerA = freshDir("worker-pin");
+	const layerX = join(workerA, ".alate", "layers", "693b38b5b400-127");
+	mkdirSync(join(layerX, ".omp", "agent"), { recursive: true });
+	writeFileSync(join(layerX, ".omp", "agent", "agent.db"), "store");
+	// Turn 1 runs on the shared copy of X.
+	expect(ensureLayerCopy(layerX, turnHome, workerA, ids)).toBe(
+		join(turnHome.layers, "693b38b5b400-127"),
+	);
+
+	// A wave of turns starts on the same project, each from its own worker
+	// home whose alate set never held X (disjoint homes).
+	for (const [i, id] of [
+		"693b38b5b400-129",
+		"693b38b5b400-130",
+		"693b38b5b400-131",
+	].entries()) {
+		const workerHome = freshDir(`worker-wave-${i}`);
+		const layerDir = join(workerHome, ".alate", "layers", id);
+		mkdirSync(layerDir, { recursive: true });
+		expect(ensureLayerCopy(layerDir, turnHome, workerHome, ids)).toBe(
+			join(turnHome.layers, id),
+		);
+	}
+
+	// Turn 1's copy and its omp store survive the whole wave.
+	const copyX = join(turnHome.layers, "693b38b5b400-127");
+	expect(existsSync(copyX)).toBe(true);
+	expect(readFileSync(join(copyX, ".omp", "agent", "agent.db"), "utf8")).toBe(
+		"store",
+	);
 });
 
 function statOf(path: string): Stats | null {
