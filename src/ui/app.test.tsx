@@ -31,6 +31,7 @@ import {
 	PR_REVIEW_WAITING,
 	UPDATE_HOLD_REASON,
 } from "../types.ts";
+import type { Act } from "./kit.tsx";
 // Static: models.ts touches no browser global at load, so hoisting is safe.
 import { resetCatalogCache } from "./models.ts";
 // Static: notify.ts reads localStorage only when called, never at load.
@@ -99,6 +100,7 @@ const {
 	appInboxMeta,
 	AppInboxBell,
 	AppInboxPanel,
+	HoldResumeButton,
 	SystemBar,
 } = await import("./app.tsx");
 const {
@@ -16283,5 +16285,172 @@ describe("service quotas in the overview", () => {
 				expect(document.body.textContent).not.toContain("%");
 			}),
 		);
+	});
+});
+
+describe("HoldResumeButton refusal surface (client)", () => {
+	// React interaction needs browser globals; the same happy-dom swap as the
+	// AskBlock tests above: installed after app.tsx's import, removed after.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		HTMLButtonElement: window.HTMLButtonElement,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+		// The accepted-resume case runs the button's real `post` body: happy-dom
+		// cannot fetch a relative URL, so the network boundary answers 200 here.
+		fetch: async () =>
+			({
+				ok: true,
+				status: 200,
+				json: async () => ({}),
+			}) as unknown as Response,
+	};
+	const originals = new Map<string, unknown>();
+
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	const MESSAGE =
+		"anthropic is still out of quota; the limit resets at 2026-11-21 19:00 UTC. Pick another model.";
+	const task = { project: "proj", id: "t1", holdProvider: "openai-codex" };
+
+	/** act with the production contract for a refused resume: the server answered
+	 *  409, the message went to the inline surface, act reports false. */
+	const refusedAct = (): Act => async (_fn, onError) => {
+		onError?.(MESSAGE);
+		return false;
+	};
+
+	/** act with the production contract for an accepted resume: the body ran, the
+	 *  switch landed, act reports true. */
+	const acceptedAct = (): Act => async (fn) => {
+		await fn();
+		return true;
+	};
+
+	const click = (): Event =>
+		new window.Event("click", { bubbles: true }) as unknown as Event;
+
+	async function mount(
+		actStub: Act,
+		model = "anthropic/claude-sonnet-5-5",
+	): Promise<{
+		container: HTMLDivElement;
+		root: ReturnType<typeof createRoot>;
+	}> {
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(
+				<HoldResumeButton
+					task={task}
+					catalog={null}
+					model={model}
+					act={actStub}
+				/>,
+			);
+		});
+		return { container, root };
+	}
+
+	const resumeButton = (container: HTMLDivElement): HTMLButtonElement =>
+		container.querySelector(
+			"button:not(.icon)",
+		) as unknown as HTMLButtonElement;
+
+	const problemLine = (container: HTMLDivElement): Element | null =>
+		container.querySelector(".resume-problem");
+
+	test("a refused resume shows the server's message beside the button", async () => {
+		const { container, root } = await mount(refusedAct());
+		// Closed until the click: no line, no alert role.
+		expect(problemLine(container)).toBeNull();
+		await act(async () => {
+			resumeButton(container).dispatchEvent(click());
+			await Promise.resolve();
+		});
+		const line = problemLine(container);
+		expect(line?.getAttribute("role")).toBe("alert");
+		expect(line?.textContent).toContain(MESSAGE);
+		await act(async () => {
+			root.unmount();
+		});
+		container.remove();
+	});
+
+	test("a successful retry clears the shown refusal", async () => {
+		const { container, root } = await mount(refusedAct());
+		await act(async () => {
+			resumeButton(container).dispatchEvent(click());
+			await Promise.resolve();
+		});
+		expect(problemLine(container)?.textContent).toContain(MESSAGE);
+		// The same button retries with an accepting act: the line drops.
+		await act(async () => {
+			root.render(
+				<HoldResumeButton
+					task={task}
+					catalog={null}
+					model="anthropic/claude-sonnet-5-5"
+					act={acceptedAct()}
+				/>,
+			);
+		});
+		await act(async () => {
+			resumeButton(container).dispatchEvent(click());
+			await Promise.resolve();
+		});
+		expect(problemLine(container)).toBeNull();
+		await act(async () => {
+			root.unmount();
+		});
+		container.remove();
+	});
+
+	test("a different model pick hides a stale refusal", async () => {
+		const { container, root } = await mount(refusedAct());
+		await act(async () => {
+			resumeButton(container).dispatchEvent(click());
+			await Promise.resolve();
+		});
+		expect(problemLine(container)?.textContent).toContain(MESSAGE);
+		// The reset time named anthropic; the zai pick must not keep that text up.
+		await act(async () => {
+			root.render(
+				<HoldResumeButton
+					task={task}
+					catalog={null}
+					model="zai/glm-5.3-flash"
+					act={refusedAct()}
+				/>,
+			);
+		});
+		expect(problemLine(container)).toBeNull();
+		await act(async () => {
+			root.unmount();
+		});
+		container.remove();
 	});
 });

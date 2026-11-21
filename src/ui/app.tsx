@@ -12592,8 +12592,10 @@ function SteerComposer(p: {
 
 /** The steer composer's way out of a usage-limit hold: start the card now on the model its
  *  picker holds. On a model of the held provider the button stays off: that model waits for
- *  the same reset. The server ends the hold with the switch (`resume: true`). */
-function HoldResumeButton({
+ *  the same reset. The server ends the hold with the switch (`resume: true`); a refusal —
+ *  the 409 for a provider that is still out of quota (OTTR-1181) — shows beside the button:
+ *  the bell's copy alone hides inside the closed notifications popover. */
+export function HoldResumeButton({
 	task,
 	catalog,
 	model,
@@ -12606,26 +12608,49 @@ function HoldResumeButton({
 }) {
 	const runs = model === "" ? (catalog?.defaultModel ?? "") : model;
 	const held = providerOf(runs) === task.holdProvider;
+	const [problem, setProblem] = useState<string | null>(null);
+	// A different pick invalidates the shown refusal: drop it so the line names only
+	// the model the user chose last.
+	useEffect(() => {
+		setProblem(null);
+	}, [model]);
 	return (
-		<BusyButton
-			disabled={held}
-			title={
-				held
-					? `This model waits for the same ${task.holdProvider} reset: pick one from another provider`
-					: "End the usage-limit hold and start the task now with this model"
-			}
-			run={() =>
-				act(async () => {
-					await post(
-						`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/model`,
-						{ model, resume: true },
-					);
-				})
-			}
-		>
-			<Icon name="play" />
-			Resume
-		</BusyButton>
+		<>
+			<BusyButton
+				disabled={held}
+				title={
+					held
+						? `This model waits for the same ${task.holdProvider} reset: pick one from another provider`
+						: "End the usage-limit hold and start the task now with this model"
+				}
+				run={() =>
+					act(async () => {
+						await post(
+							`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/model`,
+							{ model, resume: true },
+						);
+						setProblem(null);
+					}, setProblem)
+				}
+			>
+				<Icon name="play" />
+				Resume
+			</BusyButton>
+			{problem !== null && (
+				<p className="resume-problem" role="alert">
+					<Mark kind="crit" />
+					<span>{problem}</span>
+					<button
+						type="button"
+						className="icon"
+						aria-label="Dismiss error"
+						onClick={() => setProblem(null)}
+					>
+						<Icon name="x" />
+					</button>
+				</p>
+			)}
+		</>
 	);
 }
 

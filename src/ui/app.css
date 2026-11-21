@@ -5411,6 +5411,29 @@ dialog.confirm-dialog {
 .attach-error .icon {
 	flex: none;
 }
+/* A refused resume (the model route's 409 for a provider still out of quota): crit
+   text on the composer surface beside the Resume button, like a refused image pick;
+   the bell's copy alone hides inside the closed notifications popover. */
+.resume-problem {
+	display: flex;
+	align-items: baseline;
+	gap: 6px;
+	margin: 0;
+	font-size: 12px;
+	color: var(--crit-text);
+	overflow-wrap: anywhere;
+	/* Its own full line of the button bar, under the Resume button. */
+	flex-basis: 100%;
+}
+.resume-problem .icon {
+	flex: none;
+}
+/* Steer grid: an implicit full-width row under the named stop row, only when shown. */
+.drawer-body > .steer-form .composer-bar > .resume-problem {
+	grid-row: auto;
+	grid-column: 1 / -1;
+	margin-top: 8px;
+}
 /* The footer is its own group: it sits farther from the fields above it (their gap
    plus this margin) than the fields sit from each other. */
 .dialog-actions {
