@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import {
 	existsSync,
 	mkdtempSync,
@@ -33,6 +33,10 @@ import {
 } from "./gitHosts.ts";
 import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import fc from "./test/properties.ts";
+import {
+	installSshKeygenStub,
+	removeSshKeygenStub,
+} from "./test/sshKeygenStub.ts";
 
 const root = mkdtempSync(join(tmpdir(), "ottr-gh-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
@@ -48,6 +52,14 @@ function runKeygen(args: string[]): void {
 	});
 	if (r.exitCode !== 0) throw new Error(r.stderr.toString());
 }
+
+// OTTR-1180: the real ssh-keygen dies on hosts whose uid has no passwd entry (it runs
+// getpwuid at startup; this worker container's ephemeral uid has none), which fails the
+// fixtures above and every production spawn (generatePendingKey, keyInfo, importPendingKey).
+// The stub from ./test/sshKeygenStub.ts answers the same command lines; the suite env belt
+// restores the ambient PATH after each test.
+beforeEach(installSshKeygenStub);
+afterAll(removeSshKeygenStub);
 
 describe("parseGitUrl", () => {
 	test("accepts the four remote forms", () => {
@@ -778,7 +790,14 @@ describe("defaultSshDir", () => {
 	test("a native start keeps keys outside the Ottr checkout and every project root", () => {
 		const home = mkdtempSync(join(tmpdir(), "ottr-home-"));
 		try {
-			const roots = [repo, join(home, "workspace"), resolve(repo, "..")];
+			// The projects parent claims the home itself when the checkout sits under the OS
+			// temp dir (a scratch tree, like the /tmp probes of OTTR-1154): the parent then
+			// contains the home and the assertion false-reds on the home's own ssh dir.
+			// Roots stay the checkout, its projects parent, and a workspace under the home;
+			// the parent drops from that one layout only.
+			const projectsRoot = resolve(repo, "..");
+			const roots = [repo, join(home, "workspace")];
+			if (!inside(home, projectsRoot)) roots.push(projectsRoot);
 			for (const [env, platform] of [
 				[{}, "linux"],
 				[{ XDG_DATA_HOME: join(home, "data") }, "linux"],

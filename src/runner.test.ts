@@ -6366,6 +6366,15 @@ describe("startRun commit identity env", () => {
 
 	test("a fully configured git identity injects nothing", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-ident-set-"));
+		// The turn env starts from the ambient env, so an inherited ident pair (a worker
+		// session's Ottr-provided default, OTTR-1180) would ride into seen[0].env and read
+		// as an injection. The fixture supplies a clean base; the suite env belt restores
+		// the ambient values after the test even when an assertion fails.
+		const scrubbed: Record<string, string | undefined> = {};
+		for (const k of IDENT_VARS) {
+			scrubbed[k] = process.env[k];
+			delete process.env[k];
+		}
 		try {
 			const seen: Parameters<RunLauncher>[2][] = [];
 			const handle = await startRun({
@@ -6382,6 +6391,11 @@ describe("startRun commit identity env", () => {
 			await handle.done;
 			for (const k of IDENT_VARS) expect(seen[0]!.env).not.toHaveProperty(k);
 		} finally {
+			for (const k of IDENT_VARS) {
+				const v = scrubbed[k];
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});

@@ -240,6 +240,19 @@ export function gitEnv(
 	// would otherwise redirect every `git -C <project>` call to that gitdir (OTTR-1162). Calls
 	// that need them pass them as the explicit env below, which merges after this strip.
 	stripRepoRelocatingEnv(env);
+	// Ambient ident vars (a turn env carries the worker's GIT_AUTHOR_*/GIT_COMMITTER_* pair)
+	// outrank every config scope, so an inherited pair would silently override the identity
+	// this call pins with -c (observed 2026-11-21: the worker session's GIT_COMMITTER_NAME=Ottr
+	// beat rebaseTargetBranch's Settings pin). The board's identity comes from identityArgs or
+	// config, never from inherited env; a caller that needs one passes it in the explicit env
+	// below, which merges after this strip.
+	for (const k of [
+		"GIT_AUTHOR_NAME",
+		"GIT_AUTHOR_EMAIL",
+		"GIT_COMMITTER_NAME",
+		"GIT_COMMITTER_EMAIL",
+	])
+		delete env[k];
 	let sub = "";
 	let isNetwork = false;
 	for (let i = 0; i < args.length; i++) {

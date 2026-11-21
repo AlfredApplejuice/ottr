@@ -147,7 +147,6 @@ const SHIM_TEMPLATE = [
 	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash expansion, not a TS template
 	'        case "${args[$j]}" in --file|-f)',
 	'          if [ $((j+1)) -lt "$n" ]; then',
-	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash expansion, not a TS template
 	'            f="${args[$((j+1))]}"',
 	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal bash expansion, not a TS template
 	'            case "$f" in /*) fp="$f";; *) fp="$PWD/$f";; esac',

@@ -1,4 +1,11 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	test,
+} from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
 	appendFileSync,
@@ -4663,6 +4670,39 @@ describe("gitEnv", () => {
 		}
 	});
 
+	test("gitEnv strips ambient ident vars that would beat a -c identity pin (OTTR-1180)", () => {
+		const names = [
+			"GIT_AUTHOR_NAME",
+			"GIT_AUTHOR_EMAIL",
+			"GIT_COMMITTER_NAME",
+			"GIT_COMMITTER_EMAIL",
+		];
+		const saved: Record<string, string | undefined> = {};
+		for (const n of names) {
+			saved[n] = process.env[n];
+			process.env[n] = "Ottr";
+		}
+		try {
+			// Ident env outranks command-line config, so a pair inherited from a turn env
+			// would silently replace the identity a call pins with -c (the board's rebase
+			// replay). The strip covers every subcommand: ident vars only matter for
+			// commit-creating calls, and stripping them everywhere stays uniform.
+			for (const args of [
+				["rebase", "origin/main", "main"],
+				["status", "--porcelain"],
+				["fetch", "origin"],
+			]) {
+				const env = gitEnv(args);
+				for (const n of names) expect(env).not.toHaveProperty(n);
+			}
+		} finally {
+			for (const n of names) {
+				if (saved[n] === undefined) delete process.env[n];
+				else process.env[n] = saved[n];
+			}
+		}
+	});
+
 	test("git(fetch) passes the resolver env to the git child", async () => {
 		const r = repo();
 		await must(r, "init", "-q", "-b", "main");
@@ -4770,6 +4810,12 @@ describe("empty origin", () => {
 	// (observed 2026-11-07). The pinned dates keep every seed commit one git object;
 	// afterAll restores the environment.
 	const pinnedDate = "@1577836800 +0000"; // 2020-01-01T00:00:00Z
+	beforeEach(() => {
+		// The suite env belt (OTTR-1180) restores the snapshot after each test; the pin
+		// re-asserts per test so every seed commit keeps hashing to one git object.
+		process.env.GIT_AUTHOR_DATE = pinnedDate;
+		process.env.GIT_COMMITTER_DATE = pinnedDate;
+	});
 	beforeAll(async () => {
 		sweepStaleFixtures("ott-worktree-empty-origin-");
 		process.env.GIT_AUTHOR_DATE = pinnedDate;

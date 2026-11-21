@@ -113,6 +113,10 @@ import { createServiceQuotaHttpReader } from "./serviceQuotaHttp.ts";
 import { ProjectStore } from "./store.ts";
 import { prFeedbackReason } from "./supervisor.ts";
 import fc from "./test/properties.ts";
+import {
+	installSshKeygenStub,
+	removeSshKeygenStub,
+} from "./test/sshKeygenStub.ts";
 import type { TmpDiskSpace } from "./tmpsweep.ts";
 import { formatBytes } from "./tmpsweep.ts";
 import { parseTrending, TRENDING_PAGES } from "./trending.ts";
@@ -320,6 +324,12 @@ const sshFixture = () => {
 const seedGlobalKey = (dir: string): void => {
 	execSync(`ssh-keygen -t ed25519 -N "" -q -f ${join(dir, "global")}`);
 };
+// OTTR-1180: the real ssh-keygen dies on hosts whose uid has no passwd entry (it runs
+// getpwuid at startup; this worker container's ephemeral uid has none), which fails every
+// fixture above and every key route through production generatePendingKey/keyInfo. The
+// stub from src/test/sshKeygenStub.ts answers the same command lines; the suite env belt
+// restores the ambient PATH after each test.
+beforeEach(installSshKeygenStub);
 /** Servers mounted by the per-describe helpers, and the global stores await mount() opened; the shared afterAll stops and closes them. */
 const mounted: Server<undefined>[] = [];
 const mountStores: GlobalStore[] = [];
@@ -336,6 +346,7 @@ afterAll(async () => {
 	// Windows cannot delete an open db: every store under root must be closed before the rm.
 	for (const g of mountStores) await closeTestStore(g);
 	for (const d of sshTempDirs) rmSync(d, { recursive: true, force: true });
+	removeSshKeygenStub();
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 	// The whole-shutdown sweep (every mounted server's graceful stop, then the root rm) passes
 	// bun's 5 s hook default on a loaded machine (OTTR-548 gate): a ceiling, not a wait.
@@ -10435,9 +10446,14 @@ describe("hindsight settings", () => {
 	const savedHome = process.env.HOME;
 	const flipHome = mkdtempSync(join(tmpdir(), "ottr-hindsight-home"));
 	const flipCfg = join(flipHome, ".omp", "agent", "config.yml");
-	beforeAll(() => {
+	const setFlipHome = () => {
+		// The suite env belt (OTTR-1180) restores the snapshot after each test; the
+		// stand-in home re-asserts per test so the board never writes the developer's
+		// own omp config.
 		process.env.HOME = flipHome;
-	});
+	};
+	beforeAll(setFlipHome);
+	beforeEach(setFlipHome);
 	afterAll(() => {
 		if (savedHome === undefined) delete process.env.HOME;
 		else process.env.HOME = savedHome;
