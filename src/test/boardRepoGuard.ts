@@ -35,7 +35,7 @@ export interface BoardGuard {
 
 const holder = globalThis as { __ottrBoardGuard?: BoardGuard | null };
 
-const SHIM = [
+const SHIM_TEMPLATE = [
 	"#!/bin/bash",
 	"# ottr board-repo guard (OTTR-1162), installed by src/test/boardRepoGuard.ts as a bun test",
 	"# preload. Every git exec of the suite runs through this shim: a write command whose repo",
@@ -199,6 +199,27 @@ const SHIM = [
 	'exec "$realgit" "$@"',
 ].join("\n");
 
+/**
+ * Builds one shim instance. The drills build their own instance with a fixture repository
+ * baked in as the watched repo — never the enclosing one: a shim bug during a drill (the
+ * missing writer fallthrough of 2026-11-20 produced three guard-drill commits on the board's
+ * main) must not be able to write the real repository.
+ */
+export function buildShim(opts: {
+	realgit: string;
+	repo: string;
+	log: string;
+	shimPath: string;
+}): void {
+	writeFileSync(
+		opts.shimPath,
+		SHIM_TEMPLATE.replace("@@REALGIT@@", opts.realgit)
+			.replace("@@REPODIR@@", opts.repo)
+			.replace("@@GUARDLOG@@", opts.log),
+	);
+	chmodSync(opts.shimPath, 0o755);
+}
+
 function install(): BoardGuard | null {
 	// Resolve before the PATH change: this is the binary the shim must exec.
 	const git = Bun.which("git");
@@ -216,11 +237,7 @@ function install(): BoardGuard | null {
 	const dir = mkdtempSync(join(tmpdir(), "ottr-board-guard-"));
 	const log = join(dir, "blocks.log");
 	const shim = join(dir, "git");
-	const script = SHIM.replace("@@REALGIT@@", git)
-		.replace("@@REPODIR@@", common)
-		.replace("@@GUARDLOG@@", log);
-	writeFileSync(shim, script);
-	chmodSync(shim, 0o755);
+	buildShim({ realgit: git, repo: common, log, shimPath: shim });
 	process.env.PATH = `${dir}:${process.env.PATH ?? ""}`;
 	process.stderr.write(`ottr board-repo guard: watching ${common}\n`);
 	return { repo: common, shim, git, log };
