@@ -10271,6 +10271,9 @@ describe(
 			});
 
 			test("Settings replaces the token; a bad one keeps the old; boot reapplies it", async () => {
+				// The onboarding test's token: the suite env belt restores the env after
+				// each test, so the chain re-asserts its own starting state.
+				process.env.GH_TOKEN = first;
 				const bad = await call("/api/settings/github-token", {
 					token: "short",
 				});

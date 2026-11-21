@@ -378,17 +378,32 @@ describe("runSelfCheck", () => {
 		// this test failed. The prlimit prefix sets exactly the configured soft limit,
 		// so the first field must read it back; the other three fields must parse on
 		// this host, whose CPU count and memory differ from VM_VALIDATE's on purpose.
-		const proc = Bun.spawn([...prlimit(), ...LIMITS_PROBE_ARGV], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
+		// Production drops to the job user (uid 65534) before the limit lands; this
+		// unprivileged run keeps its own uid, whose task count under parallel suites
+		// can exceed the job's 256 and kill the fork, so the soft limit here is a
+		// load-safe floor and the readback must name the value this run set.
+		const nprocLimit = Math.max(VM_VALIDATE.maxProcesses, 50_000);
+		const proc = Bun.spawn(
+			[
+				"prlimit",
+				`--nproc=${nprocLimit}`,
+				"--core=0",
+				`--fsize=${VM_VALIDATE.fileSizeBytes}`,
+				"--",
+				...LIMITS_PROBE_ARGV,
+			],
+			{
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
 		const stdout = await new Response(proc.stdout).text();
 		const stderr = await new Response(proc.stderr).text();
 		const exitCode = await proc.exited;
 		expect(exitCode).toBe(0);
 		expect(stderr).toBe("");
 		const readback = parseLimitsReadback(stdout);
-		expect(readback.nprocLimit).toBe(String(VM_VALIDATE.maxProcesses));
+		expect(readback.nprocLimit).toBe(String(nprocLimit));
 		expect(readback.cpus).not.toBeNull();
 		expect(readback.memKb).not.toBeNull();
 		// scratchKb is deliberately not asserted here: a host's /tmp can sit on the
