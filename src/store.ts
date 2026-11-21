@@ -171,7 +171,9 @@ const PR_REVIEW_RUNS_DDL = `CREATE TABLE IF NOT EXISTS pr_review_runs (
   done INTEGER NOT NULL DEFAULT 0,
   blocking INTEGER NOT NULL DEFAULT 1
 )`;
-const SCHEMA = `
+/** The application tables DDL: exported so the PostgreSQL migration-surface test can
+ *  compare the SQLite columns against the numbered PG steps (AGENTS.md hard stop 2). */
+export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ${TASKS_DDL};
 CREATE TABLE IF NOT EXISTS turns (

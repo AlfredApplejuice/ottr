@@ -213,10 +213,22 @@ const projectMigrations: readonly PostgresMigration[] = [
 		await db.exec(`CREATE TRIGGER tasks_insertion_ordinal_insert BEFORE INSERT OR UPDATE OF insertion_ordinal
 		ON ${schema}.tasks FOR EACH ROW EXECUTE FUNCTION ${schema}.allocate_task_insertion_ordinal()`);
 	},
+	// posted_via landed with the board's automatic PR review posts
+	// (docs/specs/pr-review-auto-post.md): the same additive convergence the SQLite
+	// ProjectStore.addColumn path runs. Step 1 keeps the d4a617f oracle untouched, so a
+	// fresh database gets the column from this step too. Null reads as "not posted by
+	// this build", the state of every older row.
+	async (db) => {
+		for (const statement of projectStepTwo) await db.exec(statement);
+	},
+];
+
+export const projectStepTwo: readonly string[] = [
+	"ALTER TABLE pr_review ADD COLUMN posted_via text",
 ];
 
 // Step 1 maps the fully opened d4a617f SQLite oracle plus insertion_ordinal.
-const projectStepOne: readonly string[] = [
+export const projectStepOne: readonly string[] = [
 	`CREATE TABLE ask_drafts (
 		task_id text PRIMARY KEY, fp text NOT NULL, answers text NOT NULL, at bigint NOT NULL
 	)`,
