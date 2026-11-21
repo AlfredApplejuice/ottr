@@ -8685,12 +8685,12 @@ describe("ProjectBoard done lane time view", () => {
 		}
 	});
 
-	test("a matching retro the lane cannot render keeps Show more honest", async () => {
-		// Retro cards hide in Done (onBoard), but the server's matching total and
-		// the fetched pages still carry them. The hidden count reads the merged
-		// result's real IDs minus such never-rendering cards, so "Show more"
-		// disappears when every renderable match is on the board instead of
-		// paging through empty pages forever.
+	test("a fetched retro counts as rendered; the match beyond page 1 keeps Show more", async () => {
+		// A real donePage response slices every settled match, so page 1 can carry
+		// a retro card the state window also holds. laneColumnData keeps that
+		// fetched retro (it renders like any card), and the hidden count must
+		// subtract only retro matches missing from the rendered IDs — otherwise
+		// the match on page 2 loses its "Show more" control.
 		const held = [
 			...Array.from({ length: 19 }, (_, j) =>
 				cardFixture({
@@ -8702,6 +8702,8 @@ describe("ProjectBoard done lane time view", () => {
 					doneAt: j + 1,
 				}),
 			),
+			// The newest settled match is the retro itself: the server's page 1
+			// contains it, and the state window holds it too.
 			cardFixture({
 				id: "r0",
 				kind: "retro",
@@ -8709,27 +8711,23 @@ describe("ProjectBoard done lane time view", () => {
 				sessionTitle: "Retro of the heatmap work",
 				stage: "done",
 				state: "idle",
-				doneAt: 0,
+				doneAt: 100,
 			}),
 		];
-		const fetched = [
+		// 21 matches: page 1 = the retro plus 19 work cards, page 2 = the last
+		// matching work card (DONE_PAGE = 20).
+		const work = Array.from({ length: 20 }, (_, j) =>
 			cardFixture({
-				id: "o0",
-				title: "add a room presence heatmap",
-				sessionTitle: "add a room presence heatmap",
+				id: `w${j}`,
+				title: `heatmap work ${j}`,
+				sessionTitle: `heatmap work ${j}`,
 				stage: "done",
 				state: "idle",
-				doneAt: -1,
+				doneAt: 50 - j,
 			}),
-			cardFixture({
-				id: "o1",
-				title: "heatmap legend contrast",
-				sessionTitle: "heatmap legend contrast",
-				stage: "done",
-				state: "idle",
-				doneAt: -2,
-			}),
-		];
+		);
+		const page1 = [held[19]!, ...work.slice(0, 19)];
+		const page2 = [work[19]!];
 		const container = window.document.createElement(
 			"div",
 		) as unknown as HTMLDivElement;
@@ -8754,7 +8752,14 @@ describe("ProjectBoard done lane time view", () => {
 			const u = String(url);
 			if (u === "/api/projects/proj/done?page=1&q=heatmap") {
 				fetches.push(u);
-				return new Response(JSON.stringify({ tasks: fetched, total: 3 }), {
+				return new Response(JSON.stringify({ tasks: page1, total: 21 }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			if (u === "/api/projects/proj/done?page=2&q=heatmap") {
+				fetches.push(u);
+				return new Response(JSON.stringify({ tasks: page2, total: 21 }), {
 					status: 200,
 					headers: { "content-type": "application/json" },
 				});
@@ -8794,13 +8799,28 @@ describe("ProjectBoard done lane time view", () => {
 			await act(async () => {
 				await Bun.sleep(SEARCH_APPLY_MS + 100);
 			});
-			// Three matches: the two fetched work cards render; the window's retro
-			// match hides by design and stays out of the hidden count. Every
-			// renderable match is on the board, so "Show more" is gone and the head
-			// reads the two rendered of the three matches.
+			// Page 1 renders all 20 of its cards — the fetched retro included — and
+			// the one match beyond page 1 keeps the button at exactly 1. Subtracting
+			// the held retro here would hide the button and strand that card.
 			expect(fetches).toEqual(["/api/projects/proj/done?page=1&q=heatmap"]);
-			expect(ids()).toEqual(["o0", "o1"]);
-			expect(lane!.querySelector(".count")?.textContent).toBe("2/3");
+			expect(ids()).toEqual([
+				held[19]!.id,
+				...work.slice(0, 19).map((t) => t.id),
+			]);
+			expect(lane!.querySelector(".count")?.textContent).toBe("20/21");
+			const more = lane!.querySelector<HTMLButtonElement>("button.lane-more");
+			expect(more?.getAttribute("aria-label")).toBe("Show more, 1 older cards");
+			// Paging to page 2 renders the last match and retires the button.
+			await act(async () => {
+				more!.click();
+			});
+			await act(async () => {});
+			expect(fetches).toEqual([
+				"/api/projects/proj/done?page=1&q=heatmap",
+				"/api/projects/proj/done?page=2&q=heatmap",
+			]);
+			expect(ids()).toEqual([held[19]!.id, ...work.map((t) => t.id)]);
+			expect(lane!.querySelector(".count")?.textContent).toBe("21/21");
 			expect(lane!.querySelector("button.lane-more")).toBeNull();
 		} finally {
 			await act(async () => {

@@ -4691,7 +4691,6 @@ export function ProjectBoard({
 	);
 	// The done-lane cards the state holds (the window and the pinned ones).
 	const heldDoneCount = tasks.filter((t) => laneStage(t) === "done").length;
-	const heldIds = new Set(tasks.map((t) => t.id));
 	// With a query applied the done lane reads the server search, not the state
 	// window: the shown done cards and the fetched ones the state lacks drive the
 	// search count against the server's matching total.
@@ -4708,14 +4707,17 @@ export function ProjectBoard({
 	).col;
 	// Retro cards hide in Done (onBoard) unless they need the user, but the
 	// settled total and the fetched pages still carry them. The hidden count
-	// excludes them, or a match the lane can never render would keep "Show more"
-	// alive through empty pages.
+	// excludes retro matches the lane has not rendered and can never render — a
+	// retro a fetched page delivered renders like any card, so only the ones
+	// missing from the rendered IDs leave "Show more" honest.
+	const renderedDoneIds = new Set(doneCol.map((t) => t.id));
 	const heldHiddenDone = tasks.filter(
 		(t) =>
 			laneStage(t) === "done" &&
 			t.kind === "retro" &&
 			t.state !== "needs_you" &&
-			(q === "" || matchesQuery(t, q)),
+			(q === "" || matchesQuery(t, q)) &&
+			!renderedDoneIds.has(t.id),
 	).length;
 	const doneHidden =
 		q === ""
