@@ -123,7 +123,7 @@ import type {
 	Task,
 	WorkCheckRun,
 } from "./types.ts";
-import { vmState } from "./vmState.ts";
+import { resetVmState, vmState } from "./vmState.ts";
 import { VmTokens } from "./vmTokens.ts";
 import type { DetachedRun, WorkerTarget } from "./workers.ts";
 import {
@@ -25244,14 +25244,14 @@ describe("worker OOM kill: one automatic continue, then a park", () => {
 
 describe("microVM dispatch (OTTR-532)", () => {
 	const VM_URL = "http://vm-runner:8787";
-	const savedHealth = vmState.health;
+	beforeEach(() => {
+		resetVmState();
+	});
 	afterEach(() => {
-		vmState.health = savedHealth;
 		// OTTR-1162: a test file that ran earlier (scripts/no-proxy.test.ts probes a
 		// runner this container can really resolve) leaves a pool max that gates every
 		// dispatch here; each test starts with the pool unknown, like a fresh boot.
-		vmState.pool = { busy: 0, max: 0 };
-		vmState.busy.clear();
+		resetVmState();
 		setSystemTime();
 	});
 
@@ -25622,16 +25622,12 @@ describe("microVM dispatch (OTTR-532)", () => {
 
 describe("microVM pool hold (OTTR-1142)", () => {
 	const VM_URL = "http://vm-runner:8787";
-	const savedHealth = vmState.health;
-	const savedPool = vmState.pool;
-	const savedInflight = vmState.inflight;
 	beforeEach(() => {
+		resetVmState();
 		vmState.health = { configured: true, ok: true, reason: null };
 	});
 	afterEach(() => {
-		vmState.health = savedHealth;
-		vmState.pool = savedPool;
-		vmState.inflight = savedInflight;
+		resetVmState();
 		setSystemTime();
 	});
 

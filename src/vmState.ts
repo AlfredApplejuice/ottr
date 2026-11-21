@@ -34,6 +34,15 @@ export const vmState: {
 
 export const VM_BUSY_HOLD = "waiting for a free microVM";
 
+/** The singleton's boot state, for test isolation: a suite that reads vmState resets it
+ * first instead of trusting earlier test files, and leaves it pristine afterwards. */
+export function resetVmState(): void {
+	vmState.health = { configured: false, ok: false, reason: VM_UNCONFIGURED };
+	vmState.busy = new Set();
+	vmState.pool = { busy: 0, max: 0 };
+	vmState.inflight = 0;
+}
+
 /**
  * The queued-card hold text for a project with microVM mode on, or null when nothing holds
  * the card back on the microVM side. A full pool holds every microVM card of the board
