@@ -518,7 +518,9 @@ function restoreOne(
 	try {
 		withDir(job.anchor, dirname(job.to), { create: true }, (d) => {
 			removeCopyIn(d, copyName);
-			// confine: refuses a symlinked or FIFO source, it is never followed.
+			// confine: refuses a FIFO or another non-regular source, and never blocks on one.
+			// A final symlink to a regular file is followed, like the copyFileSync it replaces;
+			// the snapshot tree is the server's own backup dir, not the worker-shared volume.
 			const sid = openRegular(job.from);
 			try {
 				const fd = openExclusive(d, copyName, fstatSync(sid).mode & 0o777);
