@@ -13627,13 +13627,16 @@ export async function createApp(deps: AppDeps) {
 		if (!w.ok) {
 			if (w.pinMismatch) return json({ error: w.error }, 409);
 			if (w.status !== 409) return json({ error: w.error }, w.status);
-			// The data repo moved: show the user its current roles.
+			// The loaded commit is not the branch head (a move since the import,
+			// or alate's base was never the head): show the user the repo's
+			// current roles. The next save re-checks the head against its base.
 			const again = await loadConfigYml(alate, true);
 			if (!again.ok) return json({ error: again.error }, again.status);
 			return json(
 				{
-					error:
-						"the data repo changed while the roles saved; check the current roles and save again",
+					error: w.refMismatch
+						? "the loaded commit is not the head of the data repo branch; check the current roles and save again"
+						: "the data repo changed while the roles saved; check the current roles and save again",
 					base: again.body.base,
 					hash: again.body.hash,
 					roles: readRoles(again.body.content),

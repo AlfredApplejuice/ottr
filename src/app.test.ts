@@ -6793,6 +6793,13 @@ extensions:
 		let pending: { content: string; parent: string } | null = null;
 		// The branch alate's source reports; "" plays a repo source on the default branch.
 		let repoRef = "main";
+		// The branch head GitHub answers for the save's head check; null follows headSha.
+		// A value plays a lying alate whose loaded commit is not the head.
+		let refHead: string | null = null;
+		const REF_HEAD_AHEAD = "0".repeat(40);
+		// Fires after the ref/heads answer is built: a commit landing between the
+		// save's head read and its ref update (the PATCH must refuse, never force).
+		let beforeRefPatch: (() => void) | null = null;
 		// config.yml bytes pinned per commit for the save's parent-blob binding check
 		// (a test plants a doctored entry to play a snapshot that lies about `base`).
 		let blobs: Record<string, string> = {};
@@ -6814,6 +6821,8 @@ extensions:
 			ghCalls = [];
 			pending = null;
 			repoRef = "main";
+			refHead = null;
+			beforeRefPatch = null;
 			blobs = {};
 			blobMissing = false;
 		};
@@ -6936,6 +6945,16 @@ extensions:
 				});
 			}
 			if (path === "repos/o/data") return ok({ default_branch: "main" });
+			if (path.startsWith("repos/o/data/git/ref/heads/")) {
+				const answer = ok({
+					ref: `refs/heads/${path.slice("repos/o/data/git/ref/heads/".length)}`,
+					object: { sha: refHead ?? headSha },
+				});
+				const hook = beforeRefPatch;
+				beforeRefPatch = null;
+				hook?.();
+				return answer;
+			}
 			if (path.startsWith("repos/o/data/git/commits/"))
 				return ok({ sha: path.split("/").at(-1), tree: { sha: "t0" } });
 			if (path === "repos/o/data/git/trees") {
@@ -7140,6 +7159,7 @@ cycleOrder:
 						"api",
 						`repos/o/data/contents/user/omp/agent/config.yml?ref=${BASE}`,
 					],
+					["api", "repos/o/data/git/ref/heads/main"],
 					["api", `repos/o/data/git/commits/${BASE}`],
 					[
 						"api",
@@ -7270,7 +7290,7 @@ cycleOrder:
 				expect(res.status).toBe(409);
 				expect(await res.json()).toEqual({
 					error:
-						"the data repo changed while the roles saved; check the current roles and save again",
+						"the loaded commit is not the head of the data repo branch; check the current roles and save again",
 					base: OTHER,
 					hash: sha(ORIGINAL),
 					roles: {
@@ -7281,9 +7301,24 @@ cycleOrder:
 				});
 				expect(head).toBe(ORIGINAL);
 				expect(headSha).toBe(OTHER);
-				// One refused fast-forward, never retried and never forced.
-				expect(refMoves()).toHaveLength(1);
-				expect(refMoves()[0]).toContain("force=false");
+				// The head read caught the move before any write: no tree, commit
+				// or ref update ever ran, so nothing was retried or forced.
+				expect(refMoves()).toHaveLength(0);
+				expect(
+					ghCalls.filter(
+						(a) =>
+							(a[1] ?? "").startsWith("repos/o/data/git/commits") ||
+							(a[1] ?? "").startsWith("repos/o/data/git/trees") ||
+							a.includes("-X"),
+					),
+				).toEqual([]);
+				expect(ghCalls).toEqual([
+					[
+						"api",
+						`repos/o/data/contents/user/omp/agent/config.yml?ref=${BASE}`,
+					],
+					["api", "repos/o/data/git/ref/heads/main"],
+				]);
 			});
 
 			test("a commit on main before the save leaves config.yml alone and still gives 409 and no write", async () => {
@@ -7928,6 +7963,57 @@ cycleOrder:
 				expect(
 					ghCalls.filter((a) => (a[1] ?? "").startsWith("repos/o/data/git/")),
 				).toEqual([]);
+			});
+
+			test("a loaded commit ahead of the branch head is refused before any write", async () => {
+				reset();
+				// Alate reports `base` as its loaded commit while the branch head is
+				// an older commit. The force=false PATCH would still fast-forward and
+				// move main onto the loaded history, so the head read refuses first.
+				refHead = REF_HEAD_AHEAD;
+				const res = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5:high" },
+				});
+				expect(res.status).toBe(409);
+				expect(await res.json()).toMatchObject({
+					error:
+						"the loaded commit is not the head of the data repo branch; check the current roles and save again",
+					base: BASE,
+					hash: sha(ORIGINAL),
+				});
+				expect(
+					ghCalls.filter(
+						(a) =>
+							(a[1] ?? "").startsWith("repos/o/data/git/commits") ||
+							(a[1] ?? "").startsWith("repos/o/data/git/trees") ||
+							a.includes("-X"),
+					),
+				).toEqual([]);
+			});
+
+			test("a move between the head read and the ref update gives the fast-forward 409", async () => {
+				reset();
+				// The head read passes (the head still equals base), but the branch
+				// moves before the ref update: the PATCH refuses, never forces.
+				beforeRefPatch = () => {
+					headSha = OTHER;
+				};
+				const res = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5" },
+				});
+				expect(res.status).toBe(409);
+				expect(await res.json()).toMatchObject({
+					error:
+						"the data repo changed while the roles saved; check the current roles and save again",
+					base: OTHER,
+					hash: sha(ORIGINAL),
+				});
+				expect(refMoves()).toHaveLength(1);
+				expect(refMoves()[0]).toContain("force=false");
 			});
 
 			test("an invalid pinned repo or branch is refused with 400 and pins persist", async () => {

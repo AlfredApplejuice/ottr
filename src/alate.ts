@@ -142,7 +142,15 @@ export async function alateHealth(
 
 export type AlateOut<T> =
 	| { ok: true; body: T }
-	| { ok: false; status: number; error: string; pinMismatch?: true };
+	| {
+			ok: false;
+			status: number;
+			error: string;
+			/** The write branch is not the pinned branch (commitConfigYml). */
+			pinMismatch?: true;
+			/** The loaded commit is not the branch head GitHub reports (commitConfigYml). */
+			refMismatch?: true;
+	  };
 function outError(
 	body: Record<string, unknown> | null,
 	status: number,
@@ -585,6 +593,22 @@ export async function commitConfigYml(
 			// never moved, so there is nothing to re-import.
 			error: `the data repo branch is ${branch.slice(0, 100)}, but the pinned branch is ${expectBranch}`,
 			pinMismatch: true,
+		};
+	// The parent commit must be the branch's head, read from GitHub: a base that
+	// is only a descendant of the head (another branch, a fork's PR commit)
+	// would still fast-forward and move the branch onto alate's chosen history.
+	// The PATCH below stays the race guard for a move after this read.
+	const headRef = await ghApi(gh, [
+		`repos/${repo.name}/git/ref/heads/${branch}`,
+	]);
+	if (!headRef.ok) return headRef;
+	const head = (headRef.body.object as { sha?: unknown } | undefined)?.sha;
+	if (head !== base)
+		return {
+			ok: false,
+			status: 409,
+			error: `the data repo branch head is ${typeof head === "string" ? head.slice(0, 40) : "unknown"}, but the loaded commit is ${base.slice(0, 40)}`,
+			refMismatch: true,
 		};
 	const parent = await ghApi(gh, [`repos/${repo.name}/git/commits/${base}`]);
 	if (!parent.ok) return parent;
