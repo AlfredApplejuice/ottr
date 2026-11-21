@@ -8,6 +8,7 @@ import { describe, expect, test } from "bun:test";
 import type { PostgresDatabase } from "./postgresDriver.ts";
 import {
 	applyPostgresMigrations,
+	projectMigrationCount,
 	projectMigrations,
 	projectStepOne,
 	projectStepTwo,
@@ -144,8 +145,11 @@ describe("PostgreSQL migration surface", () => {
 				.slice(0, alter)
 				.some((statement) => statement.startsWith("CREATE TABLE pr_review")),
 		).toBe(true);
-		// Both versions carry their record.
-		expect([...db.applied].sort()).toEqual([1, 2]);
+		// Every step version carries its record; the count derives from the real
+		// step list, so a new store step never desyncs the pin.
+		expect([...db.applied].sort()).toEqual(
+			Array.from({ length: projectMigrationCount }, (_, index) => index + 1),
+		);
 		// A recorded version skips its step: the re-run only re-ensures the
 		// migrations table and executes no step statement.
 		db.executed.length = 0;
