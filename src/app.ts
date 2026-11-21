@@ -11915,17 +11915,16 @@ export async function createApp(deps: AppDeps) {
 		free = free.trim();
 		// A plain line whose number names no question refuses the whole reply, so a
 		// stale number from before a partial reply can not silently drop or
-		// misapply an answer (OTTR-1130).
-		if (asked.length > 1) {
-			const bad = plainAskOutOfRangeLine(text, asked.length);
-			if (bad !== null)
-				return json(
-					{
-						error: `answer line "Q${bad}" names no question: ${asked.length} questions are waiting, numbered Q1 to Q${asked.length}. Answer with one line per question, as: ${askAnswerLine(asked[0]!.question, "<answer>")}`,
-					},
-					400,
-				);
-		}
+		// misapply an answer — also on a card with one question left, where the
+		// whole-text fallback would otherwise take the line as a note (OTTR-1130).
+		const bad = plainAskOutOfRangeLine(text, asked.length);
+		if (bad !== null)
+			return json(
+				{
+					error: `answer line "Q${bad}" names no question: ${asked.length === 1 ? "the card asks 1 question, numbered Q1" : `${asked.length} questions are waiting, numbered Q1 to Q${asked.length}`}. Answer with one line per question, as: ${askAnswerLine(asked[0]!.question, "<answer>")}`,
+				},
+				400,
+			);
 		// OTTR-1130: a multi-question reply matching no question is refused before
 		// anything is written, so a mis-formatted reply cannot land the card Done
 		// with the whole text as a note on every lead.

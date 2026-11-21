@@ -2548,6 +2548,48 @@ describe("task routes", () => {
 		expect((await store.getTask(ask.id))!.state).toBe("needs_you");
 	});
 
+	test("a stale plain line on a one-question card refuses the reply", async () => {
+		const { lead1, lead2, ask } = await seedLeadAsk();
+		const first = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(`Q one? (card #${lead1.id})`, LEAD_APPLIES_OPTION),
+		});
+		expect(first.status).toBe(200);
+		// One question is left; the operator's stale Q2 names nothing on the card,
+		// so the reply is refused and the last lead stays untouched.
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "Q2: Yes, the risk applies.",
+		});
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			`answer line "Q2" names no question: the card asks 1 question, numbered Q1. Answer with one line per question, as: ${askAnswerLine(`Q two? (card #${lead2.id})`, "<answer>")}`,
+		);
+		const two = (await store.getTask(lead2.id))!;
+		expect(two.stage).toBe("backlog");
+		expect(two.state).toBe("idle");
+		expect(two.cancelledAt).toBeNull();
+		expect(two.details).toBeNull();
+		const card = (await store.getTask(ask.id))!;
+		expect(card.state).toBe("needs_you");
+		expect(card.asked).toHaveLength(1);
+		expect(card.doneAt).toBeNull();
+	});
+
+	test("an out-of-range plain line refuses a fresh one-question card's reply", async () => {
+		const { lead1, ask } = await seedLeadAskOne();
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "Q2: No, it does not apply",
+		});
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			`answer line "Q2" names no question: the card asks 1 question, numbered Q1. Answer with one line per question, as: ${askAnswerLine(`Q one? (card #${lead1.id})`, "<answer>")}`,
+		);
+		const one = (await store.getTask(lead1.id))!;
+		expect(one.stage).toBe("backlog");
+		expect(one.state).toBe("idle");
+		expect(one.details).toBeNull();
+		expect((await store.getTask(ask.id))!.state).toBe("needs_you");
+	});
+
 	test("a started lead cancels through the sanctioned cancel", async () => {
 		const { lead1, ask } = await seedLeadAskOne();
 		// The user kicked the lead by hand before answering: the bare cancel patch
