@@ -1,23 +1,38 @@
 /**
  * OTTR-1180: suite-wide env hygiene. The full suite runs ~185 files in one process, and a
- * test that loses its restore (a load-capped test never reaches its finally) leaves the
- * write in process.env for every later file — the full-suite-only failure class: a leftover
- * GIT_CONFIG_COUNT without its key makes every later git spawn die with a config fatal, a
- * leftover PATH or HOME reroutes later fixtures. bunfig lists this file after
- * boardRepoGuard.ts, so the snapshot keeps the guard's shim PATH and the restore below
- * never disarms the guard. A file that needs an env value across its tests re-asserts it
- * in beforeEach (the sandboxRun, worktree date-pin, release-gates and hindsight describes
- * do); per-call writers with try/finally keeps are unaffected.
+ * load-capped test never reaches its finally, so its env writes ride into every later file
+ * (observed as git exit-128 fatals from a leftover GIT_CONFIG_COUNT in the board-repo guard
+ * probe). The hooks below snapshot the env before each test and restore the drift after it:
+ * the leak heals at its source, and every file's own module and beforeAll pins stand.
+ * bunfig lists this file after boardRepoGuard.ts, so the captures keep the guard's shim
+ * PATH and the restore never disarms the guard.
+ *
+ * The scrub below runs once at preload: the worker session exports its own runtime names
+ * (OTTR_*, OMP_*, ALATE_*, HINDSIGHT_*, GH_*, PI_CODING_AGENT_DIR and the git ident pair),
+ * and a CI run — the suite's reference environment — carries none of them. Tests read the
+ * scrubbed base the same way here and on CI; a test that needs one of the names sets it
+ * itself.
  */
-import { afterEach } from "bun:test";
+import { afterEach, beforeEach } from "bun:test";
 
-const snapshot: Readonly<Record<string, string>> = Object.freeze({
-	...process.env,
-} as Record<string, string>);
+for (const key of Object.keys(process.env)) {
+	if (
+		/^(OTTR_|OMP_|ALATE_|HINDSIGHT_|GH_|PI_CODING_|GIT_AUTHOR_|GIT_COMMITTER_)/.test(
+			key,
+		)
+	)
+		delete process.env[key];
+}
+
+let start: Record<string, string> = {};
+
+beforeEach(() => {
+	start = { ...process.env } as Record<string, string>;
+});
 
 afterEach(() => {
 	for (const key of Object.keys(process.env))
-		if (!Object.hasOwn(snapshot, key)) delete process.env[key];
-	for (const [key, value] of Object.entries(snapshot))
+		if (!Object.hasOwn(start, key)) delete process.env[key];
+	for (const [key, value] of Object.entries(start))
 		if (process.env[key] !== value) process.env[key] = value;
 });

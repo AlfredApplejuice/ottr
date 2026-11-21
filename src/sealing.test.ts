@@ -1,12 +1,5 @@
 import { Database } from "bun:sqlite";
-import {
-	afterAll,
-	beforeAll,
-	beforeEach,
-	describe,
-	expect,
-	test,
-} from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,19 +14,11 @@ import { isSealed, loadSecretBox, type SecretBox } from "./secretBox.ts";
 
 const root = mkdtempSync(join(tmpdir(), "ottr-sealing-"));
 const home = mkdtempSync(join(tmpdir(), "ottr-sealing-home-"));
-// Pinned board omp home and agent dir: boot never touches the real ~/.omp. beforeEach
-// re-asserts both because the suite env belt (OTTR-1180) restores the snapshot after
-// each test.
-const pinHomes = (): void => {
-	process.env.OTTR_BOARD_OMP_HOME = join(home, "omp-home");
-	process.env.PI_CODING_AGENT_DIR = join(home, "agent");
-};
-beforeAll(() => {
-	mkdirSync(join(home, "agent"), { recursive: true });
-	writeFileSync(join(home, "agent", "config.yml"), "modelRoles: {}\n");
-	pinHomes();
-});
-beforeEach(pinHomes);
+// Pinned board omp home and agent dir: boot never touches the real ~/.omp.
+process.env.OTTR_BOARD_OMP_HOME = join(home, "omp-home");
+mkdirSync(join(home, "agent"), { recursive: true });
+writeFileSync(join(home, "agent", "config.yml"), "modelRoles: {}\n");
+process.env.PI_CODING_AGENT_DIR = join(home, "agent");
 // One project env list naming HS_TOKEN, so the env route lists the stored spot.
 const workersHome = join(root, "workers");
 mkdirSync(join(workersHome, ".ottr", "workers", "w1"), { recursive: true });

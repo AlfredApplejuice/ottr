@@ -1,11 +1,4 @@
-import {
-	afterAll,
-	beforeAll,
-	beforeEach,
-	describe,
-	expect,
-	test,
-} from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
 	chmodSync,
 	existsSync,
@@ -1318,11 +1311,6 @@ describe("runReleaseCommand against real repos", () => {
 	let record = "";
 	let notesFile = "";
 	let seq = 0;
-	beforeEach(() => {
-		// The suite env belt (OTTR-1180) restores the snapshot after each test; the fake
-		// git path re-asserts per test what the beforeAll seeds once.
-		process.env.OTT_GIT_EXE = gitExe();
-	});
 	beforeAll(() => {
 		// FAKE_COMMAND runs as a separate process and cannot import gitExe; inherit it via env.
 		process.env.OTT_GIT_EXE = gitExe();

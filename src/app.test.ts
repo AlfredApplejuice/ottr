@@ -10446,14 +10446,9 @@ describe("hindsight settings", () => {
 	const savedHome = process.env.HOME;
 	const flipHome = mkdtempSync(join(tmpdir(), "ottr-hindsight-home"));
 	const flipCfg = join(flipHome, ".omp", "agent", "config.yml");
-	const setFlipHome = () => {
-		// The suite env belt (OTTR-1180) restores the snapshot after each test; the
-		// stand-in home re-asserts per test so the board never writes the developer's
-		// own omp config.
+	beforeAll(() => {
 		process.env.HOME = flipHome;
-	};
-	beforeAll(setFlipHome);
-	beforeEach(setFlipHome);
+	});
 	afterAll(() => {
 		if (savedHome === undefined) delete process.env.HOME;
 		else process.env.HOME = savedHome;

@@ -2,7 +2,6 @@ import {
 	afterAll,
 	afterEach,
 	beforeAll,
-	beforeEach,
 	describe,
 	expect,
 	test,
@@ -126,15 +125,12 @@ function tmpRoot(): string {
 }
 
 const savedDataDir = process.env.OTTR_DATA_DIR;
-const setDataDir = () => {
+beforeAll(() => {
 	// Both modes: in guard mode this re-establishes the value after
 	// tracker.test.ts's afterEach deletes it, so ambient staging still lands in
-	// the belt root instead of the "/data" fallback. beforeEach re-asserts the
-	// value: the suite env belt (OTTR-1180) restores the snapshot after each test.
+	// the belt root instead of the "/data" fallback.
 	process.env.OTTR_DATA_DIR = ambientDataRoot;
-};
-beforeAll(setDataDir);
-beforeEach(setDataDir);
+});
 afterAll(() => {
 	// Read, restore, remove, then assert: a failure here must not orphan the dir.
 	const staged = sandboxStageDirs(ambientDataRoot);

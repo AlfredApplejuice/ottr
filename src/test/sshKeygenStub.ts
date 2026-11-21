@@ -12,7 +12,7 @@
  * `-N` passphrase writes an ENCRYPTED PKCS8 header the export refuses, so the import path
  * keeps rejecting protected keys.
  */
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -83,9 +83,11 @@ fail("ssh-keygen stub: unsupported call: " + args.join(" "));
 
 let dir: string | null = null;
 
-/** The stub dir; prepend it to PATH so every ssh-keygen spawn resolves here. */
+/** The stub dir; prepend it to PATH so every ssh-keygen spawn resolves here. A sibling
+ * file's afterAll may have removed the shared dir (one module instance per process), so a
+ * missing script rebuilds it. */
 export function sshKeygenStubDir(): string {
-	if (dir === null) {
+	if (dir === null || !existsSync(join(dir, "ssh-keygen"))) {
 		dir = mkdtempSync(join(tmpdir(), "ottr-ssh-keygen-stub-"));
 		writeFileSync(join(dir, "ssh-keygen"), SCRIPT, { mode: 0o755 });
 	}

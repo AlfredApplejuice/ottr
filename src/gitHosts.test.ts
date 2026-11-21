@@ -36,6 +36,7 @@ import fc from "./test/properties.ts";
 import {
 	installSshKeygenStub,
 	removeSshKeygenStub,
+	sshKeygenStubDir,
 } from "./test/sshKeygenStub.ts";
 
 const root = mkdtempSync(join(tmpdir(), "ottr-gh-"));
@@ -45,7 +46,10 @@ const hasKeygen = Bun.which("ssh-keygen") !== null;
 
 /** One ssh-keygen run for a test fixture; throws its stderr on failure. */
 function runKeygen(args: string[]): void {
-	const r = Bun.spawnSync(["ssh-keygen", ...args], {
+	// An explicit stub path: Bun.spawnSync resolves a bare name from the PATH the
+	// process started with, not the current env, so the PATH prepend alone cannot
+	// switch it to the stub (OTTR-1180).
+	const r = Bun.spawnSync([join(sshKeygenStubDir(), "ssh-keygen"), ...args], {
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -445,7 +449,7 @@ describe("importPendingKey", () => {
 			expect("id" in r).toBe(true);
 			if (!("id" in r)) return;
 			const ref = Bun.spawnSync([
-				"ssh-keygen",
+				join(sshKeygenStubDir(), "ssh-keygen"),
 				"-l",
 				"-E",
 				"sha256",

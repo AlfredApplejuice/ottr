@@ -868,6 +868,10 @@ describe("propose_task tool", () => {
 
 	test("accepts all five summary fields and resolves locally once, then refuses the second call; create_task untouched", async () => {
 		process.env.OTTR_RETRO = "1";
+		// The board's project list this run proposes against; set here, not inherited
+		// from an earlier test's value (OTTR-1180: the suite env belt restores the env
+		// after each test, so a leaked value no longer reaches this call).
+		process.env.OTTR_PROJECTS = "alate\nagent-data\nottr";
 		let fetched = false;
 		globalThis.fetch = (async () => {
 			fetched = true;
