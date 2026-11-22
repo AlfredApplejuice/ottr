@@ -5013,6 +5013,21 @@ async function until(pred: () => boolean): Promise<void> {
 	if (!pred()) throw new Error("timed out waiting for the fake omp child");
 }
 
+/** Poll for the fake omp child's env file until it parses: writeFileSync is not
+ * atomic, so existsSync can fire while the write is still landing (the suite
+ * read truncated JSON under load). */
+async function untilEnv(out: string): Promise<Record<string, string>> {
+	await until(() => {
+		try {
+			JSON.parse(readFileSync(out, "utf8"));
+			return true;
+		} catch {
+			return false;
+		}
+	});
+	return JSON.parse(readFileSync(out, "utf8")) as Record<string, string>;
+}
+
 describe("startRun agent layer pinning", () => {
 	const ENV_KEYS = [
 		"HOME",
@@ -5064,10 +5079,7 @@ describe("startRun agent layer pinning", () => {
 			const h1 = await startRun(workerOpts(out1, rel1));
 			expect(h1.pid).toBeNull();
 			expect(h1.layerId).toBe("A");
-			await until(() => existsSync(out1));
-			const env1: Record<string, string> = JSON.parse(
-				readFileSync(out1, "utf8"),
-			);
+			const env1 = await untilEnv(out1);
 			expect(env1.HOME).toBe(realpathSync(aDir));
 			expect(env1.PI_CODING_AGENT_DIR).toBe(
 				join(realpathSync(aDir), ".omp", "agent"),
@@ -5087,10 +5099,7 @@ describe("startRun agent layer pinning", () => {
 			switchCurrentTo(shared, "B");
 			const h2 = await startRun(workerOpts(out2, rel2));
 			expect(h2.layerId).toBe("B");
-			await until(() => existsSync(out2));
-			const env2: Record<string, string> = JSON.parse(
-				readFileSync(out2, "utf8"),
-			);
+			const env2 = await untilEnv(out2);
 			expect(env1.HOME).toBe(realpathSync(aDir)); // run 1 never moved
 			expect(env2.HOME).toBe(realpathSync(bDir));
 			expect(env2.PI_CODING_AGENT_DIR).toBe(
@@ -5471,8 +5480,7 @@ describe("startRun layer leases (OTTR-1132)", () => {
 			return handle.done;
 		};
 		cleanups.push(settle);
-		await until(() => existsSync(out));
-		const env: Record<string, string> = JSON.parse(readFileSync(out, "utf8"));
+		const env = await untilEnv(out);
 		return { handle, env, settle };
 	}
 
