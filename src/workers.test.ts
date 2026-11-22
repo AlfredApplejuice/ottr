@@ -2793,6 +2793,13 @@ describe("serveWorker turn identity", () => {
 			// A real workspace: each project dir holds a git repo, the daemon's
 			// structural git-dir derivation and per-run chown run against it.
 			const ws = freshWorkerHome();
+			// Own passwd/group fixtures: provisioning writes these, never the host's
+			// real files (a leftover ottr-<id> entry carrying another run's temp home
+			// would fail the identity check closed).
+			const passwd = join(homesRoot, "passwd");
+			const group = join(homesRoot, "group");
+			writeFileSync(passwd, "root:x:0:0:root:/root:/bin/bash\n");
+			writeFileSync(group, "root:x:0:\n");
 			const mkRepo = (name: string): string => {
 				const repo = join(ws, name);
 				mkdirSync(repo, { recursive: true });
@@ -2827,7 +2834,13 @@ describe("serveWorker turn identity", () => {
 			const url = start({
 				ompPath: identPath,
 				home: workerHome,
-				turnUid: { homesRoot, workerHome, dataRoots: [], workspaceRoot: ws },
+				turnUid: {
+					homesRoot,
+					workerHome,
+					dataRoots: [],
+					workspaceRoot: ws,
+					provisionPaths: { passwd, group },
+				},
 			});
 			const run = async (
 				project: string,
@@ -2914,10 +2927,22 @@ describe("serveWorker turn identity", () => {
 			const workerHome = freshWorkerHome();
 			const homesRoot = freshWorkerHome();
 			const ws = freshWorkerHome();
+			// Own passwd/group fixtures: provisioning writes these, never the host's
+			// real files.
+			const passwd = join(homesRoot, "passwd");
+			const group = join(homesRoot, "group");
+			writeFileSync(passwd, "root:x:0:0:root:/root:/bin/bash\n");
+			writeFileSync(group, "root:x:0:\n");
 			const url = start({
 				ompPath: process.execPath,
 				home: workerHome,
-				turnUid: { homesRoot, workerHome, dataRoots: [], workspaceRoot: ws },
+				turnUid: {
+					homesRoot,
+					workerHome,
+					dataRoots: [],
+					workspaceRoot: ws,
+					provisionPaths: { passwd, group },
+				},
 			});
 			const res = await post(url, {
 				id: "ti-gone",
