@@ -209,6 +209,12 @@ describe("redactSecrets", () => {
 		expect(r.hits).toBe(1);
 		expect(r.text).toBe("[REDACTED]db.example.com/x");
 	});
+	test("URL user part beyond the bound stays visible (OTTR-997)", () => {
+		const s = `postgres://${"u".repeat(256)}:password123@db.example.com/x`;
+		const r = redactSecrets(s);
+		expect(r.hits).toBe(0);
+		expect(r.text).toBe(s);
+	});
 	test("suspicious assignment redacts the quoted value", () => {
 		const r = redactSecrets('cfg.password = "abcdefghijklmnop"');
 		expect(r.hits).toBe(1);
@@ -594,6 +600,71 @@ describe("buildUserMessage", () => {
 		expect(msg).not.toContain("XXXXXXXXXX");
 		expect(msg).not.toContain("BEGIN RSA");
 		expect(msg).toContain("aaaa");
+	});
+	test("cleaned text below the drop zone emits nothing (OTTR-997)", () => {
+		// Two commits -> cap 200_000, raw cut at 216_384. Thirty redacted blocks
+		// and one smaller one shrink the cleaned text to 30 000 chars, below the
+		// 32 KiB drop zone. slice(0, -2768) counted from the end and kept 1584
+		// chars of the cut block's body; the endpoint must clamp at zero.
+		const block = (body: number) =>
+			`-----BEGIN RSA PRIVATE KEY-----\n${"X".repeat(body)}\n-----END RSA PRIVATE KEY-----`;
+		const patch1 =
+			block(6000).repeat(30) +
+			block(4772) +
+			"a".repeat(25_306) +
+			block(6000) +
+			"b".repeat(500);
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: patch1,
+					branches: [],
+				},
+				{
+					sha: SHA2,
+					subject: "t",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "+x",
+					branches: [],
+				},
+			],
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("COMMITS");
+		expect(msg).not.toContain("XXXXXXXXXX");
+		expect(msg).not.toContain("BEGIN RSA");
+	});
+	test("a cut PEM on a small-cap range emits nothing without shrinkage (OTTR-997)", () => {
+		// 25 commits -> cap 16_000, raw cut at 32_384, cleaned 32_384: the old
+		// negative endpoint kept 32 000 chars including 3968 body chars with no
+		// shrinkage involved. The clamp must emit nothing here too.
+		const patch1 =
+			`${"a".repeat(28_000)}-----BEGIN RSA PRIVATE KEY-----\n` +
+			`${"X".repeat(6000)}\n-----END RSA PRIVATE KEY-----${"b".repeat(5_000)}`;
+		const r = range({
+			commits: Array.from({ length: 25 }, (_, i) => ({
+				sha: `${"c".repeat(38)}${String(i).padStart(2, "0")}`,
+				subject: "s",
+				files: 1,
+				plus: 1,
+				minus: 0,
+				patch: i === 0 ? patch1 : "+x",
+				branches: [],
+			})),
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("COMMITS");
+		expect(msg).not.toContain("XXXXXXXXXX");
+		expect(msg).not.toContain("BEGIN RSA");
 	});
 	test("truncates a huge patch in budget instead of stalling (OTTR-997)", () => {
 		// Before the fix this input cleaned the whole 1 MB patch for 81 s and

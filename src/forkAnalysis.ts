@@ -41,7 +41,9 @@ const REDACT_PATTERNS: RegExp[] = [
 	/eyJ[A-Za-z0-9_-]{10,128}\.[A-Za-z0-9_-]{10,2048}\.[A-Za-z0-9_-]{10,2048}/g,
 	// PEM key: header word <=32 chars, gap <=8 KiB (a real key PEM is smaller).
 	/-----BEGIN [A-Z ]{0,32}PRIVATE KEY-----[\s\S]{0,8192}?-----END [A-Z ]{0,32}PRIVATE KEY-----/g,
-	/\b\w+:\/\/[^/\s:]+:[^/\s@]{8,}@/g,
+	// URL credentials: every run bounded like the other rules (OTTR-997), so no
+	// accepted span can cross the raw pre-cut with an unbounded prefix.
+	/\b\w{1,64}:\/\/[^/\s:]{1,255}:[^/\s@]{8,512}@/g,
 ];
 
 // Redact QUOTED literal values: `apiKey = whisparr.apiKey` is an identifier copy, a
@@ -194,9 +196,15 @@ function cleanBlocks(
 			if (c.patch.length <= precap) return clean(c.patch);
 			// OTTR-997: bound clean()'s input. The raw cut can split a token; its
 			// unredacted prefix lands in the cleaned tail zone, so drop that zone
-			// by cleaned length, then keep the rest within cap.
+			// by cleaned length, then keep the rest within cap. The endpoint must
+			// clamp at zero: a negative slice(0, -k) counts from the end and would
+			// keep the tail zone it is meant to remove when the whole cleaned text
+			// is shorter than the drop zone.
 			const cleaned = clean(c.patch.slice(0, precap));
-			return cleaned.slice(0, Math.min(cleaned.length - CLEAN_TAIL_DROP, cap));
+			return cleaned.slice(
+				0,
+				Math.max(0, Math.min(cleaned.length - CLEAN_TAIL_DROP, cap)),
+			);
 		}),
 		upstreamCommits: clean(range.upstreamCommits.join("\n")),
 		upstreamFiles: clean(range.upstreamFiles.join("\n")),
