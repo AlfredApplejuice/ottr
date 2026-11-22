@@ -157,10 +157,10 @@ function patchCap(commitCount: number): number {
 }
 
 /** Longest span any redaction rule accepts: PEM block ~8.3 KiB, quoted value
- * ~8.25 KiB, JWT ~4.2 KiB, stored tokens are short literals. clean() must see a
- * whole match to redact it, so the raw pre-cut sits one MAX_TOKEN_LEN past the
- * per-patch cap: a token straddling the trim boundary is fully inside the
- * cleaned region (OTTR-997). */
+ * ~8.25 KiB, JWT ~4.2 KiB, URL credentials ~0.8 KiB, stored tokens are short
+ * literals. clean() must see a whole match to redact it, so the raw pre-cut
+ * sits this far past the per-patch cap: a token straddling the trim boundary
+ * is fully inside the cleaned region (OTTR-997). */
 const MAX_TOKEN_LEN = 16_384;
 
 /** clean() does not map cleaned positions back to raw positions: it shrinks
@@ -186,7 +186,7 @@ function cleanBlocks(
 	priorSection: string;
 } {
 	const cap = patchCap([...range.commits, ...range.merges].length);
-	const precap = cap + MAX_TOKEN_LEN;
+	const precap = cap + CLEAN_TAIL_DROP + MAX_TOKEN_LEN;
 	return {
 		fork: clean(
 			`owner/name: ${range.fork.owner}/${range.fork.name}\n` +
@@ -196,15 +196,18 @@ function cleanBlocks(
 			if (c.patch.length <= precap) return clean(c.patch);
 			// OTTR-997: bound clean()'s input. The raw cut can split a token; its
 			// unredacted prefix lands in the cleaned tail zone, so drop that zone
-			// by cleaned length, then keep the rest within cap. The endpoint must
-			// clamp at zero: a negative slice(0, -k) counts from the end and would
-			// keep the tail zone it is meant to remove when the whole cleaned text
-			// is shorter than the drop zone.
+			// by cleaned length (clamped at zero: a negative slice endpoint counts
+			// from the end), then keep the rest within cap. The pre-cut sits one
+			// CLEAN_TAIL_DROP past cap + MAX_TOKEN_LEN, so without shrinkage a cut
+			// patch still keeps its full cap of benign content.
 			const cleaned = clean(c.patch.slice(0, precap));
-			return cleaned.slice(
+			const kept = cleaned.slice(
 				0,
 				Math.max(0, Math.min(cleaned.length - CLEAN_TAIL_DROP, cap)),
 			);
+			// Appended after clean(): patch text cannot forge or remove it, and
+			// the model learns that content ends early even on an in-budget range.
+			return `${kept}\n[patch truncated]`;
 		}),
 		upstreamCommits: clean(range.upstreamCommits.join("\n")),
 		upstreamFiles: clean(range.upstreamFiles.join("\n")),
