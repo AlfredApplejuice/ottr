@@ -105,7 +105,10 @@ export function turnHomesRoot(): string {
 	return process.env.OTTR_TURN_HOMES || "/turn-homes";
 }
 
-/** Project names are single path segments; anything else is refused (fail closed). */
+/** Project names are single path segments with no field separators; anything
+ * else is refused (fail closed). The colon and line breaks keep request names
+ * out of the structured files root writes: passwd/group lines and the pinned
+ * gitconfig (OTTR-1184). */
 export function assertProjectSegment(name: string): void {
 	if (
 		name === "" ||
@@ -113,7 +116,10 @@ export function assertProjectSegment(name: string): void {
 		name === ".." ||
 		name.includes("/") ||
 		name.includes("\\") ||
-		name.includes("\0")
+		name.includes("\0") ||
+		name.includes(":") ||
+		name.includes("\n") ||
+		name.includes("\r")
 	)
 		throw new Error(`turn-uid: refusing project name ${JSON.stringify(name)}`);
 }
@@ -856,11 +862,6 @@ function provisionName(content: string, uid: number): string {
 	);
 }
 
-/** GECOS carries no field separators or newlines; project names may legally hold a colon. */
-function provisionGecos(project: string): string {
-	return project.replace(/[\n\r:]/g, " ");
-}
-
 /**
  * Passwd and group entries for one project uid (OTTR-1184): idempotent,
  * fail closed. Group entry first, then passwd entry, so a passwd entry never
@@ -894,7 +895,7 @@ export function ensureProjectIdentity(
 		appendIdentityLine(
 			passwdPath,
 			passwdContent,
-			`${name}:x:${uid}:${gid}:Ottr turn uid for ${provisionGecos(project)}:${turnHome.home}:/bin/false`,
+			`${name}:x:${uid}:${gid}:Ottr turn uid for ${project}:${turnHome.home}:/bin/false`,
 		);
 	}
 }

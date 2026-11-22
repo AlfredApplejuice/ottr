@@ -38,7 +38,9 @@ stays unchanged.
   collision unlikely (about 0.003% at 100 projects).
 - At turn start the daemon provisions a passwd and group entry for the
   project uid (OTTR-1184): name `ottr-<uid>`, home = the turn home, shell
-  `/bin/false`, gecos names the project. Idempotent, fail closed.
+  `/bin/false`, gecos names the project. Idempotent, fail closed. Project
+  names refuse the field separators (`:`, line breaks), so a request name
+  cannot shape the appended lines or the pinned gitconfig.
 
 ### Soundness rule: root never touches a uid-mutable path
 

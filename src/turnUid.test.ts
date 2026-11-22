@@ -130,8 +130,20 @@ describe("uidCollisionNote", () => {
 });
 
 describe("assertProjectSegment", () => {
-	test("rejects traversal, separators and empties", () => {
-		for (const bad of ["", ".", "..", "a/b", "../x", "/abs", "a\\b", "a\0b"])
+	test("rejects traversal, separators, empties and field breaks", () => {
+		for (const bad of [
+			"",
+			".",
+			"..",
+			"a/b",
+			"../x",
+			"/abs",
+			"a\\b",
+			"a\0b",
+			"a\nb",
+			"a\rb",
+			"a:b",
+		])
 			expect(() => assertProjectSegment(bad)).toThrow();
 		assertProjectSegment("ottr");
 		assertProjectSegment("my-project.v2");
