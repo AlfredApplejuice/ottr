@@ -17528,4 +17528,3 @@ describe("credits chip in the board bar", () => {
 		expect(requested.every((url) => !url.includes("credit"))).toBe(true);
 	});
 });
-
