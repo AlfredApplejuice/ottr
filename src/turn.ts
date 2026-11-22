@@ -4623,6 +4623,7 @@ export function createTurnLoop(
 		const handoff = gateHandoff({
 			prompt: live.prompt,
 			handoffsDir: join(store.tasksDir, "handoffs"),
+			anchor: store.dataRoot,
 		});
 		for (const reason of handoff.reasons)
 			await log(`! prompt gate: handoff not judged: ${reason}`);

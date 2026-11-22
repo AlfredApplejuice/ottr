@@ -12160,6 +12160,7 @@ export async function createApp(deps: AppDeps) {
 		const handoff = gateHandoff({
 			prompt: task.prompt,
 			handoffsDir: join(e.store.tasksDir, "handoffs"),
+			anchor: e.store.dataRoot,
 		});
 		await updateSnapshot(e, task, {
 			state: "queued",

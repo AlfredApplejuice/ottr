@@ -283,12 +283,16 @@ A follow-up prompt names its handoff file (`Read the handoff file first:
 @<path>`, `followUpPrompt`), and the handoff holds the checks the gate would
 otherwise miss. The gate judges the prompt plus that file:
 
-- `gateHandoff` (src/promptGate.ts) takes the prompt and the project's
-  handoffs folder (`join(store.tasksDir, "handoffs")`). The first `@<path>`
-  in the prompt that resolves strictly inside the folder decides; the text
-  comes through `realpathSync` (the folder's own real path included), so a
-  symlink cannot lead the read out of the folder. A path outside the folder,
-  a missing file, or an unreadable file adds nothing: the gate judges the
+- `gateHandoff` (src/promptGate.ts) takes the prompt, the project's
+  handoffs folder (`join(store.tasksDir, "handoffs")`), and the store's
+  data root as the walk anchor. The first `@<path>` in the prompt that
+  resolves strictly inside the folder decides; the read walks below the
+  data root through the confined readers (`readBelow` in src/confine.ts),
+  so no path component is ever followed through a symlink, the entry must
+  be a regular file, and the read stops at `HANDOFF_CAP + STEPS_CAP`
+  bytes — a turn that can write the tasks dir cannot point the read at a
+  host file or another project's data. A path outside the folder, a
+  missing file, or a refused read adds nothing: the gate judges the
   prompt alone, and each rejected path logs one
   `! prompt gate: handoff not judged: <path>: <reason>` line.
 - `gateJudgedPrompt` appends the block after the prompt as one untrusted data

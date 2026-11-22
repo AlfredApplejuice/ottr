@@ -619,6 +619,7 @@ describe("gateHandoff", () => {
 		const r = gateHandoff({
 			prompt: `Read the handoff file first: @${join(handoffs, "h.md")}`,
 			handoffsDir: handoffs,
+			anchor: dir,
 		});
 		expect(r.text).toBe("the real steps");
 		expect(r.path).toBe(join(handoffs, "h.md"));
@@ -630,6 +631,7 @@ describe("gateHandoff", () => {
 		const r = gateHandoff({
 			prompt: "Read the handoff file first: @/etc/passwd",
 			handoffsDir: handoffs,
+			anchor: dir,
 			read: () => {
 				reads += 1;
 				return "root:x:0:0:root:/root:/bin/bash";
@@ -645,6 +647,7 @@ describe("gateHandoff", () => {
 		const r = gateHandoff({
 			prompt: `@${escapePath}`,
 			handoffsDir: handoffs,
+			anchor: dir,
 			read: () => "x",
 		});
 		expect(r.text).toBeNull();
@@ -653,28 +656,62 @@ describe("gateHandoff", () => {
 
 	test("a missing handoff file adds nothing and names the reason", () => {
 		const missing = join(handoffs, "absent.md");
-		const r = gateHandoff({ prompt: `@${missing}`, handoffsDir: handoffs });
+		const r = gateHandoff({
+			prompt: `@${missing}`,
+			handoffsDir: handoffs,
+			anchor: dir,
+		});
 		expect(r.text).toBeNull();
 		expect(r.reasons).toEqual([`${missing}: the handoff file is missing`]);
 	});
 
-	test("a symlink out of the folder resolves outside and is not read", () => {
-		const outside = join(dir, "outside.md");
-		writeFileSync(outside, "secret");
-		const link = join(handoffs, "link.md");
-		symlinkSync(outside, link);
-		const r = gateHandoff({ prompt: `@${link}`, handoffsDir: handoffs });
-		expect(r.text).toBeNull();
-		expect(r.reasons).toEqual([
-			`${link}: resolves outside the handoffs folder`,
-		]);
-	});
+	test.skipIf(process.platform !== "linux")(
+		"a symlink out of the folder resolves outside and is not read",
+		() => {
+			const outside = join(dir, "outside.md");
+			writeFileSync(outside, "secret");
+			const link = join(handoffs, "link.md");
+			symlinkSync(outside, link);
+			const r = gateHandoff({
+				prompt: `@${link}`,
+				handoffsDir: handoffs,
+				anchor: dir,
+			});
+			expect(r.text).toBeNull();
+			expect(r.reasons).toEqual([
+				`${link}: resolves outside the handoffs folder`,
+			]);
+		},
+	);
+
+	test.skipIf(process.platform !== "linux")(
+		"a symlinked handoffs folder is refused unread",
+		() => {
+			const target = join(dir, "handoffs-target");
+			mkdirSync(target, { recursive: true });
+			writeFileSync(join(target, "h.md"), "the chosen host file");
+			const linked = join(dir, "linked-handoffs");
+			symlinkSync(target, linked);
+			const named = join(linked, "h.md");
+			const r = gateHandoff({
+				prompt: `@${named}`,
+				handoffsDir: linked,
+				anchor: dir,
+			});
+			expect(r.text).toBeNull();
+			expect(r.reasons).toEqual([
+				`${named}: resolves outside the handoffs folder`,
+			]);
+			expect(r.path).toBeNull();
+		},
+	);
 
 	test("an unreadable handoff names the reason", () => {
 		mkdirSync(join(handoffs, "dir.md"), { recursive: true });
 		const r = gateHandoff({
 			prompt: `@${join(handoffs, "dir.md")}`,
 			handoffsDir: handoffs,
+			anchor: dir,
 		});
 		expect(r.text).toBeNull();
 		expect(r.reasons).toEqual([
@@ -687,6 +724,7 @@ describe("gateHandoff", () => {
 		const r = gateHandoff({
 			prompt: `see @/etc/passwd then read @${join(handoffs, "b.md")}`,
 			handoffsDir: handoffs,
+			anchor: dir,
 		});
 		expect(r.text).toBe("the steps");
 		expect(r.reasons).toEqual(["/etc/passwd: outside the handoffs folder"]);

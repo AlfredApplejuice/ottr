@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
+import { isSizeRefusal, readBelow } from "./confine.ts";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import { gatePrompt, gateSystem } from "./prompts.ts";
 import type { ProjectStore } from "./store.ts";
@@ -70,6 +70,11 @@ export const HANDOFF_CAP = 20_000;
  * stays bounded. */
 export const STEPS_CAP = 20_000;
 
+/** The confined read cap for a handoff file: the head cap plus the steps section the
+ * gate can carry past it — every byte the gate can use, and nothing more. A file
+ * larger than this is refused with a reason, never read. */
+const HANDOFF_READ_CAP = HANDOFF_CAP + STEPS_CAP;
+
 /** The heading that opens a research report's steps section — the checks the gate
  * judges for follow-up cards. "Recommended steps" is the current report contract;
  * "Next steps" and "Action items" are the older report headings. Case-insensitive. */
@@ -111,52 +116,63 @@ function insideDir(dir: string, candidate: string): boolean {
 
 /** Reads the handoff file a prompt names (OTTR-844): follow-up prompts carry
  * "Read the handoff file first: @<path>" and the handoff holds the checks the gate
- * would otherwise miss. The first @-path that resolves inside `handoffsDir` decides;
- * the text comes through `realpathSync` first, so a symlink cannot lead the read out
- * of the folder. A path outside the folder, a missing file, or an unreadable file
- * adds nothing: text stays null, the reason lands in `reasons`, and the gate judges
- * the prompt alone. */
+ * would otherwise miss. The first @-path that resolves inside `handoffsDir` decides.
+ * The read walks below `anchor` (the store's data root) with the confined readers
+ * (readBelow): no path component is followed through a symlink and the entry must be
+ * a regular file of at most HANDOFF_READ_CAP bytes, so a turn that can write the
+ * tasks dir cannot point the read at a host file or another project's data. A path
+ * outside the folder, a missing file, or a refused read adds nothing: text stays
+ * null, the reason lands in `reasons`, and the gate judges the prompt alone. */
 export function gateHandoff(o: {
 	prompt: string;
 	handoffsDir: string;
+	/** The trusted data root `handoffsDir` lives below; the read walks below it. */
+	anchor: string;
+	/** Test seam: replaces the confined read for the path that passed the checks. */
 	read?: (path: string) => string;
 }): GateHandoff {
-	const read = o.read ?? ((path: string) => readFileSync(path, "utf8"));
 	const out: GateHandoff = { text: null, path: null, reasons: [] };
-	// The folder's real path: the file's realpath must stay inside it. The folder may
-	// not exist yet (a fresh project), which the file's own realpath then reports.
-	let dirReal = o.handoffsDir;
-	try {
-		dirReal = realpathSync(o.handoffsDir);
-	} catch {
-		// keep the lexical dir
-	}
 	for (const raw of promptHandoffPaths(o.prompt)) {
 		const resolved = resolve(raw);
 		if (!insideDir(o.handoffsDir, resolved)) {
 			out.reasons.push(`${raw}: outside the handoffs folder`);
 			continue;
 		}
-		let real: string;
-		try {
-			real = realpathSync(resolved);
-		} catch {
-			out.reasons.push(`${raw}: the handoff file is missing`);
-			return out;
-		}
-		if (!insideDir(dirReal, real)) {
-			out.reasons.push(`${raw}: resolves outside the handoffs folder`);
+		const rel = relative(resolve(o.anchor), resolved);
+		if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
+			out.reasons.push(`${raw}: outside the handoffs folder`);
 			return out;
 		}
 		try {
-			out.text = read(real);
-			out.path = real;
-		} catch {
-			out.reasons.push(`${raw}: the handoff file is unreadable`);
+			if (o.read) {
+				out.text = o.read(resolved);
+			} else {
+				const buf = readBelow(o.anchor, resolved, HANDOFF_READ_CAP);
+				if (buf === null) {
+					out.reasons.push(`${raw}: the handoff file is missing`);
+					return out;
+				}
+				out.text = buf.toString("utf8");
+			}
+			out.path = resolved;
+		} catch (err) {
+			out.reasons.push(`${raw}: ${handoffRefusal(err)}`);
 		}
 		return out;
 	}
 	return out;
+}
+
+/** The reason for a refused confined handoff read, for `reasons` and the turn log. */
+function handoffRefusal(err: unknown): string {
+	if (isSizeRefusal(err))
+		return `the handoff file is larger than ${HANDOFF_READ_CAP} bytes`;
+	// readRegularFile marks a non-regular entry with this phrase; everything else the
+	// walk refuses (a symlink at any component, an unreadable entry) means the read
+	// cannot be proven to stay inside the handoffs folder.
+	if (err instanceof Error && err.message.includes("not a regular file"))
+		return "the handoff file is unreadable";
+	return "resolves outside the handoffs folder";
 }
 
 /** The report's steps section: the heading line plus its body, up to the next
