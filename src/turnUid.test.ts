@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import {
 	chmodSync,
+	chownSync,
 	closeSync,
 	existsSync,
 	lstatSync,
@@ -1055,10 +1056,16 @@ describe("applyTurnGitEnv", () => {
 		const gitconfig = join(turnHome.provision, "gitconfig");
 		expect(env.GIT_CONFIG_GLOBAL).toBe(gitconfig);
 		const content = readFileSync(gitconfig, "utf8");
-		expect(content).toContain("include path = /env-home/.gitconfig");
+		expect(content).toContain("[include]");
+		expect(content).toContain("path = /env-home/.gitconfig");
 		expect(content).toContain("[user]");
 		expect(content).toContain("name = project with spaces turn");
 		expect(content).toContain("email = ottr+project-with-spaces@localhost");
+		// OTTR-693: the include sits after [user], so a configured turn-home
+		// identity keeps winning over the project fallback.
+		expect(content.indexOf("[user]")).toBeLessThan(
+			content.indexOf("[include]"),
+		);
 	});
 
 	test("without env.HOME the include points at the turn home", () => {
@@ -1072,9 +1079,9 @@ describe("applyTurnGitEnv", () => {
 			GIT_COMMITTER_EMAIL: "junk@junk",
 		};
 		applyTurnGitEnv(env, project, turnHome);
-		expect(readFileSync(env.GIT_CONFIG_GLOBAL!, "utf8")).toContain(
-			`include path = ${turnHome.home}/.gitconfig`,
-		);
+		const content = readFileSync(env.GIT_CONFIG_GLOBAL!, "utf8");
+		expect(content).toContain("[include]");
+		expect(content).toContain(`path = ${turnHome.home}/.gitconfig`);
 	});
 });
 
@@ -1178,28 +1185,38 @@ rootTest(
 	() => {
 		const project = "git-identity-regression";
 		const ids = projectTurnUid(project);
-		const turnHome = fakeTurnHome(project);
-		const repo = join(freshDir("gitid"), "repo");
-		mkdirSync(repo, { recursive: true });
-		const baseEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" };
-		const git = (...argv: string[]) => {
+		// The dropped uid reads the pinned gitconfig and its include through
+		// this chain: mkdtemp dirs are root-0700, so the homes root opens up,
+		// and prepareTurnHome gives the uid its own 0700 home (the production
+		// shape its HOME points at).
+		const homesRoot = freshDir("gitid-homes");
+		chmodSync(homesRoot, 0o755);
+		const turnHome = prepareTurnHome(homesRoot, project, ids);
+		const base = freshDir("gitid-repos");
+		chmodSync(base, 0o755);
+		const rootEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" };
+		const gitAsRoot = (repo: string, ...argv: string[]): void => {
 			const r = Bun.spawnSync(["git", "-C", repo, ...argv], {
 				stdout: "pipe",
 				stderr: "pipe",
-				env: baseEnv,
+				env: rootEnv,
 			});
 			if (r.exitCode !== 0)
 				throw new Error(`git ${argv.join(" ")} failed: ${r.stderr.toString()}`);
-			return r.stdout.toString();
 		};
-		git("init", "-b", "main");
-		git("config", "user.name", "fixture-user");
-		git("config", "user.email", "fixture@localhost");
-		writeFileSync(join(repo, "f.txt"), "x\n");
-		chownTree(repo, ids);
+		const configless = join(base, "configless");
+		mkdirSync(configless, { recursive: true });
+		gitAsRoot(configless, "init", "-b", "main");
+		chownTree(configless, ids);
+		const fixture = join(base, "fixture");
+		mkdirSync(fixture, { recursive: true });
+		gitAsRoot(fixture, "init", "-b", "main");
+		gitAsRoot(fixture, "config", "user.name", "fixture-user");
+		gitAsRoot(fixture, "config", "user.email", "fixture@localhost");
+		chownTree(fixture, ids);
 
 		const childEnv: Record<string, string | undefined> = {
-			...baseEnv,
+			...rootEnv,
 			HOME: turnHome.home,
 			GIT_AUTHOR_NAME: "junk",
 			GIT_AUTHOR_EMAIL: "junk@junk",
@@ -1214,53 +1231,54 @@ rootTest(
 
 		const expectedName = "git-identity-regression turn";
 		const expectedEmail = `ottr+${project}@localhost`;
-		const ident = Bun.spawnSync(
-			[
-				"setpriv",
-				"--reuid",
-				String(ids.uid),
-				"--regid",
-				String(ids.gid),
-				"--clear-groups",
-				"sh",
-				"-c",
-				"git var GIT_AUTHOR_IDENT",
-			],
-			{
-				cwd: repo,
-				stdout: "pipe",
-				stderr: "pipe",
-				env: childEnv as Record<string, string>,
-			},
-		);
-		expect(ident.exitCode).toBe(0);
-		const identOut = ident.stdout.toString();
-		expect(identOut).toContain(expectedName);
-		expect(identOut).toContain(expectedEmail);
-		expect(identOut).not.toContain("junk");
+		const drop = (repo: string, cmd: string): string => {
+			const r = Bun.spawnSync(
+				[
+					"setpriv",
+					"--reuid",
+					String(ids.uid),
+					"--regid",
+					String(ids.gid),
+					"--clear-groups",
+					"sh",
+					"-c",
+					cmd,
+				],
+				{
+					cwd: repo,
+					stdout: "pipe",
+					stderr: "pipe",
+					env: childEnv as Record<string, string>,
+				},
+			);
+			expect(r.exitCode).toBe(0);
+			return r.stdout.toString();
+		};
 
-		// Repo-local config still wins over the project identity file.
-		const local = Bun.spawnSync(
-			[
-				"setpriv",
-				"--reuid",
-				String(ids.uid),
-				"--regid",
-				String(ids.gid),
-				"--clear-groups",
-				"sh",
-				"-c",
-				"git config user.name",
-			],
-			{
-				cwd: repo,
-				stdout: "pipe",
-				stderr: "pipe",
-				env: childEnv as Record<string, string>,
-			},
+		// A configless repo picks up the project identity from the pinned
+		// config file, and no inherited env var reaches the ident.
+		const ident = drop(configless, "git var GIT_AUTHOR_IDENT");
+		expect(ident).toContain(expectedName);
+		expect(ident).toContain(expectedEmail);
+		expect(ident).not.toContain("junk");
+
+		// A repo-local fixture identity still wins: git precedence puts local
+		// config above GIT_CONFIG_GLOBAL, and no env override rides the turn
+		// env any more.
+		expect(drop(fixture, "git var GIT_AUTHOR_IDENT")).toContain("fixture-user");
+		expect(drop(fixture, "git config user.name").trim()).toBe("fixture-user");
+
+		// OTTR-693: a configured turn-home gitconfig keeps winning over the
+		// project fallback — the pinned file's include sits after its [user].
+		const homeConfig = join(turnHome.home, ".gitconfig");
+		writeFileSync(
+			homeConfig,
+			"[user]\n\tname = home-user\n\temail = home@localhost\n",
 		);
-		expect(local.exitCode).toBe(0);
-		expect(local.stdout.toString().trim()).toBe("fixture-user");
+		chownSync(homeConfig, ids.uid, ids.gid);
+		const homeIdent = drop(configless, "git var GIT_AUTHOR_IDENT");
+		expect(homeIdent).toContain("home-user");
+		expect(homeIdent).not.toContain(expectedName);
 	},
 );
 

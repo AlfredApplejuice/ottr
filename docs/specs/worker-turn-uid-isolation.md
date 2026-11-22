@@ -202,9 +202,11 @@ fails the run with the cause (fail closed): no silent fall-back to a root
 turn. The spawn env strips inherited `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
 identity vars (OTTR-1184): env ident vars beat every git config scope. The
 env points `GIT_CONFIG_GLOBAL` at a daemon-owned gitconfig in the turn
-home's provisioning dir that pins the project identity (`<project> turn` /
-`ottr+<project>@localhost`, a slug replaces unsafe chars) while including
-the turn home's own `.gitconfig`; repo-local config still wins over both.
+home's provisioning dir whose `[user]` pins the project identity
+(`<project> turn` / `ottr+<project>@localhost`, a slug replaces unsafe
+chars) as the fallback. The include of the turn home's own `.gitconfig`
+sits after that section, so a configured turn-home identity keeps winning
+(OTTR-693), and repo-local config wins over both.
 
 ### Server side
 
@@ -271,8 +273,9 @@ their repo's owner and need nothing.
   and deletes nothing.
 - A provisioned uid's `id -un` prints the entry name.
 - `git var GIT_AUTHOR_IDENT` exits 0 under the project uid with the project
-  identity, and a fixture's repo-local identity still wins over the turn
-  identity.
+  identity, a fixture's repo-local identity still wins over the turn
+  identity, and a configured turn-home `.gitconfig` identity wins over the
+  project fallback.
 - A child under the project uid forks twelve parallel processes.
 - `bun run check` and `bun test` pass.
 

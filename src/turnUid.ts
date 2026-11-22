@@ -909,8 +909,8 @@ function appendIdentityLine(path: string, content: string, line: string): void {
  * Strip inherited git identity env overrides and pin the project identity
  * through GIT_CONFIG_GLOBAL (OTTR-1184): env ident vars beat every git config
  * scope, so a turn's own env must never carry them; the project identity
- * rides a daemon-owned config file that repo-local and fixture config still
- * beat.
+ * rides a daemon-owned config file whose [user] is only the fallback — the
+ * included turn-home gitconfig (OTTR-693) and repo-local config still win.
  */
 export function applyTurnGitEnv(
 	env: Record<string, string | undefined>,
@@ -938,13 +938,15 @@ export function applyTurnGitEnv(
 	writeFileSync(
 		gitconfigPath,
 		`# Project turn identity (OTTR-1184): classic isolated turns point GIT_CONFIG_GLOBAL
-# here. The include keeps the turn home's own git config; this file's keys win over
-# the included file, and repo-local config wins over both.
-include path = ${homePath}/.gitconfig
-
+# here. The [user] section below is only the fallback for a turn home without
+# its own git identity: the include comes after it, so keys in the turn home's
+# .gitconfig win (OTTR-693), and repo-local config wins over both.
 [user]
 	name = ${name}
 	email = ${email}
+
+[include]
+	path = ${homePath}/.gitconfig
 `,
 	);
 	env.GIT_CONFIG_GLOBAL = gitconfigPath;
