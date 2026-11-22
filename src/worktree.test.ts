@@ -4148,6 +4148,7 @@ describe("git", () => {
 		main: string;
 		jar: string;
 		bytes: string;
+		url: string;
 		stop: () => void;
 	}> {
 		const main = repo();
@@ -4207,12 +4208,8 @@ describe("git", () => {
 		const jar = join(main, "server-only.db");
 		const bytes = "SERVER-ONLY-DATA\n";
 		writeFileSync(jar, bytes);
-		await must(
-			main,
-			"config",
-			"remote.origin.url",
-			`https://127.0.0.1:${server.port}/`,
-		);
+		const url = `https://127.0.0.1:${server.port}/`;
+		await must(main, "config", "remote.origin.url", url);
 		await must(main, "config", "http.cookieFile", jar);
 		await must(main, "config", "http.saveCookies", "true");
 		// Control: the plant is live — plain git's libcurl rewrites the file as a jar.
@@ -4230,7 +4227,7 @@ describe("git", () => {
 		if ((await control.exited) !== 0)
 			throw new Error(`control git fetch: ${controlErr}`);
 		expect(readFileSync(jar, "utf8")).not.toBe(bytes);
-		return { main, jar, bytes, stop: () => server.stop(true) };
+		return { main, jar, bytes, url, stop: () => server.stop(true) };
 	}
 
 	test("never rewrites a planted http.cookieFile jar on a board fetch (R5-1)", async () => {
@@ -4240,10 +4237,17 @@ describe("git", () => {
 			// Production shape: git() argv overrides and the gitAuthEnv env config together
 			// (pinnedFetch passes the auth env of the project). The per-layer tests below
 			// pin each half on its own, so a deletion in one layer fails its own test.
+			// Per-URL plants too: git's URL match prefers the longest match across sources,
+			// so these would beat both generic overrides if git() did not out-plant every
+			// http(s) URL the call names.
+			for (const key of [f.url, new URL(f.url).origin]) {
+				await must(f.main, "config", `http.${key}.cookieFile`, f.jar);
+				await must(f.main, "config", `http.${key}.saveCookies`, "true");
+			}
 			writeFileSync(f.jar, f.bytes);
 			const before = statSync(f.jar);
 			const r = await git(
-				["-c", "http.sslVerify=false", "fetch", "origin"],
+				["-c", "http.sslVerify=false", "fetch", f.url],
 				f.main,
 				30_000,
 				gitAuthEnv({ tokens: [], key: null, knownHosts: "/nonexistent" }),
@@ -4261,11 +4265,16 @@ describe("git", () => {
 		const f = await plantedCookieJar();
 		try {
 			// No authEnv: git() resolves networkGitAuth(cwd), which carries no cookie keys
-			// here — the argv -c pair is this fetch's only cookie protection.
+			// here — the argv -c pairs (generic plus per-URL for the named fetch URL) are
+			// this fetch's only cookie protection.
+			for (const key of [f.url, new URL(f.url).origin]) {
+				await must(f.main, "config", `http.${key}.cookieFile`, f.jar);
+				await must(f.main, "config", `http.${key}.saveCookies`, "true");
+			}
 			writeFileSync(f.jar, f.bytes);
 			const before = statSync(f.jar);
 			const r = await git(
-				["-c", "http.sslVerify=false", "fetch", "origin"],
+				["-c", "http.sslVerify=false", "fetch", f.url],
 				f.main,
 				30_000,
 			);

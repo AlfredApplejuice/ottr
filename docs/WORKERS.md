@@ -1332,8 +1332,12 @@ the child git of a submodule, so board git also never recurses into submodules
 (`--submodule=short`, `--no-recurse-submodules`, `--recurse-submodules=no`). Every board
 git also clears `http.cookieFile` and `http.saveCookies`: a planted cookie path would
 make libcurl rewrite that file as a cookie jar after a successful fetch, and the file
-may be a server-only one. Residual limit: a planted
-`http.<url>.proxy` with
+may be a server-only one. A network call that names an http(s) URL also gets a per-URL
+clear for that exact URL (`http.<url>.cookieFile` / `http.<url>.saveCookies`): git's URL
+match prefers the longest match across sources, so a planted per-URL key would beat both
+generic overrides. Residual limit: a call that names a remote instead of a URL reads the
+URL from the repo config, so a per-URL cookie key matching that URL can still win there,
+and a planted `http.<url>.proxy` with
 `http.<url>.sslVerify=false` can also see a token, because git prefers the most
 specific URL match over the env value. No turn's shell sees
 them.

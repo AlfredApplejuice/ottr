@@ -301,6 +301,34 @@ export async function git(
 	}
 	const sub = at < 0 ? "" : (args[at] as string);
 	const isNetwork = NETWORK_GIT[sub] === true;
+	// A planted http.<url>.cookieFile/saveCookies beats the generic pair below: git's URL
+	// match keeps the longest match across sources, and specificity outranks scope. Every
+	// http(s) URL the call names outright therefore gets its own clear — the exact URL is
+	// the most specific pattern possible, and command-line config wins the equal-specificity
+	// tie. A call that names a remote instead reads its URL from repo config, which no -c
+	// can enumerate (docs/WORKERS.md residual).
+	const urlClears: string[] = [];
+	if (isNetwork) {
+		for (let i = 0; i < args.length; i++) {
+			if (args[i] === "-c") {
+				i++;
+				continue;
+			}
+			const a = args[i];
+			if (
+				a !== undefined &&
+				/^https?:\/\//.test(a) &&
+				!urlClears.includes(`http.${a}.cookieFile=`)
+			) {
+				urlClears.push(
+					"-c",
+					`http.${a}.cookieFile=`,
+					"-c",
+					`http.${a}.saveCookies=false`,
+				);
+			}
+		}
+	}
 	const hosted =
 		isNetwork && authEnv === undefined && hostedAuth !== null
 			? await hostedAuth.network(cwd, args)
@@ -361,6 +389,7 @@ export async function git(
 			"http.cookieFile=",
 			"-c",
 			"http.saveCookies=false",
+			...urlClears,
 			...args.slice(0, at + 1),
 			...(PINNED_ARGS[sub] ?? []),
 			...args.slice(at + 1),
