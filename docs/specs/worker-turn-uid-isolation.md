@@ -35,7 +35,10 @@ stays unchanged.
 - The daemon keeps a name-to-uid map for the container's lifetime. When two
   different names map to one uid, the run logs an error line: those two
   projects share a trust boundary until one is renamed. The 2^24 space makes
-  a collision unlikely (about 0.003% at 100 projects).
+  collision unlikely (about 0.003% at 100 projects).
+- At turn start the daemon provisions a passwd and group entry for the
+  project uid (OTTR-1184): name `ottr-<uid>`, home = the turn home, shell
+  `/bin/false`, gecos names the project. Idempotent, fail closed.
 
 ### Soundness rule: root never touches a uid-mutable path
 
@@ -186,13 +189,22 @@ daemon prepares it once per boot, root-only:
   profile is on. The key authorizes image builds, which every turn of the
   pool could run before; the container-internal exposure class is unchanged.
 
+- At boot, when root, the daemon raises its soft RLIMIT_NPROC toward the
+  hard cap (floor 4096) so turn uids can fork (OTTR-1184); it logs a
+  `turn-uid:` note. An unavailable setrlimit degrades to that note.
+
 ### Spawn
 
 `startRun` spawns omp with `uid` and `gid` of the project and the rewritten
 env. The feature is active only when the daemon runs as root; otherwise the
 daemon keeps today's behavior (dev setups). Any identity step that fails
 fails the run with the cause (fail closed): no silent fall-back to a root
-turn.
+turn. The spawn env strips inherited `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
+identity vars (OTTR-1184): env ident vars beat every git config scope. The
+env points `GIT_CONFIG_GLOBAL` at a daemon-owned gitconfig in the turn
+home's provisioning dir that pins the project identity (`<project> turn` /
+`ottr+<project>@localhost`, a slug replaces unsafe chars) while including
+the turn home's own `.gitconfig`; repo-local config still wins over both.
 
 ### Server side
 
@@ -217,6 +229,9 @@ their repo's owner and need nothing.
   the run fails with the cause.
 - Uid collision between two project names: logged per run; both projects
   share a trust boundary until one is renamed.
+- Passwd or group write failure, or a gitconfig write failure: the run
+  fails with the cause.
+- Fork-capacity raise failure: a boot note only; the daemon keeps serving.
 
 ## Acceptance checks
 
@@ -254,6 +269,11 @@ their repo's owner and need nothing.
   marker under the decision lock, so retention stays bounded. A start whose
   marker cannot be written, or whose decision lock stays busy, fails closed
   and deletes nothing.
+- A provisioned uid's `id -un` prints the entry name.
+- `git var GIT_AUTHOR_IDENT` exits 0 under the project uid with the project
+  identity, and a fixture's repo-local identity still wins over the turn
+  identity.
+- A child under the project uid forks twelve parallel processes.
 - `bun run check` and `bun test` pass.
 
 ## Alternatives considered

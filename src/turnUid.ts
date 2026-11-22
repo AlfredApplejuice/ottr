@@ -803,3 +803,240 @@ function closeRootProjectDirs(root: string): string[] {
 	}
 	return notes;
 }
+
+// ---------------------------------------------------------------------------
+// Project identity provisioning (OTTR-1184)
+// ---------------------------------------------------------------------------
+
+import { dlopen, FFIType, ptr, suffix } from "bun:ffi";
+import { appendFileSync } from "node:fs";
+
+/** Where the passwd and group snapshots live; tests point these at temp files. */
+export interface ProvisionPaths {
+	/** Default /etc/passwd. */
+	passwd?: string;
+	/** Default /etc/group. */
+	group?: string;
+}
+
+/** One line's colon-separated fields; field 3 is the numeric id. */
+function numericIdInLine(line: string): number | null {
+	const fields = line.split(":");
+	const id = Number(fields[2]);
+	return fields.length >= 3 && Number.isInteger(id) ? id : null;
+}
+
+function firstFieldName(line: string): string {
+	return line.split(":")[0] ?? "";
+}
+
+function findEntryLine(content: string, id: number): boolean {
+	for (const line of content.split("\n")) {
+		if (numericIdInLine(line) === id) return true;
+	}
+	return false;
+}
+
+/**
+ * A passwd/group entry name for the uid: `ottr-<uid>`, falling back to `-r2`
+ * through `-r4` when that exact name is already bound to a different id. All
+ * four taken fails the run (fail closed): provisioning must never reuse a
+ * name that maps to another uid.
+ */
+function provisionName(content: string, uid: number): string {
+	for (const suffixName of ["", "-r2", "-r3", "-r4"]) {
+		const name = `ottr-${uid}${suffixName}`;
+		const bound = content
+			.split("\n")
+			.find((line) => firstFieldName(line) === name);
+		if (bound === undefined || numericIdInLine(bound) === uid) return name;
+	}
+	throw new Error(
+		`turn-uid: no free passwd/group name for uid ${uid} (ottr-${uid}, -r2..-r4 all taken)`,
+	);
+}
+
+/** GECOS carries no field separators or newlines; project names may legally hold a colon. */
+function provisionGecos(project: string): string {
+	return project.replace(/[\n\r:]/g, " ");
+}
+
+/**
+ * Passwd and group entries for one project uid (OTTR-1184): idempotent,
+ * fail closed. Group entry first, then passwd entry, so a passwd entry never
+ * names a gid the group file lacks.
+ */
+export function ensureProjectIdentity(
+	project: string,
+	ids: TurnIdentity,
+	turnHome: TurnHome,
+	paths: ProvisionPaths = {},
+): void {
+	assertProjectSegment(project);
+	const uid = String(ids.uid);
+	const gid = String(ids.gid);
+
+	const groupPath = paths.group ?? "/etc/group";
+	const groupContent = existsSync(groupPath)
+		? readFileSync(groupPath, "utf8")
+		: "";
+	if (!findEntryLine(groupContent, ids.gid)) {
+		const name = provisionName(groupContent, ids.gid);
+		appendIdentityLine(groupPath, groupContent, `${name}:x:${gid}:`);
+	}
+
+	const passwdPath = paths.passwd ?? "/etc/passwd";
+	const passwdContent = existsSync(passwdPath)
+		? readFileSync(passwdPath, "utf8")
+		: "";
+	if (!findEntryLine(passwdContent, ids.uid)) {
+		const name = provisionName(passwdContent, ids.uid);
+		appendIdentityLine(
+			passwdPath,
+			passwdContent,
+			`${name}:x:${uid}:${gid}:Ottr turn uid for ${provisionGecos(project)}:${turnHome.home}:/bin/false`,
+		);
+	}
+}
+
+/** Append one entry, guarding a missing trailing newline on the snapshot. */
+function appendIdentityLine(path: string, content: string, line: string): void {
+	const prefix = content !== "" && !content.endsWith("\n") ? "\n" : "";
+	appendFileSync(path, `${prefix}${line}\n`);
+}
+
+/**
+ * Strip inherited git identity env overrides and pin the project identity
+ * through GIT_CONFIG_GLOBAL (OTTR-1184): env ident vars beat every git config
+ * scope, so a turn's own env must never carry them; the project identity
+ * rides a daemon-owned config file that repo-local and fixture config still
+ * beat.
+ */
+export function applyTurnGitEnv(
+	env: Record<string, string | undefined>,
+	project: string,
+	turnHome: TurnHome,
+): void {
+	delete env.GIT_AUTHOR_NAME;
+	delete env.GIT_AUTHOR_EMAIL;
+	delete env.GIT_COMMITTER_NAME;
+	delete env.GIT_COMMITTER_EMAIL;
+
+	// Git uses the ident verbatim in commits; the display name keeps only
+	// printable, non-bracket characters, the email only a safe local-part slug.
+	const name = `${project
+		.replace(/[\p{Cc}<>]/gu, " ")
+		.replace(/\s+/g, " ")
+		.trim()} turn`.slice(0, 100);
+	const slug =
+		project.replace(/[^\p{L}\p{N}._-]/gu, "-").slice(0, 64) || "project";
+	const email = `ottr+${slug}@localhost`;
+
+	const homePath =
+		typeof env.HOME === "string" && env.HOME !== "" ? env.HOME : turnHome.home;
+	const gitconfigPath = join(turnHome.provision, "gitconfig");
+	writeFileSync(
+		gitconfigPath,
+		`# Project turn identity (OTTR-1184): classic isolated turns point GIT_CONFIG_GLOBAL
+# here. The include keeps the turn home's own git config; this file's keys win over
+# the included file, and repo-local config wins over both.
+include path = ${homePath}/.gitconfig
+
+[user]
+	name = ${name}
+	email = ${email}
+`,
+	);
+	env.GIT_CONFIG_GLOBAL = gitconfigPath;
+}
+
+/** The soft RLIMIT_NPROC floor a daemon passes to its children (OTTR-1184). */
+const FORK_CAPACITY_FLOOR = 4096;
+
+const RLIMIT_NPROC = 6;
+const UNLIMITED = 18446744073709551615n;
+
+/** setrlimit(RLIMIT_NPROC) through libc; loaded once per process. */
+let setrlimit: ((resource: number, limits: BigUint64Array) => void) | null =
+	null;
+function libcSetrlimit(): (resource: number, limits: BigUint64Array) => void {
+	if (setrlimit === null) {
+		const lib = dlopen(`libc.${suffix}`, {
+			setrlimit: {
+				args: [FFIType.i32, FFIType.ptr],
+				returns: FFIType.i32,
+			},
+		});
+		const symbol = lib.symbols.setrlimit;
+		setrlimit = (resource, limits) => {
+			const rc = symbol(resource, ptr(limits));
+			if (rc !== 0) {
+				throw new Error(`setrlimit(RLIMIT_NPROC) failed, errno ${rc}`);
+			}
+		};
+	}
+	return setrlimit;
+}
+
+function parseMaxProcesses(
+	content: string,
+): { soft: number; hard: number } | null {
+	for (const line of content.split("\n")) {
+		const fields = line.split(/\s+/);
+		if (fields[0] !== "Max" || fields[1] !== "processes") continue;
+		const parse = (field: string | undefined): number | null => {
+			if (field === "unlimited") return Infinity;
+			const value = Number(field);
+			return Number.isInteger(value) && value >= 0 ? value : null;
+		};
+		// 1-based fields: Max(1) processes(2) soft(3) hard(4).
+		const soft = parse(fields[2]);
+		const hard = parse(fields[3]);
+		if (soft === null || hard === null) return null;
+		return { soft, hard };
+	}
+	return null;
+}
+
+/**
+ * Boot check that the daemon's children can fork (OTTR-1184): raises the soft
+ * RLIMIT_NPROC the daemon passes to its children when it sits below the
+ * floor. Returns a boot note line, or null when nothing changed.
+ */
+export function ensureForkCapacity(
+	deps: {
+		limitsPath?: string;
+		setLimit?: (soft: bigint, hard: bigint) => void;
+		floor?: number;
+	} = {},
+): string | null {
+	const limitsPath = deps.limitsPath ?? "/proc/self/limits";
+	const floor = deps.floor ?? FORK_CAPACITY_FLOOR;
+	let parsed: { soft: number; hard: number } | null;
+	try {
+		parsed = parseMaxProcesses(readFileSync(limitsPath, "utf8"));
+	} catch {
+		parsed = null;
+	}
+	if (parsed === null) {
+		return `fork capacity: could not read max processes from ${limitsPath}`;
+	}
+	const { soft, hard } = parsed;
+	if (soft === Infinity) return null;
+	if (soft >= floor) return null;
+	const target = hard === Infinity ? floor : Math.min(floor, hard);
+	if (target <= soft) return null;
+	try {
+		const raise =
+			deps.setLimit ??
+			((limitSoft, limitHard) =>
+				libcSetrlimit()(
+					RLIMIT_NPROC,
+					new BigUint64Array([BigInt(limitSoft), BigInt(limitHard)]),
+				));
+		raise(BigInt(target), hard === Infinity ? UNLIMITED : BigInt(hard));
+	} catch (cause) {
+		return `fork capacity: raise failed: ${String(cause)}`;
+	}
+	return `fork capacity: max processes soft ${soft} -> ${target}`;
+}

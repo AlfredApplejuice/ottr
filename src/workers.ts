@@ -31,8 +31,11 @@ import {
 	type ToolEntry,
 } from "./tools.ts";
 import {
+	applyTurnGitEnv,
 	applyTurnHomeEnv,
 	closeProjectDir,
+	ensureProjectIdentity,
+	type ProvisionPaths,
 	prepareRunWorkspace,
 	prepareTurnHome,
 	projectTurnUid,
@@ -227,6 +230,8 @@ export function serveWorker(opts: {
 		dataRoots: readonly string[];
 		/** The workspace mount root: run cwds must live under it (fail closed). */
 		workspaceRoot: string;
+		/** Provisioning paths the boot/test can point at temp files (OTTR-1184). */
+		provisionPaths?: ProvisionPaths;
 	} | null;
 	/** Only for tests: the sign-ins GET /signins reports instead of reading the worker's own store. */
 	readSignIns?: () => SignIn[];
@@ -493,6 +498,8 @@ export function serveWorker(opts: {
 						turnHome,
 						ids,
 					});
+					ensureProjectIdentity(project, ids, turnHome, turnUid.provisionPaths);
+					applyTurnGitEnv(env, project, turnHome);
 					for (const root of turnUid.dataRoots)
 						closeProjectDir(join(root, project), ids);
 					prepareRunWorkspace(body.cwd, ids, turnUid.workspaceRoot, project);

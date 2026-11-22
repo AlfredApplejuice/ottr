@@ -2934,4 +2934,80 @@ describe("serveWorker turn identity", () => {
 		},
 		30_000,
 	);
+
+	rootTest(
+		"a run provisions the project identity and pins its git identity env",
+		async () => {
+			const workerHome = freshWorkerHome();
+			const homesRoot = freshWorkerHome();
+			const ws = freshWorkerHome();
+			const passwd = join(homesRoot, "passwd");
+			const group = join(homesRoot, "group");
+			writeFileSync(passwd, "root:x:0:0:root:/root:/bin/bash\n");
+			writeFileSync(group, "root:x:0:\n");
+			const repo = join(ws, "git-env-proj");
+			mkdirSync(repo, { recursive: true });
+			Bun.spawnSync(["git", "-C", repo, "init", "-b", "main"], {
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			// Identity stub: dumps the env keys the git-identity rewrite must touch.
+			const identPath = join(workerHome, "gitenv-omp.js");
+			writeFileSync(
+				identPath,
+				`#!${process.execPath}\nprocess.stdout.write(JSON.stringify({ GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL, A_NAME: process.env.GIT_AUTHOR_NAME, A_EMAIL: process.env.GIT_AUTHOR_EMAIL, C_NAME: process.env.GIT_COMMITTER_NAME, C_EMAIL: process.env.GIT_COMMITTER_EMAIL }) + "\\n");`,
+			);
+			chmodSync(identPath, 0o755);
+			chmodSync(workerHome, 0o755);
+
+			const url = start({
+				ompPath: identPath,
+				home: workerHome,
+				turnUid: {
+					homesRoot,
+					workerHome,
+					dataRoots: [],
+					workspaceRoot: ws,
+					provisionPaths: { passwd, group },
+				},
+			});
+			const res = await post(url, {
+				id: "ti-git-env",
+				argv: ["-p"],
+				cwd: repo,
+				stdin: "",
+				project: "git-env-proj",
+				env: {
+					GIT_AUTHOR_NAME: "junk",
+					GIT_AUTHOR_EMAIL: "junk@junk",
+				},
+			});
+			expect(res.status).toBe(200);
+			const dumped = JSON.parse((await readLines(res))[0] ?? "") as Record<
+				string,
+				string | undefined
+			>;
+			const ids = projectTurnUid("git-env-proj");
+			const gitconfig = join(homesRoot, "git-env-proj", "ottr", "gitconfig");
+			expect(dumped.GIT_CONFIG_GLOBAL).toBe(gitconfig);
+			expect(dumped.A_NAME).toBeUndefined();
+			expect(dumped.A_EMAIL).toBeUndefined();
+			expect(dumped.C_NAME).toBeUndefined();
+			expect(dumped.C_EMAIL).toBeUndefined();
+
+			// The passwd and group files gained one entry each for the project uid.
+			const passwdLine = readFileSync(passwd, "utf8")
+				.split("\n")
+				.find((l) => l.split(":")[2] === String(ids.uid));
+			expect(passwdLine).toBeDefined();
+			const groupLine = readFileSync(group, "utf8")
+				.split("\n")
+				.find((l) => l.split(":")[2] === String(ids.uid));
+			expect(groupLine).toBeDefined();
+			// The daemon-owned gitconfig pins the project identity.
+			const gitconfigText = readFileSync(gitconfig, "utf8");
+			expect(gitconfigText).toContain("[user]");
+		},
+		30_000,
+	);
 });

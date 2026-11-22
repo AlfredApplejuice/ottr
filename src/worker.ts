@@ -3,6 +3,7 @@ import { auditProvisioned, rulesDirEntries } from "./provision.ts";
 import { formatBytes, sweepTmpDirs } from "./tmpsweep.ts";
 import {
 	bootTurnIsolation,
+	ensureForkCapacity,
 	isolationEnabled,
 	turnHomesRoot,
 } from "./turnUid.ts";
@@ -31,6 +32,10 @@ if (import.meta.main) {
 	const dataRoots = ["/workspace", "/data"] as const;
 	for (const note of bootTurnIsolation(homedir(), [...dataRoots]))
 		console.log(`turn-uid: ${note}`);
+	if (isolationEnabled()) {
+		const forkNote = ensureForkCapacity();
+		if (forkNote !== null) console.log(`turn-uid: ${forkNote}`);
+	}
 	const server = serveWorker({
 		port: Number(process.env.WORKER_PORT) || 8787,
 		token,

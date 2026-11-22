@@ -22,13 +22,16 @@ import { join } from "node:path";
 import fc from "fast-check";
 import { holdLock } from "./layerLeaseLock.ts";
 import {
+	applyTurnGitEnv,
 	applyTurnHomeEnv,
 	assertProjectSegment,
 	bootTurnIsolation,
 	chownTree,
 	chownTreeFd,
 	closeProjectDir,
+	ensureForkCapacity,
 	ensureLayerCopy,
+	ensureProjectIdentity,
 	isolationEnabled,
 	openPinned,
 	prepareRunWorkspace,
@@ -831,4 +834,457 @@ rootTest("a cwd naming another project fails the run", () => {
 			"other-project",
 		),
 	).toThrow(/does not belong to project/);
+});
+
+// ---------------------------------------------------------------------------
+// Project identity provisioning (OTTR-1184)
+// ---------------------------------------------------------------------------
+
+// The container's real /etc/passwd at authoring time; the fixture starts every
+// provisioning test from real-world data instead of a toy file.
+const PASSWD_SNAPSHOT = `root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+bin:x:2:2:bin:/bin:/usr/sbin/nologin
+sys:x:3:3:sys:/usr/sbin:/usr/sbin/nologin
+sync:x:4:65534:sync:/bin:/bin/sync
+games:x:5:60:games:/usr/games:/usr/sbin/nologin
+man:x:6:12:man:/var/cache/man:/usr/sbin/nologin
+lp:x:7:7:lp:/var/spool/lpd:/usr/sbin/nologin
+mail:x:8:8:mail:/var/mail:/usr/sbin/nologin
+news:x:9:9:news:/var/spool/news:/usr/sbin/nologin
+uucp:x:10:10:uucp:/var/spool/uucp:/usr/sbin/nologin
+proxy:x:13:13:proxy:/bin:/usr/sbin/nologin
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+backup:x:34:34:backup:/var/backups:/usr/sbin/nologin
+list:x:38:38:Mailing List Manager:/var/list:/usr/sbin/nologin
+irc:x:39:39:ircd:/run/ircd:/usr/sbin/nologin
+_apt:x:42:65534::/nonexistent:/usr/sbin/nologin
+nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
+bun:x:1000:1000::/home/bun:/bin/sh
+`;
+
+const GROUP_SNAPSHOT = `root:x:0:
+daemon:x:1:
+bin:x:2:
+sys:x:3:
+adm:x:4:
+tty:x:5:
+disk:x:6:
+lp:x:7:
+mail:x:8:
+news:x:9:
+uucp:x:10:
+man:x:12:
+proxy:x:13:
+kmem:x:15:
+dialout:x:20:
+fax:x:21:
+voice:x:22:
+cdrom:x:24:
+floppy:x:25:
+tape:x:26:
+sudo:x:27:
+audio:x:29:
+dip:x:30:
+www-data:x:33:
+backup:x:34:
+operator:x:37:
+list:x:38:
+irc:x:39:
+src:x:40:
+shadow:x:42:
+utmp:x:43:
+video:x:44:
+sasl:x:45:
+plugdev:x:46:
+staff:x:50:
+games:x:60:
+users:x:100:
+nogroup:x:65534:
+bun:x:1000:
+_ssh:x:101:
+`;
+
+/** A turn home layout without the root-only chown: plain temp dirs. */
+function fakeTurnHome(project: string): TurnHome {
+	const root = freshDir(`fake-home-${project}`);
+	const home = join(root, "home");
+	const provision = join(root, "ottr");
+	mkdirSync(home, { recursive: true });
+	mkdirSync(provision, { recursive: true });
+	return { root, home, layers: join(root, "layers"), provision };
+}
+
+/** A temp passwd/group pair seeded from the real snapshots. */
+function freshIdentityFiles(): { passwd: string; group: string } {
+	const dir = freshDir("identity");
+	const passwd = join(dir, "passwd");
+	const group = join(dir, "group");
+	writeFileSync(passwd, PASSWD_SNAPSHOT);
+	writeFileSync(group, GROUP_SNAPSHOT);
+	return { passwd, group };
+}
+
+describe("ensureProjectIdentity", () => {
+	test("adds one passwd and one group line over the real snapshot", () => {
+		const paths = freshIdentityFiles();
+		const project = "provision-proj";
+		const ids = projectTurnUid(project);
+		const turnHome = fakeTurnHome(project);
+		ensureProjectIdentity(project, ids, turnHome, paths);
+
+		const passwd = readFileSync(paths.passwd, "utf8");
+		const group = readFileSync(paths.group, "utf8");
+		const addedPasswd = passwd
+			.slice(PASSWD_SNAPSHOT.length)
+			.split("\n")
+			.filter((line) => line !== "");
+		const addedGroup = group
+			.slice(GROUP_SNAPSHOT.length)
+			.split("\n")
+			.filter((line) => line !== "");
+		expect(addedPasswd).toHaveLength(1);
+		expect(addedGroup).toHaveLength(1);
+		const name = `ottr-${ids.uid}`;
+		expect(addedPasswd[0]).toBe(
+			`${name}:x:${ids.uid}:${ids.gid}:Ottr turn uid for ${project}:${turnHome.home}:/bin/false`,
+		);
+		expect(addedGroup[0]).toBe(`${name}:x:${ids.gid}:`);
+
+		const before = [passwd, group];
+		ensureProjectIdentity(project, ids, turnHome, paths);
+		expect([
+			readFileSync(paths.passwd, "utf8"),
+			readFileSync(paths.group, "utf8"),
+		]).toEqual(before);
+	});
+
+	test("a name bound to another uid falls back to -r2", () => {
+		const paths = freshIdentityFiles();
+		const project = "provision-conflict";
+		const ids = projectTurnUid(project);
+		const turnHome = fakeTurnHome(project);
+		writeFileSync(
+			paths.passwd,
+			`${PASSWD_SNAPSHOT}ottr-${ids.uid}:x:1:1::/:/bin/false\n`,
+		);
+		ensureProjectIdentity(project, ids, turnHome, paths);
+		const line = readFileSync(paths.passwd, "utf8")
+			.split("\n")
+			.find((l) => l.startsWith(`ottr-${ids.uid}-r2:`));
+		expect(line).toBeDefined();
+		expect(line?.split(":")[2]).toBe(String(ids.uid));
+	});
+
+	test("an unwritable passwd file fails the run", () => {
+		const paths = freshIdentityFiles();
+		const project = "provision-readonly";
+		const ids = projectTurnUid(project);
+		const turnHome = fakeTurnHome(project);
+		chmodSync(paths.passwd, 0o444);
+		expect(() =>
+			ensureProjectIdentity(project, ids, turnHome, paths),
+		).toThrow();
+	});
+
+	test("property: one line per file, ids match, repeat is a no-op", () => {
+		const nameArb = fc
+			.array(fc.constantFrom(..."abcdefghijklmnopqrstuvwxyz0123456789-._ "), {
+				minLength: 1,
+				maxLength: 40,
+			})
+			.map((chars) => chars.join("").replace(/^[.\- ]+/, "") || "p");
+		fc.assert(
+			fc.property(nameArb, (project) => {
+				const dir = mkdtempSync(join(tmpdir(), "ottr-turnuid-prop-"));
+				try {
+					const paths = { passwd: join(dir, "p"), group: join(dir, "g") };
+					writeFileSync(paths.passwd, "");
+					writeFileSync(paths.group, "");
+					const ids = projectTurnUid(project);
+					const turnHome = fakeTurnHome(project);
+					ensureProjectIdentity(project, ids, turnHome, paths);
+					const passwdLines = readFileSync(paths.passwd, "utf8")
+						.split("\n")
+						.filter((l) => l !== "");
+					const groupLines = readFileSync(paths.group, "utf8")
+						.split("\n")
+						.filter((l) => l !== "");
+					if (passwdLines.length !== 1 || groupLines.length !== 1) return false;
+					const passwdFields = passwdLines[0]?.split(":");
+					const groupFields = groupLines[0]?.split(":");
+					if (passwdFields?.[2] !== String(ids.uid)) return false;
+					if (passwdFields?.[3] !== String(ids.gid)) return false;
+					if (groupFields?.[2] !== String(ids.gid)) return false;
+					const before = [
+						readFileSync(paths.passwd, "utf8"),
+						readFileSync(paths.group, "utf8"),
+					];
+					ensureProjectIdentity(project, ids, turnHome, paths);
+					return (
+						readFileSync(paths.passwd, "utf8") === before[0] &&
+						readFileSync(paths.group, "utf8") === before[1]
+					);
+				} finally {
+					rmSync(dir, { recursive: true, force: true });
+				}
+			}),
+			{ numRuns: 100 },
+		);
+	});
+});
+
+describe("applyTurnGitEnv", () => {
+	test("strips ident vars and pins the project identity", () => {
+		const project = "project with spaces";
+		const turnHome = fakeTurnHome(project);
+		const env: Record<string, string | undefined> = {
+			HOME: "/env-home",
+			GIT_AUTHOR_NAME: "junk",
+			GIT_AUTHOR_EMAIL: "junk@junk",
+			GIT_COMMITTER_NAME: "junk",
+			GIT_COMMITTER_EMAIL: "junk@junk",
+			GIT_CONFIG_SYSTEM: "/keep-me",
+		};
+		applyTurnGitEnv(env, project, turnHome);
+		expect(env.GIT_AUTHOR_NAME).toBeUndefined();
+		expect(env.GIT_AUTHOR_EMAIL).toBeUndefined();
+		expect(env.GIT_COMMITTER_NAME).toBeUndefined();
+		expect(env.GIT_COMMITTER_EMAIL).toBeUndefined();
+		expect(env.GIT_CONFIG_SYSTEM).toBe("/keep-me");
+		const gitconfig = join(turnHome.provision, "gitconfig");
+		expect(env.GIT_CONFIG_GLOBAL).toBe(gitconfig);
+		const content = readFileSync(gitconfig, "utf8");
+		expect(content).toContain("include path = /env-home/.gitconfig");
+		expect(content).toContain("[user]");
+		expect(content).toContain("name = project with spaces turn");
+		expect(content).toContain("email = ottr+project-with-spaces@localhost");
+	});
+
+	test("without env.HOME the include points at the turn home", () => {
+		const project = "no-home-proj";
+		const turnHome = fakeTurnHome(project);
+		const env: Record<string, string | undefined> = {
+			HOME: undefined,
+			GIT_AUTHOR_NAME: "junk",
+			GIT_AUTHOR_EMAIL: "junk@junk",
+			GIT_COMMITTER_NAME: "junk",
+			GIT_COMMITTER_EMAIL: "junk@junk",
+		};
+		applyTurnGitEnv(env, project, turnHome);
+		expect(readFileSync(env.GIT_CONFIG_GLOBAL!, "utf8")).toContain(
+			`include path = ${turnHome.home}/.gitconfig`,
+		);
+	});
+});
+
+describe("ensureForkCapacity", () => {
+	function limits(soft: string, hard: string): string {
+		return `Max cpu time            unlimited            unlimited   seconds
+Max processes            ${soft}            ${hard}   processes
+Max open files            1024              524288   files
+`;
+	}
+
+	test("unlimited soft needs no raise", () => {
+		const dir = freshDir("forkcap");
+		const p = join(dir, "limits");
+		writeFileSync(p, limits("unlimited", "unlimited"));
+		expect(ensureForkCapacity({ limitsPath: p })).toBeNull();
+	});
+
+	test("soft below the floor raises to the floor, hard passes through", () => {
+		const dir = freshDir("forkcap");
+		const p = join(dir, "limits");
+		writeFileSync(p, limits("128", "unlimited"));
+		let called: [bigint, bigint] | undefined;
+		const note = ensureForkCapacity({
+			limitsPath: p,
+			setLimit: (soft, hard) => {
+				called = [soft, hard];
+			},
+		});
+		expect(called ?? null).toEqual([4096n, 18446744073709551615n]);
+		expect(note).toBe("fork capacity: max processes soft 128 -> 4096");
+	});
+
+	test("soft at the floor needs no raise", () => {
+		const dir = freshDir("forkcap");
+		const p = join(dir, "limits");
+		writeFileSync(p, limits("5000", "5000"));
+		expect(ensureForkCapacity({ limitsPath: p })).toBeNull();
+	});
+
+	test("a hard cap below the floor caps the target", () => {
+		const dir = freshDir("forkcap");
+		const p = join(dir, "limits");
+		writeFileSync(p, limits("128", "1024"));
+		let called: [bigint, bigint] | undefined;
+		ensureForkCapacity({
+			limitsPath: p,
+			floor: 4096,
+			setLimit: (soft, hard) => {
+				called = [soft, hard];
+			},
+		});
+		expect(called ?? null).toEqual([1024n, 1024n]);
+	});
+
+	test("a missing Max processes line returns the non-fatal note", () => {
+		const dir = freshDir("forkcap");
+		const p = join(dir, "limits");
+		writeFileSync(p, "Max open files            1024   files\n");
+		expect(ensureForkCapacity({ limitsPath: p })).toBe(
+			`fork capacity: could not read max processes from ${p}`,
+		);
+	});
+
+	test("a throwing setter becomes the raise-failed note", () => {
+		const dir = freshDir("forkcap");
+		const p = join(dir, "limits");
+		writeFileSync(p, limits("128", "unlimited"));
+		const note = ensureForkCapacity({
+			limitsPath: p,
+			setLimit: () => {
+				throw new Error("EPERM");
+			},
+		});
+		expect(note?.startsWith("fork capacity: raise failed:")).toBe(true);
+	});
+});
+
+rootTest("ensureProjectIdentity appends a parseable passwd entry", () => {
+	const project = "provision-root";
+	const ids = projectTurnUid(project);
+	const turnHome = fakeTurnHome(project);
+	const paths = freshIdentityFiles();
+	ensureProjectIdentity(project, ids, turnHome, paths);
+	const fields = readFileSync(paths.passwd, "utf8")
+		.split("\n")
+		.find((l) => l.split(":")[2] === String(ids.uid))
+		?.split(":");
+	expect(fields).toBeDefined();
+	expect(fields![0]).toBe(`ottr-${ids.uid}`);
+	expect(fields![1]).toBe("x");
+	expect(fields![2]).toBe(String(ids.uid));
+	expect(fields![3]).toBe(String(ids.gid));
+	expect(fields![4]).toBe(`Ottr turn uid for ${project}`);
+	expect(fields![5]).toBe(turnHome.home);
+	expect(fields![6]).toBe("/bin/false");
+});
+
+rootTest(
+	"a turn's git identity comes from the project config, not inherited env",
+	() => {
+		const project = "git-identity-regression";
+		const ids = projectTurnUid(project);
+		const turnHome = fakeTurnHome(project);
+		const repo = join(freshDir("gitid"), "repo");
+		mkdirSync(repo, { recursive: true });
+		const baseEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" };
+		const git = (...argv: string[]) => {
+			const r = Bun.spawnSync(["git", "-C", repo, ...argv], {
+				stdout: "pipe",
+				stderr: "pipe",
+				env: baseEnv,
+			});
+			if (r.exitCode !== 0)
+				throw new Error(`git ${argv.join(" ")} failed: ${r.stderr.toString()}`);
+			return r.stdout.toString();
+		};
+		git("init", "-b", "main");
+		git("config", "user.name", "fixture-user");
+		git("config", "user.email", "fixture@localhost");
+		writeFileSync(join(repo, "f.txt"), "x\n");
+		chownTree(repo, ids);
+
+		const childEnv: Record<string, string | undefined> = {
+			...baseEnv,
+			HOME: turnHome.home,
+			GIT_AUTHOR_NAME: "junk",
+			GIT_AUTHOR_EMAIL: "junk@junk",
+			GIT_COMMITTER_NAME: "junk",
+			GIT_COMMITTER_EMAIL: "junk@junk",
+		};
+		applyTurnGitEnv(childEnv, project, turnHome);
+		expect(childEnv.GIT_AUTHOR_NAME).toBeUndefined();
+		expect(childEnv.GIT_AUTHOR_EMAIL).toBeUndefined();
+		expect(childEnv.GIT_COMMITTER_NAME).toBeUndefined();
+		expect(childEnv.GIT_COMMITTER_EMAIL).toBeUndefined();
+
+		const expectedName = "git-identity-regression turn";
+		const expectedEmail = `ottr+${project}@localhost`;
+		const ident = Bun.spawnSync(
+			[
+				"setpriv",
+				"--reuid",
+				String(ids.uid),
+				"--regid",
+				String(ids.gid),
+				"--clear-groups",
+				"sh",
+				"-c",
+				"git var GIT_AUTHOR_IDENT",
+			],
+			{
+				cwd: repo,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: childEnv as Record<string, string>,
+			},
+		);
+		expect(ident.exitCode).toBe(0);
+		const identOut = ident.stdout.toString();
+		expect(identOut).toContain(expectedName);
+		expect(identOut).toContain(expectedEmail);
+		expect(identOut).not.toContain("junk");
+
+		// Repo-local config still wins over the project identity file.
+		const local = Bun.spawnSync(
+			[
+				"setpriv",
+				"--reuid",
+				String(ids.uid),
+				"--regid",
+				String(ids.gid),
+				"--clear-groups",
+				"sh",
+				"-c",
+				"git config user.name",
+			],
+			{
+				cwd: repo,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: childEnv as Record<string, string>,
+			},
+		);
+		expect(local.exitCode).toBe(0);
+		expect(local.stdout.toString().trim()).toBe("fixture-user");
+	},
+);
+
+rootTest("a turn uid can fork twelve parallel children", () => {
+	ensureForkCapacity();
+	const ids = projectTurnUid("fork-capacity-probe");
+	const probe = Bun.spawnSync(
+		[
+			"setpriv",
+			"--reuid",
+			String(ids.uid),
+			"--regid",
+			String(ids.gid),
+			"--clear-groups",
+			"sh",
+			"-c",
+			"i=0; while [ $i -lt 12 ]; do sleep 0.2 & i=$((i+1)); done; wait",
+		],
+		{
+			stdout: "pipe",
+			stderr: "pipe",
+			env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+		},
+	);
+	expect(probe.stderr.toString()).not.toContain("Cannot fork");
+	expect(probe.exitCode).toBe(0);
 });
