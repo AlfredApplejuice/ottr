@@ -460,6 +460,40 @@ describe("serverMergePush", () => {
 		}
 	});
 
+	test("a diverged non-checked-out target branch parks instead of discarding commits", async () => {
+		// branch -f never refuses divergence: the old merge --ff-only parked there, and
+		// the ref move must not silently orphan local-only commits on the target.
+		const f = fixture(false);
+		try {
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			run(f.bare, "branch", "develop", "main");
+			run(f.main, "fetch", "-q", "origin", "develop");
+			run(f.main, "branch", "develop", "origin/develop");
+			run(f.main, "checkout", "-q", "--detach", "origin/develop");
+			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "divergent");
+			const divergent = run(f.main, "rev-parse", "HEAD");
+			run(f.main, "update-ref", "refs/heads/develop", divergent);
+			const diverged = run(f.main, "rev-parse", "refs/heads/develop");
+			run(f.main, "checkout", "-q", "main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/develop",
+				"ott/x",
+				null,
+				f.bare,
+				true,
+			);
+			expect(r.status).toBe("failed");
+			expect(
+				r.status === "failed" && r.error.includes("cannot fast-forward"),
+			).toBe(true);
+			expect(run(f.main, "rev-parse", "refs/heads/develop")).toBe(diverged);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
 	test("a worktree head the target cannot fast-forward to parks the push with the reason", async () => {
 		const f = fixture(false);
 		try {

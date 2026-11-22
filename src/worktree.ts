@@ -1826,6 +1826,20 @@ async function serverFastForward(
 		mainPath,
 	);
 	if (holds.code === 0) return { status: "done", output: "" };
+	// branch -f never refuses divergence, and silently discarding local-only commits
+	// would lose what the old merge --ff-only refused: the move must be a fast-forward
+	// (OTTR-987 review).
+	const ffable = await git(
+		["merge-base", "--is-ancestor", local, head],
+		mainPath,
+	);
+	if (ffable.code !== 0)
+		return {
+			status: "failed",
+			error: redactUrlCredentials(
+				`the target branch ${branch} cannot fast-forward to the integration head ${head}`,
+			),
+		};
 	const checkedOut = await checkedOutBranch(mainPath);
 	const r =
 		checkedOut === branch
