@@ -19,6 +19,11 @@ for (const key of Object.keys(process.env)) {
 	if (
 		/^(OTTR_|OMP_|ALATE_|HINDSIGHT_|GH_|PI_CODING_|GIT_AUTHOR_|GIT_COMMITTER_)/.test(
 			key,
+		) &&
+		// Test controls survive the scrub: CI sets these on its test step, and the
+		// sandbox data guard passes its watched roots to its child through them.
+		!/^(OTTR_TEST_|OTTR_REQUIRE_PG_TESTS|OTTR_DATA_DIR|OTTR_DATABASE_URL|OTTR_PG_ALLOW_EMPTY)/.test(
+			key,
 		)
 	)
 		delete process.env[key];

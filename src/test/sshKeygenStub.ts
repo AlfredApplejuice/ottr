@@ -45,14 +45,22 @@ const pubLine = (key, comment) => {
 
 const f = get("-f");
 if (args.includes("-l")) {
+	const algo = get("-E") ?? "sha256";
+	if (algo !== "sha256" && algo !== "md5")
+		fail("ssh-keygen: unknown digest " + algo);
 	const input = f === "-"
 		? await new Response(Bun.stdin.stream()).text()
 		: existsSync(f) ? readFileSync(f, "utf8") : fail("ssh-keygen: " + f + ": No such file or directory");
 	for (const line of input.split("\\n")) {
 		const m = line.match(/(ssh-ed25519|ssh-rsa|ecdsa-sha2-\\S+)\\s+([A-Za-z0-9+/=]+)/);
 		if (!m) continue;
-		const fp = createHash("sha256").update(Buffer.from(m[2], "base64")).digest("base64").replace(/=+$/, "");
-		console.log("256 SHA256:" + fp + " (ED25519)");
+		if (algo === "md5") {
+			const fp = createHash("md5").update(Buffer.from(m[2], "base64")).digest("hex").replace(/(..)(?=.)/g, "$1:");
+			console.log("256 MD5:" + fp + " (ED25519)");
+		} else {
+			const fp = createHash("sha256").update(Buffer.from(m[2], "base64")).digest("base64").replace(/=+$/, "");
+			console.log("256 SHA256:" + fp + " (ED25519)");
+		}
 	}
 	process.exit(0);
 }

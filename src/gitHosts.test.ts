@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	existsSync,
 	mkdtempSync,
@@ -448,15 +449,48 @@ describe("importPendingKey", () => {
 			const r = await importPendingKey(dir, readFileSync(plain, "utf8"));
 			expect("id" in r).toBe(true);
 			if (!("id" in r)) return;
-			const ref = Bun.spawnSync([
-				join(sshKeygenStubDir(), "ssh-keygen"),
-				"-l",
-				"-E",
-				"sha256",
-				"-f",
-				`${plain}.pub`,
-			]).stdout.toString();
-			expect(r.fingerprint).toBe(/SHA256:[A-Za-z0-9+/=]+/.exec(ref)?.[0] ?? "");
+			// The expected fingerprint, computed from the key bytes against the OpenSSH
+			// wire spec: an oracle independent of both the stub and the production path,
+			// so the real-tool check survives the stub substitution.
+			const pub = readFileSync(`${plain}.pub`, "utf8").trim();
+			const blob = Buffer.from(pub.split(/\s+/)[1] ?? "", "base64");
+			const expectSha =
+				"SHA256:" +
+				createHash("sha256").update(blob).digest("base64").replace(/=+$/, "");
+			expect(r.fingerprint).toBe(expectSha);
+			// The stub answers -E per algorithm, so production's digest choice stays
+			// observable: a regression from sha256 to md5 cannot hide behind the stub.
+			const sha = Bun.spawnSync(
+				[
+					join(sshKeygenStubDir(), "ssh-keygen"),
+					"-l",
+					"-E",
+					"sha256",
+					"-f",
+					`${plain}.pub`,
+				],
+				{ stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+			);
+			expect(sha.exitCode).toBe(0);
+			expect(sha.stdout.toString()).toContain(expectSha);
+			const md5 = Bun.spawnSync(
+				[
+					join(sshKeygenStubDir(), "ssh-keygen"),
+					"-l",
+					"-E",
+					"md5",
+					"-f",
+					`${plain}.pub`,
+				],
+				{ stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+			);
+			expect(md5.exitCode).toBe(0);
+			expect(md5.stdout.toString()).toContain(
+				`MD5:${createHash("md5")
+					.update(blob)
+					.digest("hex")
+					.replace(/(..)(?=.)/g, "$1:")}`,
+			);
 			const crlf = await importPendingKey(
 				dir,
 				readFileSync(plain, "utf8").replaceAll("\n", "\r\n"),
@@ -793,15 +827,13 @@ describe("defaultSshDir", () => {
 
 	test("a native start keeps keys outside the Ottr checkout and every project root", () => {
 		const home = mkdtempSync(join(tmpdir(), "ottr-home-"));
+		// The projects root as OMP_TRACKER_ROOTS would name it: its own fixture tree,
+		// kept disjoint from the home, so all three roots assert unconditionally in
+		// every layout — a checkout under the OS temp dir included.
+		const projectsTree = mkdtempSync(join(tmpdir(), "ottr-ssh-proj-"));
 		try {
-			// The projects parent claims the home itself when the checkout sits under the OS
-			// temp dir (a scratch tree, like the /tmp probes of OTTR-1154): the parent then
-			// contains the home and the assertion false-reds on the home's own ssh dir.
-			// Roots stay the checkout, its projects parent, and a workspace under the home;
-			// the parent drops from that one layout only.
-			const projectsRoot = resolve(repo, "..");
-			const roots = [repo, join(home, "workspace")];
-			if (!inside(home, projectsRoot)) roots.push(projectsRoot);
+			const projectsRoot = join(projectsTree, "projects");
+			const roots = [repo, projectsRoot, join(home, "workspace")];
 			for (const [env, platform] of [
 				[{}, "linux"],
 				[{ XDG_DATA_HOME: join(home, "data") }, "linux"],
@@ -816,6 +848,7 @@ describe("defaultSshDir", () => {
 			expect(inside(defaultSshDir({}), repo)).toBe(false);
 		} finally {
 			rmSync(home, { recursive: true, force: true });
+			rmSync(projectsTree, { recursive: true, force: true });
 		}
 	});
 
