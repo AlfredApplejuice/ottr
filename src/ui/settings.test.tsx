@@ -1,6 +1,6 @@
-import { afterAll, beforeAll, describe, expect, jest, test } from "bun:test";
-import { type Node as HappyNode, Window } from "happy-dom";
-import { act } from "react";
+import { describe, expect, jest, test } from "bun:test";
+import type { Node as HappyNode } from "happy-dom";
+import { act, type ReactElement } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import type {
@@ -47,6 +47,13 @@ import {
 	userLayerEmpty,
 	userLayerLine,
 } from "./settings.tsx";
+import {
+	installBrowserGlobals,
+	mount,
+	onChangeOf,
+	onClickOf,
+	stubFetch,
+} from "./testDom.tsx";
 import { stamp } from "./time.ts";
 
 describe("runner cap draft", () => {
@@ -59,55 +66,34 @@ describe("runner cap draft", () => {
 	});
 });
 
-// React interaction needs browser globals; bun test has none. happy-dom (added
-// with the card's approval) registers them here; afterAll puts the originals
-// back, so later test files in the same process see no DOM. One named alias
-// keeps the assignments type-checked in one place.
-const window = new Window({ url: "http://localhost/" });
-const host = globalThis as unknown as Record<string, unknown>;
-const browserGlobals: Record<string, unknown> = {
-	window,
-	document: window.document,
-	navigator: window.navigator,
-	location: window.location,
-	history: window.history,
-	PopStateEvent: window.PopStateEvent,
-	Event: window.Event,
-	HTMLElement: window.HTMLElement,
-	HTMLInputElement: window.HTMLInputElement,
-	HTMLTextAreaElement: window.HTMLTextAreaElement,
-	Node: window.Node,
-	getComputedStyle: window.getComputedStyle,
-	requestAnimationFrame: window.requestAnimationFrame,
-	cancelAnimationFrame: window.cancelAnimationFrame,
-};
-const originals = new Map<string, unknown>();
+// React interaction needs browser globals; bun test has none. installBrowserGlobals
+// (shared with the other UI test files) registers the happy-dom globals here, and
+// afterAll puts the originals back, so later test files in the same process see
+// no DOM.
+const { window } = installBrowserGlobals([
+	"location",
+	"history",
+	"PopStateEvent",
+	"Event",
+	"HTMLElement",
+	"HTMLInputElement",
+	"HTMLTextAreaElement",
+	"Node",
+	"getComputedStyle",
+	"requestAnimationFrame",
+	"cancelAnimationFrame",
+]);
 
-beforeAll(() => {
-	host.IS_REACT_ACT_ENVIRONMENT = true;
-	for (const [key, value] of Object.entries(browserGlobals)) {
-		originals.set(key, host[key]);
-		host[key] = value;
-	}
-	// happy-dom has no popover API; the model picker calls showPopover/hidePopover
-	// directly. No-op stand-ins keep those calls working here: the top-layer
-	// placement they drive in browsers is browser-only anyway. happy-dom's
-	// element classes are per-Window, so this never reaches another test file.
-	const proto = window.HTMLElement.prototype as unknown as Record<
-		string,
-		unknown
-	>;
-	for (const method of ["showPopover", "hidePopover", "togglePopover"])
-		if (proto[method] === undefined) proto[method] = () => {};
-});
-
-afterAll(() => {
-	delete host.IS_REACT_ACT_ENVIRONMENT;
-	for (const [key, value] of originals) {
-		if (value === undefined) delete host[key];
-		else host[key] = value;
-	}
-});
+// happy-dom has no popover API; the model picker calls showPopover/hidePopover
+// directly. No-op stand-ins keep those calls working here: the top-layer
+// placement they drive in browsers is browser-only anyway. happy-dom's
+// element classes are per-Window, so this never reaches another test file.
+const popoverProto = window.HTMLElement.prototype as unknown as Record<
+	string,
+	unknown
+>;
+for (const method of ["showPopover", "hidePopover", "togglePopover"])
+	if (popoverProto[method] === undefined) popoverProto[method] = () => {};
 
 /** The rendered GitHub App block, isolated from the other sec-blocks. */
 const appBlock = (): string => {
@@ -119,6 +105,289 @@ const appBlock = (): string => {
 	expect(start).toBeGreaterThan(-1);
 	expect(end).toBeGreaterThan(start);
 	return html.slice(start, end);
+};
+
+/** A minimal ProjectView: the form reads the name and the full settings shape.
+ *  `over` sets top-level fields, `settings` adds setting keys beside the shared base. */
+const baseSettings = {
+	maxParallel: 2,
+	copyExtra: [],
+	displayName: null,
+	releaseCommand: null,
+	archReviewCap: 30,
+	maxImages: 4,
+	keptWorktreeDays: 7,
+	autoTend: false,
+	autoTendLimit: 5,
+	tendChurnGlobs: [],
+	holdUpdateMerges: false,
+	retroSince: null,
+	retroFilter: true,
+	forkResearch: false,
+	prReviews: false,
+	prMode: false,
+	microVm: false,
+	setupChecklist: false,
+	targetBranch: null,
+	originUrl: null,
+};
+
+const projectView = (
+	over: Record<string, unknown> = {},
+	settings: Record<string, unknown> = {},
+): ProjectView =>
+	({
+		name: "proj",
+		icon: null,
+		remote: null,
+		github: null,
+		vmRunner: {
+			configured: false,
+			ok: false,
+			reason: "OTTR_VM_RUNNER_URL is not set",
+		},
+		hasRules: true,
+		gitless: false,
+		settings: { ...baseSettings, ...settings },
+		...over,
+	}) as unknown as ProjectView;
+
+/** The watch-card settings both watch describes serve: every watch off. A
+ *  describe spreads its own flag (and its extra keys) over this base. */
+const watchBaseSettings = {
+	holdUpdateMerges: false,
+	retroSince: null,
+	retroFilter: false,
+	forkResearch: false,
+	trendingScout: false,
+	prReviews: false,
+	prMode: false,
+	issueWatch: false,
+	codeScanWatch: false,
+	ompWatch: false,
+	dependabotWarn: true,
+	microVm: false,
+	maxParallel: 2,
+	copyExtra: [],
+	displayName: null,
+	releaseCommand: null,
+	archReviewCap: 30,
+	maxImages: 4,
+	keptWorktreeDays: 7,
+	autoTend: false,
+	autoTendLimit: 5,
+	tendChurnGlobs: [],
+	setupChecklist: false,
+	targetBranch: null,
+	originUrl: null,
+} as unknown as ProjectView["settings"];
+
+/** A JSON Response with `status`. */
+const jsonResponse = (status: number, body: unknown): Response =>
+	new Response(JSON.stringify(body), {
+		status,
+		headers: { "Content-Type": "application/json" },
+	});
+
+/** The watch row whose label names `label` in the watches card. */
+const watchRowByLabel = (container: Element, label: string): Element =>
+	[...container.querySelectorAll("#project-watches-section .check-row")].find(
+		(r) => r.querySelector("label")?.textContent === label,
+	) as Element;
+
+/** The button whose trimmed text is `text`. */
+const buttonByText = (container: Element, text: string): HTMLButtonElement =>
+	Array.from(container.querySelectorAll("button")).find(
+		(b) => b.textContent?.trim() === text,
+	) as HTMLButtonElement;
+
+/** The shared /api/git-hosts section mock: the host view load (`hosts`, with
+ *  `onHostsGet` counting), the GitHub token check (`tokenCheck`), and the
+ *  turn-token block (GET `turnGet`; POSTs go to `onTurnPost`, whose Response
+ *  answers). `extra` handles the routes a test adds; anything else throws. */
+const gitHostsMock = (config: {
+	hosts: () => unknown;
+	onHostsGet?: () => void;
+	tokenCheck?: () => unknown;
+	turnGet?: () => unknown;
+	onTurnPost?: (url: string, body: unknown) => Response | undefined;
+	extra?: (
+		url: string,
+		init?: RequestInit,
+	) => Response | undefined | Promise<Response>;
+}): typeof fetch =>
+	(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+		const url = String(input);
+		if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET") {
+			config.onHostsGet?.();
+			return ok(config.hosts());
+		}
+		if (url.endsWith("/api/settings/github-token"))
+			return ok(config.tokenCheck?.() ?? { tokenSet: false, expiresAt: null });
+		if (url.includes("/api/settings/turn-github-token")) {
+			if ((init?.method ?? "GET") === "GET")
+				return ok(config.turnGet?.() ?? { tokens: [] });
+			const hit = config.onTurnPost?.(url, JSON.parse(String(init?.body)));
+			if (hit !== undefined) return hit;
+			throw new Error(`unexpected fetch POST ${url}`);
+		}
+		const hit = await config.extra?.(url, init);
+		if (hit !== undefined) return hit;
+		throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+	}) as typeof fetch;
+
+/** The checkbox of the first watches-card row whose label includes `text`. */
+const watchCheckbox = (container: Element, text: string): HTMLInputElement => {
+	const card = container.querySelector("#project-watches-section");
+	const label = [...(card?.querySelectorAll("label") ?? [])].find((l) =>
+		l.textContent?.includes(text),
+	);
+	if (label === undefined) throw new Error(`${text} row missing`);
+	const input = container.querySelector<HTMLInputElement>(
+		`input[id="${label.htmlFor}"]`,
+	);
+	if (input === null || input === undefined)
+		throw new Error(`${text} checkbox did not render`);
+	return input;
+};
+
+/** The watch-card form mount both watch describes use: POST /api/projects/proj/settings
+ *  records into `posted` and answers with `p`, the visibility and ssh-key mount calls
+ *  answer, and POST/GET `checkRoute` records its calls and answers `answer`. The
+ *  cleanup puts fetch and the DOM back. */
+async function watchForm(
+	p: ProjectView,
+	checkRoute: string,
+	answer: (url: string) => Response,
+): Promise<{
+	container: HTMLDivElement;
+	posted: { body: Record<string, unknown> | undefined };
+	checkCalls: { url: string; method: string }[];
+	unmount: () => Promise<void>;
+}> {
+	const checkCalls: { url: string; method: string }[] = [];
+	const posted: { body: Record<string, unknown> | undefined } = {
+		body: undefined,
+	};
+	const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
+		const url = String(input);
+		if (url.endsWith(checkRoute)) {
+			checkCalls.push({ url, method: init?.method ?? "GET" });
+			return answer(url);
+		}
+		if (
+			url.endsWith("/api/projects/proj/settings") &&
+			init?.method === "POST"
+		) {
+			posted.body = JSON.parse(String(init.body)) as Record<string, unknown>;
+			return jsonResponse(200, p);
+		}
+		if (url.endsWith("/api/projects/proj/github/visibility"))
+			return jsonResponse(200, { private: false });
+		if (url.endsWith("/api/projects/proj/ssh-key"))
+			return jsonResponse(200, { own: null, expiresAt: null });
+		throw new Error(`unexpected fetch ${url}`);
+	}) as typeof fetch;
+	const { restore: fetchRestore } = stubFetch(fetchMock);
+	const { container, unmount } = await mount(
+		<ProjectSettingsForm
+			project={p}
+			tasks={[]}
+			trendingScan={true}
+			act={async (fn) => {
+				await fn();
+				return true;
+			}}
+			openTask={() => {}}
+		/>,
+	);
+	return {
+		container,
+		posted,
+		checkCalls,
+		unmount: async () => {
+			await unmount();
+			fetchRestore();
+		},
+	};
+}
+
+/** Answers the check route from `checks` in order; an extra call throws. */
+const answerQueue =
+	(checks: Response[]) =>
+	(url: string): Response => {
+		const answers = [...checks];
+		const next = answers.shift();
+		if (next === undefined) throw new Error(`unexpected fetch ${url}`);
+		return next;
+	};
+
+/** Mounts ProjectSettingsForm for `project` against `fetchMock`; the cleanup
+ *  puts fetch and the DOM back. */
+async function mountForm(
+	project: ProjectView,
+	fetchMock: typeof fetch,
+): Promise<{
+	container: HTMLDivElement;
+	unmount: () => Promise<void>;
+}> {
+	const { restore: fetchRestore } = stubFetch(fetchMock);
+	const { container, unmount } = await mount(
+		<ProjectSettingsForm
+			project={project}
+			tasks={[]}
+			trendingScan={true}
+			act={async (fn) => {
+				await fn();
+				return true;
+			}}
+			openTask={() => {}}
+		/>,
+	);
+	return {
+		container,
+		unmount: async () => {
+			await unmount();
+			fetchRestore();
+		},
+	};
+}
+
+/** Fetch mock for the form sections: POST /api/projects/proj/settings hands the
+ *  decoded body to `onPost` and answers with `project`; the ssh-key probe that the
+ *  side sections load on mount answers empty. */
+const projectFormFetch = (
+	project: ProjectView,
+	onPost: (body: Record<string, unknown>) => void,
+): typeof fetch =>
+	(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+		const url = String(input);
+		if (
+			url.endsWith("/api/projects/proj/settings") &&
+			init?.method === "POST"
+		) {
+			onPost(JSON.parse(String(init.body)) as Record<string, unknown>);
+			return ok(project);
+		}
+		if (url.endsWith("/api/projects/proj/ssh-key"))
+			return ok({ own: null, expiresAt: null });
+		throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+	}) as typeof fetch;
+
+/** Every JSON body these fetch mocks answer with: a 200 application/json Response. */
+const ok = (body: unknown): Response =>
+	new Response(JSON.stringify(body), {
+		status: 200,
+		headers: { "Content-Type": "application/json" },
+	});
+const okRes = ok;
+
+/** Lets a chain of section requests and refetches land. */
+const flushSection = async (): Promise<void> => {
+	for (let k = 0; k < 5; k++)
+		await act(async () => {
+			await new Promise((r) => setTimeout(r, 0));
+		});
 };
 
 /** A React onChange picks up programmatic edits only through the native value setter. */
@@ -136,33 +405,9 @@ const typeInto = (
 };
 
 /** happy-dom's dispatched input and change events never reach React's
- *  ChangeEventPlugin (upstream gap; the submit event does). The test therefore
- *  calls the production onChange React rendered onto the node, which is the
- *  same handler a browser input event would run. */
-const onChangeOf = (node: Element): ((e: unknown) => void) => {
-	const key = Object.getOwnPropertyNames(node).find((k) =>
-		k.startsWith("__reactProps$"),
-	);
-	if (key === undefined) throw new Error("react props missing on node");
-	const props = (node as unknown as Record<string, unknown>)[key] as {
-		onChange?: (e: unknown) => void;
-	};
-	if (props.onChange === undefined) throw new Error("node has no onChange");
-	return props.onChange;
-};
-
-/** The production onClick React rendered onto the node, read like onChangeOf. */
-const onClickOf = (node: Element): ((e: unknown) => void) => {
-	const key = Object.getOwnPropertyNames(node).find((k) =>
-		k.startsWith("__reactProps$"),
-	);
-	if (key === undefined) throw new Error("react props missing on node");
-	const props = (node as unknown as Record<string, unknown>)[key] as {
-		onClick?: (e: unknown) => void;
-	};
-	if (props.onClick === undefined) throw new Error("node has no onClick");
-	return props.onClick;
-};
+ *  ChangeEventPlugin (upstream gap; the submit event does). The tests therefore
+ *  call the production onChange/onClick React rendered onto the node, via the
+ *  shared onChangeOf/onClickOf helpers; handlerOf covers the other props. */
 
 /** The production React handler `prop` on the node, read like onChangeOf. Drag and key
  * handlers attach conditionally (a drag only once dragstart set the state), so a missing
@@ -202,28 +447,17 @@ async function mountSection(fetchMock: typeof fetch): Promise<{
 	container: HTMLDivElement;
 	unmount: () => Promise<void>;
 }> {
-	const realFetch = globalThis.fetch;
-	globalThis.fetch = fetchMock;
+	const { restore: fetchRestore } = stubFetch(fetchMock);
 	// happy-dom's DOM classes do not structurally match lib.dom's; the test
 	// speaks lib types, so the boundary converts once here.
-	const container = window.document.createElement(
-		"div",
-	) as unknown as HTMLDivElement;
-	window.document.body.appendChild(container as unknown as HappyNode);
-	const root = createRoot(container);
-	await act(async () => {
-		root.render(
-			<GitHostsSection commitIdentity={null} act={async () => true} />,
-		);
-	});
+	const { container, unmount } = await mount(
+		<GitHostsSection commitIdentity={null} act={async () => true} />,
+	);
 	return {
 		container,
 		unmount: async () => {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			fetchRestore();
 		},
 	};
 }
@@ -247,37 +481,26 @@ describe("GitHostsSection GitHub App form", () => {
 		let postBody: { id?: string; key?: string } | undefined;
 		const { promise: postInFlight, resolve: resolvePost } =
 			Promise.withResolvers<Response>();
-		const ok = (body: unknown): Response =>
-			new Response(JSON.stringify(body), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
 		const view = {
 			tokens: [],
 			globalKey: null,
 			githubApp: null,
 			githubHost: "github.com",
 		};
-		const fetchMock = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET")
-				return ok(view);
-			// The GitHub token block in the same section checks its state on mount.
-			if (url.endsWith("/api/settings/github-token"))
-				return ok({ tokenSet: false, expiresAt: null });
-			// The turn-token block in the same section loads its rows on mount.
-			if (url.endsWith("/api/settings/turn-github-token"))
-				return ok({ host: "github.com", tokens: [] });
-			if (url.endsWith("/api/git-hosts/github-app")) {
-				postCalls += 1;
-				postBody = JSON.parse(String(init?.body));
-				return postInFlight;
-			}
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
+		const fetchMock = gitHostsMock({
+			hosts: () => view,
+			// The GitHub token block in the same section checks its state on mount,
+			// and the turn-token block loads its rows; gitHostsMock serves both.
+			turnGet: () => ({ host: "github.com", tokens: [] }),
+			extra: (url, init) => {
+				if (url.endsWith("/api/git-hosts/github-app")) {
+					postCalls += 1;
+					postBody = JSON.parse(String(init?.body));
+					return postInFlight;
+				}
+				return undefined;
+			},
+		});
 
 		const { container, unmount } = await mountSection(fetchMock);
 		try {
@@ -355,11 +578,6 @@ describe("GitHostsSection GitHub App form", () => {
 });
 
 describe("GitHostsSection GitHub host", () => {
-	const ok = (body: unknown): Response =>
-		new Response(JSON.stringify(body), {
-			status: 200,
-			headers: { "Content-Type": "application/json" },
-		});
 	const view = {
 		tokens: [],
 		globalKey: null,
@@ -367,28 +585,21 @@ describe("GitHostsSection GitHub host", () => {
 		githubHost: "github.com",
 	};
 
-	/** Mock for /api/git-hosts and the GitHub token check; `extra` handles the rest. */
+	/** Mock for /api/git-hosts and the GitHub token check; `extra` handles the
+	 *  rest. `fixture` replaces the served view (a save test mutates its copy). */
 	const baseMock = (
 		loaded: { calls: number },
 		extra: (url: string, init?: RequestInit) => Response | undefined,
+		fixture: typeof view = view,
 	): typeof fetch =>
-		(async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET") {
+		gitHostsMock({
+			hosts: () => fixture,
+			onHostsGet: () => {
 				loaded.calls += 1;
-				return ok(view);
-			}
-			if (url.endsWith("/api/settings/github-token"))
-				return ok({ tokenSet: false, expiresAt: null });
-			if (url.endsWith("/api/settings/turn-github-token"))
-				return ok({ host: view.githubHost, tokens: [] });
-			const hit = extra(url, init);
-			if (hit !== undefined) return hit;
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
+			},
+			turnGet: () => ({ host: fixture.githubHost, tokens: [] }),
+			extra,
+		});
 
 	test("the input is prefilled with the host in effect", async () => {
 		const loaded = { calls: 0 };
@@ -413,31 +624,23 @@ describe("GitHostsSection GitHub host", () => {
 		let postCalls = 0;
 		let postBody: { host?: string } | undefined;
 		const fixture = { ...view };
-		const fetchMock = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET") {
-				loaded.calls += 1;
-				return ok(fixture);
-			}
-			if (url.endsWith("/api/settings/github-token"))
-				return ok({ tokenSet: false, expiresAt: null });
-			if (url.endsWith("/api/settings/turn-github-token"))
-				return ok({ host: fixture.githubHost, tokens: [] });
-			if (
-				url.endsWith("/api/settings/github-host") &&
-				init?.method === "POST"
-			) {
-				postCalls += 1;
-				postBody = JSON.parse(String(init.body));
-				// The save lands; the refetch then reports the new host.
-				fixture.githubHost = "acme.ghe.com";
-				return ok({ host: "acme.ghe.com", expiresAt: null });
-			}
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
+		const fetchMock = baseMock(
+			loaded,
+			(url, init) => {
+				if (
+					url.endsWith("/api/settings/github-host") &&
+					init?.method === "POST"
+				) {
+					postCalls += 1;
+					postBody = JSON.parse(String(init.body));
+					// The save lands; the refetch then reports the new host.
+					fixture.githubHost = "acme.ghe.com";
+					return ok({ host: "acme.ghe.com", expiresAt: null });
+				}
+				return undefined;
+			},
+			fixture,
+		);
 		const { container, unmount } = await mountSection(fetchMock);
 		try {
 			const input = container.querySelector<HTMLInputElement>(
@@ -511,10 +714,7 @@ describe("GitHostsSection GitHub host", () => {
 				form.dispatchEvent(submitEvent());
 			});
 			// The save chains two requests and a refetch: let them all land.
-			for (let k = 0; k < 5; k++)
-				await act(async () => {
-					await new Promise((r) => setTimeout(r, 0));
-				});
+			await flushSection();
 			expect(posts.map((p) => p.url.replace(/^.*\/api/, "/api"))).toEqual([
 				"/api/settings/github-host",
 				"/api/settings/github-token",
@@ -530,10 +730,7 @@ describe("GitHostsSection GitHub host", () => {
 				form.dispatchEvent(submitEvent());
 			});
 			// The save chains two requests and a refetch: let them all land.
-			for (let k = 0; k < 5; k++)
-				await act(async () => {
-					await new Promise((r) => setTimeout(r, 0));
-				});
+			await flushSection();
 			expect(posts.map((p) => p.url.replace(/^.*\/api/, "/api"))).toEqual([
 				"/api/settings/github-token",
 			]);
@@ -591,109 +788,17 @@ describe("GitHostsSection GitHub host", () => {
 });
 
 describe("ProjectSettingsForm target branch", () => {
-	// A minimal ProjectView: the form reads the name and the full settings shape.
-	const project = {
-		name: "proj",
-		icon: null,
-		remote: null,
-		github: null,
-		vmRunner: {
-			configured: false,
-			ok: false,
-			reason: "OTTR_VM_RUNNER_URL is not set",
-		},
-		hasRules: true,
-		gitless: false,
-		settings: {
-			maxParallel: 2,
-			copyExtra: [],
-			displayName: null,
-			releaseCommand: null,
-			archReviewCap: 30,
-			maxImages: 4,
-			keptWorktreeDays: 7,
-			autoTend: false,
-			autoTendLimit: 5,
-			tendChurnGlobs: [],
-			holdUpdateMerges: false,
-			forkMergeHold: true,
-			retroSince: null,
-			retroFilter: true,
-			forkResearch: false,
-			prReviews: false,
-			prMode: false,
-			microVm: false,
-			setupChecklist: false,
-			targetBranch: null,
-			originUrl: null,
-			taskIdPrefix: null,
-		},
-		taskPrefix: "PROJ",
-	} as unknown as ProjectView;
-
-	/** Mounts the form against `fetchMock`; the cleanup puts fetch and the DOM back. */
-	async function mountForm(fetchMock: typeof fetch): Promise<{
-		container: HTMLDivElement;
-		unmount: () => Promise<void>;
-	}> {
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = fetchMock;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(
-				<ProjectSettingsForm
-					project={project}
-					tasks={[]}
-					trendingScan={true}
-					act={async (fn) => {
-						await fn();
-						return true;
-					}}
-					openTask={() => {}}
-				/>,
-			);
-		});
-		return {
-			container,
-			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
-				globalThis.fetch = realFetch;
-			},
-		};
-	}
+	const project = projectView(
+		{ taskPrefix: "PROJ" },
+		{ forkMergeHold: true, taskIdPrefix: null },
+	);
 
 	test("the Worktrees card shows the target branch row and saving posts it", async () => {
 		let postBody: Record<string, unknown> | undefined;
-		const ok = (body: unknown): Response =>
-			new Response(JSON.stringify(body), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
-		const fetchMock = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (
-				url.endsWith("/api/projects/proj/settings") &&
-				init?.method === "POST"
-			) {
-				postBody = JSON.parse(String(init.body)) as Record<string, unknown>;
-				return ok(project);
-			}
-			// Sections beside the form that load on mount.
-			if (url.endsWith("/api/projects/proj/ssh-key"))
-				return ok({ own: null, expiresAt: null });
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
-		const { container, unmount } = await mountForm(fetchMock);
+		const fetchMock = projectFormFetch(project, (body) => {
+			postBody = body;
+		});
+		const { container, unmount } = await mountForm(project, fetchMock);
 		try {
 			const card = container.querySelector("#project-worktrees-section");
 			expect(card).not.toBeNull();
@@ -729,28 +834,10 @@ describe("ProjectSettingsForm target branch", () => {
 
 	test("the Identity card saves both fields through one footer Save", async () => {
 		let postBody: Record<string, unknown> | undefined;
-		const ok = (body: unknown): Response =>
-			new Response(JSON.stringify(body), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
-		const fetchMock = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (
-				url.endsWith("/api/projects/proj/settings") &&
-				init?.method === "POST"
-			) {
-				postBody = JSON.parse(String(init.body)) as Record<string, unknown>;
-				return ok(project);
-			}
-			if (url.endsWith("/api/projects/proj/ssh-key"))
-				return ok({ own: null, expiresAt: null });
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
-		const { container, unmount } = await mountForm(fetchMock);
+		const fetchMock = projectFormFetch(project, (body) => {
+			postBody = body;
+		});
+		const { container, unmount } = await mountForm(project, fetchMock);
 		try {
 			const card = container.querySelector("#project-identity-section");
 			expect(card).not.toBeNull();
@@ -796,28 +883,10 @@ describe("ProjectSettingsForm target branch", () => {
 
 	test("the Updates card shows the hold fork-born merges checkbox and toggling posts it", async () => {
 		let postBody: Record<string, unknown> | undefined;
-		const ok = (body: unknown): Response =>
-			new Response(JSON.stringify(body), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
-		const fetchMock = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (
-				url.endsWith("/api/projects/proj/settings") &&
-				init?.method === "POST"
-			) {
-				postBody = JSON.parse(String(init.body)) as Record<string, unknown>;
-				return ok(project);
-			}
-			if (url.endsWith("/api/projects/proj/ssh-key"))
-				return ok({ own: null, expiresAt: null });
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
-		const { container, unmount } = await mountForm(fetchMock);
+		const fetchMock = projectFormFetch(project, (body) => {
+			postBody = body;
+		});
+		const { container, unmount } = await mountForm(project, fetchMock);
 		try {
 			const card = container.querySelector("#project-merging-section");
 			expect(card).not.toBeNull();
@@ -843,107 +912,20 @@ describe("ProjectSettingsForm target branch", () => {
 });
 
 describe("ProjectSettingsForm icon text marker", () => {
-	// A minimal ProjectView: the form reads the name and the full settings shape.
-	const project = {
-		name: "proj",
-		icon: null,
-		remote: "https://github.com/octo/repo",
-		github: "https://github.com/octo/repo",
-		vmRunner: {
-			configured: false,
-			ok: false,
-			reason: "OTTR_VM_RUNNER_URL is not set",
+	const project = projectView(
+		{
+			remote: "https://github.com/octo/repo",
+			github: "https://github.com/octo/repo",
 		},
-		hasRules: true,
-		gitless: false,
-		settings: {
-			maxParallel: 2,
-			copyExtra: [],
-			displayName: null,
-			iconText: null,
-			releaseCommand: null,
-			archReviewCap: 30,
-			maxImages: 4,
-			keptWorktreeDays: 7,
-			autoTend: false,
-			autoTendLimit: 5,
-			tendChurnGlobs: [],
-			holdUpdateMerges: false,
-			retroSince: null,
-			retroFilter: true,
-			forkResearch: false,
-			prReviews: false,
-			prMode: false,
-			microVm: false,
-			setupChecklist: false,
-			targetBranch: null,
-			originUrl: null,
-		},
-	} as unknown as ProjectView;
-
-	/** Mounts the form against `fetchMock`; the cleanup puts fetch and the DOM back. */
-	async function mountForm(fetchMock: typeof fetch): Promise<{
-		container: HTMLDivElement;
-		unmount: () => Promise<void>;
-	}> {
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = fetchMock;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(
-				<ProjectSettingsForm
-					project={project}
-					tasks={[]}
-					trendingScan={true}
-					act={async (fn) => {
-						await fn();
-						return true;
-					}}
-					openTask={() => {}}
-				/>,
-			);
-		});
-		return {
-			container,
-			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
-				globalThis.fetch = realFetch;
-			},
-		};
-	}
+		{ iconText: null },
+	);
 
 	test("the Icon card shows the marker row and saving posts the trimmed text", async () => {
 		let postBody: Record<string, unknown> | undefined;
-		const ok = (body: unknown): Response =>
-			new Response(JSON.stringify(body), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
-		const fetchMock = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (
-				url.endsWith("/api/projects/proj/settings") &&
-				init?.method === "POST"
-			) {
-				postBody = JSON.parse(String(init.body)) as Record<string, unknown>;
-				return ok(project);
-			}
-			// Sections beside the form that load on mount.
-			if (url.endsWith("/api/projects/proj/ssh-key"))
-				return ok({ own: null, expiresAt: null });
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
-		const { container, unmount } = await mountForm(fetchMock);
+		const fetchMock = projectFormFetch(project, (body) => {
+			postBody = body;
+		});
+		const { container, unmount } = await mountForm(project, fetchMock);
 		try {
 			const card = container.querySelector("#project-icon-section");
 			expect(card).not.toBeNull();
@@ -976,31 +958,30 @@ describe("ProjectSettingsForm icon text marker", () => {
 });
 
 /** Mounts SessionSection against `fetchMock`, same cleanup as mountSection. */
-async function mountSessions(fetchMock: typeof fetch): Promise<{
+/** Mounts `element` against `fetchMock`; the cleanup puts fetch and the DOM
+ *  back, then runs `after` (extra resets a section needs). */
+async function mountElement(
+	element: ReactElement,
+	fetchMock: typeof fetch,
+	after?: () => void,
+): Promise<{
 	container: HTMLDivElement;
 	unmount: () => Promise<void>;
 }> {
-	const realFetch = globalThis.fetch;
-	globalThis.fetch = fetchMock;
-	const container = window.document.createElement(
-		"div",
-	) as unknown as HTMLDivElement;
-	window.document.body.appendChild(container as unknown as HappyNode);
-	const root = createRoot(container);
-	await act(async () => {
-		root.render(<SessionSection />);
-	});
+	const { restore: fetchRestore } = stubFetch(fetchMock);
+	const { container, unmount } = await mount(element);
 	return {
 		container,
 		unmount: async () => {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			fetchRestore();
+			after?.();
 		},
 	};
 }
+
+const mountSessions = (fetchMock: typeof fetch) =>
+	mountElement(<SessionSection />, fetchMock);
 
 describe("SessionSection", () => {
 	test("the list renders one row per session and marks only the current browser", async () => {
@@ -1077,31 +1058,8 @@ describe("SessionSection", () => {
 });
 
 /** Mounts OmpStatsSection against `fetchMock`, same cleanup as mountSessions. */
-async function mountOmpStats(fetchMock: typeof fetch): Promise<{
-	container: HTMLDivElement;
-	unmount: () => Promise<void>;
-}> {
-	const realFetch = globalThis.fetch;
-	globalThis.fetch = fetchMock;
-	const container = window.document.createElement(
-		"div",
-	) as unknown as HTMLDivElement;
-	window.document.body.appendChild(container as unknown as HappyNode);
-	const root = createRoot(container);
-	await act(async () => {
-		root.render(<OmpStatsSection />);
-	});
-	return {
-		container,
-		unmount: async () => {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
-		},
-	};
-}
+const mountOmpStats = (fetchMock: typeof fetch) =>
+	mountElement(<OmpStatsSection />, fetchMock);
 
 describe("OmpStatsSection", () => {
 	test("the report renders totals, both sources, and the by-model rows", async () => {
@@ -1375,11 +1333,6 @@ describe("OmpStatsSection", () => {
 
 describe("GitHostsSection global SSH key", () => {
 	test("Test and Save key send the server's pending:<id> reference, not the bare id", async () => {
-		const ok = (body: unknown): Response =>
-			new Response(JSON.stringify(body), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
 		const sent: { method: string; url: string; body: unknown }[] = [];
 		const fetchMock = (async (
 			input: RequestInfo | URL,
@@ -1534,79 +1487,10 @@ describe("ProjectSettingsForm review counter", () => {
 			hasRules: true,
 			gitless: false,
 			archReview,
-			settings: {
-				maxParallel: 2,
-				copyExtra: [],
-				displayName: null,
-				releaseCommand: null,
-				archReviewCap: 30,
-				maxImages: 4,
-				keptWorktreeDays: 7,
-				autoTend: false,
-				autoTendLimit: 5,
-				tendChurnGlobs: [],
-				holdUpdateMerges: false,
-				retroSince: null,
-				retroFilter: true,
-				forkResearch: false,
-				prReviews: false,
-				prMode: false,
-				microVm: false,
-				setupChecklist: false,
-				targetBranch: null,
-				originUrl: null,
-			},
+			settings: { ...baseSettings },
 		}) as unknown as ProjectView;
 
 	/** Mounts the form for one project; the cleanup puts fetch and the DOM back. */
-	async function mount(
-		project: ProjectView,
-		tasks: TaskCard[],
-		openTask: (id: string) => void,
-	): Promise<{ container: HTMLDivElement; unmount: () => Promise<void> }> {
-		const ok = (body: unknown): Response =>
-			new Response(JSON.stringify(body), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
-		const fetchMock = (async (input: RequestInfo | URL) => {
-			const url = String(input);
-			if (url.endsWith("/api/projects/proj/ssh-key"))
-				return ok({ own: null, expiresAt: null });
-			throw new Error(`unexpected fetch ${url}`);
-		}) as typeof fetch;
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = fetchMock;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(
-				<ProjectSettingsForm
-					project={project}
-					tasks={tasks}
-					trendingScan={true}
-					act={async (fn) => {
-						await fn();
-						return true;
-					}}
-					openTask={openTask}
-				/>,
-			);
-		});
-		return {
-			container,
-			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
-				globalThis.fetch = realFetch;
-			},
-		};
-	}
 
 	const counterLine = (container: HTMLDivElement): Element | null =>
 		container.querySelector("#project-reviews-section .hint");
@@ -1614,7 +1498,7 @@ describe("ProjectSettingsForm review counter", () => {
 	test("counts from the review's base: the sha links to the commit, the card id opens the card", async () => {
 		const opened: string[] = [];
 		const review = { id: "R-1", doneAt: DONE_AT } as unknown as TaskCard;
-		const { container, unmount } = await mount(
+		const { container, unmount } = await mountProjectForm(
 			projectWith(
 				{
 					delta: 12,
@@ -1656,7 +1540,7 @@ describe("ProjectSettingsForm review counter", () => {
 	});
 
 	test("no GitHub remote shows the sha as plain code text", async () => {
-		const { container, unmount } = await mount(
+		const { container, unmount } = await mountProjectForm(
 			projectWith(
 				{
 					delta: 12,
@@ -1685,7 +1569,7 @@ describe("ProjectSettingsForm review counter", () => {
 	});
 
 	test("no full review yet says the whole history counts", async () => {
-		const { container, unmount } = await mount(
+		const { container, unmount } = await mountProjectForm(
 			projectWith(
 				{
 					delta: 7,
@@ -1715,7 +1599,7 @@ describe("ProjectSettingsForm review counter", () => {
 	});
 
 	test("a review open says so on the same line", async () => {
-		const { container, unmount } = await mount(
+		const { container, unmount } = await mountProjectForm(
 			projectWith(
 				{
 					delta: 12,
@@ -1740,7 +1624,7 @@ describe("ProjectSettingsForm review counter", () => {
 	});
 
 	test("a project with no arch review state shows no counter line", async () => {
-		const { container, unmount } = await mount(
+		const { container, unmount } = await mountProjectForm(
 			projectWith(null, null),
 			[],
 			() => {},
@@ -1852,28 +1736,20 @@ describe("Project switch cards", () => {
 				return json(200, { own: null, expiresAt: null });
 			throw new Error(`unexpected fetch ${url}`);
 		}) as typeof fetch;
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = fetchMock;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		const { restore: fetchRestore } = stubFetch(fetchMock);
+		const { container, unmount } = await mount(
+			<ProjectSettingsForm
+				project={project()}
+				tasks={[]}
+				trendingScan={true}
+				act={async (fn) => {
+					await fn();
+					return true;
+				}}
+				openTask={() => {}}
+			/>,
+		);
 		try {
-			await act(async () => {
-				root.render(
-					<ProjectSettingsForm
-						project={project()}
-						tasks={[]}
-						trendingScan={true}
-						act={async (fn) => {
-							await fn();
-							return true;
-						}}
-						openTask={() => {}}
-					/>,
-				);
-			});
 			await act(async () => {
 				const settled = Promise.withResolvers<void>();
 				setTimeout(settled.resolve, 0);
@@ -1885,11 +1761,8 @@ describe("Project switch cards", () => {
 				.filter((row) => row.textContent?.includes(TAG))
 				.map((row) => row.querySelector("label")?.textContent ?? "");
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			fetchRestore();
 		}
 	}
 
@@ -1909,35 +1782,11 @@ describe("Project switch cards", () => {
 });
 
 describe("PR reviews watch facts and Check PRs now", () => {
-	const settings = (prReviews: boolean): ProjectView["settings"] =>
-		({
-			holdUpdateMerges: false,
-			retroSince: null,
-			retroFilter: false,
-			forkResearch: false,
-			trendingScout: false,
-			prReviews,
-			prReviewManualPost: true,
-			prMode: false,
-			issueWatch: false,
-			codeScanWatch: false,
-			ompWatch: false,
-			dependabotWarn: true,
-			microVm: false,
-			maxParallel: 2,
-			copyExtra: [],
-			displayName: null,
-			releaseCommand: null,
-			archReviewCap: 30,
-			maxImages: 4,
-			keptWorktreeDays: 7,
-			autoTend: false,
-			autoTendLimit: 5,
-			tendChurnGlobs: [],
-			setupChecklist: false,
-			targetBranch: null,
-			originUrl: null,
-		}) as unknown as ProjectView["settings"];
+	const settings = (prReviews: boolean): ProjectView["settings"] => ({
+		...watchBaseSettings,
+		prReviews,
+		prReviewManualPost: true,
+	});
 
 	const project = (prReviews: boolean, prWatch: unknown): ProjectView =>
 		({
@@ -1954,24 +1803,15 @@ describe("PR reviews watch facts and Check PRs now", () => {
 			settings: settings(prReviews),
 		}) as unknown as ProjectView;
 
-	const json = (status: number, body: unknown): Response =>
-		new Response(JSON.stringify(body), {
-			status,
-			headers: { "Content-Type": "application/json" },
-		});
+	const json = jsonResponse;
 
-	const rowByLabel = (container: Element, label: string): Element =>
-		[...container.querySelectorAll("#project-watches-section .check-row")].find(
-			(r) => r.querySelector("label")?.textContent === label,
-		) as Element;
+	const rowByLabel = watchRowByLabel;
 
 	const watchRow = (container: Element): Element =>
-		rowByLabel(container, "PR reviews");
+		watchRowByLabel(container, "PR reviews");
 
 	const checkButton = (container: Element): HTMLButtonElement =>
-		Array.from(container.querySelectorAll("button")).find(
-			(b) => b.textContent?.trim() === "Check PRs now",
-		) as HTMLButtonElement;
+		buttonByText(container, "Check PRs now");
 
 	/** Renders the form with the check route answering `checks` in order; returns the
 	 *  container and the recorded check calls. The fetch stub answers the two mount
@@ -1985,65 +1825,7 @@ describe("PR reviews watch facts and Check PRs now", () => {
 		posted: { body: Record<string, unknown> | undefined };
 		unmount: () => Promise<void>;
 	}> {
-		const checkCalls: { url: string; method: string }[] = [];
-		const posted: { body: Record<string, unknown> | undefined } = {
-			body: undefined,
-		};
-		const answers = [...checks];
-		const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
-			const url = String(input);
-			if (url.endsWith("/api/projects/proj/prs/check")) {
-				checkCalls.push({ url, method: init?.method ?? "GET" });
-				const answer = answers.shift();
-				if (answer === undefined) throw new Error(`unexpected fetch ${url}`);
-				return answer;
-			}
-			if (
-				url.endsWith("/api/projects/proj/settings") &&
-				init?.method === "POST"
-			) {
-				posted.body = JSON.parse(String(init.body)) as Record<string, unknown>;
-				return json(200, p);
-			}
-			if (url.endsWith("/api/projects/proj/github/visibility"))
-				return json(200, { private: false });
-			if (url.endsWith("/api/projects/proj/ssh-key"))
-				return json(200, { own: null, expiresAt: null });
-			throw new Error(`unexpected fetch ${url}`);
-		}) as typeof fetch;
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = fetchMock;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(
-				<ProjectSettingsForm
-					project={p}
-					tasks={[]}
-					trendingScan={true}
-					act={async (fn) => {
-						await fn();
-						return true;
-					}}
-					openTask={() => {}}
-				/>,
-			);
-		});
-		return {
-			container,
-			checkCalls,
-			posted,
-			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
-				globalThis.fetch = realFetch;
-			},
-		};
+		return watchForm(p, "/api/projects/proj/prs/check", answerQueue(checks));
 	}
 
 	const LAST = 1_730_634_000_000;
@@ -2308,23 +2090,13 @@ describe("Code scanning watch facts and Check alerts now", () => {
 			settings: settings(codeScanWatch),
 		}) as unknown as ProjectView;
 
-	const json = (status: number, body: unknown): Response =>
-		new Response(JSON.stringify(body), {
-			status,
-			headers: { "Content-Type": "application/json" },
-		});
+	const _json = jsonResponse;
 
-	const watchRow = (container: Element): Element => {
-		const row = [
-			...container.querySelectorAll("#project-watches-section .check-row"),
-		].find((r) => r.querySelector("label")?.textContent === "Code scanning");
-		return row as Element;
-	};
+	const watchRow = (container: Element): Element =>
+		watchRowByLabel(container, "Code scanning");
 
 	const checkButton = (container: Element): HTMLButtonElement =>
-		Array.from(container.querySelectorAll("button")).find(
-			(b) => b.textContent?.trim() === "Check alerts now",
-		) as HTMLButtonElement;
+		buttonByText(container, "Check alerts now");
 
 	/** Renders the form with the settings POST and the check route recorded; returns
 	 *  the container, the posted settings body, and the recorded check calls. The
@@ -2335,62 +2107,9 @@ describe("Code scanning watch facts and Check alerts now", () => {
 		checkCalls: { url: string; method: string }[];
 		unmount: () => Promise<void>;
 	}> {
-		const checkCalls: { url: string; method: string }[] = [];
-		const posted: { body: Record<string, unknown> | undefined } = {
-			body: undefined,
-		};
-		const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
-			const url = String(input);
-			if (url.endsWith("/api/projects/proj/code-scanning/check")) {
-				checkCalls.push({ url, method: init?.method ?? "GET" });
-				return json(200, { ok: true });
-			}
-			if (
-				url.endsWith("/api/projects/proj/settings") &&
-				init?.method === "POST"
-			) {
-				posted.body = JSON.parse(String(init.body)) as Record<string, unknown>;
-				return json(200, p);
-			}
-			if (url.endsWith("/api/projects/proj/github/visibility"))
-				return json(200, { private: false });
-			if (url.endsWith("/api/projects/proj/ssh-key"))
-				return json(200, { own: null, expiresAt: null });
-			throw new Error(`unexpected fetch ${url}`);
-		}) as typeof fetch;
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = fetchMock;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(
-				<ProjectSettingsForm
-					project={p}
-					tasks={[]}
-					trendingScan={true}
-					act={async (fn) => {
-						await fn();
-						return true;
-					}}
-					openTask={() => {}}
-				/>,
-			);
-		});
-		return {
-			container,
-			posted,
-			checkCalls,
-			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
-				globalThis.fetch = realFetch;
-			},
-		};
+		return watchForm(p, "/api/projects/proj/code-scanning/check", () =>
+			jsonResponse(200, { ok: true }),
+		);
 	}
 
 	const LAST = 1_730_634_000_000;
@@ -2414,16 +2133,7 @@ describe("Code scanning watch facts and Check alerts now", () => {
 	test("toggling the row posts the setting on", async () => {
 		const { container, posted, unmount } = await csForm(project(false, OFF));
 		try {
-			const card = container.querySelector("#project-watches-section");
-			const label = [...(card?.querySelectorAll("label") ?? [])].find((l) =>
-				l.textContent?.includes("Code scanning"),
-			);
-			if (label === undefined) throw new Error("code scanning row missing");
-			const input = container.querySelector<HTMLInputElement>(
-				`input[id="${label.htmlFor}"]`,
-			);
-			if (input === null || input === undefined)
-				throw new Error("code scanning checkbox did not render");
+			const input = watchCheckbox(container, "Code scanning");
 			expect(input.checked).toBe(false);
 			await act(async () => {
 				onChangeOf(input)({ target: { checked: true }, currentTarget: input });
@@ -2543,39 +2253,28 @@ describe("Trending scout depends on the general weekly scan", () => {
 				return json({ own: null, expiresAt: null });
 			throw new Error(`unexpected fetch ${url}`);
 		}) as typeof fetch;
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = fetchMock;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(
-				<ProjectSettingsForm
-					project={project(trendingScout)}
-					tasks={[]}
-					trendingScan={trendingScan}
-					trendingStatus={trendingStatus}
-					act={async (fn) => {
-						await fn();
-						return true;
-					}}
-					openTask={() => {}}
-				/>,
-			);
-		});
+		const { restore: fetchRestore } = stubFetch(fetchMock);
+		const { container, unmount } = await mount(
+			<ProjectSettingsForm
+				project={project(trendingScout)}
+				tasks={[]}
+				trendingScan={trendingScan}
+				trendingStatus={trendingStatus}
+				act={async (fn) => {
+					await fn();
+					return true;
+				}}
+				openTask={() => {}}
+			/>,
+		);
 		const row = [
 			...container.querySelectorAll("#project-proposals-section .check-row"),
 		].find((r) => r.querySelector("label")?.textContent === "Trending scout");
 		return {
 			row: row as Element,
 			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
-				globalThis.fetch = realFetch;
+				await unmount();
+				fetchRestore();
 			},
 		};
 	}
@@ -2669,36 +2368,25 @@ describe("ProjectsOrderSection", () => {
 		fetchMock: typeof fetch,
 		projects: ProjectView[] = PROJECTS,
 	): Promise<{ container: HTMLDivElement; unmount: () => Promise<void> }> {
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = fetchMock;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(
-				<ProjectsOrderSection
-					projects={projects}
-					act={async (fn) => {
-						try {
-							await fn();
-							return true;
-						} catch {
-							return false;
-						}
-					}}
-				/>,
-			);
-		});
+		const { restore: fetchRestore } = stubFetch(fetchMock);
+		const { container, unmount } = await mount(
+			<ProjectsOrderSection
+				projects={projects}
+				act={async (fn) => {
+					try {
+						await fn();
+						return true;
+					} catch {
+						return false;
+					}
+				}}
+			/>,
+		);
 		return {
 			container,
 			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
-				globalThis.fetch = realFetch;
+				await unmount();
+				fetchRestore();
 			},
 		};
 	}
@@ -2755,6 +2443,32 @@ describe("ProjectsOrderSection", () => {
 			headers: { "Content-Type": "application/json" },
 		});
 
+	/** The order list and row beta; a missing list is a test bug. */
+	const listAndBeta = (
+		container: HTMLDivElement,
+	): { ul: Element; rowB: HTMLElement } => {
+		const ul = container.querySelector(".projects-order");
+		const rowB = container.querySelector<HTMLElement>('li[data-name="beta"]');
+		if (ul === null || rowB === null)
+			throw new Error("projects list did not render");
+		return { ul, rowB };
+	};
+
+	/** Presses Alt+ArrowUp on row beta. */
+	const altArrowUp = async (ul: Element, rowB: HTMLElement): Promise<void> => {
+		await act(async () => {
+			handlerOf(
+				ul,
+				"onKeyDown",
+			)({
+				altKey: true,
+				key: "ArrowUp",
+				target: rowB,
+				preventDefault() {},
+			});
+		});
+	};
+
 	test("rows render in props order with the label and position in each aria-label", async () => {
 		const fetchMock = (async (): Promise<Response> => {
 			throw new Error("the section fetches nothing on mount");
@@ -2783,10 +2497,7 @@ describe("ProjectsOrderSection", () => {
 		const { container, unmount } = await mountProjects(mock.fetch);
 		try {
 			withRowBoxes(container);
-			const ul = container.querySelector(".projects-order");
-			const rowB = container.querySelector<HTMLElement>('li[data-name="beta"]');
-			if (ul === null || rowB === null)
-				throw new Error("projects list did not render");
+			const { ul, rowB } = listAndBeta(container);
 			// dragstart dims the row only after the browser captured the drag image: one rAF.
 			await act(async () => {
 				handlerOf(
@@ -2836,21 +2547,8 @@ describe("ProjectsOrderSection", () => {
 		const mock = orderFetch(ok);
 		const { container, unmount } = await mountProjects(mock.fetch);
 		try {
-			const ul = container.querySelector(".projects-order");
-			const rowB = container.querySelector<HTMLElement>('li[data-name="beta"]');
-			if (ul === null || rowB === null)
-				throw new Error("projects list did not render");
-			await act(async () => {
-				handlerOf(
-					ul,
-					"onKeyDown",
-				)({
-					altKey: true,
-					key: "ArrowUp",
-					target: rowB,
-					preventDefault() {},
-				});
-			});
+			const { ul, rowB } = listAndBeta(container);
+			await altArrowUp(ul, rowB);
 			expect(mock.calls()).toBe(1);
 			expect(mock.body()).toEqual({ order: ["beta", "alpha", "gamma"] });
 			expect(rowNames(container)).toEqual(["beta", "alpha", "gamma"]);
@@ -2869,20 +2567,9 @@ describe("ProjectsOrderSection", () => {
 		);
 		const { container, unmount } = await mountProjects(mock.fetch);
 		try {
-			const ul = container.querySelector(".projects-order");
-			const rowB = container.querySelector<HTMLElement>('li[data-name="beta"]');
-			if (ul === null || rowB === null)
-				throw new Error("projects list did not render");
+			const { ul, rowB } = listAndBeta(container);
 			await act(async () => {
-				handlerOf(
-					ul,
-					"onKeyDown",
-				)({
-					altKey: true,
-					key: "ArrowUp",
-					target: rowB,
-					preventDefault() {},
-				});
+				await altArrowUp(ul, rowB);
 				// Let the failed POST settle before reading the tick and the rows.
 				const settled = Promise.withResolvers<void>();
 				setTimeout(settled.resolve, 0);
@@ -2906,30 +2593,14 @@ type HindsightView = {
 	memoryReason: string | null;
 };
 
-/** Mounts HindsightSection against a fetch mock that answers the view load, same cleanup as mountSessions. */
-async function mountHindsight(view: HindsightView) {
-	const realFetch = globalThis.fetch;
-	globalThis.fetch = (async (): Promise<Response> =>
-		new Response(JSON.stringify(view))) as unknown as typeof fetch;
-	const container = window.document.createElement(
-		"div",
-	) as unknown as HTMLDivElement;
-	window.document.body.appendChild(container as unknown as HappyNode);
-	const root = createRoot(container);
-	await act(async () => {
-		root.render(<HindsightSection />);
-	});
-	return {
-		container,
-		unmount: async () => {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
-		},
-	};
-}
+/** Mounts HindsightSection against a fetch mock that answers the view load,
+ *  same cleanup as mountSessions. */
+const mountHindsight = (view: HindsightView) =>
+	mountElement(
+		<HindsightSection />,
+		(async (): Promise<Response> =>
+			new Response(JSON.stringify(view))) as unknown as typeof fetch,
+	);
 
 /** Mounts settings with optional page, fetch, and action fixtures. By default,
  * requests stay pending. Cleanup unmounts and restores fetch. */
@@ -2952,10 +2623,11 @@ async function mountPage(
 	setView: (view: string) => Promise<void>;
 	unmount: () => Promise<void>;
 }> {
-	const realFetch = globalThis.fetch;
-	globalThis.fetch =
+	const { restore: fetchRestore } = stubFetch(
 		fetchMock ??
-		((async () => new Promise<Response>(() => {})) as unknown as typeof fetch);
+			((async () =>
+				new Promise<Response>(() => {})) as unknown as typeof fetch),
+	);
 	const container = window.document.createElement(
 		"div",
 	) as unknown as HTMLDivElement;
@@ -2992,46 +2664,20 @@ async function mountPage(
 				root.unmount();
 			});
 			container.remove();
-			globalThis.fetch = realFetch;
+			fetchRestore();
 		},
 	};
 }
 
 describe("settings search", () => {
-	const project = {
-		name: "search-project",
-		icon: null,
-		remote: null,
-		github: null,
-		vmRunner: { configured: true, ok: true, reason: null },
-		hasRules: true,
-		gitless: false,
-		taskPrefix: "SEARCH",
-		settings: {
-			maxParallel: 2,
-			copyExtra: [],
-			displayName: null,
-			releaseCommand: null,
-			archReviewCap: 30,
-			maxImages: 4,
-			keptWorktreeDays: 7,
-			autoTend: false,
-			autoTendLimit: 5,
-			tendChurnGlobs: [],
-			holdUpdateMerges: false,
-			forkMergeHold: true,
-			retroSince: null,
-			retroFilter: true,
-			forkResearch: false,
-			prReviews: false,
-			prMode: false,
-			microVm: false,
-			setupChecklist: false,
-			targetBranch: null,
-			originUrl: null,
-			taskIdPrefix: null,
+	const project = projectView(
+		{
+			name: "search-project",
+			vmRunner: { configured: true, ok: true, reason: null },
+			taskPrefix: "SEARCH",
 		},
-	} as unknown as ProjectView;
+		{ forkMergeHold: true, taskIdPrefix: null },
+	);
 
 	const searchField = (container: HTMLElement): HTMLInputElement => {
 		const label = [...container.querySelectorAll("label")].find(
@@ -3730,6 +3376,22 @@ const pinnedRow = (container: HTMLDivElement): string | null =>
 		?.textContent ?? null;
 
 describe("settings deep links", () => {
+	/** Mounts the page at `hash` and asserts `check` before the cleanup puts the
+	 *  hash and the DOM back. */
+	const mountAtHash = async (
+		hash: string,
+		check: (container: HTMLDivElement) => Promise<void> | void,
+	): Promise<void> => {
+		window.location.hash = hash;
+		const { container, unmount } = await mountPage();
+		try {
+			await check(container);
+		} finally {
+			await unmount();
+			window.location.hash = "";
+		}
+	};
+
 	test(
 		"openSettingsSection pushes the settings path with the fragment and runs" +
 			" the app's popstate listener",
@@ -3760,24 +3422,17 @@ describe("settings deep links", () => {
 		"a deep link fragment pins the matching TOC row and the section exists" +
 			" on mount",
 		async () => {
-			window.location.hash = "#git-hosts-section";
-			const { container, unmount } = await mountPage();
-			try {
+			await mountAtHash("#git-hosts-section", (container) => {
 				expect(pinnedRow(container)).toBe("GitHub");
 				expect(
 					container.querySelector('[id="git-hosts-section"]'),
 				).not.toBeNull();
-			} finally {
-				await unmount();
-				window.location.hash = "";
-			}
+			});
 		},
 	);
 
 	test("a sub-block fragment pins its card: the map shows no block rows", async () => {
-		window.location.hash = "#github-token-block";
-		const { container, unmount } = await mountPage();
-		try {
+		await mountAtHash("#github-token-block", (container) => {
 			expect(pinnedRow(container)).toBe("GitHub");
 			const rows = [...container.querySelectorAll(".smap-row")].map(
 				(r) => r.textContent,
@@ -3787,16 +3442,11 @@ describe("settings deep links", () => {
 			expect(
 				container.querySelector('[id="github-token-block"]'),
 			).not.toBeNull();
-		} finally {
-			await unmount();
-			window.location.hash = "";
-		}
+		});
 	});
 
 	test("a popstate to another fragment moves the pin to that row", async () => {
-		window.location.hash = "#git-hosts-section";
-		const { container, unmount } = await mountPage();
-		try {
+		await mountAtHash("#git-hosts-section", async (container) => {
 			expect(pinnedRow(container)).toBe("GitHub");
 			await act(async () => {
 				window.location.hash = "#env-section";
@@ -3805,16 +3455,11 @@ describe("settings deep links", () => {
 				);
 			});
 			expect(pinnedRow(container)).toBe("Env");
-		} finally {
-			await unmount();
-			window.location.hash = "";
-		}
+		});
 	});
 
 	test("a fragment naming nothing on the page pins nothing of its own", async () => {
-		window.location.hash = "#bogus";
-		const { container, unmount } = await mountPage();
-		try {
+		await mountAtHash("#bogus", (container) => {
 			// The scroll-spy may mark a row current on its own; the bogus fragment
 			// must not pin the row it names.
 			const current = [
@@ -3824,10 +3469,7 @@ describe("settings deep links", () => {
 			expect(
 				container.querySelector('[id="git-hosts-section"]'),
 			).not.toBeNull();
-		} finally {
-			await unmount();
-			window.location.hash = "";
-		}
+		});
 	});
 });
 
@@ -4005,11 +3647,6 @@ describe("HindsightSection memory backend", () => {
 });
 
 describe("GitHostsSection board GitHub token reuse", () => {
-	const ok = (body: unknown): Response =>
-		new Response(JSON.stringify(body), {
-			status: 200,
-			headers: { "Content-Type": "application/json" },
-		});
 	/** The /api/git-hosts view shape these tests serve; tokens carry no secrets. */
 	type GitHostsFixture = {
 		tokens: { host: string; username: string; tokenSet: boolean }[];
@@ -4305,110 +3942,42 @@ describe("GitHostsSection board GitHub token reuse", () => {
 				hasRules: true,
 				gitless: false,
 				archReviewCap: 30,
-				settings: {
-					maxParallel: 2,
-					copyExtra: [],
-					displayName: null,
-					releaseCommand: null,
-					archReviewCap: 30,
-					maxImages: 4,
-					keptWorktreeDays: 7,
-					autoTend: false,
-					autoTendLimit: 5,
-					tendChurnGlobs: [],
-					holdUpdateMerges: false,
-					retroSince: null,
-					retroFilter: true,
-					forkResearch: false,
-					prReviews: false,
-					prMode,
-					microVm,
-					setupChecklist: false,
-					targetBranch: null,
-					originUrl: null,
-				},
+				settings: { ...baseSettings, prMode, microVm },
 			}) as unknown as ProjectView;
 
-		/** Mounts the form against `fetchMock`; the cleanup puts fetch and the DOM back. */
-		async function mount(
-			project: ProjectView,
-			fetchMock: typeof fetch,
-		): Promise<{ container: HTMLDivElement; unmount: () => Promise<void> }> {
-			const realFetch = globalThis.fetch;
-			globalThis.fetch = fetchMock;
-			const container = window.document.createElement(
-				"div",
-			) as unknown as HTMLDivElement;
-			window.document.body.appendChild(container as unknown as HappyNode);
-			const root = createRoot(container);
-			await act(async () => {
-				root.render(
-					<ProjectSettingsForm
-						project={project}
-						tasks={[]}
-						trendingScan={true}
-						act={async (fn) => {
-							await fn();
-							return true;
-						}}
-						openTask={() => {}}
-					/>,
-				);
-			});
-			return {
-				container,
-				unmount: async () => {
-					await act(async () => {
-						root.unmount();
-					});
-					container.remove();
-					globalThis.fetch = realFetch;
-				},
-			};
-		}
+		/* The tests mount through mountProjectFormFetch; the cleanup puts fetch
+		 * and the DOM back. */
 
-		/** The PR mode checkbox, found through its row label like the push sync test. */
-		const prModeRow = (container: HTMLDivElement) => {
+		/** The checkbox of the row whose label includes `text` (htmlFor wiring). */
+		const rowCheckbox = (
+			container: HTMLDivElement,
+			text: string,
+			what: string,
+		) => {
 			const label = [...container.querySelectorAll("label")].find((l) =>
-				l.textContent?.includes("PR mode"),
+				l.textContent?.includes(text),
 			);
-			if (label === undefined) throw new Error("PR mode row missing");
+			if (label === undefined) throw new Error(`${what} row missing`);
 			const input = container.querySelector<HTMLInputElement>(
 				`input[id="${label.htmlFor}"]`,
 			);
-			if (input === null) throw new Error("PR mode checkbox did not render");
+			if (input === null) throw new Error(`${what} checkbox did not render`);
 			return input;
 		};
+
+		/** The PR mode checkbox, found through its row label like the push sync test. */
+		const prModeRow = (container: HTMLDivElement) =>
+			rowCheckbox(container, "PR mode", "PR mode");
 
 		const fetchMockFor = (
 			project: ProjectView,
 			read: (postBody: Record<string, unknown> | undefined) => void,
-		): typeof fetch =>
-			(async (input: RequestInfo | URL, init?: RequestInit) => {
-				const url = String(input);
-				if (
-					url.endsWith("/api/projects/proj/settings") &&
-					init?.method === "POST"
-				) {
-					const body = JSON.parse(String(init.body)) as Record<string, unknown>;
-					read(body);
-					return new Response(JSON.stringify(project), {
-						status: 200,
-						headers: { "Content-Type": "application/json" },
-					});
-				}
-				if (url.endsWith("/api/projects/proj/ssh-key"))
-					return new Response(JSON.stringify({ own: null, expiresAt: null }), {
-						status: 200,
-						headers: { "Content-Type": "application/json" },
-					});
-				throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-			}) as typeof fetch;
+		): typeof fetch => projectFormFetch(project, (body) => read(body));
 
 		test("renders checked from the setting and toggling posts prMode true and false", async () => {
 			const posts: (Record<string, unknown> | undefined)[] = [];
 			const project = projectWith("https://github.com/octo/repo", true);
-			const { container, unmount } = await mount(
+			const { container, unmount } = await mountProjectFormFetch(
 				project,
 				fetchMockFor(project, (body) => posts.push(body)),
 			);
@@ -4436,7 +4005,7 @@ describe("GitHostsSection board GitHub token reuse", () => {
 		});
 		test("without a GitHub remote the row renders off and disabled until saved on", async () => {
 			const project = projectWith(null, false);
-			const { container, unmount } = await mount(
+			const { container, unmount } = await mountProjectFormFetch(
 				project,
 				fetchMockFor(project, () => {}),
 			);
@@ -4451,7 +4020,7 @@ describe("GitHostsSection board GitHub token reuse", () => {
 		});
 		test("saved on without a GitHub remote keeps the row enabled", async () => {
 			const project = projectWith(null, true);
-			const { container, unmount } = await mount(
+			const { container, unmount } = await mountProjectFormFetch(
 				project,
 				fetchMockFor(project, () => {}),
 			);
@@ -4465,22 +4034,13 @@ describe("GitHostsSection board GitHub token reuse", () => {
 		});
 
 		/** The microVM checkbox, through its row label (htmlFor), like prModeRow. */
-		const microVmRow = (container: HTMLDivElement) => {
-			const label = [...container.querySelectorAll("label")].find((l) =>
-				l.textContent?.includes("Run work turns in microVMs"),
-			);
-			if (label === undefined) throw new Error("microVM row missing");
-			const input = container.querySelector<HTMLInputElement>(
-				`input[id="${label.htmlFor}"]`,
-			);
-			if (input === null) throw new Error("microVM checkbox did not render");
-			return input;
-		};
+		const microVmRow = (container: HTMLDivElement) =>
+			rowCheckbox(container, "Run work turns in microVMs", "microVM");
 
 		test("microVM row toggles post microVm true and false while vm-runner is up", async () => {
 			const posts: (Record<string, unknown> | undefined)[] = [];
 			const project = projectWith(null, false);
-			const { container, unmount } = await mount(
+			const { container, unmount } = await mountProjectFormFetch(
 				project,
 				fetchMockFor(project, (body) => posts.push(body)),
 			);
@@ -4513,7 +4073,7 @@ describe("GitHostsSection board GitHub token reuse", () => {
 				ok: false,
 				reason: "healthz answered 502",
 			});
-			const { container, unmount } = await mount(
+			const { container, unmount } = await mountProjectFormFetch(
 				project,
 				fetchMockFor(project, () => {}),
 			);
@@ -4535,7 +4095,7 @@ describe("GitHostsSection board GitHub token reuse", () => {
 				reason: "OTTR_VM_RUNNER_URL is not set",
 			};
 			const off = projectWith(null, false, false, down);
-			const first = await mount(
+			const first = await mountProjectFormFetch(
 				off,
 				fetchMockFor(off, () => {}),
 			);
@@ -4552,7 +4112,7 @@ describe("GitHostsSection board GitHub token reuse", () => {
 			}
 			// Already on: the row stays enabled so the user can turn it off.
 			const on = projectWith(null, false, true, down);
-			const second = await mount(
+			const second = await mountProjectFormFetch(
 				on,
 				fetchMockFor(on, () => {}),
 			);
@@ -4677,22 +4237,82 @@ describe("GitHostsSection board GitHub token reuse", () => {
 	});
 });
 
+async function mountProjectForm(
+	project: ProjectView,
+	tasks: TaskCard[],
+	openTask: (id: string) => void,
+): Promise<{ container: HTMLDivElement; unmount: () => Promise<void> }> {
+	const fetchMock = (async (input: RequestInfo | URL) => {
+		const url = String(input);
+		if (url.endsWith("/api/projects/proj/ssh-key"))
+			return ok({ own: null, expiresAt: null });
+		throw new Error(`unexpected fetch ${url}`);
+	}) as typeof fetch;
+	const { restore: fetchRestore } = stubFetch(fetchMock);
+	const { container, unmount } = await mount(
+		<ProjectSettingsForm
+			project={project}
+			tasks={tasks}
+			trendingScan={true}
+			act={async (fn) => {
+				await fn();
+				return true;
+			}}
+			openTask={openTask}
+		/>,
+	);
+	return {
+		container,
+		unmount: async () => {
+			await unmount();
+			fetchRestore();
+		},
+	};
+}
+
+async function mountProjectFormFetch(
+	project: ProjectView,
+	fetchMock: typeof fetch,
+): Promise<{ container: HTMLDivElement; unmount: () => Promise<void> }> {
+	const { restore: fetchRestore } = stubFetch(fetchMock);
+	const { container, unmount } = await mount(
+		<ProjectSettingsForm
+			project={project}
+			tasks={[]}
+			trendingScan={true}
+			act={async (fn) => {
+				await fn();
+				return true;
+			}}
+			openTask={() => {}}
+		/>,
+	);
+	return {
+		container,
+		unmount: async () => {
+			await unmount();
+			fetchRestore();
+		},
+	};
+}
+
 describe("NotificationsSection", () => {
 	test("a browser subscription the board lost is registered again, then the event switches load", async () => {
 		const endpoint = "https://push.example/dev-1";
 		const calls: string[] = [];
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
-			const u = String(url);
-			calls.push(`${init?.method ?? "GET"} ${u}`);
-			if (u === "/api/push/subscribe") return Response.json({ ok: true });
-			return Response.json({
-				classes: u.includes("endpoint=")
-					? { request: true, error: true, complete: false }
-					: null,
-				mutedProjects: [],
-			});
-		}) as unknown as typeof fetch;
+		const { restore: fetchRestore } = stubFetch(
+			async (url: string | URL, init?: RequestInit) => {
+				const u = String(url);
+				calls.push(`${init?.method ?? "GET"} ${u}`);
+				if (u === "/api/push/subscribe") return Response.json({ ok: true });
+				return Response.json({
+					classes: u.includes("endpoint=")
+						? { request: true, error: true, complete: false }
+						: null,
+					mutedProjects: [],
+				});
+			},
+		);
 		// A secure context with a service worker that already holds a subscription.
 		const nav = window.navigator as unknown as Record<string, unknown>;
 		const win = window as unknown as Record<string, unknown>;
@@ -4713,21 +4333,11 @@ describe("NotificationsSection", () => {
 			configurable: true,
 		});
 		win.PushManager = function PushManager() {};
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		const { container, unmount } = await mount(
+			<NotificationsSection projects={[]} act={async () => true} />,
+		);
 		try {
-			await act(async () => {
-				root.render(
-					<NotificationsSection projects={[]} act={async () => true} />,
-				);
-			});
-			for (let k = 0; k < 5; k++)
-				await act(async () => {
-					await new Promise((r) => setTimeout(r, 0));
-				});
+			await flushSection();
 			const subscribe = calls.indexOf("POST /api/push/subscribe");
 			const prefs = calls.findIndex((c) => c.includes("endpoint="));
 			expect(subscribe).toBeGreaterThanOrEqual(0);
@@ -4738,11 +4348,8 @@ describe("NotificationsSection", () => {
 			);
 			expect(labels).toEqual(["Request", "Error", "Complete"]);
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			fetchRestore();
 			delete win.isSecureContext;
 			delete nav.serviceWorker;
 			delete win.PushManager;
@@ -4779,28 +4386,20 @@ describe("NotificationsSection", () => {
 			expect(String(url)).toBe("/api/notifications/prefs");
 			return Response.json({ classes: null, mutedProjects: [] });
 		}) as unknown as typeof fetch;
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = fetchMock;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(
-				<NotificationsSection
-					projects={projects}
-					act={async (fn) => {
-						try {
-							await fn();
-							return true;
-						} catch {
-							return false;
-						}
-					}}
-				/>,
-			);
-		});
+		const { restore: fetchRestore } = stubFetch(fetchMock);
+		const { container, unmount } = await mount(
+			<NotificationsSection
+				projects={projects}
+				act={async (fn) => {
+					try {
+						await fn();
+						return true;
+					} catch {
+						return false;
+					}
+				}}
+			/>,
+		);
 		return {
 			boxes: () => [
 				...container.querySelectorAll<HTMLInputElement>(
@@ -4809,11 +4408,8 @@ describe("NotificationsSection", () => {
 			],
 			posts,
 			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
-				globalThis.fetch = realFetch;
+				await unmount();
+				fetchRestore();
 			},
 		};
 	}
@@ -4861,6 +4457,32 @@ describe("NotificationsSection", () => {
 /** Stale-sub recovery (ADR-0011): a fake push browser environment, the section's own
  * fetch mock, and a probe of what the section POSTs. */
 describe("NotificationsSection stale push recovery", () => {
+	/** The probe type withPushBrowser hands its callback. */
+	type PushProbe = Parameters<Parameters<typeof withPushBrowser>[0]>[0];
+	/** Clicks the section's Turn on button and lets the flow settle. */
+	const clickTurnOn = async (probe: PushProbe): Promise<void> => {
+		const on = [...probe.containerNode().querySelectorAll("button")].find(
+			(b) => b.textContent?.trim() === "Turn on",
+		);
+		expect(on).toBeDefined();
+		await act(async () => {
+			on?.click();
+		});
+		await act(async () => {});
+	};
+	/** The mute save POST carried the whole board-wide list: alpha and beta. */
+	const expectMutePost = (probe: PushProbe): void => {
+		const mutePost = probe.posts.find(
+			(p) =>
+				p.url === "/api/notifications/prefs" &&
+				(p.body as { mutedProjects?: string[] }).mutedProjects !== undefined,
+		);
+		expect(mutePost).toBeDefined();
+		expect(
+			(mutePost!.body as { mutedProjects: string[] }).mutedProjects.sort(),
+		).toEqual(["alpha", "beta"]);
+	};
+
 	/** Installs a secure-context fake browser: an existing subscription on `initialEndpoint`
 	 * (unless noInitialSub), a registration whose subscribe() records the applicationServerKey
 	 * it got, and a server whose stored rows and board-wide mutes the tests can watch. */
@@ -4900,7 +4522,6 @@ describe("NotificationsSection stale push recovery", () => {
 			failMuteLoads?: number;
 		} = {},
 	): Promise<void> {
-		const realFetch = globalThis.fetch;
 		const realNavigator = globalThis.navigator;
 		const realNotification = globalThis.Notification;
 		// The test env's Window type lacks the DOM property; a real window always has it.
@@ -5075,7 +4696,7 @@ describe("NotificationsSection stale push recovery", () => {
 			value: function PushManager() {},
 			configurable: true,
 		});
-		globalThis.fetch = fetchMock;
+		const { restore: fetchRestore } = stubFetch(fetchMock);
 		const projects = ["alpha", "beta"].map(
 			(name) =>
 				({
@@ -5103,33 +4724,23 @@ describe("NotificationsSection stale push recovery", () => {
 				PENDING_KEY,
 				JSON.stringify(options.seedPending),
 			);
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		const { container, unmount } = await mount(
+			<NotificationsSection
+				projects={projects}
+				act={async (fn: () => Promise<unknown>) => {
+					// The app act catches a failed save and reports false; the
+					// stub mirrors that contract so a refused write rolls back.
+					try {
+						await fn();
+					} catch {
+						return false;
+					}
+					return true;
+				}}
+			/>,
+		);
 		try {
-			await act(async () => {
-				root.render(
-					<NotificationsSection
-						projects={projects}
-						act={async (fn: () => Promise<unknown>) => {
-							// The app act catches a failed save and reports false; the
-							// stub mirrors that contract so a refused write rolls back.
-							try {
-								await fn();
-							} catch {
-								return false;
-							}
-							return true;
-						}}
-					/>,
-				);
-			});
-			for (let k = 0; k < 5; k++)
-				await act(async () => {
-					await new Promise((r) => setTimeout(r, 0));
-				});
+			await flushSection();
 			await run({
 				posts,
 				prefsReads,
@@ -5148,11 +4759,8 @@ describe("NotificationsSection stale push recovery", () => {
 				writable: true,
 				configurable: true,
 			});
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			fetchRestore();
 			Object.defineProperty(globalThis, "navigator", {
 				value: realNavigator,
 				writable: true,
@@ -5232,20 +4840,8 @@ describe("NotificationsSection stale push recovery", () => {
 				await act(async () => {
 					onChangeOf(beta!)({ target: { checked: true } });
 				});
-				for (let k = 0; k < 5; k++)
-					await act(async () => {
-						await new Promise((r) => setTimeout(r, 0));
-					});
-				const mutePost = probe.posts.find(
-					(p) =>
-						p.url === "/api/notifications/prefs" &&
-						(p.body as { mutedProjects?: string[] }).mutedProjects !==
-							undefined,
-				);
-				expect(mutePost).toBeDefined();
-				expect(
-					(mutePost!.body as { mutedProjects: string[] }).mutedProjects.sort(),
-				).toEqual(["alpha", "beta"]);
+				await flushSection();
+				expectMutePost(probe);
 			},
 			{
 				initialEndpoint: "https://push.example.com/ghost",
@@ -5261,14 +4857,7 @@ describe("NotificationsSection stale push recovery", () => {
 				// is queued. The queued record explains the missing row: no "unknown
 				// endpoint" error, no mute write, the switches hidden until the
 				// replay lands.
-				const on = [...probe.containerNode().querySelectorAll("button")].find(
-					(b) => b.textContent?.trim() === "Turn on",
-				);
-				expect(on).toBeDefined();
-				await act(async () => {
-					on?.click();
-				});
-				await act(async () => {});
+				await clickTurnOn(probe);
 				expect(probe.containerText()).not.toContain("unknown endpoint");
 				expect(
 					probe.posts.filter((p) => p.url === "/api/notifications/prefs"),
@@ -5362,14 +4951,7 @@ describe("NotificationsSection stale push recovery", () => {
 			async (probe) => {
 				// The enable POST failed and the undo was refused: the browser keeps
 				// the live subscription and the whole completion is queued.
-				const on = [...probe.containerNode().querySelectorAll("button")].find(
-					(b) => b.textContent?.trim() === "Turn on",
-				);
-				expect(on).toBeDefined();
-				await act(async () => {
-					on?.click();
-				});
-				await act(async () => {});
+				await clickTurnOn(probe);
 				expect(probe.currentSubscription()).not.toBeNull();
 				expect(probe.containerText()).toContain("boom");
 				expect(probe.containerText()).toContain("Turn off");
@@ -5402,14 +4984,7 @@ describe("NotificationsSection stale push recovery", () => {
 				// whole list: when the response died with the endpoint effect,
 				// mutedRef stayed empty and a save wiped the board-wide list the
 				// other devices hold.
-				const on = [...probe.containerNode().querySelectorAll("button")].find(
-					(b) => b.textContent?.trim() === "Turn on",
-				);
-				expect(on).toBeDefined();
-				await act(async () => {
-					on?.click();
-				});
-				await act(async () => {});
+				await clickTurnOn(probe);
 				// The kept path ran while the mute read was held back.
 				expect(
 					globalThis.localStorage.getItem("ottr.push.pendingSubscribe"),
@@ -5437,20 +5012,8 @@ describe("NotificationsSection stale push recovery", () => {
 				await act(async () => {
 					onChangeOf(beta!)({ target: { checked: true } });
 				});
-				for (let k = 0; k < 5; k++)
-					await act(async () => {
-						await new Promise((r) => setTimeout(r, 0));
-					});
-				const mutePost = probe.posts.find(
-					(p) =>
-						p.url === "/api/notifications/prefs" &&
-						(p.body as { mutedProjects?: string[] }).mutedProjects !==
-							undefined,
-				);
-				expect(mutePost).toBeDefined();
-				expect(
-					(mutePost!.body as { mutedProjects: string[] }).mutedProjects.sort(),
-				).toEqual(["alpha", "beta"]);
+				await flushSection();
+				expectMutePost(probe);
 			},
 			{
 				noInitialSub: true,
@@ -5490,10 +5053,7 @@ describe("NotificationsSection stale push recovery", () => {
 				await act(async () => {
 					retry?.click();
 				});
-				for (let k = 0; k < 5; k++)
-					await act(async () => {
-						await new Promise((r) => setTimeout(r, 0));
-					});
+				await flushSection();
 				const after = probe.containerNode();
 				expect(after.textContent ?? "").not.toContain("could not be loaded");
 				expect(switchOf(after, "Mute beta")?.disabled).toBe(false);
@@ -5503,63 +5063,22 @@ describe("NotificationsSection stale push recovery", () => {
 				await act(async () => {
 					onChangeOf(unlocked!)({ target: { checked: true } });
 				});
-				for (let k = 0; k < 5; k++)
-					await act(async () => {
-						await new Promise((r) => setTimeout(r, 0));
-					});
-				const mutePost = probe.posts.find(
-					(p) =>
-						p.url === "/api/notifications/prefs" &&
-						(p.body as { mutedProjects?: string[] }).mutedProjects !==
-							undefined,
-				);
-				expect(mutePost).toBeDefined();
-				expect(
-					(mutePost!.body as { mutedProjects: string[] }).mutedProjects.sort(),
-				).toEqual(["alpha", "beta"]);
+				await flushSection();
+				expectMutePost(probe);
 			},
 			{ failMuteLoads: 2 },
 		);
 	});
 });
 /** Mounts the section against `fetchMock`; the cleanup puts fetch and the catalog back. */
-async function mountRoles(fetchMock: typeof fetch): Promise<{
-	container: HTMLDivElement;
-	unmount: () => Promise<void>;
-}> {
-	const realFetch = globalThis.fetch;
-	globalThis.fetch = fetchMock;
-	const container = window.document.createElement(
-		"div",
-	) as unknown as HTMLDivElement;
-	window.document.body.appendChild(container as unknown as HappyNode);
-	const root = createRoot(container);
-	await act(async () => {
-		root.render(<ModelRolesSection />);
-	});
-	return {
-		container,
-		unmount: async () => {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
-			resetCatalogCache();
-		},
-	};
-}
+const mountRoles = (fetchMock: typeof fetch) =>
+	mountElement(<ModelRolesSection />, fetchMock, resetCatalogCache);
 
 const rolesFetch = (
 	roles: Record<string, string>,
 	fallbacks: Record<string, string[]> = {},
 ): typeof fetch =>
 	(async (input: RequestInfo | URL, init?: RequestInit) => {
-		const ok = (body: unknown): Response =>
-			new Response(JSON.stringify(body), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
 		const url = String(input);
 		if (url.endsWith("/api/settings/check-routing")) {
 			if (init?.method !== "POST") return ok({ routing: null });
@@ -5703,11 +5222,6 @@ const routingFetch = (
 	return (async (input: RequestInfo | URL, init?: RequestInit) => {
 		const url = String(input);
 		if (url.endsWith("/api/settings/check-routing")) {
-			const ok = (body: unknown): Response =>
-				new Response(JSON.stringify(body), {
-					status: 200,
-					headers: { "Content-Type": "application/json" },
-				});
 			if (init?.method === "POST") {
 				const body = JSON.parse(String(init.body ?? "{}")) as RoutingPost;
 				posts.push(body);
@@ -6193,6 +5707,45 @@ describe("ModelRolesSection save source", () => {
 		return save;
 	};
 
+	/** The POST /api/model-roles save answer: the shared roles shape with this
+	 *  save's commit, base and seed. */
+	const saveAnswer =
+		(opts: {
+			NEW: string;
+			base: string | null;
+			repo: unknown;
+			seed?: Record<string, unknown>;
+		}): (() => Response) =>
+		() =>
+			new Response(
+				JSON.stringify({
+					commit: opts.NEW,
+					base: opts.base,
+					hash: "h2",
+					roles: { plan: "anthropic/claude-opus-5-5" },
+					fallbacks: { plan: ["openai/gpt-5"] },
+					seed: opts.seed ?? {
+						needed: false,
+						commit: null,
+						roles: null,
+						fallbacks: null,
+						expiresAt: null,
+					},
+				}),
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+	/** Clicks Save and lets the chained requests land. */
+	const saveRoles = async (container: HTMLDivElement): Promise<void> => {
+		const save = saveButton(container);
+		await act(async () => {
+			onClickOf(save)({});
+		});
+		for (let i = 0; i < 3; i++)
+			await act(async () => {
+				await Bun.sleep(0);
+			});
+	};
+
 	test("a learned read-only verdict locks Save before any edit", async () => {
 		// Both causes lock: a read-only mount (EROFS/EACCES) and a plain
 		// unversioned folder (commit ""). Each hint must name the file and the
@@ -6255,25 +5808,8 @@ describe("ModelRolesSection save source", () => {
 		const { container, unmount } = await mountRoles(
 			sourceFetch(
 				{ repo: null, path: "/data", ro: null },
-				() =>
-					// The git-folder success: alate's PUT answers a local commit.
-					new Response(
-						JSON.stringify({
-							commit: NEW,
-							base: null,
-							hash: "h2",
-							roles: { plan: "anthropic/claude-opus-5-5" },
-							fallbacks: { plan: ["openai/gpt-5"] },
-							seed: {
-								needed: false,
-								commit: null,
-								roles: null,
-								fallbacks: null,
-								expiresAt: null,
-							},
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					),
+				// The git-folder success: alate's PUT answers a local commit.
+				saveAnswer({ NEW, base: null, repo: null }),
 			),
 		);
 		try {
@@ -6281,17 +5817,10 @@ describe("ModelRolesSection save source", () => {
 			// A folder alone does not lock anything: alate commits a git folder
 			// itself, and the board cannot tell git-ness without alate saying it.
 			await armDirty(container);
-			const save = saveButton(container);
-			expect(save.disabled).toBe(false);
+			expect(saveButton(container).disabled).toBe(false);
 
 			// The save lands and the steps line reports the local commit.
-			await act(async () => {
-				onClickOf(save)({});
-			});
-			for (let i = 0; i < 3; i++)
-				await act(async () => {
-					await Bun.sleep(0);
-				});
+			await saveRoles(container);
 			expect(container.textContent).toContain(
 				`Committed ${NEW.slice(0, 7)} to the data repo.`,
 			);
@@ -6306,40 +5835,20 @@ describe("ModelRolesSection save source", () => {
 		const { container, unmount } = await mountRoles(
 			sourceFetch(
 				{ repo: { name: "o/data", ref: "main" }, path: null, ro: null },
-				() =>
-					new Response(
-						JSON.stringify({
-							commit: NEW,
-							base: NEW,
-							hash: "h2",
-							roles: { plan: "anthropic/claude-opus-5-5" },
-							fallbacks: { plan: ["openai/gpt-5"] },
-							seed: {
-								needed: false,
-								commit: null,
-								roles: null,
-								fallbacks: null,
-								expiresAt: null,
-							},
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					),
+				saveAnswer({
+					NEW,
+					base: NEW,
+					repo: { name: "o/data", ref: "main" },
+				}),
 			),
 		);
 		try {
 			await act(async () => {});
 			await armDirty(container);
-			const save = saveButton(container);
-			expect(save.disabled).toBe(false);
+			expect(saveButton(container).disabled).toBe(false);
 
 			// The save commits and the steps line reports it, like any repo save.
-			await act(async () => {
-				onClickOf(save)({});
-			});
-			for (let i = 0; i < 3; i++)
-				await act(async () => {
-					await Bun.sleep(0);
-				});
+			await saveRoles(container);
 			expect(container.textContent).toContain(
 				`Committed ${NEW.slice(0, 7)} to the data repo.`,
 			);
@@ -6354,43 +5863,30 @@ describe("ModelRolesSection save source", () => {
 		const { container, unmount } = await mountRoles(
 			sourceFetch(
 				{ repo: { name: "o/data", ref: "main" }, path: null, ro: null },
-				() =>
-					// The save answer's seed: needed, the board still holds the old
-					// plan, and the seed commit is the one this save kept, so the
-					// steps line waits for the seed to install the save.
-					new Response(
-						JSON.stringify({
-							commit: NEW,
-							base: NEW,
-							hash: "h2",
-							roles: { plan: "anthropic/claude-opus-5-5" },
-							fallbacks: { plan: ["openai/gpt-5"] },
-							seed: {
-								needed: true,
-								commit: NEW,
-								roles: { plan: "zai/glm-5.3-flash" },
-								fallbacks: null,
-								expiresAt: null,
-							},
-						}),
-						{ status: 200, headers: { "Content-Type": "application/json" } },
-					),
+				// The save answer's seed: needed, the board still holds the old
+				// plan, and the seed commit is the one this save kept, so the
+				// steps line waits for the seed to install the save.
+				saveAnswer({
+					NEW,
+					base: NEW,
+					repo: { name: "o/data", ref: "main" },
+					seed: {
+						needed: true,
+						commit: NEW,
+						roles: { plan: "zai/glm-5.3-flash" },
+						fallbacks: null,
+						expiresAt: null,
+					},
+				}),
 			),
 		);
 		try {
 			await act(async () => {});
 			await armDirty(container);
-			const save = saveButton(container);
-			expect(save.disabled).toBe(false);
+			expect(saveButton(container).disabled).toBe(false);
 
 			// The save commits and the steps line waits for the 5-minute seed.
-			await act(async () => {
-				onClickOf(save)({});
-			});
-			for (let i = 0; i < 3; i++)
-				await act(async () => {
-					await Bun.sleep(0);
-				});
+			await saveRoles(container);
 			expect(container.textContent).toContain(
 				`Committed ${NEW.slice(0, 7)} to the data repo.`,
 			);
@@ -6404,32 +5900,27 @@ describe("ModelRolesSection save source", () => {
 	});
 });
 
-/** Mounts AlateSection against `fetchMock`, same cleanup as mountSessions. */
-async function mountAlate(fetchMock: typeof fetch): Promise<{
-	container: HTMLDivElement;
-	unmount: () => Promise<void>;
-}> {
-	const realFetch = globalThis.fetch;
-	globalThis.fetch = fetchMock;
-	const container = window.document.createElement(
-		"div",
-	) as unknown as HTMLDivElement;
-	window.document.body.appendChild(container as unknown as HappyNode);
-	const root = createRoot(container);
+/** Clicks the Alate section's regenerate button and confirms the dialog. */
+async function confirmRegenerate(container: HTMLDivElement): Promise<void> {
+	const regen = container.querySelector<HTMLButtonElement>(
+		'button[aria-label="Regenerate Alate API key"]',
+	);
+	if (regen === null) throw new Error("regenerate button missing");
 	await act(async () => {
-		root.render(<AlateSection />);
+		regen.click();
 	});
-	return {
-		container,
-		unmount: async () => {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
-		},
-	};
+	const okButton = [...window.document.querySelectorAll("button")].find((b) =>
+		b.textContent?.includes("Regenerate"),
+	);
+	if (okButton === undefined) throw new Error("confirm dialog missing");
+	await act(async () => {
+		okButton.click();
+	});
 }
+
+/** Mounts AlateSection against `fetchMock`, same cleanup as mountSessions. */
+const mountAlate = (fetchMock: typeof fetch) =>
+	mountElement(<AlateSection />, fetchMock);
 
 /** The fetch behavior an Alate section test configures. */
 type AlateMockHandlers = {
@@ -6458,11 +5949,7 @@ type AlateMockHandlers = {
 };
 
 /** Every JSON body the Alate tests' fetch mock answers with: a 200 application/json Response. */
-const okJson = (body: unknown): Response =>
-	new Response(JSON.stringify(body), {
-		status: 200,
-		headers: { "Content-Type": "application/json" },
-	});
+const okJson = ok;
 
 /** The POST /api/settings/alate-key answer: the key handler's Response (a factory builds
     a fresh one per call), or the default 200 when the test configures none. */
@@ -6712,20 +6199,7 @@ describe("AlateSection stored API key", () => {
 			}),
 		);
 		try {
-			const regen = container.querySelector<HTMLButtonElement>(
-				'button[aria-label="Regenerate Alate API key"]',
-			);
-			if (regen === null) throw new Error("regenerate button missing");
-			await act(async () => {
-				regen.click();
-			});
-			const ok = [...window.document.querySelectorAll("button")].find((b) =>
-				b.textContent?.includes("Regenerate"),
-			);
-			if (ok === undefined) throw new Error("confirm dialog missing");
-			await act(async () => {
-				ok.click();
-			});
+			await confirmRegenerate(container);
 			expect(posts).toBe(1);
 			expect(container.textContent).toContain("rotated_key");
 			await settleDialog();
@@ -6749,20 +6223,7 @@ describe("AlateSection stored API key", () => {
 			}),
 		);
 		try {
-			const regen = container.querySelector<HTMLButtonElement>(
-				'button[aria-label="Regenerate Alate API key"]',
-			);
-			if (regen === null) throw new Error("regenerate button missing");
-			await act(async () => {
-				regen.click();
-			});
-			const ok = [...window.document.querySelectorAll("button")].find((b) =>
-				b.textContent?.includes("Regenerate"),
-			);
-			if (ok === undefined) throw new Error("confirm dialog missing");
-			await act(async () => {
-				ok.click();
-			});
+			await confirmRegenerate(container);
 			const alert = container.querySelector('p[role="alert"]');
 			expect(alert?.textContent).toContain("disk full");
 			expect(container.textContent).toContain("rotated_key");
@@ -6783,20 +6244,7 @@ describe("AlateSection stored API key", () => {
 			}),
 		);
 		try {
-			const regen = container.querySelector<HTMLButtonElement>(
-				'button[aria-label="Regenerate Alate API key"]',
-			);
-			if (regen === null) throw new Error("regenerate button missing");
-			await act(async () => {
-				regen.click();
-			});
-			const ok = [...window.document.querySelectorAll("button")].find((b) =>
-				b.textContent?.includes("Regenerate"),
-			);
-			if (ok === undefined) throw new Error("confirm dialog missing");
-			await act(async () => {
-				ok.click();
-			});
+			await confirmRegenerate(container);
 			expect(container.querySelector('p[role="alert"]')?.textContent).toContain(
 				"unauthorized",
 			);
@@ -6985,48 +6433,39 @@ describe("ProjectSetupSteps step order", () => {
 	});
 
 	test("existing project setup saves choices before Finish later without another create", async () => {
-		const realFetch = globalThis.fetch;
 		const posts: { url: string; body: Record<string, unknown> }[] = [];
 		let closes = 0;
-		globalThis.fetch = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		) => {
-			const url = String(input);
-			if (init?.method === "POST") {
-				posts.push({
-					url,
-					body: JSON.parse(String(init.body)) as Record<string, unknown>,
-				});
-			}
-			if (url === "/api/projects/proj/settings") {
-				return okJson({
-					...fresh,
-					settings: { ...fresh.settings, retroSince: 1 },
-				});
-			}
-			return new Response("{}", { status: 404 });
-		}) as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		const { restore: fetchRestore } = stubFetch(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = String(input);
+				if (init?.method === "POST") {
+					posts.push({
+						url,
+						body: JSON.parse(String(init.body)) as Record<string, unknown>,
+					});
+				}
+				if (url === "/api/projects/proj/settings") {
+					return okJson({
+						...fresh,
+						settings: { ...fresh.settings, retroSince: 1 },
+					});
+				}
+				return new Response("{}", { status: 404 });
+			},
+		);
+		const { container, unmount } = await mount(
+			<ProjectSetupSteps
+				project={fresh}
+				act={async (fn) => {
+					await fn();
+					return true;
+				}}
+				onClose={() => {
+					closes += 1;
+				}}
+			/>,
+		);
 		try {
-			await act(async () => {
-				root.render(
-					<ProjectSetupSteps
-						project={fresh}
-						act={async (fn) => {
-							await fn();
-							return true;
-						}}
-						onClose={() => {
-							closes += 1;
-						}}
-					/>,
-				);
-			});
 			const checkbox = container.querySelector(
 				'input[type="checkbox"]',
 			) as HTMLInputElement;
@@ -7052,11 +6491,8 @@ describe("ProjectSetupSteps step order", () => {
 				{ url: "/api/projects/proj/settings", body: { setupChecklist: true } },
 			]);
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			fetchRestore();
 		}
 	});
 });
@@ -7084,37 +6520,28 @@ describe("ProjectSetupSteps gitless init jump", () => {
 	} as unknown as ProjectView;
 
 	test("creating the repo lands on the Automation step, not beside the interview", async () => {
-		const realFetch = globalThis.fetch;
 		let inits = 0;
-		globalThis.fetch = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		) => {
-			const url = String(input);
-			if (url.endsWith("/init") && (init?.method ?? "GET") === "POST") {
-				inits += 1;
-				return okJson({ project: { ...gitless, gitless: false } });
-			}
-			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		const { restore: fetchRestore } = stubFetch(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = String(input);
+				if (url.endsWith("/init") && (init?.method ?? "GET") === "POST") {
+					inits += 1;
+					return okJson({ project: { ...gitless, gitless: false } });
+				}
+				return new Response("{}", { status: 404 });
+			},
+		);
+		const { container, unmount } = await mount(
+			<ProjectSetupSteps
+				project={gitless}
+				act={async (fn) => {
+					await fn();
+					return true;
+				}}
+				onClose={() => {}}
+			/>,
+		);
 		try {
-			await act(async () => {
-				root.render(
-					<ProjectSetupSteps
-						project={gitless}
-						act={async (fn) => {
-							await fn();
-							return true;
-						}}
-						onClose={() => {}}
-					/>,
-				);
-			});
 			expect(container.textContent).toContain("Create git repo");
 			const button = [...container.querySelectorAll("button")].find(
 				(b) => b.textContent === "Create git repo",
@@ -7133,40 +6560,30 @@ describe("ProjectSetupSteps gitless init jump", () => {
 			expect(done[0]?.textContent).toBe("Source");
 			expect(inits).toBe(1);
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			fetchRestore();
 		}
 	});
 
 	test("Done appears only after the init and the settings walk", async () => {
-		const realFetch = globalThis.fetch;
 		const posts: string[] = [];
-		globalThis.fetch = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		) => {
-			const url = String(input);
-			const method = init?.method ?? "GET";
-			if (method === "POST") posts.push(url);
-			// The init answers with a non-gitless view; the interview queues; the
-			// finish patch saves the checklist flag.
-			if (url.endsWith("/init") && method === "POST")
-				return okJson({ project: { ...gitless, gitless: false } });
-			if (url.endsWith("/interview") && method === "POST")
-				return okJson({ interview: "queued", id: "BARE-1" });
-			if (url.endsWith("/settings") && method === "POST")
-				// The settings route answers with the project view itself.
-				return okJson({ ...gitless, gitless: false });
-			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		const { restore: fetchRestore } = stubFetch(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = String(input);
+				const method = init?.method ?? "GET";
+				if (method === "POST") posts.push(url);
+				// The init answers with a non-gitless view; the interview queues; the
+				// finish patch saves the checklist flag.
+				if (url.endsWith("/init") && method === "POST")
+					return okJson({ project: { ...gitless, gitless: false } });
+				if (url.endsWith("/interview") && method === "POST")
+					return okJson({ interview: "queued", id: "BARE-1" });
+				if (url.endsWith("/settings") && method === "POST")
+					// The settings route answers with the project view itself.
+					return okJson({ ...gitless, gitless: false });
+				return new Response("{}", { status: 404 });
+			},
+		);
 		const buttonOf = (label: string): HTMLButtonElement => {
 			const b = [...container.querySelectorAll("button")].find(
 				(x) => x.textContent === label,
@@ -7174,19 +6591,17 @@ describe("ProjectSetupSteps gitless init jump", () => {
 			if (b === undefined) throw new Error(`no ${label} button`);
 			return b;
 		};
+		const { container, unmount } = await mount(
+			<ProjectSetupSteps
+				project={gitless}
+				act={async (fn) => {
+					await fn();
+					return true;
+				}}
+				onClose={() => {}}
+			/>,
+		);
 		try {
-			await act(async () => {
-				root.render(
-					<ProjectSetupSteps
-						project={gitless}
-						act={async (fn) => {
-							await fn();
-							return true;
-						}}
-						onClose={() => {}}
-					/>,
-				);
-			});
 			// At the gitless open the primary interview action and Back are not
 			// offered: the init button is the only way forward.
 			expect(
@@ -7233,11 +6648,8 @@ describe("ProjectSetupSteps gitless init jump", () => {
 			expect(posts[1]?.endsWith("/interview")).toBe(true);
 			expect(posts[2]?.endsWith("/settings")).toBe(true);
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			fetchRestore();
 		}
 	});
 });
@@ -7327,11 +6739,6 @@ describe("AlateSection data repo pin", () => {
 });
 
 describe("AlateSection user layer", () => {
-	const ok = (body: unknown): Response =>
-		new Response(JSON.stringify(body), {
-			status: 200,
-			headers: { "Content-Type": "application/json" },
-		});
 	const server = {
 		url: "http://127.0.0.1:4570",
 		keySet: true,
@@ -7486,51 +6893,55 @@ describe("AlateSection user layer", () => {
 });
 
 describe("Error-Says-Fix messages", () => {
-	// The same minimal ProjectView the form tests use: the form reads the name
-	// and the full settings shape.
-	const project = {
-		name: "proj",
-		icon: null,
-		remote: null,
-		github: null,
-		vmRunner: {
-			configured: false,
-			ok: false,
-			reason: "OTTR_VM_RUNNER_URL is not set",
-		},
-		hasRules: true,
-		gitless: false,
-		settings: {
-			maxParallel: 2,
-			copyExtra: [],
-			displayName: null,
-			releaseCommand: null,
-			archReviewCap: 30,
-			maxImages: 4,
-			keptWorktreeDays: 7,
-			autoTend: false,
-			autoTendLimit: 5,
-			tendChurnGlobs: [],
-			holdUpdateMerges: false,
-			retroSince: null,
-			retroFilter: true,
-			forkResearch: false,
-			prReviews: false,
-			prMode: false,
-			microVm: false,
-			setupChecklist: false,
-			targetBranch: null,
-			originUrl: null,
-			taskIdPrefix: null,
-		},
-		taskPrefix: "PROJ",
-	} as unknown as ProjectView;
+	const project = projectView({ taskPrefix: "PROJ" }, { taskIdPrefix: null });
 
-	const ok = (body: unknown): Response =>
-		new Response(JSON.stringify(body), {
-			status: 200,
-			headers: { "Content-Type": "application/json" },
-		});
+	/** The app act that reports a thrown message through onError; the tick repeats it. */
+	const reportAct = async (
+		fn: () => Promise<unknown>,
+		onError?: (message: string) => void,
+	): Promise<boolean> => {
+		try {
+			await fn();
+			return true;
+		} catch (err) {
+			onError?.(err instanceof Error ? err.message : String(err));
+			return false;
+		}
+	};
+	/** Mounts the form with trendingScan false against `fetchMock`; `report`
+	 *  swaps in the reporting act. The cleanup puts fetch and the DOM back. */
+	const mountFailForm = async (
+		fetchMock: typeof fetch,
+		report = false,
+	): Promise<{
+		container: HTMLDivElement;
+		unmount: () => Promise<void>;
+	}> => {
+		const { restore: fetchRestore } = stubFetch(fetchMock);
+		const { container, unmount } = await mount(
+			<ProjectSettingsForm
+				project={project}
+				tasks={[]}
+				trendingScan={false}
+				act={
+					report
+						? reportAct
+						: async (fn) => {
+								await fn();
+								return true;
+							}
+				}
+				openTask={() => {}}
+			/>,
+		);
+		return {
+			container,
+			unmount: async () => {
+				await unmount();
+				fetchRestore();
+			},
+		};
+	};
 
 	test("asError names the request, the status in words and a next step", () => {
 		const line = asError({}, 500, "saving the token");
@@ -7559,33 +6970,7 @@ describe("Error-Says-Fix messages", () => {
 				return ok({ own: null, expiresAt: null });
 			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
 		}) as typeof fetch;
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = fetchMock;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(
-				<ProjectSettingsForm
-					project={project}
-					tasks={[]}
-					trendingScan={false}
-					// The app's act reports the thrown message; the tick repeats it.
-					act={async (fn, onError) => {
-						try {
-							await fn();
-							return true;
-						} catch (err) {
-							onError?.(err instanceof Error ? err.message : String(err));
-							return false;
-						}
-					}}
-					openTask={() => {}}
-				/>,
-			);
-		});
+		const { container, unmount } = await mountFailForm(fetchMock, true);
 		try {
 			const input = container.querySelector<HTMLInputElement>(
 				'input[type="file"][accept^="image/"]',
@@ -7606,11 +6991,7 @@ describe("Error-Says-Fix messages", () => {
 			expect(tick?.getAttribute("role")).toBe("alert");
 			expect(tick?.textContent).toBe("Not saved: icon too large");
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
 		}
 	});
 
@@ -7632,32 +7013,7 @@ describe("Error-Says-Fix messages", () => {
 				return ok({ own: null, expiresAt: null });
 			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
 		}) as typeof fetch;
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = fetchMock;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(
-				<ProjectSettingsForm
-					project={project}
-					tasks={[]}
-					trendingScan={false}
-					act={async (fn, onError) => {
-						try {
-							await fn();
-							return true;
-						} catch (err) {
-							onError?.(err instanceof Error ? err.message : String(err));
-							return false;
-						}
-					}}
-					openTask={() => {}}
-				/>,
-			);
-		});
+		const { container, unmount } = await mountFailForm(fetchMock, true);
 		try {
 			const input = container.querySelector<HTMLInputElement>(
 				'input[aria-label="Display name"]',
@@ -7704,42 +7060,24 @@ describe("Error-Says-Fix messages", () => {
 			expect(prefixMessage?.className).toContain("auth-error");
 			expect(prefixMessage?.textContent).toBe("settings locked");
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
 		}
 	});
 
 	test("the git remote inputs carry inputMode, spellCheck and autoComplete off", async () => {
-		const fetchMock = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (url.endsWith("/api/git-hosts"))
-				return ok({
-					githubHost: "github.com",
-					tokens: [],
-					globalKey: null,
-					githubApp: null,
-					githubTokenSet: false,
-				});
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = fetchMock;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(
-				<GitHostsSection commitIdentity={null} act={async () => true} />,
-			);
+		const fetchMock = gitHostsMock({
+			hosts: () => ({
+				githubHost: "github.com",
+				tokens: [],
+				globalKey: null,
+				githubApp: null,
+				githubTokenSet: false,
+			}),
 		});
+		const { restore: fetchRestore } = stubFetch(fetchMock);
+		const { container, unmount } = await mount(
+			<GitHostsSection commitIdentity={null} act={async () => true} />,
+		);
 		try {
 			const urls = [
 				...container.querySelectorAll<HTMLInputElement>(
@@ -7763,25 +7101,18 @@ describe("Error-Says-Fix messages", () => {
 				throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
 			}) as typeof fetch;
 			globalThis.fetch = formFetch;
-			const formContainer = window.document.createElement(
-				"div",
-			) as unknown as HTMLDivElement;
-			window.document.body.appendChild(formContainer as unknown as HappyNode);
-			const formRoot = createRoot(formContainer);
-			await act(async () => {
-				formRoot.render(
-					<ProjectSettingsForm
-						project={project}
-						tasks={[]}
-						trendingScan={false}
-						act={async (fn) => {
-							await fn();
-							return true;
-						}}
-						openTask={() => {}}
-					/>,
-				);
-			});
+			const { container: formContainer, unmount: unmountForm } = await mount(
+				<ProjectSettingsForm
+					project={project}
+					tasks={[]}
+					trendingScan={false}
+					act={async (fn) => {
+						await fn();
+						return true;
+					}}
+					openTask={() => {}}
+				/>,
+			);
 			try {
 				const pUrl = formContainer.querySelector<HTMLInputElement>(
 					'input[aria-label="Test URL (a repository this key can read)"]',
@@ -7792,17 +7123,11 @@ describe("Error-Says-Fix messages", () => {
 				expect(pUrl.getAttribute("spellcheck")).toBe("false");
 				expect(pUrl.getAttribute("autocomplete")).toBe("off");
 			} finally {
-				await act(async () => {
-					formRoot.unmount();
-				});
-				formContainer.remove();
+				await unmountForm();
 			}
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			fetchRestore();
 		}
 	});
 
@@ -7819,27 +7144,7 @@ describe("Error-Says-Fix messages", () => {
 				});
 			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
 		}) as typeof fetch;
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = fetchMock;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(
-				<ProjectSettingsForm
-					project={project}
-					tasks={[]}
-					trendingScan={false}
-					act={async (fn) => {
-						await fn();
-						return true;
-					}}
-					openTask={() => {}}
-				/>,
-			);
-		});
+		const { container, unmount } = await mountFailForm(fetchMock);
 		try {
 			const button = [
 				...container.querySelectorAll<HTMLElement>("button"),
@@ -7868,11 +7173,7 @@ describe("Error-Says-Fix messages", () => {
 			});
 			await settleDialog();
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
 		}
 	});
 });
@@ -8015,6 +7316,18 @@ describe("AlateSection provision result", () => {
 			"Checked 301 installs across 321 packages (no changes)",
 		].join("\n"),
 	};
+	/** Clicks the section's Provision button and lets the run land. */
+	const clickProvision = async (container: HTMLDivElement): Promise<void> => {
+		const button = Array.from(container.querySelectorAll("button")).find(
+			(b) => b.textContent?.trim() === "Provision",
+		);
+		if (button === undefined)
+			throw new Error("Provision button did not render");
+		await act(async () => {
+			button.click();
+		});
+	};
+
 	const syncUserFailed: ProvisionResult = {
 		script: "sync-user.mjs",
 		code: 1,
@@ -8037,14 +7350,7 @@ describe("AlateSection provision result", () => {
 			}),
 		);
 		try {
-			const button = Array.from(container.querySelectorAll("button")).find(
-				(b) => b.textContent?.trim() === "Provision",
-			);
-			if (button === undefined)
-				throw new Error("Provision button did not render");
-			await act(async () => {
-				button.click();
-			});
+			await clickProvision(container);
 			const text = container.textContent ?? "";
 			// The status keeps its wording and adds the short total.
 			expect(text).toContain("Provisioned 2 scripts successfully. 1 updated.");
@@ -8101,14 +7407,7 @@ describe("AlateSection provision result", () => {
 			}),
 		);
 		try {
-			const button = Array.from(container.querySelectorAll("button")).find(
-				(b) => b.textContent?.trim() === "Provision",
-			);
-			if (button === undefined)
-				throw new Error("Provision button did not render");
-			await act(async () => {
-				button.click();
-			});
+			await clickProvision(container);
 			const text = container.textContent ?? "";
 			expect(text).toContain(
 				"Provisioning failed: 1 of 2 scripts exited non-zero.",
@@ -8136,11 +7435,6 @@ describe("AlateSection provision result", () => {
 // line, a write row waits for an explicit confirm, an error row for a re-check, and
 // hosted mode hides the block with its card (docs/specs/turn-read-token.md).
 describe("GitHostsSection turn GitHub token", () => {
-	const ok = (body: unknown): Response =>
-		new Response(JSON.stringify(body), {
-			status: 200,
-			headers: { "Content-Type": "application/json" },
-		});
 	const gitHostsView = {
 		tokens: [],
 		globalKey: null,
@@ -8164,25 +7458,14 @@ describe("GitHostsSection turn GitHub token", () => {
 		posts: { url: string; body: unknown }[],
 		answer?: () => unknown,
 	): typeof fetch =>
-		(async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET")
-				return ok(gitHostsView);
-			if (url.endsWith("/api/settings/github-token"))
-				return ok({ tokenSet: false, expiresAt: null });
-			if (url.includes("/api/settings/turn-github-token")) {
-				if ((init?.method ?? "GET") === "GET") return ok(turn);
-				posts.push({
-					url: url.replace(/^.*\/api/, "/api"),
-					body: JSON.parse(String(init?.body)),
-				});
+		gitHostsMock({
+			hosts: () => gitHostsView,
+			turnGet: () => turn,
+			onTurnPost: (url, body) => {
+				posts.push({ url: url.replace(/^.*\/api/, "/api"), body });
 				return ok(answer?.() ?? {});
-			}
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
+			},
+		});
 	/** Lets the turn block's requests land: one act per pending microtask lane. */
 	const settle = async (): Promise<void> => {
 		for (let k = 0; k < 5; k++)
@@ -8416,205 +7699,128 @@ describe("GitHostsSection turn GitHub token", () => {
 // it is readable. The wording mirrors the Jira connections' warn chip.
 describe("Unreadable stored secrets", () => {
 	const MSG = "Token unreadable, enter it again";
-	const ok = (body: unknown): Response =>
-		new Response(JSON.stringify(body), {
-			status: 200,
-			headers: { "Content-Type": "application/json" },
-		});
 
-	test("GitHub token form shows the message when set and unreadable", async () => {
-		const fetchMock = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET")
-				return ok({
-					tokens: [],
-					globalKey: null,
-					githubApp: null,
-					githubHost: "github.com",
-					githubTokenSet: true,
-				});
-			if (url.endsWith("/api/settings/github-token"))
-				return ok({ tokenSet: true, tokenReadable: false, expiresAt: null });
-			if (url.endsWith("/api/settings/turn-github-token"))
-				return ok({ host: "github.com", tokens: [] });
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
+	/** Mounts the section with the git-hosts GET answering `over` on the shared
+	 *  view and `/api/settings/github-token` answering `tokenAnswer`; `check`
+	 *  asserts the rendered section before the cleanup. */
+	const mountSecrets = async (
+		over: Record<string, unknown>,
+		tokenAnswer: Record<string, unknown>,
+		check: (container: HTMLDivElement) => void,
+	): Promise<void> => {
+		const fetchMock = gitHostsMock({
+			hosts: () => ({
+				tokens: [],
+				globalKey: null,
+				githubApp: null,
+				githubHost: "github.com",
+				githubTokenSet: true,
+				...over,
+			}),
+			tokenCheck: () => tokenAnswer,
+			turnGet: () => ({ host: "github.com", tokens: [] }),
+		});
 		const { container, unmount } = await mountSection(fetchMock);
 		try {
-			expect(container.textContent).toContain(MSG);
+			check(container);
 		} finally {
 			await unmount();
 		}
+	};
+
+	test("GitHub token form shows the message when set and unreadable", async () => {
+		await mountSecrets(
+			{},
+			{ tokenSet: true, tokenReadable: false, expiresAt: null },
+			(container) => {
+				expect(container.textContent).toContain(MSG);
+			},
+		);
 	});
 
 	test("GitHub token form stays quiet when the token is readable", async () => {
-		const fetchMock = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET")
-				return ok({
-					tokens: [],
-					globalKey: null,
-					githubApp: null,
-					githubHost: "github.com",
-					githubTokenSet: true,
-				});
-			if (url.endsWith("/api/settings/github-token"))
-				return ok({ tokenSet: true, tokenReadable: true, expiresAt: null });
-			if (url.endsWith("/api/settings/turn-github-token"))
-				return ok({ host: "github.com", tokens: [] });
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
-		const { container, unmount } = await mountSection(fetchMock);
-		try {
-			expect(container.textContent).not.toContain(MSG);
-		} finally {
-			await unmount();
-		}
+		await mountSecrets(
+			{},
+			{ tokenSet: true, tokenReadable: true, expiresAt: null },
+			(container) => {
+				expect(container.textContent).not.toContain(MSG);
+			},
+		);
 	});
 
 	test("an unreadable git-host token row shows the message per row", async () => {
-		const fetchMock = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET")
-				return ok({
-					tokens: [
-						{
-							host: "git.corp",
-							username: "bot",
-							tokenSet: true,
-							tokenReadable: false,
-						},
-					],
-					globalKey: null,
-					githubApp: null,
-					githubHost: "github.com",
-					githubTokenSet: true,
-				});
-			if (url.endsWith("/api/settings/github-token"))
-				return ok({ tokenSet: false, expiresAt: null });
-			if (url.endsWith("/api/settings/turn-github-token"))
-				return ok({ host: "github.com", tokens: [] });
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
-		const { container, unmount } = await mountSection(fetchMock);
-		try {
-			expect(container.textContent).toContain(MSG);
-		} finally {
-			await unmount();
-		}
+		await mountSecrets(
+			{
+				tokens: [
+					{
+						host: "git.corp",
+						username: "bot",
+						tokenSet: true,
+						tokenReadable: false,
+					},
+				],
+			},
+			{ tokenSet: false, expiresAt: null },
+			(container) => {
+				expect(container.textContent).toContain(MSG);
+			},
+		);
 	});
 
 	test("a readable git-host token row shows no message", async () => {
-		const fetchMock = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET")
-				return ok({
-					tokens: [
-						{
-							host: "git.corp",
-							username: "bot",
-							tokenSet: true,
-							tokenReadable: true,
-						},
-					],
-					globalKey: null,
-					githubApp: null,
-					githubHost: "github.com",
-					githubTokenSet: true,
-				});
-			if (url.endsWith("/api/settings/github-token"))
-				return ok({ tokenSet: false, expiresAt: null });
-			if (url.endsWith("/api/settings/turn-github-token"))
-				return ok({ host: "github.com", tokens: [] });
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
-		const { container, unmount } = await mountSection(fetchMock);
-		try {
-			expect(container.textContent).not.toContain(MSG);
-		} finally {
-			await unmount();
-		}
+		await mountSecrets(
+			{
+				tokens: [
+					{
+						host: "git.corp",
+						username: "bot",
+						tokenSet: true,
+						tokenReadable: true,
+					},
+				],
+			},
+			{ tokenSet: false, expiresAt: null },
+			(container) => {
+				expect(container.textContent).not.toContain(MSG);
+			},
+		);
 	});
 
 	test("a GitHub App with an unreadable key shows the message and tolerates a null fingerprint", async () => {
-		const fetchMock = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET")
-				return ok({
-					tokens: [],
-					globalKey: null,
-					githubApp: {
-						id: "123456",
-						fingerprint: null,
-						check: null,
-						keyReadable: false,
-					},
-					githubHost: "github.com",
-					githubTokenSet: true,
-				});
-			if (url.endsWith("/api/settings/github-token"))
-				return ok({ tokenSet: false, expiresAt: null });
-			if (url.endsWith("/api/settings/turn-github-token"))
-				return ok({ host: "github.com", tokens: [] });
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
-		const { container, unmount } = await mountSection(fetchMock);
-		try {
-			const app = container.querySelector("#github-app-block");
-			expect(app?.textContent).toContain(MSG);
-		} finally {
-			await unmount();
-		}
+		await mountSecrets(
+			{
+				githubApp: {
+					id: "123456",
+					fingerprint: null,
+					check: null,
+					keyReadable: false,
+				},
+			},
+			{ tokenSet: false, expiresAt: null },
+			(container) => {
+				const app = container.querySelector("#github-app-block");
+				expect(app?.textContent).toContain(MSG);
+			},
+		);
 	});
 
 	test("a GitHub App with a readable key shows the fingerprint and no message", async () => {
-		const fetchMock = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> => {
-			const url = String(input);
-			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET")
-				return ok({
-					tokens: [],
-					globalKey: null,
-					githubApp: {
-						id: "123456",
-						fingerprint: "SHA256:abc",
-						check: null,
-						keyReadable: true,
-					},
-					githubHost: "github.com",
-					githubTokenSet: true,
-				});
-			if (url.endsWith("/api/settings/github-token"))
-				return ok({ tokenSet: false, expiresAt: null });
-			if (url.endsWith("/api/settings/turn-github-token"))
-				return ok({ host: "github.com", tokens: [] });
-			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
-		}) as typeof fetch;
-		const { container, unmount } = await mountSection(fetchMock);
-		try {
-			const app = container.querySelector("#github-app-block");
-			expect(app?.textContent).toContain("SHA256:abc");
-			expect(app?.textContent).not.toContain(MSG);
-		} finally {
-			await unmount();
-		}
+		await mountSecrets(
+			{
+				githubApp: {
+					id: "123456",
+					fingerprint: "SHA256:abc",
+					check: null,
+					keyReadable: true,
+				},
+			},
+			{ tokenSet: false, expiresAt: null },
+			(container) => {
+				const app = container.querySelector("#github-app-block");
+				expect(app?.textContent).toContain("SHA256:abc");
+				expect(app?.textContent).not.toContain(MSG);
+			},
+		);
 	});
 
 	test("Hindsight key shows the message when set and unreadable", async () => {
@@ -8683,96 +7889,82 @@ describe("Unreadable stored secrets", () => {
 	});
 
 	test("an unreadable env value shows the message", async () => {
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (): Promise<Response> =>
-			ok({
-				names: [
-					{ name: "FOO_TOKEN", projects: ["_all"], set: true, readable: false },
-				],
-			})) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(<EnvSection />);
-		});
+		const { restore: fetchRestore } = stubFetch(
+			async (): Promise<Response> =>
+				ok({
+					names: [
+						{
+							name: "FOO_TOKEN",
+							projects: ["_all"],
+							set: true,
+							readable: false,
+						},
+					],
+				}),
+		);
+		const { container, unmount } = await mount(<EnvSection />);
 		try {
 			expect(container.textContent).toContain(MSG);
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			fetchRestore();
 		}
 	});
 
 	test("a readable env value shows no message", async () => {
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (): Promise<Response> =>
-			ok({
-				names: [
-					{ name: "FOO_TOKEN", projects: ["_all"], set: true, readable: true },
-				],
-			})) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(<EnvSection />);
-		});
+		const { restore: fetchRestore } = stubFetch(
+			async (): Promise<Response> =>
+				ok({
+					names: [
+						{
+							name: "FOO_TOKEN",
+							projects: ["_all"],
+							set: true,
+							readable: true,
+						},
+					],
+				}),
+		);
+		const { container, unmount } = await mount(<EnvSection />);
 		try {
 			expect(container.textContent).not.toContain(MSG);
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			fetchRestore();
 		}
 	});
 
 	test("the env table leads with missing values, hides set secrets behind Replace, and shows plain values", async () => {
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (): Promise<Response> =>
-			ok({
-				names: [
-					{
-						name: "API_TOKEN",
-						projects: ["_all"],
-						plain: false,
-						set: true,
-						readable: true,
-					},
-					{
-						name: "MQTT_HOST",
-						projects: ["p1"],
-						plain: true,
-						set: true,
-						readable: true,
-						value: "mqtt.home.example",
-					},
-					{
-						name: "NEW_KEY",
-						projects: ["p1"],
-						plain: false,
-						set: false,
-						readable: false,
-					},
-				],
-			})) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(<EnvSection />);
-		});
+		const { restore: fetchRestore } = stubFetch(
+			async (): Promise<Response> =>
+				ok({
+					names: [
+						{
+							name: "API_TOKEN",
+							projects: ["_all"],
+							plain: false,
+							set: true,
+							readable: true,
+						},
+						{
+							name: "MQTT_HOST",
+							projects: ["p1"],
+							plain: true,
+							set: true,
+							readable: true,
+							value: "mqtt.home.example",
+						},
+						{
+							name: "NEW_KEY",
+							projects: ["p1"],
+							plain: false,
+							set: false,
+							readable: false,
+						},
+					],
+				}),
+		);
+		const { container, unmount } = await mount(<EnvSection />);
 		try {
 			const rows = [...container.querySelectorAll(".env-table tbody tr")];
 			// The missing value leads; set rows keep env.txt order after it.
@@ -8802,11 +7994,8 @@ describe("Unreadable stored secrets", () => {
 				"password",
 			);
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			fetchRestore();
 		}
 	});
 });
@@ -8836,11 +8025,6 @@ describe("Env save state is per row", () => {
 			readable: false,
 		},
 	];
-	const okRes = (body: unknown): Response =>
-		new Response(JSON.stringify(body), {
-			status: 200,
-			headers: { "Content-Type": "application/json" },
-		});
 	const settle = async (until: () => boolean): Promise<void> => {
 		for (let k = 0; k < 20 && !until(); k++)
 			await act(async () => {
@@ -8856,22 +8040,14 @@ describe("Env save state is per row", () => {
 		saveButtons: HTMLButtonElement[];
 		unmount: () => Promise<void>;
 	}> {
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (
-			_input: RequestInfo | URL,
-			init?: RequestInit,
-		): Promise<Response> =>
-			init?.method === "POST"
-				? post()
-				: okRes({ names })) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(<EnvSection />);
-		});
+		const { restore: fetchRestore } = stubFetch(
+			async (
+				_input: RequestInfo | URL,
+				init?: RequestInit,
+			): Promise<Response> =>
+				init?.method === "POST" ? post() : okRes({ names }),
+		);
+		const { container, unmount } = await mount(<EnvSection />);
 		const rows = [...container.querySelectorAll(".env-table tbody tr")];
 		const saveButtons = rows.map(
 			(r) => r.querySelector("button") as HTMLButtonElement,
@@ -8886,11 +8062,8 @@ describe("Env save state is per row", () => {
 			rows,
 			saveButtons,
 			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
-				globalThis.fetch = realFetch;
+				await unmount();
+				fetchRestore();
 			},
 		};
 	}

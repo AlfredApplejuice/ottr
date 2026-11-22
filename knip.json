@@ -7,14 +7,25 @@
     "src/ui/app.tsx",
     "src/stryker-tap.cjs",
     "scripts/**/*.{js,mjs,ts}",
-    "extension/tracker.ts"
+    "extension/tracker.ts",
+    ".agents/skills/llm-to-code/scripts/profile-session.ts"
   ],
-  "ignoreBinaries": ["tailscale", "ssh-keygen", "mkfifo"],
+  "ignoreBinaries": [
+    "tailscale",
+    "ssh-keygen",
+    "mkfifo",
+    "openssl",
+    "setsid",
+    "script"
+  ],
   "ignoreDependencies": [
     "@stryker-mutator/api",
-    "@stryker-mutator/command-runner",
-    "@stryker-mutator/instrumenter",
-    "@hughescr/stryker-bun-runner"
+    "@hughescr/stryker-bun-runner",
+    "@stryker-mutator/bun-runner"
   ],
-  "ignoreUnresolved": ["src/server.ts"]
+  "ignoreUnresolved": ["src/server.ts"],
+  "rules": {
+    "exports": "warn",
+    "types": "warn"
+  }
 }
