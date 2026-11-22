@@ -1718,20 +1718,22 @@ function cappedPushOutput(text: string): string | undefined {
  * "error:") and `output` with git's complete output (OTTR-465), so the card log shows the
  * cause a permission failure points at.
  */
-/** The merge-hold gate: the audited origin tip must be contained in the local branch. Null when it holds. */
+/** The merge-hold gate: the audited origin tip must be contained in what the push will
+ * land. `ref` is the proposed integration head before the fast-forward runs (the ff
+ * precondition), and the landed branch after it. Null when it holds. */
 async function holdGate(
 	mainPath: string,
 	leaseTip: string,
-	branch: string,
+	ref: string,
 ): Promise<{ status: "failed"; error: string } | null> {
 	const pinned = await git(
-		["merge-base", "--is-ancestor", leaseTip, `refs/heads/${branch}`],
+		["merge-base", "--is-ancestor", leaseTip, ref],
 		mainPath,
 	);
 	if (pinned.code === 0) return null;
 	return {
 		status: "failed",
-		error: `merge-hold gate: the audited origin tip ${leaseTip} is not contained in refs/heads/${branch}`,
+		error: `merge-hold gate: the audited origin tip ${leaseTip} is not contained in ${ref}`,
 	};
 }
 
@@ -1929,7 +1931,7 @@ async function mergePushPreflight(
 	const local = await sha(`refs/heads/${branch}`);
 	if (local === null || local === base) return { status: "skipped" };
 	if (leaseTip !== null) {
-		const gate = await holdGate(mainPath, leaseTip, branch);
+		const gate = await holdGate(mainPath, leaseTip, `refs/heads/${branch}`);
 		if (gate !== null) return gate;
 	}
 	const head = await integrationHead(worktreePath, taskBranch, sha);
@@ -1975,13 +1977,16 @@ export async function serverMergePush(
 	// tip into the local target before the gate reads it (OTTR-274).
 	let ffOutput = "";
 	if (fastForward) {
+		// The gate reads the head the fast-forward will land, never the stale local
+		// target: when origin moved past the checkout, or the target branch does not
+		// exist locally yet, `leaseTip ⊆ refs/heads/<branch>` fails a valid held merge
+		// before the branch creation can run (OTTR-274, OTTR-987).
 		if (leaseTip !== null && target.startsWith("origin/")) {
-			const gate = await holdGate(
-				mainPath,
-				leaseTip,
-				target.slice("origin/".length),
-			);
-			if (gate !== null) return gate;
+			const proposed = await integrationSha(worktreePath, taskBranch);
+			if (proposed !== null) {
+				const gate = await holdGate(mainPath, leaseTip, proposed);
+				if (gate !== null) return gate;
+			}
 		}
 		const ff = await serverFastForward(
 			mainPath,

@@ -1010,13 +1010,21 @@ describe("serverMergePush", () => {
 		}
 	});
 
-	test("a push whose lease tip is not contained in the local target fails", async () => {
+	test("the hold gate refuses a proposed head that misses the audited tip", async () => {
 		const f = fixture();
 		try {
 			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			// Another party pushes O1 to origin; the card worktree commits on top of the
+			// old base without rebasing, so the proposed head does not contain the
+			// audited origin tip. The gate must park before anything moves.
+			const twin = join(f.dir, "twin");
+			run(f.dir, "clone", "-q", f.bare, twin);
+			run(twin, ...id, "commit", "-q", "--allow-empty", "-m", "O1");
+			run(twin, "push", "-q", "origin", "main");
 			writeFileSync(join(f.wt, "late.txt"), "late");
 			run(f.wt, ...id, "add", ".");
 			run(f.wt, ...id, "commit", "-qm", "late");
+			const auditedTip = run(f.bare, "rev-parse", "main");
 			const before = run(f.bare, "rev-parse", "main");
 			const localBefore = run(f.main, "rev-parse", "refs/heads/main");
 			const r = await serverMergePush(
@@ -1024,7 +1032,7 @@ describe("serverMergePush", () => {
 				f.wt,
 				"origin/main",
 				"ott/x",
-				run(f.wt, "rev-parse", "HEAD"),
+				auditedTip,
 				f.bare,
 				true,
 			);
@@ -1033,9 +1041,77 @@ describe("serverMergePush", () => {
 				true,
 			);
 			expect(run(f.bare, "rev-parse", "main")).toBe(before);
-			// The gate fired before the fast-forward: commits beyond the audited tip
-			// never reach the local target (OTTR-274, the OTTR-987 ordering).
+			// The gate fired before the fast-forward: nothing moved locally either.
 			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(localBefore);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the hold gate reads the proposed head when the local target lags origin", async () => {
+		// Origin moved past the main checkout (another writer pushed O1) and the board
+		// never moved refs/heads/main: the audited tip is not contained in the stale
+		// local target, but the rebased proposed head holds it, so the held merge lands.
+		const f = fixture(false);
+		try {
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			const twin = join(f.dir, "twin");
+			run(f.dir, "clone", "-q", f.bare, twin);
+			writeFileSync(join(twin, "o.txt"), "O1");
+			run(twin, ...id, "add", ".");
+			run(twin, ...id, "commit", "-qm", "O1");
+			run(twin, "push", "-q", "origin", "main");
+			const auditedTip = run(f.bare, "rev-parse", "main");
+			run(f.wt, "fetch", "-q", "origin");
+			run(f.wt, ...id, "rebase", "-q", "origin/main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				auditedTip,
+				f.bare,
+				true,
+			);
+			expect(r.status).toBe("pushed");
+			expect(run(f.bare, "rev-parse", "main")).toBe(
+				run(f.wt, "rev-parse", "HEAD"),
+			);
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(
+				run(f.bare, "rev-parse", "main"),
+			);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the hold gate reads the proposed head when the local target is missing", async () => {
+		// A newly selected remote branch has no refs/heads/<branch>: merge-base on the
+		// missing ref must not park the held merge before the branch creation runs.
+		const f = fixture(false);
+		try {
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			run(f.bare, "branch", "develop", "main");
+			run(f.main, "fetch", "-q", "origin", "develop");
+			const auditedTip = run(
+				f.main,
+				"rev-parse",
+				"refs/remotes/origin/develop",
+			);
+			run(f.wt, ...id, "rebase", "-q", "origin/develop");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/develop",
+				"ott/x",
+				auditedTip,
+				f.bare,
+				true,
+			);
+			expect(r.status).toBe("pushed");
+			expect(run(f.bare, "rev-parse", "develop")).toBe(
+				run(f.wt, "rev-parse", "HEAD"),
+			);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
