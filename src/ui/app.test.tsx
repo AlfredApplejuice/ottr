@@ -8808,6 +8808,11 @@ describe("ProjectBoard done lane time view", () => {
 				...work.slice(0, 19).map((t) => t.id),
 			]);
 			expect(lane!.querySelector(".count")?.textContent).toBe("20/21");
+			// Every Done card matches here, including the hidden retro both sides
+			// count: the header reads 21 matching of 21 tasks, never 21 of 20.
+			expect(container.querySelector(".search-count")?.textContent).toBe(
+				"21/21",
+			);
 			const more = lane!.querySelector<HTMLButtonElement>("button.lane-more");
 			expect(more?.getAttribute("aria-label")).toBe("Show more, 1 older cards");
 			// Paging to page 2 renders the last match and retires the button.
@@ -8821,6 +8826,9 @@ describe("ProjectBoard done lane time view", () => {
 			]);
 			expect(ids()).toEqual([held[19]!.id, ...work.map((t) => t.id)]);
 			expect(lane!.querySelector(".count")?.textContent).toBe("21/21");
+			expect(container.querySelector(".search-count")?.textContent).toBe(
+				"21/21",
+			);
 			expect(lane!.querySelector("button.lane-more")).toBeNull();
 		} finally {
 			await act(async () => {

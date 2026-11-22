@@ -4689,8 +4689,6 @@ export function ProjectBoard({
 		seenAnswers,
 		seenDoneSince,
 	);
-	// The done-lane cards the state holds (the window and the pinned ones).
-	const heldDoneCount = tasks.filter((t) => laneStage(t) === "done").length;
 	// With a query applied the done lane reads the server search, not the state
 	// window: the shown done cards and the fetched ones the state lacks drive the
 	// search count against the server's matching total.
@@ -4725,11 +4723,12 @@ export function ProjectBoard({
 			: searched === null
 				? 0
 				: Math.max(0, searched.total - doneCol.length - heldHiddenDone);
-	// The search count matches the lanes: a retro off the board is no task to count,
-	// and the done cards behind the state window still belong to the project's size.
+	// The search count's two values share one card set: every task of the project
+	// (open tasks plus the full settled total the server pages count, hidden
+	// retro matches included). Filtering either side would let the numerator
+	// exceed the denominator when every Done card matches.
 	const boardTotal =
-		tasks.filter(onBoard).length +
-		Math.max(0, project.doneTotal - heldDoneCount);
+		tasks.filter((t) => laneStage(t) !== "done").length + project.doneTotal;
 	/** One older-Done-page fetch: page 1 is the state window, so the first click reads
 	 * page 2, and a success advances the counter even when the page adds no new card.
 	 * A failure keeps the previous list and re-arms the button, with no notice. */
