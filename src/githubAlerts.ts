@@ -143,6 +143,29 @@ async function fetchPage(
 	return { alerts: parsed, reason: null, nextAfter };
 }
 
+/** Dependabot pages by the after cursor until its Link header runs out. */
+async function fetchCursorPages(
+	gh: GhFn,
+	base: string,
+	kind: AlertKind,
+): Promise<Fetch> {
+	const all: Record<string, unknown>[] = [];
+	let after: string | null = null;
+	for (let page = 1; page <= MAX_PAGES; page++) {
+		const cursor = after === null ? "" : `&after=${after}`;
+		const r = await fetchPage(
+			gh,
+			`${base}?state=open&per_page=${PAGE_SIZE}${cursor}`,
+			kind,
+		);
+		if (r.reason !== null) return r;
+		all.push(...r.alerts);
+		if (r.nextAfter === null) break;
+		after = r.nextAfter;
+	}
+	return { alerts: all, reason: null };
+}
+
 /** All open alerts of one endpoint, capped at MAX_PAGES. Dependabot pages by the
  * after cursor until its Link header runs out; the scanning endpoints keep
  * whole offset pages until a short one. */
@@ -151,24 +174,10 @@ async function fetchEndpoint(
 	id: string,
 	kind: AlertKind,
 ): Promise<Fetch> {
+	if (kind === "dependabot")
+		return fetchCursorPages(gh, `repos/${id}/${kind}/alerts`, kind);
 	const base = `repos/${id}/${kind}/alerts`;
 	const all: Record<string, unknown>[] = [];
-	if (kind === "dependabot") {
-		let after: string | null = null;
-		for (let page = 1; page <= MAX_PAGES; page++) {
-			const cursor = after === null ? "" : `&after=${after}`;
-			const r = await fetchPage(
-				gh,
-				`${base}?state=open&per_page=${PAGE_SIZE}${cursor}`,
-				kind,
-			);
-			if (r.reason !== null) return r;
-			all.push(...r.alerts);
-			if (r.nextAfter === null) break;
-			after = r.nextAfter;
-		}
-		return { alerts: all, reason: null };
-	}
 	for (let page = 1; page <= MAX_PAGES; page++) {
 		const r = await fetchPage(
 			gh,
