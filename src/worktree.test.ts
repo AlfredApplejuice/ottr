@@ -332,6 +332,7 @@ describe("serverMergePush", () => {
 						"ott/x",
 						null,
 						f.bare,
+						true,
 					)
 				).status,
 			).toBe("pushed");
@@ -345,6 +346,115 @@ describe("serverMergePush", () => {
 			expect(readFileSync(marker, "utf8")).toContain(
 				"reference-transaction ran",
 			);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the fast-forward waits for an integrated report", async () => {
+		// A needs_you or ask-paused merge turn must not publish its branch: without the
+		// integrated flag the server neither fast-forwards the target nor pushes, and the
+		// old proof gate (the agent's own merge) decides as before.
+		const f = fixture(false);
+		try {
+			const localBefore = run(f.main, "rev-parse", "refs/heads/main");
+			const before = run(f.bare, "rev-parse", "main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.bare,
+			);
+			expect(r.status).toBe("skipped");
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(localBefore);
+			expect(run(f.bare, "rev-parse", "main")).toBe(before);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a local-only target fast-forwards without a push", async () => {
+		// resolveTarget supports "main" for a project with no origin; the prompt forbids
+		// the agent's merge, so the board's fast-forward is the only integration left.
+		const f = fixture(false);
+		try {
+			const workTip = run(f.wt, "rev-parse", "HEAD");
+			const bareBefore = run(f.bare, "rev-parse", "main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"main",
+				"ott/x",
+				null,
+				null,
+				true,
+			);
+			expect(r.status).toBe("skipped"); // no origin target: nothing to push
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(workTip);
+			expect(run(f.bare, "rev-parse", "main")).toBe(bareBefore);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a missing local target branch is created and pushed", async () => {
+		// A newly selected remote branch has no refs/heads/<branch> yet: the server
+		// creates it at the integration head and pushes it.
+		const f = fixture(false);
+		try {
+			run(f.bare, "branch", "develop", "main");
+			run(f.main, "fetch", "-q", "origin", "develop");
+			// precondition: no local branch
+			expect(
+				Bun.spawnSync(["git", "rev-parse", "--verify", "refs/heads/develop"], {
+					cwd: f.main,
+					stdout: "pipe",
+					stderr: "pipe",
+				}).exitCode,
+			).not.toBe(0);
+			const workTip = run(f.wt, "rev-parse", "HEAD");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/develop",
+				"ott/x",
+				null,
+				f.bare,
+				true,
+			);
+			expect(r.status).toBe("pushed");
+			expect(run(f.main, "rev-parse", "refs/heads/develop")).toBe(workTip);
+			expect(run(f.bare, "rev-parse", "develop")).toBe(workTip);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the fast-forward moves the named branch, not the checked-out one", async () => {
+		// The main checkout sits on main while the project target is origin/develop:
+		// `git merge` in the checkout would move main; the ref move must hit develop.
+		const f = fixture(false);
+		try {
+			run(f.bare, "branch", "develop", "main");
+			run(f.main, "fetch", "-q", "origin", "develop");
+			run(f.main, "branch", "develop", "origin/develop");
+			const mainBefore = run(f.main, "rev-parse", "refs/heads/main");
+			const workTip = run(f.wt, "rev-parse", "HEAD");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/develop",
+				"ott/x",
+				null,
+				f.bare,
+				true,
+			);
+			expect(r.status).toBe("pushed");
+			expect(run(f.main, "rev-parse", "refs/heads/develop")).toBe(workTip);
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(mainBefore);
+			expect(run(f.bare, "rev-parse", "develop")).toBe(workTip);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
@@ -365,6 +475,7 @@ describe("serverMergePush", () => {
 				"ott/x",
 				null,
 				f.bare,
+				true,
 			);
 			if (r.status !== "failed")
 				throw new Error(`expected failed, got ${r.status}`);
@@ -779,6 +890,7 @@ describe("serverMergePush", () => {
 				"ott/x",
 				null,
 				f.bare,
+				true,
 			);
 			// OTTR-987: the server fast-forwards the target itself, so the unmerged kept
 			// branch is no longer a silent skip — the impossible fast-forward parks the
@@ -906,6 +1018,7 @@ describe("serverMergePush", () => {
 			run(f.wt, ...id, "add", ".");
 			run(f.wt, ...id, "commit", "-qm", "late");
 			const before = run(f.bare, "rev-parse", "main");
+			const localBefore = run(f.main, "rev-parse", "refs/heads/main");
 			const r = await serverMergePush(
 				f.main,
 				f.wt,
@@ -913,12 +1026,16 @@ describe("serverMergePush", () => {
 				"ott/x",
 				run(f.wt, "rev-parse", "HEAD"),
 				f.bare,
+				true,
 			);
 			expect(r.status).toBe("failed");
 			expect(r.status === "failed" && r.error.includes("not contained")).toBe(
 				true,
 			);
 			expect(run(f.bare, "rev-parse", "main")).toBe(before);
+			// The gate fired before the fast-forward: commits beyond the audited tip
+			// never reach the local target (OTTR-274, the OTTR-987 ordering).
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(localBefore);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
@@ -941,7 +1058,16 @@ describe("mergeHoldMismatch", () => {
 	const mismatch = async (
 		f: { main: string; base: string; approvedHead: string; bare: string },
 		approvedHead = f.approvedHead,
-	) => mergeHoldMismatch(f.main, "origin/main", f.base, approvedHead, f.bare);
+		proposedHead: string | null = null,
+	) =>
+		mergeHoldMismatch(
+			f.main,
+			"origin/main",
+			f.base,
+			approvedHead,
+			f.bare,
+			proposedHead,
+		);
 	/** Origin (bare), a clone, and a worktree whose branch ott/x holds two file commits on top of
 	 * base. approvedHead is the branch tip the admin approved; origin then moves one commit (O1,
 	 * which rewrites o.txt — a file the branch never touches, so rebases stay clean), so a merge
@@ -995,6 +1121,44 @@ describe("mergeHoldMismatch", () => {
 			run(f.wt, ...id, "rebase", "-q", "origin/main");
 			run(f.main, ...id, "merge", "-q", "--no-ff", "--no-edit", "ott/x");
 			expect((await mismatch(f)).mismatch).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the hold judges the proposed head, not the stale local target", async () => {
+		// OTTR-987: the server fast-forwards the target itself, so at audit time the
+		// local target still sits at the base and the remote holds nothing. Judging the
+		// local branch or the remote would park every valid held merge; judging the
+		// proposed integration head (the rebased worktree HEAD) passes it.
+		const f = fixture();
+		try {
+			run(f.wt, ...id, "rebase", "-q", "origin/main");
+			const proposed = run(f.wt, "rev-parse", "HEAD");
+			const stale = await mismatch(f, f.approvedHead, null);
+			expect(stale.mismatch).toBe(true); // the old judgment: the bug this fixes
+			const r = await mismatch(f, f.approvedHead, proposed);
+			expect(r.mismatch).toBe(false);
+			expect(r.auditedTip).not.toBe(null);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("patches beyond the approval fail the proposed-head audit", async () => {
+		// An exactly-approved local target must not skip the audit: a resumed session's
+		// worktree can carry unapproved patches past the approved head, and the proposed
+		// push set carries them to the gate.
+		const f = fixture();
+		try {
+			run(f.wt, ...id, "rebase", "-q", "origin/main");
+			writeFileSync(join(f.wt, "evil.txt"), "evil");
+			run(f.wt, ...id, "add", ".");
+			run(f.wt, ...id, "commit", "-qm", "evil");
+			const proposed = run(f.wt, "rev-parse", "HEAD");
+			const r = await mismatch(f, f.approvedHead, proposed);
+			expect(r.mismatch).toBe(true);
+			expect(r.pushDiff).toContain("evil");
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}

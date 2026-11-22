@@ -234,6 +234,7 @@ import type {
 	fetchPrHead,
 	hasRules,
 	ignoreInMain,
+	integrationSha,
 	isClean,
 	isIntegrated,
 	mergeHoldLanded,
@@ -1041,6 +1042,11 @@ export interface TurnOps {
 	pushRetryDelayMs?: number;
 	/** OTTR-274: true when the push set of a hold-approved merge carries patches beyond the approval. */
 	mergeHoldMismatch: typeof mergeHoldMismatch;
+	/** OTTR-987: the head the server's fast-forward would land (the linked worktree's
+	 * HEAD, else the task branch tip); null when neither applies. The hold audits this
+	 * proposed head, not the stale local target: the board integrates itself now.
+	 * Optional: absent falls back to the local target branch's head. */
+	integrationHead?: typeof integrationSha;
 	/** VELV-89: true when a hold-approved merge already landed on the fetched remote target and the approval carries no extra patches. */
 	mergeHoldLanded: typeof mergeHoldLanded;
 	/** OTTR-326: on a mismatch park, moves the main checkout's target branch back to the audited tip. */
@@ -7189,6 +7195,9 @@ export function createTurnLoop(
 						st.task.branch ?? "",
 						st.holdTip,
 						st.header.settings.originUrl,
+						// The board's own fast-forward integrates only a merged-verdict turn: a
+						// needs_you or ask-paused report must not publish its branch (OTTR-987).
+						st.result.outcome?.status === "integrated",
 					)
 					.then(async (p) =>
 						(p.status === "failed" || p.status === "rejected") &&
@@ -8043,8 +8052,18 @@ export function createTurnLoop(
 				: await ops
 						.targetSha(st.e.path, `refs/heads/${branch}`)
 						.catch(() => null);
+		// The board fast-forwards the target itself now (OTTR-987), so at audit time the
+		// local target still sits at its old tip. Judge the head the fast-forward would
+		// land — the worktree's HEAD, else the task branch's tip — and fall back to the
+		// local target when the op is unwired.
+		const proposed =
+			branch === null || approvedHeads.length === 0
+				? null
+				: ((await ops
+						.integrationHead?.(st.loc.wt, st.task.branch ?? "")
+						.catch(() => null)) ?? localHead);
 		if (branch !== null && approvedHeads.length > 0)
-			await holdApprovedHead(st, approvedHeads, branch, localHead);
+			await holdApprovedHead(st, approvedHeads, branch, proposed);
 		// OTTR-326: a park whose branch reset could not run leaves the held patches as the
 		// local tip; no other card may push the branch while that head sits there.
 		st.refused = await heldMergeOnBranchTip(
@@ -8071,9 +8090,9 @@ export function createTurnLoop(
 		st: TurnSettle,
 		approvedHeads: string[],
 		branch: string,
-		localHead: string | null,
+		head: string | null,
 	): Promise<void> {
-		if (localHead !== null && approvedHeads.includes(localHead)) {
+		if (head !== null && approvedHeads.includes(head)) {
 			// the exact head a reply approved: nothing new to judge
 			return;
 		}
@@ -8101,6 +8120,7 @@ export function createTurnLoop(
 					st.header.base,
 					ah,
 					st.header.settings.originUrl,
+					head,
 				)
 				.catch(() => ({
 					mismatch: true,
@@ -8108,7 +8128,7 @@ export function createTurnLoop(
 					auditedTip: null,
 				}));
 			if (mismatch) {
-				await parkHeldMismatch(st, branch, localHead, pushDiff, auditedTip);
+				await parkHeldMismatch(st, branch, head, pushDiff, auditedTip);
 				break;
 			}
 			st.holdTip = auditedTip;
@@ -8123,12 +8143,12 @@ export function createTurnLoop(
 	async function parkHeldMismatch(
 		st: TurnSettle,
 		branch: string,
-		localHead: string | null,
+		head: string | null,
 		pushDiff: string | null,
 		auditedTip: string | null,
 	): Promise<void> {
 		st.holdMismatch = MERGE_HOLD_MISMATCH_REASON;
-		st.holdHead = localHead;
+		st.holdHead = head;
 		// Same cap as the merge-start capture: bigger diffs keep their numstat.
 		st.holdDiff =
 			pushDiff === null
@@ -8140,7 +8160,11 @@ export function createTurnLoop(
 			st.holdDiff === null
 				? null
 				: await ops
-						.diffStat(st.e.path, st.header.target, `refs/heads/${branch}`)
+						.diffStat(
+							st.e.path,
+							st.header.target,
+							head ?? `refs/heads/${branch}`,
+						)
 						.catch(() => null);
 		await st.log("! held merge carries patches beyond the approved head");
 		const reset =

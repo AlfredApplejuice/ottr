@@ -1745,18 +1745,40 @@ async function integrationHead(
 	return taskBranch === "" ? null : sha(`refs/heads/${taskBranch}`);
 }
 
+/** integrationHead with the board's own git: the head the server's fast-forward would
+ * land, so the merge hold can judge the proposed push set before the fast-forward runs. */
+export async function integrationSha(
+	worktreePath: string,
+	taskBranch: string,
+): Promise<string | null> {
+	return integrationHead(worktreePath, taskBranch, async (ref, cwd) => {
+		const r = await git(
+			["rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
+			cwd ?? worktreePath,
+		);
+		return r.code === 0 ? r.stdout.trim() : null;
+	});
+}
+
 /**
  * The server's fast-forward of the local target branch (OTTR-987). mergePrompt no longer
  * tells the agent to run `git merge --ff-only` in the main checkout: the agent's shell
  * git reads the worker-writable common gitdir, and a planted post-merge or
  * reference-transaction hook would run as root in the server container. The board runs
  * the fast-forward through git() instead, whose argv pins outrank the planted config,
- * from the same integration head the push's proof reads. `done` covers both the ran and
- * the no-op case (the local target already holds the head — an agent that still merges
- * per its project's AGENTS.md, or a re-merge); `output` then carries the merge output
- * for the card log, or "" for a no-op. A fast-forward git refuses (the branch is not
- * ahead of the target, an unconcluded merge in the main checkout) returns `failed` with
- * git's reason and full output — the same parking shape as a failed push.
+ * from the same integration head the push's proof reads. The branch is the target name
+ * itself when the target carries no `origin/` prefix (resolveTarget supports local-only
+ * targets — the prompt forbids the agent's merge, so the board is the only integrator
+ * left). A missing local branch is created at the head: a newly selected remote branch
+ * has nothing to lose, so no fast-forward check applies. The checked-out branch moves
+ * through `git merge --ff-only` (its worktree follows); any other branch moves by
+ * `git branch -f`, which refuses a branch checked out in some other worktree and fails
+ * closed. `done` covers the ran and the no-op case (the target already holds the head —
+ * an agent that still merges per its project's AGENTS.md, or a re-merge); `output`
+ * carries the merge output for the card log, or "" for a no-op. A fast-forward git
+ * refuses (the branch is not ahead of the target, an unconcluded merge in the main
+ * checkout) returns `failed` with git's reason and full output — the same parking shape
+ * as a failed push.
  */
 async function serverFastForward(
 	mainPath: string,
@@ -1767,8 +1789,9 @@ async function serverFastForward(
 	| { status: "done"; output: string }
 	| { status: "failed"; error: string; output?: string }
 > {
-	if (!target.startsWith("origin/")) return { status: "done", output: "" };
-	const branch = target.slice("origin/".length);
+	const branch = target.startsWith("origin/")
+		? target.slice("origin/".length)
+		: target;
 	const sha = async (ref: string, cwd = mainPath) => {
 		const r = await git(
 			["rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
@@ -1779,19 +1802,39 @@ async function serverFastForward(
 	const head = await integrationHead(worktreePath, taskBranch, sha);
 	if (head === null) return { status: "done", output: "" };
 	const local = await sha(`refs/heads/${branch}`);
-	if (local === null || local === head) return { status: "done", output: "" };
+	if (local === null) {
+		// The target branch does not exist locally yet: create it at the head.
+		const r = await git(["branch", branch, head], mainPath);
+		if (r.code !== 0)
+			return {
+				status: "failed",
+				error: redactUrlCredentials(
+					r.stderr.trim().split("\n").filter(Boolean).pop() ??
+						`git branch exited ${r.code}`,
+				),
+				output: cappedPushOutput(
+					redactUrlCredentials(`${r.stdout}${r.stderr}`).trim(),
+				),
+			};
+		return { status: "done", output: `${r.stdout}${r.stderr}`.trim() };
+	}
+	if (local === head) return { status: "done", output: "" };
 	const holds = await git(
 		["merge-base", "--is-ancestor", head, local],
 		mainPath,
 	);
 	if (holds.code === 0) return { status: "done", output: "" };
-	const r = await git(["merge", "--ff-only", head], mainPath);
+	const checkedOut = await checkedOutBranch(mainPath);
+	const r =
+		checkedOut === branch
+			? await git(["merge", "--ff-only", head], mainPath)
+			: await git(["branch", "-f", branch, head], mainPath);
 	if (r.code !== 0) {
 		return {
 			status: "failed",
 			error: redactUrlCredentials(
 				r.stderr.trim().split("\n").filter(Boolean).pop() ??
-					`git merge --ff-only exited ${r.code}`,
+					`git exited ${r.code}`,
 			),
 			output: cappedPushOutput(
 				redactUrlCredentials(`${r.stdout}${r.stderr}`).trim(),
@@ -1915,6 +1958,10 @@ export async function serverMergePush(
 	taskBranch: string,
 	leaseTip: string | null = null,
 	originUrl: string | null = null,
+	/** The board integrates only on the agent's integrated report: a needs_you or
+	 * ask-paused turn must not publish its branch. False keeps the old contract, where
+	 * only proof of a merge the agent already made reaches the push. */
+	fastForward = false,
 ): Promise<
 	| { status: "skipped" }
 	| { status: "pushed"; output: string }
@@ -1926,21 +1973,25 @@ export async function serverMergePush(
 	// git would run planted hooks from the worker-writable common gitdir as root.
 	// The hold gate runs first: a held merge must not carry commits beyond the audited
 	// tip into the local target before the gate reads it (OTTR-274).
-	if (leaseTip !== null && target.startsWith("origin/")) {
-		const gate = await holdGate(
+	let ffOutput = "";
+	if (fastForward) {
+		if (leaseTip !== null && target.startsWith("origin/")) {
+			const gate = await holdGate(
+				mainPath,
+				leaseTip,
+				target.slice("origin/".length),
+			);
+			if (gate !== null) return gate;
+		}
+		const ff = await serverFastForward(
 			mainPath,
-			leaseTip,
-			target.slice("origin/".length),
+			worktreePath,
+			target,
+			taskBranch,
 		);
-		if (gate !== null) return gate;
+		if (ff.status === "failed") return ff;
+		ffOutput = ff.output;
 	}
-	const ff = await serverFastForward(
-		mainPath,
-		worktreePath,
-		target,
-		taskBranch,
-	);
-	if (ff.status === "failed") return ff;
 	const pre = await mergePushPreflight(
 		mainPath,
 		worktreePath,
@@ -1986,7 +2037,7 @@ export async function serverMergePush(
 		const pushOut = `${r.stdout}${r.stderr}`.trim();
 		return {
 			status: "pushed",
-			output: ff.output === "" ? pushOut : `${ff.output}\n${pushOut}`.trim(),
+			output: ffOutput === "" ? pushOut : `${ffOutput}\n${pushOut}`.trim(),
 		};
 	}
 	// OTTR-465: the card log gets git's complete output (URL credentials redacted), and
@@ -2589,6 +2640,14 @@ export async function mergeHoldMismatch(
 	base: string,
 	approvedHead: string,
 	originUrl: string | null = null,
+	/** The head the server's fast-forward would land (worktree HEAD, else the task
+	 * branch tip). The board integrates itself now, so at audit time the local target
+	 * still sits stale at the old tip: judging `refs/heads/<branch>` would compare an
+	 * empty push set against the approval and park every valid held merge, and an
+	 * exactly-approved local target would skip the audit while a resumed session's
+	 * worktree head carries unapproved patches. When set, the gate judges the proposed
+	 * push set `auditedTip..<proposedHead>` instead of the local branch. */
+	proposedHead: string | null = null,
 ): Promise<{
 	mismatch: boolean;
 	pushDiff: string | null;
@@ -2646,6 +2705,7 @@ export async function mergeHoldMismatch(
 	// as it judges the push set. An unreadable approved-side diff falls through: the return
 	// below then mismatches, and the hold still fails closed.
 	if (
+		proposedHead === null &&
 		approved !== null &&
 		(await targetContains(
 			mainPath,
@@ -2660,7 +2720,7 @@ export async function mergeHoldMismatch(
 			auditedTip,
 		};
 	}
-	const push = await effect(auditedTip, `refs/heads/${branch}`);
+	const push = await effect(auditedTip, proposedHead ?? `refs/heads/${branch}`);
 	if (push === null) return failClosed();
 	return {
 		mismatch: approved === null || push !== approved,

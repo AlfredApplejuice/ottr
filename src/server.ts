@@ -118,6 +118,7 @@ import {
 	githubUrl,
 	hasRules,
 	ignoreInMain,
+	integrationSha,
 	isClean,
 	isGitRepoWithCommit,
 	isIntegrated,
@@ -874,6 +875,8 @@ const loop = createTurnLoop(projects, {
 	branchUnpushed,
 	checkedOutBranch,
 	checkoutState,
+	// OTTR-987: the head the server's fast-forward would land; the merge hold audits it.
+	integrationHead: integrationSha,
 	serverMergePush,
 	// OTTR-552 PR mode: the ship step pushes the card branch (server git credentials,
 	// force-with-lease) and adopts or opens the PR via gh; the integrated proof is a
