@@ -953,6 +953,7 @@ describe("hosted mode end to end", () => {
 			{
 				config: config2,
 				hooks: controlPlaneHooks(config2, { log: () => {} }),
+				creditBalance: { balance: null },
 			},
 			{
 				name: "routed",
