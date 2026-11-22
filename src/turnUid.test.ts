@@ -19,7 +19,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import fc from "fast-check";
 import { holdLock } from "./layerLeaseLock.ts";
 import {
@@ -982,7 +982,11 @@ describe("ensureProjectIdentity", () => {
 		const project = "provision-readonly";
 		const ids = projectTurnUid(project);
 		const turnHome = fakeTurnHome(project);
-		chmodSync(paths.passwd, 0o444);
+		// A directory in place of the file fails the append for root and
+		// non-root alike (root overrides plain file modes): the run fails
+		// closed either way.
+		paths.passwd = join(dirname(paths.passwd), "passwd-dir");
+		mkdirSync(paths.passwd);
 		expect(() =>
 			ensureProjectIdentity(project, ids, turnHome, paths),
 		).toThrow();
