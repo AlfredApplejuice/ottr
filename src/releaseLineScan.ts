@@ -6,9 +6,9 @@
  * npm registry itself (releaseLineBlocked). The rule lives in
  * src/releaseLine.ts (docs/specs/release-line-gate.md).
  */
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { childDatabaseEnv } from "./childEnv.ts";
+import { readBoundedFile } from "./confine.ts";
 import {
 	lineCapReached,
 	type RegistryRelease,
@@ -20,6 +20,19 @@ const DAY_MS = 86_400_000;
 export const AGE_MS = 7 * DAY_MS;
 export const CAP_MS = 14 * DAY_MS;
 const TIMEOUT_MS = 20_000;
+/** Byte cap for every worktree file the hold reads (bun.lock, package.json)
+ * and for the base blob out of git, through the bounded readers (d6f0a9dd):
+ * a bigger file fails closed to null and keeps the park. */
+export const LOCK_MAX_BYTES = 4 * 1024 * 1024;
+/** Packument body budget on the board path: a bigger answer fails the fetch,
+ * the scan fails closed, and the park stays. The check script passes a larger
+ * cap, because its legitimate packuments can be big and its failure blocks
+ * the work turn instead of arming a timer. */
+export const REGISTRY_BODY_MAX_BYTES = 64 * 1024;
+/** The board scan stops when the changed set exceeds this count or when
+ * SCAN_MS passed since its start; both fail the scan closed (park stays). */
+export const MAX_CHANGED_PACKAGES = 500;
+export const SCAN_MS = 60_000;
 /** "name@1.2.3" or "@scope/name@1.2.3-beta.1"; the last @ separates the version. */
 const REGISTRY_ENTRY = /^(@?[^@]+)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/;
 /** Stable only: a prerelease pin never blocks and never gets checked. */
@@ -193,9 +206,41 @@ export function releasesOf(body: unknown): RegistryRelease[] {
 	return releases;
 }
 
+/** Bounded packument body read (the readBoundedBody pattern in
+ * src/serviceQuotaHttp.ts): accumulates chunks up to `maxBytes`, refuses a
+ * bigger body before any JSON.parse, and cancels the stream on refusal. */
+async function readPackumentBody(
+	body: ReadableStreamDefaultReader<Uint8Array>,
+	maxBytes: number,
+): Promise<unknown> {
+	const chunks: Uint8Array[] = [];
+	let bytes = 0;
+	for (;;) {
+		const chunk = await body.read();
+		if (chunk.done) break;
+		bytes += chunk.value.byteLength;
+		if (bytes > maxBytes) {
+			await body.cancel().catch(() => {});
+			throw new Error(`packument larger than ${maxBytes} bytes`);
+		}
+		chunks.push(chunk.value);
+	}
+	const contents = new Uint8Array(bytes);
+	let offset = 0;
+	for (const chunk of chunks) {
+		contents.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return JSON.parse(new TextDecoder().decode(contents));
+}
+
 /** GET {registry}/{name} with "/" encoded as %2F and "@" kept (the
- * OMP_PACKAGE_URL style). */
-export async function fetchReleases(name: string): Promise<RegistryRelease[]> {
+ * OMP_PACKAGE_URL style). `maxBodyBytes` bounds the response body: the board
+ * passes REGISTRY_BODY_MAX_BYTES, the check script its larger budget. */
+export async function fetchReleases(
+	name: string,
+	maxBodyBytes: number,
+): Promise<RegistryRelease[]> {
 	const registry = (
 		process.env.OTTR_NPM_REGISTRY ?? "https://registry.npmjs.org"
 	).replace(/\/+$/, "");
@@ -205,7 +250,10 @@ export async function fetchReleases(name: string): Promise<RegistryRelease[]> {
 	});
 	if (!response.ok)
 		throw new Error(`registry returned HTTP ${response.status}`);
-	return releasesOf(await response.json());
+	if (response.body === null) throw new Error("registry response has no body");
+	return releasesOf(
+		await readPackumentBody(response.body.getReader(), maxBodyBytes),
+	);
 }
 
 /** One unsettled direct or transitive package: the rule's blocker names the
@@ -223,7 +271,9 @@ export type ReleaseLineScan =
 
 /** The scan: one fetch call per changed package, ascending by name. Never
  * throws: an unparseable lock reports name "bun.lock"; a failed fetch reports
- * the package and stops the scan (the script's exit-1 semantics). */
+ * the package and stops the scan (the script's exit-1 semantics). The board
+ * bounds (`maxChangedPackages`, `deadlineMs`) stop the scan the same way:
+ * both fail closed with name "bun.lock" before or between fetches. */
 export async function scanReleaseLines(input: {
 	lockText: string;
 	baseLockText: string; // "" = empty base map
@@ -232,6 +282,10 @@ export async function scanReleaseLines(input: {
 	now: number;
 	ageMs: number;
 	capMs: number;
+	/** Stop when the changed set holds more than this many packages. */
+	maxChangedPackages?: number;
+	/** Stop before a fetch when Date.now() passed this epoch ms. */
+	deadlineMs?: number;
 }): Promise<ReleaseLineScan> {
 	const { directNames, now, ageMs, capMs } = input;
 	let current: LockEntry[];
@@ -250,9 +304,29 @@ export async function scanReleaseLines(input: {
 			},
 		};
 	}
+	const changed = changedPackages(current, base, directNames);
+	if (
+		input.maxChangedPackages !== undefined &&
+		changed.length > input.maxChangedPackages
+	)
+		return {
+			ok: false,
+			failed: {
+				name: "bun.lock",
+				message: `lock diff changes ${changed.length} packages, over the ${input.maxChangedPackages} cap`,
+			},
+		};
 	const direct: Unsettled[] = [];
 	const transitive: Unsettled[] = [];
-	for (const pkg of changedPackages(current, base, directNames)) {
+	for (const pkg of changed) {
+		if (input.deadlineMs !== undefined && Date.now() > input.deadlineMs)
+			return {
+				ok: false,
+				failed: {
+					name: "bun.lock",
+					message: "release line scan deadline passed",
+				},
+			};
 		let releases: RegistryRelease[];
 		try {
 			releases = await input.fetch(pkg.name);
@@ -299,8 +373,15 @@ export async function releaseLineBlocked(
 	let lockText: string;
 	let pkgText: string;
 	try {
-		lockText = readFileSync(join(wt, "bun.lock"), "utf8");
-		pkgText = readFileSync(join(wt, "package.json"), "utf8");
+		// The bounded readers (d6f0a9dd): a symlink, a non-regular file, or a
+		// file over LOCK_MAX_BYTES fails closed below — never an unbounded
+		// read of a worker-writable path.
+		lockText = (
+			await readBoundedFile(join(wt, "bun.lock"), LOCK_MAX_BYTES)
+		).toString("utf8");
+		pkgText = (
+			await readBoundedFile(join(wt, "package.json"), LOCK_MAX_BYTES)
+		).toString("utf8");
 	} catch {
 		return null;
 	}
@@ -346,6 +427,9 @@ export async function releaseLineBlocked(
 			},
 		);
 		if (shown.exitCode !== 0) return null;
+		// The base blob sits in git's object store, but past commits wrote it:
+		// the same byte cap applies before the whole blob lands in memory.
+		if (shown.stdout.byteLength > LOCK_MAX_BYTES) return null;
 		baseLockText = shown.stdout.toString();
 	}
 	let scan: ReleaseLineScan;
@@ -354,10 +438,12 @@ export async function releaseLineBlocked(
 			lockText,
 			baseLockText,
 			directNames,
-			fetch: fetchReleases,
+			fetch: (name) => fetchReleases(name, REGISTRY_BODY_MAX_BYTES),
 			now: Date.now(),
 			ageMs: AGE_MS,
 			capMs: CAP_MS,
+			maxChangedPackages: MAX_CHANGED_PACKAGES,
+			deadlineMs: Date.now() + SCAN_MS,
 		});
 	} catch {
 		return null;

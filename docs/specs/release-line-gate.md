@@ -181,11 +181,16 @@ Scan:
   name or version differs; identical changed `(name, version)` pairs scan once.
 - Direct dependency = the name is a key of `dependencies`, `devDependencies` or
   `optionalDependencies` in `./package.json`. Everything else is transitive.
+- Reads stay bounded (OTTR-1194): the worktree is worker-writable, so the script reads
+  `./bun.lock` and `./package.json` through `readRegular` at `LOCK_MAX_BYTES` (4 MiB).
+  A bigger file fails the read and the script exits 1 with that refusal.
 - Skip changed packages whose installed version is not stable.
 - For each remaining package, ascending by name: `GET {registry}/{name}` with `/` encoded
   as `%2F` and `@` kept (the `OMP_PACKAGE_URL` style), header `user-agent: ottr`,
   `AbortSignal.timeout(20000)`. Registry base comes from env `OTTR_NPM_REGISTRY`
-  (default `https://registry.npmjs.org`); only tests set it. The response is a packument:
+  (default `https://registry.npmjs.org`); only tests set it. The response body is read
+  bounded at 8 MiB (`SCRIPT_BODY_MAX_BYTES`); a bigger body is a registry error. The
+  response is a packument:
   releases are its `time` entries for versions present in its `versions` map, with
   `deprecated` as above. A missing time map, a non-OK status, a network error or a broken
   body is a registry error.
@@ -213,6 +218,9 @@ Scan:
 - Installed prerelease: skipped, no output.
 - Non-registry lock entries: skipped.
 - Registry outage: the check fails (by decision). Re-run `bun run check` later.
+- Board bounds (OTTR-1194), each fail closed to null: an over-cap worktree file or base
+  blob (4 MiB), a packument body over 64 KiB, a changed set over 500 packages, a scan
+  past its 60 s deadline. Each keeps the park.
 - `bun.lock` `lockfileVersion` other than the entry shape pinned here: the parser must be
   revisited before trusting the result.
 
@@ -313,20 +321,26 @@ review, or release identity, the board derives the block from the card's worktre
 new optional ops seam `releaseLineBlocked`, whose default (`src/releaseLineScan.ts`)
 does:
 
-1. Read `<worktree>/bun.lock` and `<worktree>/package.json`. A missing or unreadable
-   file keeps the park (fail closed).
+1. Read `<worktree>/bun.lock` and `<worktree>/package.json` through the bounded readers
+   (`readBoundedFile`, OTTR-1194) at `LOCK_MAX_BYTES` (4 MiB). A missing, unreadable,
+   symlinked, or over-cap file keeps the park (fail closed).
 2. Read the base lock with `git rev-parse --verify origin/main`, then
    `git ls-tree origin/main -- bun.lock` for the file's presence, then
    `git cat-file blob origin/main:bun.lock`, all in the worktree. No origin/main
    keeps the park. Git trouble keeps the park. No bun.lock on origin/main means an
    empty base map. `git cat-file blob` runs no textconv, filter, or hook, so no
-   worktree-controlled code runs.
+   worktree-controlled code runs. A base blob over `LOCK_MAX_BYTES` keeps the park.
 3. Compute the changed set like the script: registry entries keyed by their `packages`
    map key; changed when the key is added, or when its resolved name or version
-   differs; stable versions only; ascending by name; identical pairs scan once.
+   differs; stable versions only; ascending by name; identical pairs scan once. A
+   changed set over `MAX_CHANGED_PACKAGES` (500) stops the scan: fail closed, park
+   stays.
 4. For each changed package whose name is direct, fetch the packument from the registry
-   (the shared `fetchReleases`; the board makes network calls, never script calls). A
-   registry error keeps the park (fail closed).
+   (the shared `fetchReleases`; the board makes network calls, never script calls). The
+   response body is read bounded at `REGISTRY_BODY_MAX_BYTES` (64 KiB); a bigger body
+   fails the fetch. The whole scan holds a deadline of `SCAN_MS` (60 s): when it passes,
+   the scan stops before the next fetch. A registry error, an over-cap body, or a
+   passed deadline keeps the park (fail closed).
 5. A direct package whose line is unsettled and not cap-lifted gives one entry
    `{ name, version, waitUntilMs }` (`releaseLineWaitUntil`).
 
@@ -380,6 +394,20 @@ still runs the card now: the existing reply and requeue paths write `holdUntil n
     as `%2F`, not a substring; the canary file does not exist: no server-side spawn
     happened.
 
+Bounds (OTTR-1194, `src/releaseLineScan.test.ts`; each fails on the unbounded tree):
+
+27. A packument body over the cap (a ~2 MB body from the listener): `fetchReleases`
+    rejects with `packument larger than 65536 bytes`.
+28. A valid 5 MiB worktree `bun.lock` whose lines are settled: `releaseLineBlocked`
+    returns null (the unbounded tree returned `[]`), and the listener saw no request.
+29. A valid 5 MiB base blob: null (the unbounded tree blocked on the young diff).
+30. A multi-MB packument for a young changed package: null (the unbounded tree armed
+    the hold) — the cap stops the scan and keeps the park.
+31. A changed set of 501 entries: null with the listener request count at 0 (the cap
+    stops the scan before the first fetch). `scanReleaseLines` with
+    `maxChangedPackages 2` and a passed `deadlineMs` fail with name `bun.lock` before
+    any fetch, and a slow fetch stops part-way at the deadline.
+
 Gates: `bun run check` and `bun test` exit 0.
 
 ## Non-goals
@@ -429,3 +457,7 @@ Gates: `bun run check` and `bun test` exit 0.
   shape and the spec names the revisit trigger.
 - The cap can take an unsettled-line version after 14 days of waiting; that is the
   decided tradeoff against waiting forever.
+- A legitimate packument over the board's 64 KiB body cap (packages with many versions,
+  for example `@types/node`) fails the board's fetch, so the hold does not arm for that
+  card and the park stays (OTTR-1194). The check script passes an 8 MiB cap, so the
+  gate still scans those packages inside a work turn; only the automatic timer is lost.

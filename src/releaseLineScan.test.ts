@@ -210,6 +210,79 @@ describe("scanReleaseLines", () => {
 		expect(result.failed.name).toBe("bun.lock");
 		expect(result.failed.message).not.toBe("");
 	});
+
+	test("a changed set over the cap stops the scan before any fetch", async () => {
+		let fetches = 0;
+		const result = await scanReleaseLines({
+			lockText: lock([
+				["a", "a@1.0.0"],
+				["b", "b@1.0.0"],
+				["c", "c@1.0.0"],
+			]),
+			baseLockText: lock([]),
+			directNames: new Set(["a", "b", "c"]),
+			fetch: async () => {
+				fetches += 1;
+				return [];
+			},
+			now: NOW,
+			ageMs: AGE_MS,
+			capMs: CAP_MS,
+			maxChangedPackages: 2,
+		});
+		expect(fetches).toBe(0);
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		expect(result.failed.name).toBe("bun.lock");
+		expect(result.failed.message).toContain("3 packages");
+	});
+
+	test("a passed deadline stops the scan before any fetch", async () => {
+		let fetches = 0;
+		const result = await scanReleaseLines({
+			lockText: lock([["left-pad", "left-pad@1.3.0"]]),
+			baseLockText: lock([]),
+			directNames: new Set(["left-pad"]),
+			fetch: async () => {
+				fetches += 1;
+				return [];
+			},
+			now: NOW,
+			ageMs: AGE_MS,
+			capMs: CAP_MS,
+			deadlineMs: Date.now() - 1,
+		});
+		expect(fetches).toBe(0);
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		expect(result.failed.name).toBe("bun.lock");
+	});
+
+	test("the deadline stops a slow scan part-way", async () => {
+		// Each fetch sleeps 100 ms against a 50 ms budget: the first fetch
+		// passes the pre-check, the second must trip the deadline.
+		let fetches = 0;
+		const result = await scanReleaseLines({
+			lockText: lock([
+				["a", "a@1.0.0"],
+				["b", "b@1.0.0"],
+				["c", "c@1.0.0"],
+			]),
+			baseLockText: lock([]),
+			directNames: new Set(["a", "b", "c"]),
+			fetch: async () => {
+				fetches += 1;
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				return [];
+			},
+			now: NOW,
+			ageMs: AGE_MS,
+			capMs: CAP_MS,
+			deadlineMs: Date.now() + 50,
+		});
+		expect(result.ok).toBe(false);
+		expect(fetches).toBeLessThan(3);
+	});
 });
 
 type Recorded = { method: string; url: string };
@@ -259,7 +332,7 @@ describe("fetchReleases", () => {
 		// The trailing slash must vanish: a kept one would show in the path.
 		const restore = seedRegistry(`${reg.base}/`);
 		try {
-			const releases = await fetchReleases("@scope/pkg");
+			const releases = await fetchReleases("@scope/pkg", 65_536);
 			expect(releases).toEqual([
 				{
 					version: "1.0.0",
@@ -297,7 +370,7 @@ describe("fetchReleases", () => {
 		});
 		const restore = seedRegistry(reg.base);
 		try {
-			const releases = await fetchReleases("left-pad");
+			const releases = await fetchReleases("left-pad", 65_536);
 			expect(releases).toEqual([
 				{
 					version: "1.0.0",
@@ -325,8 +398,28 @@ describe("fetchReleases", () => {
 		const reg = listener({}, 500);
 		const restore = seedRegistry(reg.base);
 		try {
-			await expect(fetchReleases("left-pad")).rejects.toThrow(
+			await expect(fetchReleases("left-pad", 65_536)).rejects.toThrow(
 				"registry returned HTTP 500",
+			);
+		} finally {
+			restore();
+			reg.stop();
+		}
+	});
+
+	test("a packument body over the cap fails the fetch", async () => {
+		// A ~2 MB body (the deprecated marker is a long string): the bounded
+		// read must refuse it before any JSON.parse, naming the cap.
+		const reg = listener({
+			"left-pad": {
+				versions: { "1.0.0": { deprecated: "x".repeat(2_000_000) } },
+				time: { "1.0.0": "2026-01-01T00:00:00.000Z" },
+			},
+		});
+		const restore = seedRegistry(reg.base);
+		try {
+			await expect(fetchReleases("left-pad", 65_536)).rejects.toThrow(
+				"packument larger than 65536 bytes",
 			);
 		} finally {
 			restore();
@@ -378,6 +471,13 @@ function pkgJson(deps: Record<string, string>): string {
 		null,
 		"\t",
 	)}\n`;
+}
+
+/** Appends a JSONC comment padded to roughly `mb` MiB: still valid lock
+ * content whose only fault is its size, so a byte cap (never the parser)
+ * must stop the scan. */
+function padded(lockText: string, mb: number): string {
+	return `${lockText}\n// ${"x".repeat(mb * 1024 * 1024)}\n`;
 }
 
 /** Packument with exact publish times: each version sits `days` days plus
@@ -619,6 +719,120 @@ describe("releaseLineBlocked", () => {
 			expect(reg.requests).toEqual([
 				{ method: "GET", url: `${reg.base}/left-pad` },
 			]);
+		} finally {
+			restore();
+			reg.stop();
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+
+	test("an over-cap worktree bun.lock keeps the park (null)", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-release-line-hugelock-"));
+		const t0 = Date.now();
+		const reg = listener({ "left-pad": packument(t0, [["1.3.0", 8]]) });
+		const restore = seedRegistry(reg.base);
+		try {
+			// The 5 MiB lock is valid JSONC and its left-pad line is settled
+			// (8 days): the old unbounded read returned [] here. Over the cap
+			// the read must fail closed to null and keep the park.
+			repo(
+				dir,
+				jsoncLock([["commander", "commander@14.0.3"]]),
+				pkgJson({ "left-pad": "^1.3.0" }),
+				padded(
+					jsoncLock([
+						["commander", "commander@14.0.3"],
+						["left-pad", "left-pad@1.3.0"],
+					]),
+					5,
+				),
+			);
+			expect(await releaseLineBlocked(dir)).toBeNull();
+			expect(reg.requests).toEqual([]);
+		} finally {
+			restore();
+			reg.stop();
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+
+	test("an over-cap base lock blob keeps the park (null)", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-release-line-hugebase-"));
+		const t0 = Date.now();
+		const reg = listener({
+			"left-pad": packument(t0, [
+				["1.3.0", 8],
+				["1.3.1", 2],
+			]),
+		});
+		const restore = seedRegistry(reg.base);
+		try {
+			// The 5 MiB base blob is valid JSONC: the old tree read it whole
+			// and blocked on the young 1.3.1 (non-null). Over the cap the
+			// base read must fail closed to null.
+			repo(
+				dir,
+				padded(jsoncLock([["left-pad", "left-pad@1.3.0"]]), 5),
+				pkgJson({ "left-pad": "^1.3.0" }),
+				jsoncLock([["left-pad", "left-pad@1.3.1"]]),
+			);
+			expect(await releaseLineBlocked(dir)).toBeNull();
+		} finally {
+			restore();
+			reg.stop();
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+
+	test("a multi-MB packument keeps the park (null)", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-release-line-bigbody-"));
+		const t0 = Date.now();
+		const reg = listener({
+			"left-pad": {
+				versions: {
+					"1.3.0": {},
+					"1.3.1": { note: "x".repeat(2_000_000) },
+				},
+				time: {
+					"1.3.0": new Date(t0 - 8 * DAY_MS).toISOString(),
+					"1.3.1": new Date(t0 - 2 * DAY_MS).toISOString(),
+				},
+			},
+		});
+		const restore = seedRegistry(reg.base);
+		try {
+			// The 2 MB body parses on the old tree and blocks on the young
+			// 1.3.1 (non-null). The body cap must stop the scan and keep the
+			// park instead.
+			repo(
+				dir,
+				jsoncLock([["commander", "commander@14.0.3"]]),
+				pkgJson({ "left-pad": "^1.3.0" }),
+				jsoncLock([
+					["commander", "commander@14.0.3"],
+					["left-pad", "left-pad@1.3.0"],
+				]),
+			);
+			expect(await releaseLineBlocked(dir)).toBeNull();
+		} finally {
+			restore();
+			reg.stop();
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+
+	test("a changed set over the board cap keeps the park with no registry call", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-release-line-manychg-"));
+		const reg = listener({});
+		const restore = seedRegistry(reg.base);
+		try {
+			const entries: Array<[string, string]> = [];
+			for (let i = 0; i < 501; i++) entries.push([`p${i}`, `p${i}@1.0.0`]);
+			repo(dir, jsoncLock([]), pkgJson({ p0: "^1.0.0" }), jsoncLock(entries));
+			// The old tree fetched all 501 (404s fail the scan to null, but
+			// the listener saw the requests); the cap must stop it first.
+			expect(await releaseLineBlocked(dir)).toBeNull();
+			expect(reg.requests).toEqual([]);
 		} finally {
 			restore();
 			reg.stop();

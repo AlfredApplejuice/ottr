@@ -7,18 +7,23 @@
  * The rule lives in src/releaseLine.ts and the scan's shared core in
  * src/releaseLineScan.ts (docs/specs/release-line-gate.md).
  */
-import { readFileSync } from "node:fs";
+import { readRegular } from "../src/confine.ts";
 import { RELEASE_LINE_MARKER } from "../src/releaseLine.ts";
 import {
 	AGE_MS,
 	CAP_MS,
 	directNamesOf,
 	fetchReleases,
+	LOCK_MAX_BYTES,
 	type ReleaseLineScan,
 	scanReleaseLines,
 } from "../src/releaseLineScan.ts";
 
 const DAY_MS = 86_400_000;
+/** Packument body budget for the script's own fetches: larger than the
+ * board's 64 KiB so a legitimately big packument still passes, bounded so a
+ * registry answer can never fill the worker's memory. */
+const SCRIPT_BODY_MAX_BYTES = 8 * 1024 * 1024;
 
 /** git inside the repo root; stdin ignored so nothing can hang on a prompt. */
 function git(...args: string[]): {
@@ -51,10 +56,13 @@ function baseLockText(): string {
 async function scan(): Promise<number> {
 	const now = Date.now();
 	const scan: ReleaseLineScan = await scanReleaseLines({
-		lockText: readFileSync("bun.lock", "utf8"),
+		// The worktree is worker-writable: bounded reads, never readFileSync.
+		lockText: readRegular("bun.lock", LOCK_MAX_BYTES).toString("utf8"),
 		baseLockText: baseLockText(),
-		directNames: directNamesOf(readFileSync("package.json", "utf8")),
-		fetch: fetchReleases,
+		directNames: directNamesOf(
+			readRegular("package.json", LOCK_MAX_BYTES).toString("utf8"),
+		),
+		fetch: (name) => fetchReleases(name, SCRIPT_BODY_MAX_BYTES),
 		now,
 		ageMs: AGE_MS,
 		capMs: CAP_MS,
