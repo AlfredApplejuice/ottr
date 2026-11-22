@@ -826,8 +826,12 @@ function runChildEnv(
 	// The delivered read-only GitHub token lands last (docs/specs/turn-read-token.md):
 	// it survives every strip above and overrides any ambient name.
 	Object.assign(env, githubReadEnv);
-	// Apply this after every source, including the secondary request environment.
+	// Apply these after every source, including the secondary request environment.
 	delete env.OTTR_DATABASE_URL;
+	// Same strip as childEnv on the server: the SecretBox master key unseals the
+	// sealed credential store; a turn inherits it from neither the container env
+	// nor a request env.
+	delete env.OTTR_SECRET_KEY;
 	// The tools link dir is per tool set: project pins, then _all pins, then the container
 	// PATH. The daemon's own PATH never changes, and two projects never see each
 	// other's pins because the dir is keyed by the project's own tool set.

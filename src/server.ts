@@ -32,6 +32,7 @@ import {
 	type CreditBalance,
 	controlPlaneHooks,
 	type Hosted,
+	scrubProcEnviron,
 	takeHostedConfig,
 } from "./hosted.ts";
 import { startLlmGateway } from "./llmGateway.ts";
@@ -276,6 +277,11 @@ try {
 	secretBox = loadSecretBox({ dir: join(resolve(STATE_DIR), ".tasks") });
 } catch (err) {
 	console.error(`jira: secret key: ${errmsg(err)}; Jira routes are off`);
+} finally {
+	// The master key must not outlive this read: like the database URL, it leaves
+	// env and /proc/<pid>/environ, so no spawned child or same-user process sees it.
+	delete process.env.OTTR_SECRET_KEY;
+	scrubProcEnviron("OTTR_SECRET_KEY");
 }
 
 // Mutable settings shared with createApp: /api/settings writes them, the scheduler and

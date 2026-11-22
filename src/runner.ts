@@ -120,6 +120,10 @@ export function childEnv(o: {
 	delete env.ALATE_API_KEY;
 	// The hosted identity-signing key: a holder forges owner/control/tenant headers.
 	delete env.OTTR_HOSTED_SECRET;
+	// The SecretBox master key unseals the whole sealed credential store
+	// (docs/configuration.md); no turn ever needs it, and a holder could decrypt
+	// the stored tokens offline.
+	delete env.OTTR_SECRET_KEY;
 	// Same strip in serveWorker: a corporate proxy URL with credentials
 	// (http://user:pass@proxy:8080) must not sit in a turn's env; the host and
 	// port stay, so the proxy still routes the turn's network calls.
