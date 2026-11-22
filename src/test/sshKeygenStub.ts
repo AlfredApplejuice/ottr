@@ -9,8 +9,9 @@
  * (`-y -P "" -f <path>`), and fingerprinting (`-l -E sha256 -f <path|->`, one key line per
  * input line, known_hosts forms included). Keys are fresh ed25519 pairs from node:crypto;
  * the private half serializes as PKCS8 PEM, which OpenSSH reads like its own format. A
- * `-N` passphrase writes an ENCRYPTED PKCS8 header the export refuses, so the import path
- * keeps rejecting protected keys.
+ * `-N` passphrase writes a genuinely encrypted PKCS8 key (PBES2), and the export decrypts
+ * only with that passphrase, so the import path keeps rejecting protected keys through a
+ * real decryption failure.
  */
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -65,11 +66,13 @@ if (args.includes("-l")) {
 	process.exit(0);
 }
 if (args.includes("-y")) {
+	const pass = get("-P") ?? "";
 	const text = existsSync(f) ? readFileSync(f, "utf8") : fail("ssh-keygen: " + f + ": No such file or directory");
-	if (/ENCRYPTED PRIVATE KEY/.test(text)) fail("ssh-keygen: key is encrypted");
 	let key;
 	try {
-		key = createPrivateKey(text);
+		key = pass === ""
+			? createPrivateKey(text)
+			: createPrivateKey({ key: text, format: "pem", passphrase: pass });
 	} catch {
 		fail("ssh-keygen: key is malformed or has a passphrase");
 	}
@@ -81,7 +84,12 @@ if (get("-t") === "ed25519") {
 	const pass = get("-N") ?? "";
 	const body = pass === ""
 		? privateKey.export({ type: "pkcs8", format: "pem" })
-		: "-----BEGIN ENCRYPTED PRIVATE KEY-----\\n" + Buffer.from("ottr stub: passphrase-protected key material").toString("base64") + "\\n-----END ENCRYPTED PRIVATE KEY-----\\n";
+		: privateKey.export({
+				type: "pkcs8",
+				format: "pem",
+				passphrase: pass,
+				cipher: "aes-128-cbc",
+			});
 	writeFileSync(f, body, { mode: 0o600 });
 	writeFileSync(f + ".pub", pubLine(publicKey, get("-C") ?? "") + "\\n");
 	process.exit(0);

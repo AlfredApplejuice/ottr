@@ -429,6 +429,21 @@ describe("importPendingKey", () => {
 			const r = await importPendingKey(dir, readFileSync(enc, "utf8"));
 			expect("error" in r && r.error).toContain("passphrase");
 			expect(readdirSync(join(dir, "pending"))).toEqual([]);
+			// The -N key is genuinely encrypted: the right passphrase decrypts it, so the
+			// rejection above is a real decryption failure, not header sniffing.
+			const genuine = Bun.spawnSync(
+				[
+					join(sshKeygenStubDir(), "ssh-keygen"),
+					"-y",
+					"-P",
+					"secretpass",
+					"-f",
+					enc,
+				],
+				{ stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+			);
+			expect(genuine.exitCode).toBe(0);
+			expect(genuine.stdout.toString()).toContain("ssh-ed25519 ");
 		},
 	);
 
