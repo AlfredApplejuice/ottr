@@ -33,6 +33,7 @@ import {
 	readBelow,
 	readBoundedFile,
 	readRegular,
+	readTailBounded,
 	removeBelow,
 	renameBelow,
 	renameProven,
@@ -656,6 +657,45 @@ describe("readBoundedFile", () => {
 		const link = join(anchor, "link");
 		symlinkSync(real, link);
 		await expect(readBoundedFile(link, 1024)).rejects.toThrow(/a symlink/);
+	});
+});
+
+describe("readTailBounded", () => {
+	test("reads [from, size) back", async () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "f");
+		writeFileSync(f, "abcdefgh");
+		expect((await readTailBounded(f, 3, 1024)).toString()).toBe("defgh");
+	});
+
+	test("answers empty when the file ends at or before from", async () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "f");
+		writeFileSync(f, "abc");
+		expect((await readTailBounded(f, 3, 1024)).length).toBe(0);
+		expect((await readTailBounded(f, 10, 1024)).length).toBe(0);
+	});
+
+	test("refuses an over-cap tail with a size refusal", async () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "f");
+		writeFileSync(f, "abcdefgh");
+		try {
+			await readTailBounded(f, 2, 3);
+			expect.unreachable();
+		} catch (err) {
+			expect(String(err)).toMatch(/larger than 3 bytes/);
+			expect(isSizeRefusal(err)).toBe(true);
+		}
+	});
+
+	test.skipIf(!linux)("refuses a symlink", async () => {
+		const { anchor } = fixture();
+		const real = join(anchor, "real");
+		writeFileSync(real, "bytes");
+		const link = join(anchor, "link");
+		symlinkSync(real, link);
+		await expect(readTailBounded(link, 0, 1024)).rejects.toThrow(/a symlink/);
 	});
 });
 

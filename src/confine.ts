@@ -327,6 +327,47 @@ export async function readBoundedFile(
 	}
 }
 
+/**
+ * Bounded async read of the tail [from, size) of a path on a worker-writable volume:
+ * opens once with O_NOFOLLOW, refuses a symlink ("refusing <path>: a symlink"), a
+ * non-regular file, and a tail over `maxBytes`. A file that ends at or before `from`
+ * answers an empty buffer (nothing new to read); a file that grows while read fails
+ * with "grew while read". Never reads unbounded.
+ */
+export async function readTailBounded(
+	path: string,
+	from: number,
+	maxBytes: number,
+): Promise<Buffer> {
+	let handle: fsPromises.FileHandle;
+	try {
+		handle = await fsPromises.open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+	} catch (err) {
+		if (errCode(err) === "ELOOP")
+			throw new Error(`refusing ${path}: a symlink`);
+		throw err;
+	}
+	try {
+		const st = await handle.stat();
+		if (!st.isFile()) throw new Error(`refusing ${path}: not a regular file`);
+		if (st.size <= from) return Buffer.alloc(0);
+		const len = st.size - from;
+		if (len > maxBytes) throw sizeRefusal(path, maxBytes);
+		// One spare byte catches a file that grew after stat.
+		const buf = Buffer.allocUnsafe(len + 1);
+		let n = 0;
+		while (n < buf.length) {
+			const { bytesRead } = await handle.read(buf, n, buf.length - n, from + n);
+			if (bytesRead === 0) break;
+			n += bytesRead;
+		}
+		if (n > len) throw new Error(`refusing ${path}: it grew while read`);
+		return buf.subarray(0, n);
+	} finally {
+		await handle.close();
+	}
+}
+
 /** mkdir -p for `dir` below `anchor`, following no symlink under the anchor. */
 export function mkdirBelow(anchor: string, dir: string): void {
 	openDir(anchor, dir, { create: true }).close();
