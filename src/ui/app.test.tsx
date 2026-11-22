@@ -3871,6 +3871,78 @@ describe("Drawer queued steering edit", () => {
 	});
 });
 
+describe("Drawer hold hint expiry", () => {
+	const project = {
+		name: "proj",
+		github: null,
+		hasRules: true,
+		sessionsDir: "/tmp/proj/.tasks/sessions",
+		settings: {},
+	} as unknown as ProjectView;
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	} as unknown as Partial<TaskCard>;
+	const base = {
+		task: null as never,
+		project,
+		act: async () => true,
+		onClose: () => {},
+		onFollowed: () => {},
+		projects: [],
+		read: true,
+		onMarkUnread: () => {},
+		onMarkSeen: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+	const held = (holdUntil: number): TaskCard =>
+		cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "queued",
+			holdUntil,
+			holdProvider: "openai-codex",
+			holdWindow: "7d",
+			holdSetAt: holdUntil - 120_000,
+			needsReason: "The openai-codex usage limit is reached.",
+		});
+	const HINT =
+		"To start now, pick a model from another provider in the composer";
+	const RESUME_TITLE = "End the usage-limit hold and start the task now";
+
+	test("a live hold names the composer way out and offers Resume", () => {
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={held(Date.now() + 3_600_000)} />,
+		).replaceAll("<!-- -->", "");
+		expect(html).toContain(HINT);
+		expect(html).toContain(RESUME_TITLE);
+	});
+
+	test("an expired hold hides the hint and the Resume button", () => {
+		// pickRunnable starts holdUntil <= now on its own: the card waits for a slot,
+		// so neither the hint nor the hold-only Resume button may render.
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={held(Date.now() - 60_000)} />,
+		).replaceAll("<!-- -->", "");
+		expect(html).not.toContain(HINT);
+		expect(html).not.toContain(RESUME_TITLE);
+	});
+});
 describe("Drawer queued steering edit (client)", () => {
 	// The save flows through the act prop; the stub base.act never runs the body,
 	// so save-driven tests pass an act with the production contract: run the body,

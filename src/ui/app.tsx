@@ -10857,9 +10857,11 @@ function DrawerWaiting(p: {
 						/>
 					</div>
 				)}
-			{/* A usage-limit hold's way out lives in the steer composer: name it here. */}
+			{/* A usage-limit hold's way out lives in the steer composer: name it here. An
+			    expired hold waits for a merge/dispatch slot, not for the picker. */}
 			{task.state === "queued" &&
 				task.holdUntil !== null &&
+				task.holdUntil > Date.now() &&
 				task.holdProvider !== null && (
 					<p className="hint hold-next">
 						To start now, pick a model from another provider in the composer
@@ -12862,9 +12864,12 @@ function SteerComposer(p: {
 							Stop turn
 						</BusyButton>
 					) : (
-						// A usage-limit hold names its provider; an open prompt edit holds without one.
+						// A usage-limit hold names its provider; an open prompt edit holds
+						// without one. An expired hold (holdUntil in the past) waits for a
+						// slot alone: no picker way out for a hold that no longer stands.
 						task.state === "queued" &&
 						task.holdUntil !== null &&
+						task.holdUntil > Date.now() &&
 						task.holdProvider !== null && (
 							<HoldResumeButton
 								task={task}

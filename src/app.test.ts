@@ -8683,14 +8683,48 @@ describe("model switch route", () => {
 			holdSetAt: null,
 			needsReason: null,
 		});
-		// A card held for something else (an open prompt edit: no provider) keeps its hold.
+		// A card held for something else (an open prompt edit: no provider) keeps its hold;
+		// resume without a live usage-limit hold refuses instead of switching the model.
 		const edit = await store.createTask("edit hold");
 		await store.updateTask(edit.id, { holdUntil: Date.now() + 60_000 });
-		await post(`/api/projects/p1/tasks/${edit.id}/model`, {
+		const editRes = await post(`/api/projects/p1/tasks/${edit.id}/model`, {
 			model: "x/y",
 			resume: true,
 		});
+		expect(editRes.status).toBe(409);
 		expect((await store.getTask(edit.id))!.holdUntil).not.toBeNull();
+		expect((await store.getTask(edit.id))!.model).toBeNull();
+	});
+
+	test("resume on an expired usage hold refuses: the card is only waiting for a slot", async () => {
+		const hold = {
+			holdUntil: Date.now() - 60_000,
+			holdProvider: "openai-codex",
+			holdWindow: "7d",
+			holdSetAt: Date.now() - 120_000,
+			needsReason: "The openai-codex usage limit is reached.",
+		};
+		const t = await store.createTask("expired hold");
+		await store.updateTask(t.id, hold);
+		const res = await post(`/api/projects/p1/tasks/${t.id}/model`, {
+			model: "anthropic/claude-sonnet-5-5",
+			resume: true,
+		});
+		// pickRunnable starts holdUntil <= now on its own, so the hold-only action
+		// has nothing to release: refuse, and leave every column untouched.
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe(
+			"the task has no live usage-limit hold to resume from",
+		);
+		const after = (await store.getTask(t.id))!;
+		expect(after.model).toBeNull();
+		expect(after).toMatchObject({
+			holdUntil: hold.holdUntil,
+			holdProvider: hold.holdProvider,
+			holdWindow: hold.holdWindow,
+			holdSetAt: hold.holdSetAt,
+			needsReason: hold.needsReason,
+		});
 	});
 
 	// OTTR-1181: the resume gate reads the quota report through the quotaSnapshot seam;

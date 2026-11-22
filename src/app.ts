@@ -8704,12 +8704,20 @@ export async function createApp(deps: AppDeps) {
 		if (model instanceof Response) return model;
 		// `resume: true` on a queued card held for a usage limit ends the hold with the switch,
 		// so the card starts on the new model; the start gate still checks that model's quota
-		// and holds again when it is used up too.
+		// and holds again when it is used up too. An expired (or absent) hold holds nothing:
+		// the scheduler starts such a card on its own (pickRunnable only drops holdUntil > now),
+		// so the hold-only action refuses instead of switching a model for no reason.
 		const resume =
 			r.body.resume === true &&
 			task.state === "queued" &&
 			task.holdUntil !== null &&
+			task.holdUntil > Date.now() &&
 			task.holdProvider !== null;
+		if (r.body.resume === true && !resume)
+			return json(
+				{ error: "the task has no live usage-limit hold to resume from" },
+				409,
+			);
 		// OTTR-1181: resuming into a provider that is itself out of quota only bounces —
 		// the start gate re-holds the card on the new provider, silently. When the cached
 		// quota report (the refresh loop's `quota`, same 300_000 ms window) is known and
