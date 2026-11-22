@@ -188,12 +188,16 @@ Scan:
 - For each remaining package, ascending by name: `GET {registry}/{name}` with `/` encoded
   as `%2F` and `@` kept (the `OMP_PACKAGE_URL` style), header `user-agent: ottr`,
   `AbortSignal.timeout(20000)`. Registry base comes from env `OTTR_NPM_REGISTRY`
-  (default `https://registry.npmjs.org`); only tests set it. The response body is read
-  bounded at 8 MiB (`SCRIPT_BODY_MAX_BYTES`); a bigger body is a registry error. The
-  response is a packument:
-  releases are its `time` entries for versions present in its `versions` map, with
-  `deprecated` as above. A missing time map, a non-OK status, a network error or a broken
-  body is a registry error.
+  (default `https://registry.npmjs.org`); only tests set it. The body has no byte cap:
+  real packuments legitimately reach tens of MiB (measured 2026-11-22: typescript
+  15.2 MiB with 3892 versions, vite 37.2 MiB), so the body is parsed as a stream
+  (`streamPackument`) and only the versions keys, their `deprecated` string flags, and
+  the `time` map stay in memory; a list of more than `MAX_PACKUMENT_VERSIONS`
+  (20 000, five times the measured maximum) versions is a registry error, and so are a
+  truncated stream and a body nested past 64 levels. The packument's releases are its
+  `time` entries for versions present in its `versions` map, with `deprecated` as
+  above. A missing time map, a non-OK status, a network error or a broken body is a
+  registry error.
 - Registry error: print `release line check failed: <pkg>: <message>` and exit 1
   immediately. The script never passes without data.
 - `unsettledBlocker` finds the blocker; `lineCapReached` lifts it. Blocker and no cap:
@@ -219,8 +223,9 @@ Scan:
 - Non-registry lock entries: skipped.
 - Registry outage: the check fails (by decision). Re-run `bun run check` later.
 - Board bounds (OTTR-1194), each fail closed to null: an over-cap worktree file or base
-  blob (4 MiB), a packument body over 64 KiB, a changed set over 500 packages, a scan
-  past its 60 s deadline. Each keeps the park.
+  blob (4 MiB), a packument listing more than 20 000 versions, a truncated or
+  over-nested packument stream, a changed set over 500 packages, a scan past its 60 s
+  deadline. Each keeps the park.
 - `bun.lock` `lockfileVersion` other than the entry shape pinned here: the parser must be
   revisited before trusting the result.
 
@@ -337,9 +342,12 @@ does:
    stays.
 4. For each changed package whose name is direct, fetch the packument from the registry
    (the shared `fetchReleases`; the board makes network calls, never script calls). The
-   response body is read bounded at `REGISTRY_BODY_MAX_BYTES` (64 KiB); a bigger body
-   fails the fetch. The whole scan holds a deadline of `SCAN_MS` (60 s): when it passes,
-   the scan stops before the next fetch. A registry error, an over-cap body, or a
+   body is parsed as a stream (`streamPackument`) with no byte cap: only the versions
+   keys, their `deprecated` string flags, and the `time` map stay in memory, and a list
+   of more than `MAX_PACKUMENT_VERSIONS` (20 000) versions, a truncated stream, or a
+   body nested past 64 levels fails the fetch. The whole scan holds a deadline of
+   `SCAN_MS` (60 s): when it passes,
+   the scan stops before the next fetch. A registry error, a refused packument, or a
    passed deadline keeps the park (fail closed).
 5. A direct package whose line is unsettled and not cap-lifted gives one entry
    `{ name, version, waitUntilMs }` (`releaseLineWaitUntil`).
@@ -394,17 +402,24 @@ still runs the card now: the existing reply and requeue paths write `holdUntil n
     as `%2F`, not a substring; the canary file does not exist: no server-side spawn
     happened.
 
-Bounds (OTTR-1194, `src/releaseLineScan.test.ts`; each fails on the unbounded tree):
+Bounds (OTTR-1194, `src/releaseLineScan.test.ts`; each fails on the unbounded tree or
+on the first cut's byte-capped tree):
 
-27. A packument body over the cap (a ~2 MB body from the listener): `fetchReleases`
-    rejects with `packument larger than 65536 bytes`.
+27. The streaming selector agrees with `JSON.parse` on verbatim real registry entries
+    (typescript 2.0.3, uuid 0.0.1 with its real deprecated marker) and on 150 seeded
+    random packuments served in 7-byte chunks, so tokens and multibyte characters
+    straddle chunk boundaries; a truncated stream, a body nested past 64 levels, and a
+    packument over the version cap each refuse with the cap named.
 28. A valid 5 MiB worktree `bun.lock` whose lines are settled: `releaseLineBlocked`
     returns null (the unbounded tree returned `[]`), and the listener saw no request.
 29. A valid 5 MiB base blob: null (the unbounded tree blocked on the young diff).
-30. A multi-MB packument for a young changed package: null (the unbounded tree armed
-    the hold) — the cap stops the scan and keeps the park.
-31. A changed set of 501 entries: null with the listener request count at 0 (the cap
-    stops the scan before the first fetch). `scanReleaseLines` with
+30. A multi-MB packument of real manifest shapes (about 3 MB, 1202 versions, served in
+    97-byte chunks) for a young changed package: the hold arms with the exact clear
+    time (the first cut's 64 KiB cap returned null). `fetchReleases` on the same body
+    returns all 1202 releases with the deprecated flags.
+31. A packument listing 20 001 versions: null with the listener request count at one
+    (the fetch refused). A changed set of 501 entries: null with the request count at
+    0 (the cap stops the scan before the first fetch). `scanReleaseLines` with
     `maxChangedPackages 2` and a passed `deadlineMs` fail with name `bun.lock` before
     any fetch, and a slow fetch stops part-way at the deadline.
 
@@ -457,7 +472,12 @@ Gates: `bun run check` and `bun test` exit 0.
   shape and the spec names the revisit trigger.
 - The cap can take an unsettled-line version after 14 days of waiting; that is the
   decided tradeoff against waiting forever.
-- A legitimate packument over the board's 64 KiB body cap (packages with many versions,
-  for example `@types/node`) fails the board's fetch, so the hold does not arm for that
-  card and the park stays (OTTR-1194). The check script passes an 8 MiB cap, so the
-  gate still scans those packages inside a work turn; only the automatic timer is lost.
+- A registry answer can be hostile but the board's exposure stays bounded
+  (OTTR-1194): the packument body streams, so memory holds only the selected fields
+  (at most 20 000 versions), the request timeout bounds the download, and the 60 s
+  scan deadline bounds the whole hold derivation. A hostile or broken answer fails
+  closed and keeps the park.
+- The 20 000-version retention cap is 5 times the measured real maximum (typescript,
+  3892 versions on 2026-11-22). A real package beyond it would fail the board's fetch
+  and keep the park, and the work-turn gate would report the refusal; raise
+  `MAX_PACKUMENT_VERSIONS` when the registry's real maximum grows near it.

@@ -20,10 +20,6 @@ import {
 } from "../src/releaseLineScan.ts";
 
 const DAY_MS = 86_400_000;
-/** Packument body budget for the script's own fetches: larger than the
- * board's 64 KiB so a legitimately big packument still passes, bounded so a
- * registry answer can never fill the worker's memory. */
-const SCRIPT_BODY_MAX_BYTES = 8 * 1024 * 1024;
 
 /** git inside the repo root; stdin ignored so nothing can hang on a prompt. */
 function git(...args: string[]): {
@@ -62,7 +58,7 @@ async function scan(): Promise<number> {
 		directNames: directNamesOf(
 			readRegular("package.json", LOCK_MAX_BYTES).toString("utf8"),
 		),
-		fetch: (name) => fetchReleases(name, SCRIPT_BODY_MAX_BYTES),
+		fetch: fetchReleases,
 		now,
 		ageMs: AGE_MS,
 		capMs: CAP_MS,
