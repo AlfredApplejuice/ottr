@@ -1,16 +1,11 @@
 // Pure readers of omp's JSONL session transcripts: file lookup, context-window
 // snapshot, and first-title recovery. No store state; callers pass the project's
 // sessions dir.
-import {
-	closeSync,
-	fstatSync,
-	openSync,
-	readdirSync,
-	readFileSync,
-	readSync,
-} from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { closeSync, fstatSync, openSync, readdirSync, readSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { join } from "node:path";
+
+import { isSizeRefusal, readBoundedFile, readRegular } from "./confine.ts";
 
 import type { SessionContext } from "./types.ts";
 
@@ -45,9 +40,9 @@ export function sessionModel(
 	if (file === null) return null;
 	let text: string;
 	try {
-		text = readFileSync(file, "utf8");
+		text = readRegular(file, TRANSCRIPT_MAX_BYTES).toString("utf8");
 	} catch {
-		return null; // unreadable file -> no model
+		return null; // unreadable or over-cap file -> no model
 	}
 	let model: string | null = null;
 	for (const line of text.split("\n")) {
@@ -108,9 +103,9 @@ export async function sessionHoldsPrompt(
 	let text: string;
 	try {
 		// Async: the resume path runs on the request path, and a transcript can be large.
-		text = await readFile(file, "utf8");
+		text = (await readBoundedFile(file, TRANSCRIPT_MAX_BYTES)).toString("utf8");
 	} catch {
-		return false;
+		return false; // unreadable, a symlink, or over-cap -> no re-send guard
 	}
 	for (const line of text.split("\n")) {
 		if (!line.includes('"user"')) continue; // cheap pre-filter; only user lines can match
@@ -250,11 +245,12 @@ export interface TranscriptTexts {
  * The omp transcript of one session: the `<ts>_<sessionId>.jsonl` file plus every
  * subagent file in its sibling `<ts>_<sessionId>/` folder. Reads never throw (R1): a
  * missing main file gives null, an absent subagent folder gives [], and any other
- * subagent read failure sets `complete` to false. Caps refuse oversized worker-writable
- * files before reading them whole: an over-cap file, an over-cap subagent count, or a
- * subagent set over its byte budget sets `oversize` and keeps `complete` false. Async:
- * whole transcripts are the largest reads on the board, so they must never block the
- * request path.
+ * subagent read failure sets `complete` to false. Every read opens once with O_NOFOLLOW,
+ * refuses non-regular and oversize files, and reads into a bounded buffer, so a symlink
+ * or a file grown after the size check cannot get past the caps. An over-cap file, a
+ * symlinked file, an over-cap subagent count, or a subagent set over its byte budget
+ * sets `oversize` and keeps `complete` false. Async: whole transcripts are the largest
+ * reads on the board, so they must never block the request path.
  */
 export async function readTranscript(
 	dir: string,
@@ -268,34 +264,17 @@ export async function readTranscript(
 			complete: true,
 			oversize: false,
 		};
-	let size: number;
-	try {
-		size = (await stat(file)).size;
-	} catch {
-		return {
-			sessionText: null,
-			subagentTexts: [],
-			complete: false,
-			oversize: false,
-		};
-	}
-	if (size > TRANSCRIPT_MAX_BYTES)
-		return {
-			sessionText: null,
-			subagentTexts: [],
-			complete: false,
-			oversize: true,
-		};
+	const refuse = {
+		sessionText: null,
+		subagentTexts: [],
+		complete: false,
+	};
 	let sessionText: string | null;
 	try {
-		sessionText = await readFile(file, "utf8");
-	} catch {
-		return {
-			sessionText: null,
-			subagentTexts: [],
-			complete: false,
-			oversize: false,
-		};
+		const buf = await readBoundedFile(file, TRANSCRIPT_MAX_BYTES);
+		sessionText = buf.toString("utf8");
+	} catch (err) {
+		return { ...refuse, oversize: isSizeRefusal(err) };
 	}
 	const subagentTexts: string[] = [];
 	const subDir = file.slice(0, -".jsonl".length);
@@ -314,28 +293,27 @@ export async function readTranscript(
 	let oversize = false;
 	let total = 0;
 	for (const name of names) {
-		let subSize: number;
+		let buf: Buffer;
 		try {
-			subSize = (await stat(join(subDir, name))).size;
-		} catch {
+			buf = await readBoundedFile(join(subDir, name), TRANSCRIPT_MAX_BYTES);
+		} catch (err) {
+			if (isSizeRefusal(err)) {
+				complete = false; // over a cap: this subagent and the rest stay unread
+				oversize = true;
+				break;
+			}
 			complete = false; // unreadable subagent transcript: its usage is unknown
 			continue;
 		}
-		if (
-			subSize > TRANSCRIPT_MAX_BYTES ||
-			total + subSize > TRANSCRIPT_MAX_TOTAL_BYTES
-		) {
-			complete = false; // over a cap: this subagent and the rest stay unread
+		// Budget on the bytes actually read (never a stat size); the per-file cap
+		// bounds the overshoot to one file.
+		if (total + buf.length > TRANSCRIPT_MAX_TOTAL_BYTES) {
+			complete = false;
 			oversize = true;
 			break;
 		}
-		try {
-			const text = await readFile(join(subDir, name), "utf8");
-			subagentTexts.push(text);
-			total += subSize;
-		} catch {
-			complete = false; // unreadable subagent transcript: its usage is unknown
-		}
+		subagentTexts.push(buf.toString("utf8"));
+		total += buf.length;
 	}
 	return { sessionText, subagentTexts, complete, oversize };
 }
@@ -452,9 +430,9 @@ export function firstSessionTitle(
 function topTitleChanges(file: string): string[] {
 	let text: string;
 	try {
-		text = readFileSync(file, "utf8");
+		text = readRegular(file, TRANSCRIPT_MAX_BYTES).toString("utf8");
 	} catch {
-		return [];
+		return []; // unreadable or over-cap -> no titles
 	}
 	const titles: string[] = [];
 	const needle = '"type":"title_change"';

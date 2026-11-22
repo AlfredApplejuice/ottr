@@ -26,10 +26,12 @@ import { delimiter, join, relative, sep } from "node:path";
 import {
 	appendLineBelow,
 	copyBelow,
+	isSizeRefusal,
 	mkdirBelow,
 	moveBelow,
 	openDir,
 	readBelow,
+	readBoundedFile,
 	readRegular,
 	removeBelow,
 	renameBelow,
@@ -587,6 +589,12 @@ describe("a FIFO in place of the task log", () => {
 		expect(() => readRegular(f, 1024 * 1024)).toThrow(
 			/larger than 1048576 bytes/,
 		);
+		try {
+			readRegular(f, 1024 * 1024);
+			expect.unreachable();
+		} catch (err) {
+			expect(isSizeRefusal(err)).toBe(true);
+		}
 	});
 
 	test.skipIf(!linux)(
@@ -611,6 +619,44 @@ describe("a FIFO in place of the task log", () => {
 			);
 		},
 	);
+});
+
+describe("readBoundedFile", () => {
+	test("reads a regular file back", async () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "f");
+		writeFileSync(f, "bytes");
+		expect((await readBoundedFile(f, 1024 * 1024)).toString()).toBe("bytes");
+	});
+
+	test("refuses an over-cap file with a size refusal; a missing file is not one", async () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "f");
+		writeFileSync(f, "1234");
+		try {
+			await readBoundedFile(f, 3);
+			expect.unreachable();
+		} catch (err) {
+			expect(String(err)).toMatch(/larger than 3 bytes/);
+			expect(isSizeRefusal(err)).toBe(true);
+		}
+		try {
+			await readBoundedFile(join(anchor, "absent"), 1024);
+			expect.unreachable();
+		} catch (err) {
+			expect(err).toMatchObject({ code: "ENOENT" });
+			expect(isSizeRefusal(err)).toBe(false);
+		}
+	});
+
+	test.skipIf(!linux)("refuses a symlink", async () => {
+		const { anchor } = fixture();
+		const real = join(anchor, "real");
+		writeFileSync(real, "bytes");
+		const link = join(anchor, "link");
+		symlinkSync(real, link);
+		await expect(readBoundedFile(link, 1024)).rejects.toThrow(/a symlink/);
+	});
 });
 
 describe("readBelow", () => {

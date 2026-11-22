@@ -36,6 +36,7 @@ import {
 	DEFAULT_SETTINGS,
 	discoverProjects,
 	ProjectStore,
+	resetOversizeSessions,
 	shortTitle,
 	tasksDirFor,
 } from "./store.ts";
@@ -2877,6 +2878,26 @@ describe("turn cost capture", () => {
 		const reopened = await open(dir);
 		expect((await reopened.perfFacts()).turns[0]?.cost).toBeNull();
 		await reopened.close();
+
+		// The memo is process-wide: a second store instance skips the session even
+		// after its transcript turned good, so the now-good sum must stay unread.
+		writeTranscript(store.sessionsDir, sid, [
+			usageLine(turn.startedAt + 100, { input: 4, output: 4, cost: 4 }),
+		]);
+		const reopenedMemoized = await open(dir);
+		expect((await reopenedMemoized.perfFacts()).turns[0]?.cost).toBeNull();
+		await reopenedMemoized.close();
+
+		// Un-memoizing lets the same good transcript fill the cost: the NULL above
+		// came from the memo, not from the data.
+		resetOversizeSessions();
+		const reopenedReset = await open(dir);
+		expect((await reopenedReset.perfFacts()).turns[0]?.cost).toBe(4);
+		await reopenedReset.close();
+
+		// The memo is process-wide, so reset it or later tests see this session as
+		// oversize.
+		resetOversizeSessions();
 	});
 });
 

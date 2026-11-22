@@ -8,7 +8,6 @@ import {
 	mkdirSync,
 	openSync,
 	readdirSync,
-	readFileSync,
 	readlinkSync,
 	readSync,
 	renameSync,
@@ -19,6 +18,7 @@ import {
 	writeFileSync,
 	writeSync,
 } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import {
 	basename,
 	delimiter,
@@ -238,18 +238,92 @@ export function openRegular(path: string): number {
 	return regularOrClose(openSync(path, O_RDONLY | O_NONBLOCK), path);
 }
 
+/** A task log can be large; the board never reads a worker-written log whole without bound. */
+export const TASK_LOG_MAX_BYTES = 64 * 1024 * 1024;
+
+/** Marks the "larger than N bytes" refusals, so callers can match them without message parsing. */
+interface SizeRefusal extends Error {
+	sizeRefusal: true;
+}
+
+function sizeRefusal(label: string, maxBytes: number): SizeRefusal {
+	const err = new Error(
+		`refusing ${label}: larger than ${maxBytes} bytes`,
+	) as SizeRefusal;
+	err.sizeRefusal = true;
+	return err;
+}
+
+/** True only for the "larger than N bytes" refusals of the bounded readers. */
+export function isSizeRefusal(err: unknown): boolean {
+	return (
+		err instanceof Error && (err as Partial<SizeRefusal>).sizeRefusal === true
+	);
+}
+
+/** The bounded sync read on an open descriptor: refuses non-regular and over-cap files, and
+ * a file that grows while read; never reads unbounded. */
+function readBoundedSync(fd: number, label: string, maxBytes: number): Buffer {
+	const st = fstatSync(fd);
+	if (!st.isFile()) throw new Error(`refusing ${label}: not a regular file`);
+	if (st.size > maxBytes) throw sizeRefusal(label, maxBytes);
+	// One spare byte catches a file that grew after fstat.
+	const buf = Buffer.allocUnsafe(st.size + 1);
+	let n = 0;
+	while (n < buf.length) {
+		const r = readSync(fd, buf, n, buf.length - n, null);
+		if (r === 0) break;
+		n += r;
+	}
+	if (n > st.size) throw new Error(`refusing ${label}: it grew while read`);
+	return buf.subarray(0, n);
+}
+
 /** readFileSync for a path on a worker-writable volume: openRegular's refusals apply, and
  * `maxBytes` refuses an oversized file before any read (worker-writable volumes must not
  * be read whole). */
 export function readRegular(path: string, maxBytes: number): Buffer {
 	const fd = openRegular(path);
 	try {
-		const st = fstatSync(fd);
-		if (st.size > maxBytes)
-			throw new Error(`refusing ${path}: larger than ${maxBytes} bytes`);
-		return readFileSync(fd);
+		return readBoundedSync(fd, path, maxBytes);
 	} finally {
 		closeSync(fd);
+	}
+}
+
+/**
+ * Bounded async read for a path on a worker-writable volume: opens once with O_NOFOLLOW,
+ * refuses a symlink ("refusing <path>: a symlink"), a non-regular file, a file over
+ * `maxBytes`, and a file that grew while read. Never reads unbounded.
+ */
+export async function readBoundedFile(
+	path: string,
+	maxBytes: number,
+): Promise<Buffer> {
+	let handle: fsPromises.FileHandle;
+	try {
+		handle = await fsPromises.open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+	} catch (err) {
+		if (errCode(err) === "ELOOP")
+			throw new Error(`refusing ${path}: a symlink`);
+		throw err;
+	}
+	try {
+		const st = await handle.stat();
+		if (!st.isFile()) throw new Error(`refusing ${path}: not a regular file`);
+		if (st.size > maxBytes) throw sizeRefusal(path, maxBytes);
+		// One spare byte catches a file that grew after stat.
+		const buf = Buffer.allocUnsafe(st.size + 1);
+		let n = 0;
+		while (n < buf.length) {
+			const { bytesRead } = await handle.read(buf, n, buf.length - n, null);
+			if (bytesRead === 0) break;
+			n += bytesRead;
+		}
+		if (n > st.size) throw new Error(`refusing ${path}: it grew while read`);
+		return buf.subarray(0, n);
+	} finally {
+		await handle.close();
 	}
 }
 
@@ -541,20 +615,7 @@ function readRegularFile(d: Dir, file: string, maxBytes: number): Buffer {
 		throw err;
 	}
 	try {
-		const st = fstatSync(fd);
-		if (!st.isFile()) throw new Error(`refusing ${file}: not a regular file`);
-		if (st.size > maxBytes)
-			throw new Error(`refusing ${file}: larger than ${maxBytes} bytes`);
-		// One spare byte catches a file that grew after fstat.
-		const buf = Buffer.allocUnsafe(st.size + 1);
-		let n = 0;
-		while (n < buf.length) {
-			const r = readSync(fd, buf, n, buf.length - n, null);
-			if (r === 0) break;
-			n += r;
-		}
-		if (n > st.size) throw new Error(`refusing ${file}: it grew while read`);
-		return buf.subarray(0, n);
+		return readBoundedSync(fd, file, maxBytes);
 	} finally {
 		closeSync(fd);
 	}

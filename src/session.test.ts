@@ -5,6 +5,7 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	rmSync,
+	symlinkSync,
 	truncateSync,
 	utimesSync,
 	writeFileSync,
@@ -415,11 +416,12 @@ describe("readTranscript", () => {
 		const s = subDir(d);
 		session(d, sid, ["Add Task Priority Flag"]);
 		mkdirSync(s, { recursive: true });
-		for (let i = 0; i < 4; i++) {
-			// Sparse files: the cap refuses them from their size alone, so no bytes are written.
+		for (let i = 0; i < 5; i++) {
+			// Sparse files of 63 MiB each: every one is under the per-file cap, so only
+			// the total budget stops the reads (4 read = 252 MiB, the 5th refused).
 			const f = join(s, `agent-${i}.jsonl`);
 			writeFileSync(f, '{"type":"session"}\n');
-			truncateSync(f, 70 * 1024 * 1024);
+			truncateSync(f, 63 * 1024 * 1024);
 		}
 		const texts = await readTranscript(d, sid);
 		expect(texts.sessionText).toContain("Add Task Priority Flag");
@@ -443,5 +445,63 @@ describe("readTranscript", () => {
 		expect(stray.complete).toBe(true);
 		expect(stray.oversize).toBe(false);
 		expect(stray.subagentTexts).toHaveLength(0);
+	});
+
+	test.skipIf(process.platform !== "linux")(
+		"a planted symlink is refused, not followed",
+		async () => {
+			const d = dir("transcript-symlink-main");
+			session(d, sid, ["Add Task Priority Flag"]);
+			const planted = mainFile(dir("transcript-symlink-main-target"));
+			writeFileSync(planted, '{"type":"title","v":1,"title":"Other"}\n');
+			const real = mainFile(d);
+			rmSync(real);
+			symlinkSync(planted, real);
+			expect(await readTranscript(d, sid)).toEqual({
+				sessionText: null,
+				subagentTexts: [],
+				complete: false,
+				oversize: false,
+			});
+
+			const d2 = dir("transcript-symlink-sub");
+			const s2 = subDir(d2);
+			session(d2, sid, ["Add Task Priority Flag"]);
+			mkdirSync(s2, { recursive: true });
+			const good = join(s2, "agent-good.jsonl");
+			writeFileSync(good, '{"type":"session"}\n');
+			const outside = join(root, "session-parser-outside.jsonl");
+			writeFileSync(outside, '{"type":"secret"}\n');
+			symlinkSync(outside, join(s2, "agent-link.jsonl"));
+			const texts = await readTranscript(d2, sid);
+			expect(texts.sessionText).toContain("Add Task Priority Flag");
+			expect(texts.subagentTexts).toEqual(['{"type":"session"}\n']);
+			expect(texts.complete).toBe(false);
+			expect(texts.oversize).toBe(false);
+		},
+	);
+
+	test("the other whole-file readers refuse an over-cap transcript gracefully", () => {
+		const d = dir("transcript-overcap-readers");
+		session(d, sid, ["Add Task Priority Flag"]);
+		truncateSync(mainFile(d), TRANSCRIPT_MAX_BYTES + 1);
+		expect(sessionModel(d, sid)).toBeNull();
+	});
+
+	test("sessionHoldsPrompt on an over-cap transcript is false", async () => {
+		const d = dir("transcript-overcap-prompt");
+		session(d, sid, ["Add Task Priority Flag"]);
+		truncateSync(mainFile(d), TRANSCRIPT_MAX_BYTES + 1);
+		expect(await sessionHoldsPrompt(d, sid, "Add Task Priority Flag")).toBe(
+			false,
+		);
+	});
+
+	test("firstSessionTitle on an over-cap transcript still returns the line-1 title", () => {
+		const d = dir("transcript-overcap-title");
+		session(d, sid, ["Add Task Priority Flag"]);
+		truncateSync(mainFile(d), TRANSCRIPT_MAX_BYTES + 1);
+		// topTitleChanges refuses the file -> []; the line-1 latest title is the fallback.
+		expect(firstSessionTitle(d, sid)).toBe("Add Task Priority Flag");
 	});
 });

@@ -1423,6 +1423,18 @@ function parseSetting(
  *  Lives beside the store because its fire-and-forget work (the transcript backfills and the
  *  turn-end captures) has no caller to throw into. */
 const lastStoreErrorAt = new Map<string, number>();
+
+/** Sessions whose transcript was refused as oversize; cost stays NULL and every later
+ * capture in this process skips them. Process-wide by design: session transcripts only
+ * grow, and store instances are created fresh per open, so an instance memo would never
+ * outlive the backfill that needs it. */
+const oversizeSessions = new Set<string>();
+
+/** Clears the oversize-session memo; exists for tests (the memo is process-wide). */
+export function resetOversizeSessions(): void {
+	oversizeSessions.clear();
+}
+
 export function logStoreError(name: string, err: unknown): void {
 	const now = Date.now();
 	if (now - (lastStoreErrorAt.get(name) ?? 0) < 600_000) return;
@@ -2844,10 +2856,6 @@ export class ProjectStore {
 	 * card-prefixed transcript title lands. In-memory only: a restart drops the hold and
 	 * the retry, and the card falls back to using the transcript title as before. */
 	private titleHolds = new Map<string, () => void>();
-
-	/** Sessions whose transcript exceeded the read cap: cost stays NULL, and this memo
-	 * spares every later capture in this process from re-running the refusal. */
-	private oversizeSessions = new Set<string>();
 
 	/** Holds the task's transcript title back until a pending generation retry settles. */
 	async holdTitle(id: string, cancelRetry: () => void): Promise<void> {
@@ -4849,7 +4857,7 @@ export class ProjectStore {
 				? ((await this.getTask(taskId))?.sessionId ?? null)
 				: expectedSessionId;
 		if (sessionId === null) return;
-		if (this.oversizeSessions.has(sessionId)) return;
+		if (oversizeSessions.has(sessionId)) return;
 		let sum: UsageSum | null;
 		try {
 			const texts = await readTranscript(this.sessionsDir, sessionId);
@@ -4857,7 +4865,7 @@ export class ProjectStore {
 				// An over-cap transcript is refused unread, so its cost stays unknown; without
 				// the memo every store open would re-run the refusal, so skip the session for
 				// this process (a restart re-checks once — a stat, not a read).
-				this.oversizeSessions.add(sessionId);
+				oversizeSessions.add(sessionId);
 				return;
 			}
 			sum = sumUsageIn(texts, startedAt, endedAt);
