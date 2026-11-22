@@ -272,7 +272,15 @@ writeFileSync(
 		"",
 	].join("\n"),
 );
+// bun test runs every file in one process, so this file-scope override would leak
+// into later files: src/test/boardRepoGuard.test.ts builds its git env from
+// process.env and must see the host's global config (its safe.directory
+// exception), not this fixture's insteadOf rewrites. Restored in the file afterAll.
+const hostGitConfigGlobal = process.env.GIT_CONFIG_GLOBAL;
 process.env.GIT_CONFIG_GLOBAL = gitConfigGlobal;
+afterAll(() => {
+	process.env.GIT_CONFIG_GLOBAL = hostGitConfigGlobal;
+});
 /** Local repo the insteadOf rewrite serves for https://github.com/octo/<name>; empty=true skips the commit (gitless clone). */
 const makeFixture = (name: string, empty = false) => {
 	const p = join(fixtureRepos, name);
