@@ -566,20 +566,31 @@ validated lead (for example a confirmed lead) stay normal work.
   holds the review's Done, the release publish, other merges, or the project's
   next review. `leadAtDone` (OTTR-963) still decides for untagged backlog
   findings.
-- Routing tick (`src/turn.ts`): on each schedule tick, for each project, the
-  tick finds each pending sandbox lead that matches all of these conditions:
-  - stage `todo` or `in_progress`
-  - state `queued`, `idle`, or `needs_you` (not `running`, not `preparing`)
-  - a `followUpOf` (its review)
-  - no commits beyond its base: `revListCount(main checkout, base, branch)`
-    is 0, or the card has no branch or no base
+- Routing tick (`src/turn.ts` `routeStartedLeads`): on each schedule tick,
+  for each project, the tick finds each pending sandbox lead in stage `todo`
+  or `in_progress` with state `queued`, `idle`, or `needs_you` (not
+  `running`, not `preparing`). For each such lead, the tick applies the
+  first rule that matches:
+  1. The lead has no `followUpOf`, or its review is missing, cancelled, or
+     not a review. The lead parks at `needs_you` with
+     `LEAD_NO_REVIEW_REASON`. The reason tells the user to cancel the card or
+     to remove the tag from its prompt.
+  2. A validation run is open in the project, or the review is not done and
+     not held at `merging`/`idle`. The lead keeps its stage and state, so the
+     start is not lost. A later tick routes it.
+  3. The lead has commits beyond its base, or git cannot count them (see
+     "Commits park" below).
+  4. Else the tick moves the lead to stage `backlog` and state `idle`. It
+     clears `queuedAt`, `needsReason`, and `asked`, and appends one line to
+     the details. In the same transaction, it calls
+     `filePendingValidationRun` with the review id, strict, and the moved
+     lead ids in `first`. When the call refuses, the transaction rolls the
+     move back, and a later tick routes the lead again.
 
-  The tick moves such a lead to stage `backlog` and state `idle`. It clears
-  `queuedAt`, `needsReason`, and `asked`, and appends one line to the details.
-  Then it calls `filePendingValidationRun` with the lead's review id, strict,
-  with the moved lead ids in `first`. When the call refuses (a validation run
-  is already open, or the review is not done or held), the lead waits in the
-  backlog for the chain or for the review's done trigger.
+  The commit count is `revListCount(main checkout, base, branch)`, or 0 when
+  the card has no branch or no base. Each write rereads the live card. When
+  a cancel, a claim, or a validation result (a set `validatedAt`) lands during
+  the git read, the tick does not write the card.
 - Commits park: the tick never moves a pending sandbox lead with commits
   beyond its base, or with a count that git cannot read. The lead parks at
   `needs_you` with `LEAD_COMMITS_REASON`. The reason says that the lead holds

@@ -74,6 +74,7 @@ import {
 	isReview,
 	LEAD_APPLIES_OPTION,
 	LEAD_COMMITS_REASON,
+	LEAD_NO_REVIEW_REASON,
 	LEAD_NOT_APPLY_OPTION,
 	LEAD_QUESTIONS_PROMPT_PREFIX,
 	liveCard,
@@ -29859,6 +29860,130 @@ describe("stored review findings", () => {
 		// The pending lead went to the batch instead of a work turn.
 		expect(await store.listTurns(pending.id)).toHaveLength(0);
 		expect((await store.getTask(pending.id))!.stage).toBe("backlog");
+	});
+
+	test("a lead validated during the routing tick's git read stays started, never moved (OTTR-1128)", async () => {
+		// Work-check blocker 1: a validation result writes only validatedAt on a started
+		// lead, so a stage/state recheck alone let the stale tick return the confirmed
+		// lead to the backlog, where no batch takes it and its start was lost.
+		const record = baseRecord();
+		let duringRead: () => Promise<void> = async () => {};
+		const { store, loop } = await validationCase(record, {
+			revListCount: async () => {
+				await duringRead();
+				return 0;
+			},
+		});
+		const review = await doneReview(store, "race");
+		const lead = await leadCard(
+			store,
+			review.id,
+			"Needs validation: confirmed mid-read\nBlocker: sandbox run: cr",
+		);
+		await store.updateTask(lead.id, {
+			stage: "todo",
+			state: "queued",
+			branch: "ott/race",
+			base: "shaB",
+		});
+		let confirmedAt = 0;
+		duringRead = async () => {
+			duringRead = async () => {};
+			confirmedAt = Date.now();
+			await store.updateTask(lead.id, { validatedAt: confirmedAt });
+		};
+
+		await loop.schedule();
+		await flushPromises();
+
+		const after = (await store.getTask(lead.id))!;
+		expect(confirmedAt).toBeGreaterThan(0);
+		expect(after.validatedAt).toBe(confirmedAt);
+		expect(after.stage).not.toBe("backlog");
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "validation"),
+		).toHaveLength(0);
+	});
+
+	test("a started lead waits while another review's run is open, then joins its declined review's batch (OTTR-1128)", async () => {
+		// Work-check blocker 2: the filing refusal used to strand the lead in the backlog,
+		// where declined() kept its review out of every later automatic filing.
+		const record = baseRecord();
+		const { store, loop } = await validationCase(record);
+		const reviewA = await doneReview(store, "declined A");
+		const declinedRun = await store.createTask(
+			"old run of A",
+			null,
+			"validation",
+		);
+		await store.updateTask(declinedRun.id, {
+			followUpOf: reviewA.id,
+			cancelledAt: Date.now(),
+		});
+		const reviewB = await doneReview(store, "running B");
+		const runB = await store.createTask("run of B", null, "validation");
+		await store.updateTask(runB.id, { followUpOf: reviewB.id, state: "idle" });
+		const lead = await leadCard(
+			store,
+			reviewA.id,
+			"Needs validation: started while B runs\nBlocker: sandbox run: cw",
+		);
+		await store.updateTask(lead.id, { stage: "todo", state: "queued" });
+
+		await loop.schedule();
+		await flushPromises();
+		const waiting = (await store.getTask(lead.id))!;
+		expect(waiting.stage).toBe("todo");
+		expect(waiting.state).toBe("queued");
+		expect(await store.listTurns(lead.id)).toHaveLength(0);
+
+		await store.updateTask(runB.id, { stage: "done", state: "idle" });
+		await loop.schedule();
+		await flushPromises();
+
+		const runs = (await store.listTasks()).filter(
+			(t) =>
+				t.kind === "validation" &&
+				t.followUpOf === reviewA.id &&
+				t.cancelledAt === null,
+		);
+		expect(runs).toHaveLength(1);
+		expect((await store.getTask(runs[0]!.id))!.prompt).toContain(`#${lead.id}`);
+		expect((await store.getTask(lead.id))!.stage).toBe("backlog");
+	});
+
+	test("a started lead with no live review parks needs_you with an actionable reason (OTTR-1128)", async () => {
+		// Work-check blockers 3 and 4: a lead of a cancelled review, and a lead with no
+		// review link, can never join a batch; neither may vanish into the backlog or sit
+		// queued with no reason.
+		const record = baseRecord();
+		const { store, loop } = await validationCase(record);
+		const review = await doneReview(store, "cancelled");
+		const ofCancelled = await leadCard(
+			store,
+			review.id,
+			"Needs validation: cancelled parent\nBlocker: sandbox run: cc",
+		);
+		await store.updateTask(ofCancelled.id, { stage: "todo", state: "queued" });
+		await store.updateTask(review.id, { cancelledAt: Date.now() });
+		const unlinked = await store.createTask(
+			"Needs validation: imported by hand\nBlocker: sandbox run: cu",
+		);
+
+		await loop.schedule();
+		await flushPromises();
+
+		for (const id of [ofCancelled.id, unlinked.id]) {
+			const after = (await store.getTask(id))!;
+			expect(after.stage).toBe("todo");
+			expect(after.state).toBe("needs_you");
+			expect(after.needsReason).toBe(LEAD_NO_REVIEW_REASON);
+			expect(after.cancelledAt).toBeNull();
+			expect(await store.listTurns(id)).toHaveLength(0);
+		}
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "validation"),
+		).toHaveLength(0);
 	});
 });
 

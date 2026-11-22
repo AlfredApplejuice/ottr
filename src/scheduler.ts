@@ -1277,6 +1277,12 @@ export const LEAD_NOT_APPLY_OPTION = "No, it does not apply";
 export const LEAD_COMMITS_REASON =
 	"This Needs validation lead holds commits from an earlier work turn, so the board did not move it back to the backlog. A work turn has no sandbox_run: move the card to the backlog to validate it in its review's batch run, or cancel it.";
 
+/** OTTR-1128: the needs_you reason of a started lead with no live review to validate it:
+ * no review link, or a missing, cancelled or non-review parent. Only a review's batch
+ * validation run can prove a lead, so the board cannot route it; the user decides. */
+export const LEAD_NO_REVIEW_REASON =
+	"This Needs validation lead has no open review, so no batch validation run can take it, and a work turn has no sandbox_run. Cancel it, or remove the Needs validation tag from its prompt to run it as normal work.";
+
 /** The question card a review files for its deployment-fact leads; the reply route
  * recognizes it by this prompt prefix plus a non-null `asked`. */
 export const LEAD_QUESTIONS_PROMPT_PREFIX =

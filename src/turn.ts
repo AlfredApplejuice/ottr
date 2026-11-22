@@ -141,6 +141,7 @@ import {
 	isReview,
 	LEAD_APPLIES_OPTION,
 	LEAD_COMMITS_REASON,
+	LEAD_NO_REVIEW_REASON,
 	LEAD_NOT_APPLY_OPTION,
 	LEAD_QUESTIONS_PROMPT_PREFIX,
 	lastReviewBase,
@@ -521,6 +522,10 @@ function readyReportText(outcome: Outcome | null, finalText: string): string {
 		.filter((s) => s !== "")
 		.join("\n\n");
 }
+
+/** OTTR-1128: a batch filing refused inside routeStartedLeads' transaction; thrown to roll
+ * the leads' backlog moves back, then caught by the same pass. */
+class LeadFilingRefused extends Error {}
 
 /** Log marker of the UI-shot guard; a second miss is recognized by finding it in the task log. */
 export const UI_SHOT_WARNING =
@@ -9636,65 +9641,113 @@ export function createTurnLoop(
 	}
 
 	/** OTTR-1128: a lead only a sandbox can prove (pendingSandboxLead) never runs a work
-	 * turn: pickRunnable skips it, and this per-tick pass routes a started one back into its
-	 * review's batch validation. A lead in todo or in_progress that is not in flight (Accept,
-	 * a drag, a reply, or a lead that ran as a work turn before this rule) returns to the
-	 * backlog when its branch holds no commits beyond its base, and the review's next batch
-	 * takes it first. A lead with commits (or an unreadable branch) is never moved: it parks
-	 * needs_you with LEAD_COMMITS_REASON, so the board lists it for the user. No card is
-	 * deleted. Never throws past a project: the caller logs a store failure. */
+	 * turn: pickRunnable skips it, and this per-tick pass routes a started one (Accept, a
+	 * drag, a reply, or a lead that ran as a work turn before this rule) into its review's
+	 * batch validation. Per started lead that is not in flight:
+	 * - no live review to validate it (no followUpOf, a missing, cancelled or non-review
+	 *   parent): park needs_you with LEAD_NO_REVIEW_REASON;
+	 * - a validation run already open, or a review that cannot take a batch yet (still
+	 *   running): wait — the card keeps its stage and state, so the start is not lost and
+	 *   a later tick routes it;
+	 * - commits beyond its base (or an unreadable branch): park needs_you with
+	 *   LEAD_COMMITS_REASON, never moved;
+	 * - else return to the backlog and file the review's batch with the lead first, in one
+	 *   transaction: a refused filing rolls the move back, so the start waits for a later
+	 *   tick instead of stranding the lead in the backlog.
+	 * Every write rechecks the live row, so a cancel, a claim or a validation result that
+	 * landed during the git read owns the card. No card is deleted. */
 	async function routeStartedLeads(e: TurnProject): Promise<void> {
-		const started = (await e.store.listTasks()).filter(
+		const tasks = await e.store.listTasks();
+		const started = tasks.filter(
 			(t) =>
 				t.cancelledAt === null &&
 				(t.stage === "todo" || t.stage === "in_progress") &&
 				(t.state === "queued" ||
 					t.state === "idle" ||
-					// A lead already parked for its commits costs no git read per tick.
-					(t.state === "needs_you" && t.needsReason !== LEAD_COMMITS_REASON)) &&
+					// A lead already parked by this pass costs no reads per tick.
+					(t.state === "needs_you" &&
+						t.needsReason !== LEAD_COMMITS_REASON &&
+						t.needsReason !== LEAD_NO_REVIEW_REASON)) &&
 				pendingSandboxLead(t),
 		);
-		const moved = new Map<string, Set<string>>();
+		if (started.length === 0) return;
+		const runOpen = tasks.some(
+			(t) =>
+				t.kind === "validation" && t.cancelledAt === null && t.stage !== "done",
+		);
+		// The row as listed still holds: same stage and state, still a pending lead of the
+		// same review. A validation result writes only validatedAt on a started lead, so
+		// the classification is part of the check, not just stage and state.
+		const unchanged = (t: ListedTask, live: Task | null): live is Task =>
+			live !== null &&
+			live.cancelledAt === null &&
+			live.stage === t.stage &&
+			live.state === t.state &&
+			live.followUpOf === t.followUpOf &&
+			pendingSandboxLead(live);
+		const park = (t: ListedTask, reason: string) =>
+			e.store.transaction(async () => {
+				if (unchanged(t, await e.store.getTask(t.id)))
+					await e.store.updateTask(t.id, {
+						state: "needs_you",
+						needsReason: reason,
+					});
+			});
+		const ready = new Map<string, ListedTask[]>();
 		for (const t of started) {
-			const reviewId = t.followUpOf;
-			if (reviewId === null) continue;
+			const review = tasks.find((r) => r.id === t.followUpOf);
+			if (
+				review === undefined ||
+				review.cancelledAt !== null ||
+				!isReview(review)
+			) {
+				await park(t, LEAD_NO_REVIEW_REASON);
+				continue;
+			}
+			if (runOpen || !validatableReview(review)) continue;
 			const commits =
 				t.branch === null || t.base === null
 					? 0
 					: await ops.revListCount(e.path, t.base, t.branch).catch(() => null);
-			await e.store.transaction(async () => {
-				const live = await e.store.getTask(t.id);
-				// A write that landed since the list (a cancel, a claim) owns the card.
-				if (
-					live === null ||
-					live.cancelledAt !== null ||
-					live.stage !== t.stage ||
-					live.state !== t.state
-				)
-					return;
-				if (commits !== 0) {
-					await e.store.updateTask(t.id, {
-						state: "needs_you",
-						needsReason: LEAD_COMMITS_REASON,
-					});
-					return;
-				}
-				await e.store.updateTask(t.id, {
-					stage: "backlog",
-					state: "idle",
-					queuedAt: null,
-					needsReason: null,
-					asked: null,
-					details: `${live.details ?? ""}\nMoved back to the backlog on ${new Date().toISOString().slice(0, 10)}: a Needs validation lead runs in its review's batch validation run, never in a work turn.`,
-				});
-				const ids = moved.get(reviewId) ?? new Set<string>();
-				moved.set(reviewId, ids.add(t.id));
-			});
+			if (commits !== 0) {
+				await park(t, LEAD_COMMITS_REASON);
+				continue;
+			}
+			ready.set(review.id, [...(ready.get(review.id) ?? []), t]);
 		}
-		// A refusal (a run already open, a review still running) leaves the lead in the
-		// backlog for the chain or the review's done trigger, like the other triggers.
-		for (const [id, leads] of moved)
-			await filePendingValidationRun(e, id, true, undefined, leads);
+		const date = new Date().toISOString().slice(0, 10);
+		for (const [reviewId, leads] of ready)
+			await e.store
+				.transaction(async () => {
+					const moved = new Set<string>();
+					for (const t of leads) {
+						const live = await e.store.getTask(t.id);
+						if (!unchanged(t, live)) continue;
+						await e.store.updateTask(t.id, {
+							stage: "backlog",
+							state: "idle",
+							queuedAt: null,
+							needsReason: null,
+							asked: null,
+							details: `${live.details ?? ""}\nMoved back to the backlog on ${date}: a Needs validation lead runs in its review's batch validation run, never in a work turn.`,
+						});
+						moved.add(t.id);
+					}
+					if (moved.size === 0) return;
+					const filed = await filePendingValidationRun(
+						e,
+						reviewId,
+						true,
+						undefined,
+						moved,
+					);
+					// The throw rolls the moves back: the leads keep their start and a later
+					// tick routes them (the prechecks above make this a race-only path).
+					if ("error" in filed) throw new LeadFilingRefused(filed.error);
+				})
+				.catch((err: unknown) => {
+					if (!(err instanceof LeadFilingRefused)) throw err;
+				});
 	}
 
 	/** UI-shot guard: a work turn whose diff touches UI files (uiFiles) but attached no
