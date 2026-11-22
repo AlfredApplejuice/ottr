@@ -381,8 +381,21 @@ describe("runSelfCheck", () => {
 		// Production drops to the job user (uid 65534) before the limit lands; this
 		// unprivileged run keeps its own uid, whose task count under parallel suites
 		// can exceed the job's 256 and kill the fork, so the soft limit here is a
-		// load-safe floor and the readback must name the value this run set.
-		const nprocLimit = Math.max(VM_VALIDATE.maxProcesses, 50_000);
+		// load-safe floor and the readback must name the value this run set. A soft
+		// limit above the inherited hard one is refused (EPERM), so the floor clamps
+		// to the hard cap this process carries, unlimited ones aside.
+		const maxProcessesRow = /^Max processes\s+\S+\s+(\S+)/m.exec(
+			readFileSync("/proc/self/limits", "utf8"),
+		);
+		const hardNproc = maxProcessesRow?.[1] ?? "";
+		const hardValue =
+			hardNproc === "" || hardNproc === "unlimited"
+				? Number.POSITIVE_INFINITY
+				: Number(hardNproc);
+		const nprocLimit = Math.min(
+			Number.isFinite(hardValue) ? hardValue : 50_000,
+			Math.max(VM_VALIDATE.maxProcesses, 50_000),
+		);
 		const proc = Bun.spawn(
 			[
 				"prlimit",
