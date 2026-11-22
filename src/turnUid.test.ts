@@ -989,6 +989,51 @@ describe("ensureProjectIdentity", () => {
 		expect(line?.split(":")[2]).toBe(String(ids.uid));
 	});
 
+	test("an unrelated account at the hashed uid fails the run", () => {
+		const paths = freshIdentityFiles();
+		const project = "provision-id-collision";
+		const ids = projectTurnUid(project);
+		const turnHome = fakeTurnHome(project);
+		writeFileSync(
+			paths.passwd,
+			`${PASSWD_SNAPSHOT}svc-ldap:x:${ids.uid}:${ids.gid}::/srv/ldap:/bin/false\n`,
+		);
+		const before = readFileSync(paths.passwd, "utf8");
+		expect(() => ensureProjectIdentity(project, ids, turnHome, paths)).toThrow(
+			/unrelated/,
+		);
+		expect(readFileSync(paths.passwd, "utf8")).toBe(before);
+	});
+
+	test("an unrelated group at the hashed gid fails the run", () => {
+		const paths = freshIdentityFiles();
+		const project = "provision-gid-collision";
+		const ids = projectTurnUid(project);
+		const turnHome = fakeTurnHome(project);
+		writeFileSync(paths.group, `${GROUP_SNAPSHOT}svc-ldap:x:${ids.gid}:\n`);
+		const beforeGroup = readFileSync(paths.group, "utf8");
+		expect(() => ensureProjectIdentity(project, ids, turnHome, paths)).toThrow(
+			/unrelated/,
+		);
+		// The group check runs first: neither file gains an entry.
+		expect(readFileSync(paths.group, "utf8")).toBe(beforeGroup);
+		expect(readFileSync(paths.passwd, "utf8")).toBe(PASSWD_SNAPSHOT);
+	});
+
+	test("our name and id over a foreign home fails the run", () => {
+		const paths = freshIdentityFiles();
+		const project = "provision-home-collision";
+		const ids = projectTurnUid(project);
+		const turnHome = fakeTurnHome(project);
+		writeFileSync(
+			paths.passwd,
+			`${PASSWD_SNAPSHOT}ottr-${ids.uid}:x:${ids.uid}:${ids.gid}::/elsewhere:/bin/false\n`,
+		);
+		expect(() => ensureProjectIdentity(project, ids, turnHome, paths)).toThrow(
+			/unrelated/,
+		);
+	});
+
 	test("an unwritable passwd file fails the run", () => {
 		const paths = freshIdentityFiles();
 		const project = "provision-readonly";

@@ -233,6 +233,8 @@ their repo's owner and need nothing.
   the run fails with the cause.
 - Uid collision between two project names: logged per run; both projects
   share a trust boundary until one is renamed.
+- An unrelated account already holding the hashed uid or gid (OTTR-1193):
+  the run fails closed; the operator frees the id or renames the project.
 - Passwd or group write failure, or a gitconfig write failure: the run
   fails with the cause.
 - Fork-capacity raise failure: a boot note only; the daemon keeps serving.

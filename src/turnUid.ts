@@ -836,11 +836,41 @@ function firstFieldName(line: string): string {
 	return line.split(":")[0] ?? "";
 }
 
-function findEntryLine(content: string, id: number): boolean {
+/** The entry names this project's own passwd/group record may carry. */
+function ownIdentityNames(id: number): string[] {
+	return [`ottr-${id}`, `ottr-${id}-r2`, `ottr-${id}-r3`, `ottr-${id}-r4`];
+}
+
+/**
+ * Fail closed on an occupied id (OTTR-1193): when an entry with this numeric
+ * id already exists, every such entry must be this project's own record —
+ * name `ottr-<id>` or `-r2..-r4`, the id itself and, for passwd, this turn
+ * home. An unrelated account at the hashed id would run the project's turns
+ * under that principal and let it read the 0700 turn home, so any other
+ * entry throws, mirroring provisionName's name-conflict behavior. Returns
+ * true only when the id is free and provisioning must add the entry.
+ */
+function idFreeOrOwn(
+	content: string,
+	id: number,
+	home: string | null,
+): boolean {
+	let occupied = false;
 	for (const line of content.split("\n")) {
-		if (numericIdInLine(line) === id) return true;
+		if (numericIdInLine(line) !== id) continue;
+		occupied = true;
+		const fields = line.split(":");
+		const name = fields[0] ?? "";
+		if (
+			!ownIdentityNames(id).includes(name) ||
+			(home !== null && fields[5] !== home)
+		) {
+			throw new Error(
+				`turn-uid: id ${id} is held by an unrelated account ${JSON.stringify(name)}; refusing to share the project identity`,
+			);
+		}
 	}
-	return false;
+	return !occupied;
 }
 
 /**
@@ -850,8 +880,7 @@ function findEntryLine(content: string, id: number): boolean {
  * name that maps to another uid.
  */
 function provisionName(content: string, uid: number): string {
-	for (const suffixName of ["", "-r2", "-r3", "-r4"]) {
-		const name = `ottr-${uid}${suffixName}`;
+	for (const name of ownIdentityNames(uid)) {
 		const bound = content
 			.split("\n")
 			.find((line) => firstFieldName(line) === name);
@@ -881,7 +910,7 @@ export function ensureProjectIdentity(
 	const groupContent = existsSync(groupPath)
 		? readFileSync(groupPath, "utf8")
 		: "";
-	if (!findEntryLine(groupContent, ids.gid)) {
+	if (idFreeOrOwn(groupContent, ids.gid, null)) {
 		const name = provisionName(groupContent, ids.gid);
 		appendIdentityLine(groupPath, groupContent, `${name}:x:${gid}:`);
 	}
@@ -890,7 +919,7 @@ export function ensureProjectIdentity(
 	const passwdContent = existsSync(passwdPath)
 		? readFileSync(passwdPath, "utf8")
 		: "";
-	if (!findEntryLine(passwdContent, ids.uid)) {
+	if (idFreeOrOwn(passwdContent, ids.uid, turnHome.home)) {
 		const name = provisionName(passwdContent, ids.uid);
 		appendIdentityLine(
 			passwdPath,
