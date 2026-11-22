@@ -622,6 +622,25 @@ function readRegularFile(d: Dir, file: string, maxBytes: number): Buffer {
 }
 
 /**
+ * Opens `file` below `anchor` for reading without following a symlink at any component
+ * below the anchor (the file included); O_NONBLOCK keeps a planted FIFO from blocking
+ * the board's thread. Anything but a regular file fails with "refusing". Close the result.
+ */
+export function openRegularBelow(anchor: string, file: string): number {
+	return withDir(anchor, dirname(file), {}, (d) => {
+		let fd: number;
+		try {
+			fd = openSync(d.at(basename(file)), O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+		} catch (err) {
+			if (errCode(err) === "ELOOP")
+				throw new Error(`refusing ${file}: a symlink`);
+			throw err;
+		}
+		return regularOrClose(fd, file);
+	});
+}
+
+/**
  * Reads the regular file `file` below `anchor`, following no symlink under the anchor (the
  * file included). Null when the file or a parent is missing. A symlink, a non-regular entry,
  * or a file over `maxBytes` fails with "refusing <path>".

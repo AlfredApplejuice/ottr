@@ -74,7 +74,7 @@ import { acceptsGzip, boardBundle, bundleResponse } from "./boardBundle.ts";
 import { lookupBranchRules } from "./branchRules.ts";
 import { createCodeScanWatcher } from "./codeScanWatch.ts";
 import {
-	openRegular,
+	openRegularBelow,
 	readBelow,
 	unlinkBelow,
 	withDir,
@@ -499,11 +499,13 @@ function isStringList(v: unknown, max: number): v is string[] {
 
 const ICON_EXTS = ["png", "jpg", "gif", "webp"] as const;
 
-/** Path of the stored icon in the project's data dir, or null when none exists. */
+/** Path of the stored icon in the project's data dir, or null when none exists. A
+ * symlink at an icon name refuses: lstat never follows it, so a worker-planted link
+ * shows no icon and the GET route never serves the target's bytes. */
 function iconFile(tasksDir: string): string | null {
 	for (const ext of ICON_EXTS) {
 		const file = join(tasksDir, `icon.${ext}`);
-		if (statSync(file, { throwIfNoEntry: false })?.isFile()) return file;
+		if (lstatSync(file, { throwIfNoEntry: false })?.isFile()) return file;
 	}
 	return null;
 }
@@ -522,6 +524,8 @@ function removeIcons(root: string, tasksDir: string): void {
 
 const IMAGE_BODY_BYTES = 32 * 1024 * 1024;
 const LOG_CHUNK_BYTES = 256 * 1024;
+/** The worktree file viewer never serves a worker-written file whole without bound. */
+const WORKTREE_FILE_MAX_BYTES = 64 * 1024 * 1024;
 /** A route param that names a task: legacy 8-hex or the project's `PREFIX-n` handle, either
  * with a retro child suffix `-retro[-k]`. resolveTask reads it; SEEN_ID_RE below repeats it
  * with the optional completion suffix, so change both together. */
@@ -5340,7 +5344,7 @@ export async function createApp(deps: AppDeps) {
 	async function projectView(e: Entry): Promise<ProjectView> {
 		const file = iconFile(e.store.tasksDir);
 		const icon = file
-			? statSync(file, { throwIfNoEntry: false })?.mtimeMs
+			? lstatSync(file, { throwIfNoEntry: false })?.mtimeMs
 			: undefined;
 		const settings = await e.store.getSettings();
 		const homepageRepo = e.github === null ? null : ownerRepo(e.github);
@@ -8866,15 +8870,22 @@ export async function createApp(deps: AppDeps) {
 		const file = await found.e.store.logPath(found.task.id);
 		let fd: number;
 		try {
-			fd = openRegular(file);
-		} catch {
-			return new Response("", {
-				headers: {
-					"Content-Type": "text/plain; charset=utf-8",
-					"X-Log-Size": "0",
-					Connection: "close",
-				},
-			});
+			// Anchored at the trusted data root: a worker-planted symlink at the log
+			// path or any component below it refuses, it is never followed.
+			fd = openRegularBelow(found.e.store.dataRoot, file);
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+				// A missing log keeps the empty-log shape the drawer expects.
+				return new Response("", {
+					headers: {
+						"Content-Type": "text/plain; charset=utf-8",
+						"X-Log-Size": "0",
+						Connection: "close",
+					},
+				});
+			}
+			// refused: a symlink at any component or a non-regular entry
+			return json({ error: "log unavailable" }, 404);
 		}
 		try {
 			const size = fstatSync(fd).size;
@@ -8937,12 +8948,23 @@ export async function createApp(deps: AppDeps) {
 			return json({ error: "bad path" }, 400);
 		}
 		if (task.worktree === null) return json({ error: "unknown task" }, 404);
+		// Anchored at the board-created .worktrees entry one level above the
+		// worktree: readBelow refuses a symlink at every component below it, so a
+		// worker-planted link inside the worktree or a swapped worktree entry
+		// cannot widen the read past the worktree. The cap bounds the buffer;
+		// the read never runs unbounded.
 		const file = join(task.worktree, rel);
-		if (!resolve(file).startsWith(resolve(task.worktree) + sep))
-			return json({ error: "bad path" }, 404);
-		const f = Bun.file(file);
-		if (!(await f.exists())) return json({ error: "unknown file" }, 404);
-		return new Response(f, {
+		let bytes: Buffer | null;
+		try {
+			bytes = readBelow(dirname(task.worktree), file, WORKTREE_FILE_MAX_BYTES);
+		} catch {
+			// refused: a symlink at any component or a non-regular entry
+			return json({ error: "unknown file" }, 404);
+		}
+		if (bytes === null) return json({ error: "unknown file" }, 404);
+		const f = Bun.file(file); // extension-based Content-Type only; no disk access
+		// readBelow returns a subarray view; BodyInit wants a standalone buffer.
+		return new Response(new Uint8Array(bytes), {
 			headers: {
 				"Content-Type": f.type || "application/octet-stream",
 				"Content-Security-Policy": "sandbox allow-scripts",
@@ -9443,10 +9465,21 @@ export async function createApp(deps: AppDeps) {
 			return json({ error: "unknown image" }, 404);
 		}
 		const file = join(await e.store.imagesDir(task.id), name);
-		const st = statSync(file, { throwIfNoEntry: false });
-		if (!st?.isFile()) return json({ error: "unknown image" }, 404);
-		const f = Bun.file(file);
-		return new Response(f, {
+		// Anchored at the trusted data root: readBelow refuses a symlink at every
+		// component, so a worker-planted link at a member name never serves another
+		// file's bytes. The cap bounds the buffer; stored images pass the same cap
+		// at upload, so a legit shot always fits.
+		let bytes: Buffer | null;
+		try {
+			bytes = readBelow(e.store.dataRoot, file, MAX_IMAGE_BYTES);
+		} catch {
+			// refused: a symlink at any component or a non-regular entry
+			return json({ error: "unknown image" }, 404);
+		}
+		if (bytes === null) return json({ error: "unknown image" }, 404);
+		const f = Bun.file(file); // extension-based Content-Type only; no disk access
+		// readBelow returns a subarray view; BodyInit wants a standalone buffer.
+		return new Response(new Uint8Array(bytes), {
 			headers: {
 				"Content-Type": f.type,
 				"Cache-Control": "private, max-age=31536000, immutable",
@@ -9573,8 +9606,21 @@ export async function createApp(deps: AppDeps) {
 		if (!e) return json({ error: "unknown project" }, 404);
 		const file = iconFile(e.store.tasksDir);
 		if (file === null) return json({ error: "no icon" }, 404);
-		const f = Bun.file(file);
-		return new Response(f, {
+		// Anchored at the trusted data root: readBelow refuses a symlink at every
+		// component, so a worker-planted icon link never serves another file's
+		// bytes. The cap bounds the buffer; uploads pass the same cap, so a stored
+		// icon always fits.
+		let bytes: Buffer | null;
+		try {
+			bytes = readBelow(e.store.dataRoot, file, MAX_IMAGE_BYTES);
+		} catch {
+			// refused: a symlink at any component or a non-regular entry
+			return json({ error: "no icon" }, 404);
+		}
+		if (bytes === null) return json({ error: "no icon" }, 404);
+		const f = Bun.file(file); // extension-based Content-Type only; no disk access
+		// readBelow returns a subarray view; BodyInit wants a standalone buffer.
+		return new Response(new Uint8Array(bytes), {
 			headers: {
 				"Content-Type": f.type,
 				"Cache-Control": "private, max-age=31536000, immutable",

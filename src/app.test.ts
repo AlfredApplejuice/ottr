@@ -1099,6 +1099,82 @@ describe("task routes", () => {
 			(await get(`/api/projects/p1/tasks/${noWt.id}/files?path=mockup.html`))
 				.status,
 		).toBe(404);
+
+		// A worker with write access to the worktree plants a link at a served name:
+		// the viewer must refuse it instead of following it to a server-only file.
+		const outside = join(root, "wt-outside.txt");
+		writeFileSync(outside, "server-only");
+		symlinkSync(outside, join(wt, "leak.html"));
+		const leak = await get(
+			`/api/projects/p1/tasks/${t.id}/files?path=leak.html`,
+		);
+		expect(leak.status).toBe(404);
+		expect(await errorOf(leak)).toBe("unknown file");
+		// A symlinked component inside the tree must not widen the read either.
+		symlinkSync("/", join(wt, "up"));
+		const viaUp = await get(
+			`/api/projects/p1/tasks/${t.id}/files?path=${encodeURIComponent("up/etc/passwd")}`,
+		);
+		expect(viaUp.status).toBe(404);
+		// The worktree entry itself swapped for a link: the viewer refuses it.
+		const realWt = join(root, "wt-real");
+		mkdirSync(realWt, { recursive: true });
+		writeFileSync(join(realWt, "mockup.html"), "<h1>swap</h1>");
+		symlinkSync(realWt, join(root, "wt-link"));
+		const swapped = await store.createTask("swapped worktree");
+		await store.updateTask(swapped.id, { worktree: join(root, "wt-link") });
+		const swapRes = await get(
+			`/api/projects/p1/tasks/${swapped.id}/files?path=mockup.html`,
+		);
+		expect(swapRes.status).toBe(404);
+		expect(await errorOf(swapRes)).toBe("unknown file");
+	});
+
+	test("the log chunker serves the real log and refuses a symlinked one", async () => {
+		const t = await store.createTask("logged");
+		const log = await store.logPath(t.id);
+		mkdirSync(dirname(log), { recursive: true });
+		writeFileSync(log, "real log bytes");
+		const ok = await get(`/api/projects/p1/tasks/${t.id}/log`);
+		expect(ok.status).toBe(200);
+		expect(await ok.text()).toBe("real log bytes");
+		expect(ok.headers.get("x-log-size")).toBe(String("real log bytes".length));
+		const mid = await get(`/api/projects/p1/tasks/${t.id}/log?from=5`);
+		expect(await mid.text()).toBe("log bytes");
+
+		// A worker swaps a log path for a link to a server-only file: the chunker
+		// must refuse it instead of streaming the target's bytes.
+		const outside = join(root, "log-outside.txt");
+		writeFileSync(outside, "server-only");
+		const planted = await store.createTask("planted log");
+		const plantedLog = await store.logPath(planted.id);
+		mkdirSync(dirname(plantedLog), { recursive: true });
+		symlinkSync(outside, plantedLog);
+		const leak = await get(`/api/projects/p1/tasks/${planted.id}/log`);
+		expect(leak.status).toBe(404);
+		expect(await leak.clone().text()).not.toContain("server-only");
+		expect(await errorOf(leak)).toBe("log unavailable");
+	});
+
+	test("the image route serves the stored shot and refuses a symlinked one", async () => {
+		const t = await store.createTask("shots");
+		const dir = await store.imagesDir(t.id);
+		mkdirSync(dir, { recursive: true });
+		const png = Buffer.from("89504e470d0a1a0a", "hex");
+		writeFileSync(join(dir, "1.png"), png);
+		await store.updateTask(t.id, { shots: ["1.png", "2.png"] });
+		const ok = await get(`/api/projects/p1/tasks/${t.id}/images/1.png`);
+		expect(ok.status).toBe(200);
+		expect(new Uint8Array(await ok.arrayBuffer())).toEqual(new Uint8Array(png));
+
+		// A worker plants a link at a member name: the route must refuse it instead
+		// of following it to a server-only file.
+		const outside = join(root, "image-outside.txt");
+		writeFileSync(outside, "server-only");
+		symlinkSync(outside, join(dir, "2.png"));
+		const leak = await get(`/api/projects/p1/tasks/${t.id}/images/2.png`);
+		expect(leak.status).toBe(404);
+		expect(await errorOf(leak)).toBe("unknown image");
 	});
 
 	test("drawer detail lists saved files and serves them safely", async () => {
@@ -13325,6 +13401,24 @@ describe("project icon", () => {
 				symlinkSync(outside, join(store.tasksDir, "icon.png"));
 				await rawPost("/api/projects/p1/icon", png);
 				expect(readFileSync(outside, "utf8")).toBe("keep me");
+			} finally {
+				rmSync(outDir, { recursive: true, force: true });
+				rmSync(join(store.tasksDir, "icon.png"), { force: true });
+			}
+		},
+	);
+
+	test.skipIf(process.platform !== "linux")(
+		"GET does not serve through a symlinked icon",
+		async () => {
+			const outDir = mkdtempSync(join(tmpdir(), "app-icon-leak-"));
+			try {
+				const outside = join(outDir, "target");
+				writeFileSync(outside, "server-only");
+				symlinkSync(outside, join(store.tasksDir, "icon.png"));
+				const res = await get("/api/projects/p1/icon");
+				expect(res.status).toBe(404);
+				expect(await errorOf(res)).toBe("no icon");
 			} finally {
 				rmSync(outDir, { recursive: true, force: true });
 				rmSync(join(store.tasksDir, "icon.png"), { force: true });
