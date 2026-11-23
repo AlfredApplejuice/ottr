@@ -1,9 +1,19 @@
 import { Database } from "bun:sqlite";
-import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import {
+	afterAll,
+	afterEach,
+	describe,
+	expect,
+	setSystemTime,
+	test,
+} from "bun:test";
+import {
+	closeSync,
 	existsSync,
+	ftruncateSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readdirSync,
 	rmSync,
 	symlinkSync,
@@ -19,12 +29,14 @@ import {
 	RULES_INTERVIEW_MARKER,
 } from "./prompts.ts";
 import { FINDINGS_HOLD, mergeHold } from "./scheduler.ts";
+import { TRANSCRIPT_MAX_BYTES } from "./session.ts";
 import { SQLiteDatabase } from "./sqliteDriver.ts";
 import {
 	adoptSharedProjectData,
 	DEFAULT_SETTINGS,
 	discoverProjects,
 	ProjectStore,
+	resetOversizeSessions,
 	shortTitle,
 	tasksDirFor,
 } from "./store.ts";
@@ -200,9 +212,9 @@ describe("old-driver file compatibility", () => {
 	});
 });
 
-describe("reorderQueue", () => {
-	test("exact permutation moves a task to the front as queueIds reports", async () => {
-		const store = await open(join(root, "reorder"));
+describe("moveInQueue", () => {
+	test("a move lands while another card leaves and another enters the queue", async () => {
+		const store = await open(join(root, "move-race"));
 		const a = await store.createTask("a");
 		const b = await store.createTask("b");
 		const c = await store.createTask("c");
@@ -210,24 +222,190 @@ describe("reorderQueue", () => {
 		await store.updateTask(a.id, { queuedAt: 1 });
 		await store.updateTask(b.id, { queuedAt: 2 });
 		await store.updateTask(c.id, { queuedAt: 3 });
-		expect(await store.queueIds()).toEqual([a.id, b.id, c.id]);
-		expect(await store.reorderQueue([c.id, a.id, b.id])).toBe(true);
-		expect(await store.queueIds()).toEqual([c.id, a.id, b.id]);
+		// The board's stale /api/state view says [a, b, c]; then b starts a turn (leaves
+		// the queue) and d enters before the move's write lands.
+		await store.updateTask(b.id, { state: "preparing" });
+		const d = await store.createTask("d");
+		expect(await store.moveInQueue(c.id, a.id)).toBe(true);
+		// The named move lands; every other card keeps its order.
+		expect(await store.queueIds()).toEqual([c.id, a.id, d.id]);
 		await store.close();
 	});
 
-	test("wrong length, duplicate id, and unknown id each return false without writing", async () => {
-		const store = await open(join(root, "reorder-bad"));
+	test("before null moves to the end, before the first card moves to the top", async () => {
+		const store = await open(join(root, "move-ends"));
+		const a = await store.createTask("a");
+		const b = await store.createTask("b");
+		const c = await store.createTask("c");
+		await store.updateTask(a.id, { queuedAt: 1 });
+		await store.updateTask(b.id, { queuedAt: 2 });
+		await store.updateTask(c.id, { queuedAt: 3 });
+		expect(await store.moveInQueue(a.id, null)).toBe(true);
+		expect(await store.queueIds()).toEqual([b.id, c.id, a.id]);
+		expect(await store.moveInQueue(c.id, b.id)).toBe(true);
+		expect(await store.queueIds()).toEqual([c.id, b.id, a.id]);
+		await store.close();
+	});
+
+	test("a before that left the queue still anchors by its stored queuedAt", async () => {
+		const store = await open(join(root, "move-anchor"));
+		const a = await store.createTask("a");
+		const gone = await store.createTask("gone");
+		const b = await store.createTask("b");
+		await store.updateTask(a.id, { queuedAt: 1 });
+		await store.updateTask(gone.id, { queuedAt: 10 });
+		await store.updateTask(b.id, { queuedAt: 20 });
+		// gone started a turn, so it left the queue; the drag names it as before anyway.
+		await store.updateTask(gone.id, { state: "preparing" });
+		expect(await store.moveInQueue(b.id, gone.id)).toBe(true);
+		// b lands between a and gone's old slot, in a one-row write.
+		expect(await store.queueIds()).toEqual([a.id, b.id]);
+		expect((await store.getTask(b.id))!.queuedAt).toBe(5);
+		expect((await store.getTask(a.id))!.queuedAt).toBe(1);
+		await store.close();
+	});
+
+	test("the renumber keeps same-queuedAt cards in queue order around the moved card", async () => {
+		const store = await open(join(root, "move-renumber-tie"));
+		try {
+			// Pinned createdAt: x and b tie on queuedAt, and x's earlier creation
+			// puts x above b in queueOrder, right where the moved card must land.
+			setSystemTime(new Date(1000));
+			const x = await store.createTask("x");
+			setSystemTime(new Date(2000));
+			const b = await store.createTask("b");
+			setSystemTime(new Date(3000));
+			const p = await store.createTask("p");
+			setSystemTime(new Date(4000));
+			const m = await store.createTask("m");
+			await store.updateTask(p.id, { queuedAt: 4 });
+			await store.updateTask(x.id, { queuedAt: 5 });
+			await store.updateTask(b.id, { queuedAt: 5 });
+			await store.updateTask(m.id, { queuedAt: 6 });
+			expect(await store.queueIds()).toEqual([p.id, x.id, b.id, m.id]);
+			// No integer slot between p (4) and b's anchor (5): the queue renumbers.
+			// m must land between x and b, not above x.
+			expect(await store.moveInQueue(m.id, b.id)).toBe(true);
+			expect(await store.queueIds()).toEqual([p.id, x.id, m.id, b.id]);
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	test("a same-key card created before the anchor stays above the moved card", async () => {
+		const store = await open(join(root, "move-twin-above"));
+		try {
+			// Pinned createdAt: x ties with b on queuedAt and sorts above b.
+			setSystemTime(new Date(1000));
+			const p = await store.createTask("p");
+			setSystemTime(new Date(2000));
+			const x = await store.createTask("x");
+			setSystemTime(new Date(3000));
+			const b = await store.createTask("b");
+			setSystemTime(new Date(4000));
+			const m = await store.createTask("m");
+			await store.updateTask(p.id, { queuedAt: 1 });
+			await store.updateTask(x.id, { queuedAt: 10 });
+			await store.updateTask(b.id, { queuedAt: 10 });
+			await store.updateTask(m.id, { queuedAt: 20 });
+			expect(await store.queueIds()).toEqual([p.id, x.id, b.id, m.id]);
+			// A free integer slot exists below the anchor (between 1 and 10), but a
+			// write there would land m above x; m must go between x and b.
+			expect(await store.moveInQueue(m.id, b.id)).toBe(true);
+			expect(await store.queueIds()).toEqual([p.id, x.id, m.id, b.id]);
+			await store.close();
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	test("a same-key twin forces the renumber on a top insert too", async () => {
+		const store = await open(join(root, "move-twin-top"));
+		try {
+			setSystemTime(new Date(1000));
+			const x = await store.createTask("x");
+			setSystemTime(new Date(2000));
+			const b = await store.createTask("b");
+			setSystemTime(new Date(3000));
+			const m = await store.createTask("m");
+			await store.updateTask(x.id, { queuedAt: 10 });
+			await store.updateTask(b.id, { queuedAt: 10 });
+			await store.updateTask(m.id, { queuedAt: 20 });
+			expect(await store.queueIds()).toEqual([x.id, b.id, m.id]);
+			// Nothing queues below the anchor, but x (same key, earlier createdAt)
+			// sorts above b, so the top-insert slot below the anchor is wrong too.
+			expect(await store.moveInQueue(m.id, b.id)).toBe(true);
+			expect(await store.queueIds()).toEqual([x.id, m.id, b.id]);
+			await store.close();
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	test("adjacent queuedAt leaves no slot, so the queue renumbers", async () => {
+		const store = await open(join(root, "move-renumber"));
+		const a = await store.createTask("a");
+		const b = await store.createTask("b");
+		const c = await store.createTask("c");
+		await store.updateTask(a.id, { queuedAt: 1 });
+		await store.updateTask(b.id, { queuedAt: 2 });
+		await store.updateTask(c.id, { queuedAt: 3 });
+		expect(await store.moveInQueue(c.id, b.id)).toBe(true);
+		expect(await store.queueIds()).toEqual([a.id, c.id, b.id]);
+		const keys = await Promise.all(
+			[a.id, c.id, b.id].map(async (id) => (await store.getTask(id))!.queuedAt),
+		);
+		expect(keys[0]!).toBeLessThan(keys[1]!);
+		expect(keys[1]!).toBeLessThan(keys[2]!);
+		await store.close();
+	});
+
+	test("a card that is not queued, and an unknown id, are refused without writing", async () => {
+		const store = await open(join(root, "move-refuse"));
 		const a = await store.createTask("a");
 		const b = await store.createTask("b");
 		await store.updateTask(a.id, { queuedAt: 1 });
 		await store.updateTask(b.id, { queuedAt: 2 });
+		await store.updateTask(b.id, { state: "preparing" });
 		const before = await store.queueIds();
-		expect(await store.reorderQueue([a.id])).toBe(false);
-		expect(await store.reorderQueue([a.id, a.id])).toBe(false);
-		expect(await store.reorderQueue([a.id, "nope"])).toBe(false);
+		expect(await store.moveInQueue(b.id, a.id)).toBe(false);
+		expect(await store.moveInQueue("nope", null)).toBe(false);
 		expect(await store.queueIds()).toEqual(before);
-		expect(await store.reorderQueue([a.id, b.id])).toBe(true);
+		await store.close();
+	});
+
+	test("a before that names no card behaves like null: end of the queue", async () => {
+		const store = await open(join(root, "move-unknown-before"));
+		const a = await store.createTask("a");
+		const b = await store.createTask("b");
+		await store.updateTask(a.id, { queuedAt: 1 });
+		await store.updateTask(b.id, { queuedAt: 2 });
+		expect(await store.moveInQueue(a.id, "nope")).toBe(true);
+		expect(await store.queueIds()).toEqual([b.id, a.id]);
+		await store.close();
+	});
+
+	test("a within-lane move leaves other lanes' relative order alone", async () => {
+		const store = await open(join(root, "move-lane"));
+		const t1 = await store.createTask("t1");
+		const t2 = await store.createTask("t2");
+		const t3 = await store.createTask("t3");
+		const m = await store.createTask("m");
+		await store.updateTask(t1.id, { queuedAt: 1 });
+		await store.updateTask(t2.id, { queuedAt: 2 });
+		await store.updateTask(t3.id, { queuedAt: 3 });
+		await store.updateTask(m.id, { stage: "merging", queuedAt: 4 });
+		// The board drags t3 above t1 inside the todo lane; the server orders globally.
+		expect(await store.moveInQueue(t3.id, t1.id)).toBe(true);
+		expect(await store.queueIds()).toEqual([t3.id, t1.id, t2.id, m.id]);
+		// The lane's own queued order matches the lane-local splice the UI computes, and
+		// the merging card keeps its queuedAt (one-row write).
+		expect((await store.queueIds()).filter((id) => id !== m.id)).toEqual([
+			t3.id,
+			t1.id,
+			t2.id,
+		]);
+		expect((await store.getTask(m.id))!.queuedAt).toBe(4);
 		await store.close();
 	});
 });
@@ -678,6 +856,85 @@ describe("deriveTitle", () => {
 		expect(edited.task.title).toBe("second title");
 		await store.close();
 	});
+
+	test("a bare-tag lead titles from its claim line (OTTR-1164)", async () => {
+		const store = await open(join(root, "derive-title-lead"));
+		const claim = "The setup limiter keys on the first X-Forwarded-For entry.";
+		const task = await store.createTask(
+			`Needs validation\nFingerprint: fp-1\n## Claim\n${claim}\n\nEvidence.`,
+		);
+		expect(task.title).toBe(`Needs validation: ${claim}`);
+		await store.close();
+	});
+
+	test("an old-shape lead keeps its first-line title", async () => {
+		const store = await open(join(root, "derive-title-lead-old"));
+		const task = await store.createTask(
+			"Needs validation: Legacy-layout restore follows worker-planted symlinks",
+		);
+		expect(task.title).toBe(
+			"Needs validation: Legacy-layout restore follows worker-planted symlinks",
+		);
+		await store.close();
+	});
+});
+
+describe("bare lead retitle (OTTR-1164)", () => {
+	test("open retitles open bare-tag leads; renamed, done and cancelled keep theirs", async () => {
+		const dir = join(root, "lead-retitle");
+		const store = await open(dir);
+		const claim = "The setup limiter keys on the first X-Forwarded-For entry.";
+		const shape = (subject: string, fingerprint: string) =>
+			`Needs validation\nFingerprint: ${fingerprint}\n## Claim\n${subject}`;
+		const openLead = await store.createTask(shape(claim, "fp-open"));
+		const doneLead = await store.createTask(
+			shape("The probe starts Bun in the venv.", "fp-done"),
+		);
+		const cancelledLead = await store.createTask(
+			shape("Receive-pack buffers whole bodies.", "fp-cancel"),
+		);
+		const renamedLead = await store.createTask(
+			shape("Copy-out lacks byte budgets.", "fp-renamed"),
+		);
+		await store.updateTask(doneLead.id, { stage: "done", state: "idle" });
+		await store.updateTask(cancelledLead.id, {
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+			cancelledAt: Date.now(),
+		});
+		await store.close();
+		// Force the pre-fix titles back: every card then carries the bare tag,
+		// except the renamed one, which keeps a title the user wrote.
+		const raw = new Database(join(dir, ".tasks", "tasks.db"), {
+			create: true,
+		});
+		raw.run("UPDATE tasks SET title = 'Needs validation'");
+		raw.run("UPDATE tasks SET title = 'User renamed this lead' WHERE id = ?", [
+			renamedLead.id,
+		]);
+		raw.close();
+		const reopened = await open(dir);
+		expect((await reopened.getTask(openLead.id))!.title).toBe(
+			`Needs validation: ${claim}`,
+		);
+		expect((await reopened.getTask(renamedLead.id))!.title).toBe(
+			"User renamed this lead",
+		);
+		expect((await reopened.getTask(doneLead.id))!.title).toBe(
+			"Needs validation",
+		);
+		expect((await reopened.getTask(cancelledLead.id))!.title).toBe(
+			"Needs validation",
+		);
+		// A second open is a no-op: the new titles never match the bare tag again.
+		await reopened.close();
+		const again = await open(dir);
+		expect((await again.getTask(openLead.id))!.title).toBe(
+			`Needs validation: ${claim}`,
+		);
+		await again.close();
+	});
 });
 
 describe("asked", () => {
@@ -687,6 +944,7 @@ describe("asked", () => {
 			options: [{ label: "A", description: "faster" }, { label: "B" }],
 			multi: false,
 			recommended: 1,
+			text: false,
 		},
 	];
 
@@ -1049,16 +1307,19 @@ describe("settings", () => {
 			forkMergeHold: true,
 			retroSince: null,
 			retroFilter: true,
+			retroAutoStart: false,
 			forkResearch: false,
 			prReviews: false,
 			prReviewNotify: true,
 			prReviewApprove: false,
 			prReviewRequestChanges: false,
+			prReviewManualPost: true,
 			prMode: false,
 			microVm: false,
 			trendingScout: false,
 			issueWatch: false,
 			issueWatchSince: null,
+			codeScanWatch: false,
 			jiraConnection: null,
 			jiraLastJql: null,
 			ompWatch: false,
@@ -1066,7 +1327,6 @@ describe("settings", () => {
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
-			pushSyncCommits: false,
 			taskIdPrefix: null,
 		});
 		await store.setSettings({ displayName: null, releaseCommand: null });
@@ -1087,16 +1347,19 @@ describe("settings", () => {
 			forkMergeHold: true,
 			retroSince: null,
 			retroFilter: true,
+			retroAutoStart: false,
 			forkResearch: false,
 			prReviews: false,
 			prReviewNotify: true,
 			prReviewApprove: false,
 			prReviewRequestChanges: false,
+			prReviewManualPost: true,
 			prMode: false,
 			microVm: false,
 			trendingScout: false,
 			issueWatch: false,
 			issueWatchSince: null,
+			codeScanWatch: false,
 			jiraConnection: null,
 			jiraLastJql: null,
 			ompWatch: false,
@@ -1104,7 +1367,6 @@ describe("settings", () => {
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
-			pushSyncCommits: false,
 			taskIdPrefix: null,
 		});
 		await store.close();
@@ -2010,29 +2272,40 @@ describe("work check log", () => {
 				{
 					at: 3000,
 					model: null,
-					// A value the union never names: the parse whitelist drops it.
-					role: "plan" as unknown as "critic" | "adversary" | "default",
+					// A non-string role drops: the parse whitelist keeps strings only.
+					role: 5 as unknown as string,
 					outcome: "error",
 					blockers: [],
 					notes: [],
 					durationMs: 0,
 					error: "the run was lost",
 				},
+				{
+					at: 4000,
+					model: "moonshot/kimi-k2",
+					// A routed role is user data: any nonempty string role survives.
+					role: "reviewer",
+					outcome: "pass",
+					blockers: [],
+					notes: [],
+					durationMs: 1000,
+				},
 			],
 		});
 		await store.close();
 		const reopened = await open(join(root, "wc-log"));
 		const log = (await reopened.getTask(task.id))?.workCheckLog ?? [];
-		expect(log).toHaveLength(3);
+		expect(log).toHaveLength(4);
 		expect(log[0]?.warn).toBe(
 			"The check model zai/glm-5.3-flash:medium is the same model as the run it checks — no second-model opinion.",
 		);
 		expect(log[2]?.warn).toBeUndefined();
-		// The role rides the same whitelist: a picked role survives, a bogus
-		// value lands as undefined.
+		// The role rides the same whitelist: a picked role and a routed role survive,
+		// a non-string drops.
 		expect(log[0]?.role).toBe("critic");
 		expect(log[1]?.role).toBe("default");
 		expect(log[2]?.role).toBeUndefined();
+		expect(log[3]?.role).toBe("reviewer");
 		await reopened.close();
 	});
 });
@@ -2551,6 +2824,81 @@ describe("turn cost capture", () => {
 		])
 			expect(cols).toContain(col);
 	});
+
+	// A transcript over TRANSCRIPT_MAX_BYTES is refused unread by the reader, so the
+	// turn's cost stays unknown: NULL at turn end and on every later reopen.
+	test("an oversize transcript keeps cost and tokens NULL at turn end and on reopen", async () => {
+		const dir = join(root, "cost-oversize");
+		const store = await open(dir);
+		const t = await store.updateTask((await store.createTask("huge log")).id, {
+			sessionId: sid,
+		});
+		const turn = await store.startTurn(t.id, "work", "p", null);
+		writeTranscript(store.sessionsDir, sid, [
+			usageLine(turn.startedAt + 100, { input: 9, output: 9, cost: 9 }),
+		]);
+		const fd = openSync(
+			join(store.sessionsDir, `2026-09-27T10-00-00-000Z_${sid}.jsonl`),
+			"r+",
+		);
+		ftruncateSync(fd, TRANSCRIPT_MAX_BYTES + 1);
+		closeSync(fd);
+
+		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
+		await store.close();
+
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		const rows = raw
+			.query<
+				{
+					tokens_in: number | null;
+					tokens_out: number | null;
+					cache_read: number | null;
+					cache_write: number | null;
+					cost: number | null;
+				},
+				[]
+			>(
+				"SELECT tokens_in, tokens_out, cache_read, cache_write, cost FROM turns",
+			)
+			.all();
+		raw.close();
+		expect(rows).toEqual([
+			{
+				tokens_in: null,
+				tokens_out: null,
+				cache_read: null,
+				cache_write: null,
+				cost: null,
+			},
+		]);
+
+		// Reopen runs the backfill over the same oversize transcript: still refused,
+		// still NULL, and no error surfaces.
+		const reopened = await open(dir);
+		expect((await reopened.perfFacts()).turns[0]?.cost).toBeNull();
+		await reopened.close();
+
+		// The memo is process-wide: a second store instance skips the session even
+		// after its transcript turned good, so the now-good sum must stay unread.
+		writeTranscript(store.sessionsDir, sid, [
+			usageLine(turn.startedAt + 100, { input: 4, output: 4, cost: 4 }),
+		]);
+		const reopenedMemoized = await open(dir);
+		expect((await reopenedMemoized.perfFacts()).turns[0]?.cost).toBeNull();
+		await reopenedMemoized.close();
+
+		// Un-memoizing lets the same good transcript fill the cost: the NULL above
+		// came from the memo, not from the data.
+		resetOversizeSessions();
+		const reopenedReset = await open(dir);
+		expect((await reopenedReset.perfFacts()).turns[0]?.cost).toBe(4);
+		await reopenedReset.close();
+
+		// The memo is process-wide, so reset it or later tests see this session as
+		// oversize.
+		resetOversizeSessions();
+	});
 });
 
 describe("turn dispatched model (provider fallback)", () => {
@@ -2977,6 +3325,9 @@ describe("preparing migration", () => {
 				'["λ.png"]',
 			],
 		);
+		// D-era rebuilds run only after the old-rowid ordinal backfill.
+		legacy.exec("ALTER TABLE tasks ADD COLUMN insertion_ordinal INTEGER");
+		legacy.exec("UPDATE tasks SET insertion_ordinal = 1");
 		const before = {
 			ddl: legacy
 				.query<Record<string, unknown>, []>(
@@ -4902,6 +5253,7 @@ describe("issue watch store methods", () => {
 			stage: "backlog",
 			state: "idle",
 			topic: "github issue",
+			sourceIssue: "7",
 			queuedAt: null,
 		});
 		expect(await store.getIssueWatch(7)).toEqual({
@@ -4934,6 +5286,39 @@ describe("issue watch store methods", () => {
 		expect(await store.issueCardsFiledSince(301)).toBe(0);
 	});
 
+	test("open stamps source_issue on outside-text cards filed before the column existed", async () => {
+		const dir = join(root, "issue-converge");
+		const store = await open(dir);
+		const issue = await store.fileIssueCard({
+			number: 7,
+			title: "a",
+			prompt: "a",
+			now: 1,
+		});
+		const { filed } = await store.fileJiraCards({
+			site: "jira.example.com",
+			stage: "backlog",
+			items: [{ key: "C-1", title: "t", prompt: "p" }],
+			now: 2,
+		});
+		const jira = filed[0];
+		if (jira === undefined) throw new Error("fileJiraCards filed nothing");
+		await store.close();
+		// Rows of cards filed before the column existed: NULL source_issue.
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		db.run("UPDATE tasks SET source_issue = NULL");
+		db.close();
+		const again = await open(dir);
+		expect((await again.getTask(issue.id))?.sourceIssue).toBe("7");
+		expect((await again.getTask(jira.id))?.sourceIssue).toBe("C-1");
+		await again.close();
+		// Idempotent: a second open keeps the values.
+		const third = await open(dir);
+		expect((await third.getTask(issue.id))?.sourceIssue).toBe("7");
+		expect((await third.getTask(jira.id))?.sourceIssue).toBe("C-1");
+		await third.close();
+	});
+
 	test("unlabelledIssues lists ascending until markIssueLabelled", async () => {
 		const store = await open(join(root, "issue-label"));
 		await store.fileIssueCard({ number: 9, title: "a", prompt: "a", now: 1 });
@@ -4956,6 +5341,7 @@ describe("pr review store methods", () => {
 		postedUrl: null,
 		postedLogin: null,
 		postedEvent: null,
+		postedVia: null,
 		state: "open" as const,
 		draft: false,
 		title: "Fix the thing",
@@ -5007,6 +5393,19 @@ describe("pr review store methods", () => {
 			(await (await open(join(root, "pr-request-changes"))).getSettings())
 				.prReviewRequestChanges,
 		).toBe(true);
+	});
+
+	test("prReviewManualPost defaults to true and persists across reopen", async () => {
+		expect(DEFAULT_SETTINGS.prReviewManualPost).toBe(true);
+		const store = await open(join(root, "pr-manual-post"));
+		expect((await store.getSettings()).prReviewManualPost).toBe(true);
+		await store.setSettings({ prReviewManualPost: false });
+		expect((await store.getSettings()).prReviewManualPost).toBe(false);
+		await store.close();
+		expect(
+			(await (await open(join(root, "pr-manual-post"))).getSettings())
+				.prReviewManualPost,
+		).toBe(false);
 	});
 
 	test("savePrReview upserts by number and round-trips booleans and nulls", async () => {
@@ -5281,6 +5680,7 @@ describe("pr review store methods", () => {
 			postedUrl: "https://github.com/acme/widget/pull/7#pullrequestreview-2",
 			postedLogin: null,
 			postedEvent: null,
+			postedVia: null,
 		});
 		await store.setPrPostedUrl(7, null, "octocat");
 		expect((await store.getPrReview(7))?.postedLogin).toBe("octocat");
@@ -5311,6 +5711,46 @@ describe("pr review store methods", () => {
 			postedLogin: "ottr[bot]",
 			postedEvent: "REQUEST_CHANGES",
 		});
+		// The poster lands with its own argument; a later update without one keeps it.
+		await store.setPrPostedUrl(7, changesUrl, "ottr[bot]", "COMMENT", "auto");
+		expect((await store.getPrReview(7))?.postedVia).toBe("auto");
+		await store.setPrPostedUrl(7, changesUrl, "octocat", "COMMENT", "user");
+		expect((await store.getPrReview(7))?.postedVia).toBe("user");
+		await store.setPrPostedUrl(7, changesUrl, "octocat");
+		expect((await store.getPrReview(7))?.postedVia).toBe("user");
+		await store.close();
+	});
+
+	test("boardCardFacts stamps posted only while the board's own post is current", async () => {
+		const store = await open(join(root, "pr-posted-facts"));
+		const url = "https://github.com/acme/widget/pull/12#pullrequestreview-1";
+		await store.savePrReview({
+			...row,
+			number: 12,
+			taskId: "T-9",
+			reviewedHead: "h1",
+			postedHead: "h1",
+		});
+		// No post yet: no stamp.
+		expect((await store.boardCardFacts()).pr.get("T-9")?.posted).toBeNull();
+		// A person's post never stamps.
+		await store.setPrPostedUrl(12, url, "ottr[bot]", "COMMENT", "user");
+		expect((await store.boardCardFacts()).pr.get("T-9")?.posted).toBeNull();
+		// The board's own post, still current: stamped with the PR number and head.
+		await store.setPrPostedUrl(12, url, "ottr[bot]", "COMMENT", "auto");
+		expect((await store.boardCardFacts()).pr.get("T-9")).toMatchObject({
+			posted: { number: 12, head: "h1" },
+		});
+		// A newer reviewed head ends the currency: the stamp clears.
+		await store.savePrReview({
+			...row,
+			number: 12,
+			taskId: "T-9",
+			reviewedHead: "h2",
+			head: "h2",
+			postedHead: "h1",
+		});
+		expect((await store.boardCardFacts()).pr.get("T-9")?.posted).toBeNull();
 		await store.close();
 	});
 
@@ -5978,6 +6418,8 @@ describe("review findings storage", () => {
 		detail TEXT
 	)`;
 
+	// The upgrade backfill walks many stores; under a full parallel suite run it
+	// can pass the 5 s default, so this test carries its own budget.
 	test("open adds lead_at_done and backfills it on the upgrade open itself (OTTR-963)", async () => {
 		const dir = join(root, "lead-flag-upgrade");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
@@ -6079,7 +6521,7 @@ describe("review findings storage", () => {
 		await store.close();
 		const again = await open(dir);
 		expect((await again.getTask("f1"))?.leadAtDone).toBe(true);
-	});
+	}, 15_000);
 
 	test("a review landing done stamps its backlog findings, and the stamp survives re-queues (OTTR-963)", async () => {
 		const dir = join(root, "lead-flag-forward");
@@ -6269,6 +6711,7 @@ describe("jira imports", () => {
 				stage: "backlog",
 				state: "idle",
 				topic: "jira",
+				sourceIssue: `A-${i + 1}`,
 				queuedAt: null,
 				title: `A-${i + 1}: t`,
 				prompt: `prompt A-${i + 1}`,
@@ -6435,6 +6878,7 @@ describe("ask drafts", () => {
 				options: [{ label: "yes" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			})),
 		});
 
@@ -6988,31 +7432,35 @@ describe("async store serial operations", () => {
 		expect(await store.events()).toHaveLength(2);
 	});
 
-	test("concurrent queue permutations expose only complete orders", async () => {
+	test("concurrent queue moves expose only complete orders", async () => {
 		const store = await open(join(root, "async-queue"));
 		const cards = await Promise.all(
 			["a", "b", "c"].map((p) => store.createTask(p)),
 		);
 		const [a, b, c] = cards.map((card) => card.id) as [string, string, string];
+		await store.updateTask(a, { queuedAt: 1 });
+		await store.updateTask(b, { queuedAt: 2 });
+		await store.updateTask(c, { queuedAt: 3 });
 		const events = await store.events();
 		const [first, firstOrder, second, secondOrder, invalid, lastOrder] =
 			await Promise.all([
-				store.reorderQueue([c, a, b]),
+				store.moveInQueue(c, a),
 				store.queueIds(),
-				store.reorderQueue([b, c, a]),
+				store.moveInQueue(b, a),
 				store.queueIds(),
-				store.reorderQueue([a, a, c]),
+				store.moveInQueue("nope", null),
 				store.queueIds(),
 			]);
 		expect(first).toBe(true);
 		expect(firstOrder).toEqual([c, a, b]);
 		expect(second).toBe(true);
-		expect(secondOrder).toEqual([b, c, a]);
+		expect(secondOrder).toEqual([c, b, a]);
 		expect(invalid).toBe(false);
-		expect(lastOrder).toEqual([b, c, a]);
-		for (const card of cards) {
-			expect((await store.getTask(card.id))?.revision).toBe(card.revision + 2);
-		}
+		expect(lastOrder).toEqual([c, b, a]);
+		// The plain move rewrote one row; the move with no free slot renumbered the queue.
+		expect((await store.getTask(c))!.revision).toBe(cards[2]!.revision + 3);
+		expect((await store.getTask(b))!.revision).toBe(cards[1]!.revision + 2);
+		expect((await store.getTask(a))!.revision).toBe(cards[0]!.revision + 2);
 		expect(await store.events()).toEqual(events);
 	});
 
@@ -7396,6 +7844,7 @@ describe("async store serial operations", () => {
 			postedUrl: null,
 			postedLogin: null,
 			postedEvent: null,
+			postedVia: null,
 			state: "open",
 			draft: false,
 			title: "PR",
@@ -7735,5 +8184,182 @@ describe("sqlite auto-rollback", () => {
 			second.id,
 			first.id,
 		]);
+	});
+});
+
+describe("persistent task insertion order", () => {
+	test("old rowids survive both CHECK rebuilds and a later reopen", async () => {
+		const dir = join(root, "ordinal-old-checks");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const file = join(dir, ".tasks", "tasks.db");
+		const raw = new Database(file, { create: true });
+		raw.exec(`CREATE TABLE tasks (
+			id TEXT PRIMARY KEY, title TEXT, prompt TEXT,
+			stage TEXT NOT NULL CHECK (stage IN ('todo','in_progress','merging','done')),
+			state TEXT NOT NULL CHECK (state IN ('queued','running','needs_you','idle')),
+			needs_reason TEXT, pending_prompt TEXT, branch TEXT, base TEXT, worktree TEXT,
+			session_id TEXT, summary TEXT, details TEXT, queued_at INTEGER, cancelled_at INTEGER,
+			images TEXT NOT NULL DEFAULT '[]', pending_images TEXT NOT NULL DEFAULT '[]',
+			release_version TEXT, release_notes TEXT, session_title TEXT, asked TEXT, model TEXT,
+			kept_files TEXT NOT NULL DEFAULT '[]', follow_up_of TEXT, commits INTEGER, done_at INTEGER,
+			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+		)`);
+		for (const [rowid, id] of [
+			[90, "a-last"],
+			[4, "z-first"],
+			[20, "m-middle"],
+		] as const)
+			raw.run(
+				"INSERT INTO tasks (rowid, id, stage, state, created_at, updated_at) VALUES (?, ?, 'todo', 'queued', 100, 100)",
+				[rowid, id],
+			);
+		raw.close();
+		const store = await open(dir);
+		expect((await store.listTasks()).map((task) => task.id)).toEqual([
+			"a-last",
+			"m-middle",
+			"z-first",
+		]);
+		await store.close();
+		const reader = new Database(file);
+		expect(
+			reader
+				.query(
+					"SELECT id, insertion_ordinal FROM tasks ORDER BY insertion_ordinal",
+				)
+				.all(),
+		).toEqual([
+			{ id: "z-first", insertion_ordinal: 1 },
+			{ id: "m-middle", insertion_ordinal: 2 },
+			{ id: "a-last", insertion_ordinal: 3 },
+		]);
+		reader.run("DELETE FROM tasks WHERE id = 'a-last'");
+		reader.run(
+			"INSERT INTO tasks (id, stage, state, created_at, updated_at) VALUES ('raw-next', 'todo', 'queued', 100, 100)",
+		);
+		expect(
+			reader
+				.query("SELECT insertion_ordinal FROM tasks WHERE id = 'raw-next'")
+				.get(),
+		).toEqual({ insertion_ordinal: 4 });
+		reader.run("DELETE FROM tasks WHERE id = 'raw-next'");
+		reader.close();
+		const reopened = await open(dir);
+		const created = await reopened.createTask("later", null, "work", "b-new");
+		await reopened.close();
+		const final = new Database(file, { readonly: true });
+		expect(
+			final
+				.query("SELECT insertion_ordinal FROM tasks WHERE id = ?")
+				.get(created.id),
+		).toEqual({ insertion_ordinal: 5 });
+		final.close();
+	});
+
+	test("raw explicit ordinals advance the counter and collisions fail", async () => {
+		const store = await open(join(root, "ordinal-import"));
+		const file = join(store.serverDir, "tasks.db");
+		await store.close();
+		const raw = new Database(file);
+		raw.run(
+			"INSERT INTO tasks (id, stage, state, created_at, updated_at, insertion_ordinal) VALUES ('imported', 'todo', 'queued', 1, 1, 900)",
+		);
+		expect(() =>
+			raw.run(
+				"INSERT INTO tasks (id, stage, state, created_at, updated_at, insertion_ordinal) VALUES ('collision', 'todo', 'queued', 1, 1, 900)",
+			),
+		).toThrow();
+		for (const ordinal of [0, -1, 1.5])
+			expect(() =>
+				raw.run(
+					"INSERT INTO tasks (id, stage, state, created_at, updated_at, insertion_ordinal) VALUES (?, 'todo', 'queued', 1, 1, ?)",
+					[`invalid-${ordinal}`, ordinal],
+				),
+			).toThrow();
+		raw.run("DELETE FROM tasks WHERE id = 'imported'");
+		raw.close();
+		const reopened = await open(store.path);
+		const task = await reopened.createTask("after import");
+		await reopened.close();
+		const reader = new Database(file, { readonly: true });
+		expect(
+			reader
+				.query("SELECT insertion_ordinal FROM tasks WHERE id = ?")
+				.get(task.id),
+		).toEqual({ insertion_ordinal: 901 });
+		reader.close();
+	});
+
+	test("signed-int64 exhaustion refuses creation without a partial task or events", async () => {
+		const store = await open(join(root, "ordinal-int64-limit"));
+		const file = join(store.serverDir, "tasks.db");
+		await store.close();
+		const raw = new Database(file);
+		raw.exec(
+			"INSERT INTO tasks (id, stage, state, created_at, updated_at, insertion_ordinal) VALUES ('maximum', 'todo', 'queued', 1, 1, 9223372036854775807)",
+		);
+		raw.exec("DELETE FROM tasks WHERE id = 'maximum'");
+		raw.close();
+		const reopened = await open(store.path);
+		await expect(reopened.createTask("too late")).rejects.toThrow(
+			"Task insertion ordinal exhausted",
+		);
+		expect(await reopened.listTasks()).toEqual([]);
+		expect(await reopened.events()).toEqual([]);
+	});
+});
+
+describe("report read admission", () => {
+	for (const rollback of [false, true]) {
+		test(`outside report reads wait for ${rollback ? "rollback" : "commit"}`, async () => {
+			const store = await open(join(root, `report-admission-${rollback}`));
+			const task = await store.createTask("report");
+			await store.updateTask(task.id, { report: "committed" });
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const failure = new Error("report transaction rollback");
+			const write = store.transaction(async () => {
+				await store.updateTask(task.id, { report: "uncommitted" });
+				entered.resolve();
+				await release.promise;
+				if (rollback) throw failure;
+			});
+			// Observe the rejection before the paused transaction can resume.
+			const outcome = write.catch((error: unknown) => error);
+			await entered.promise;
+			let settled = false;
+			const read = store.getTaskReport(task.id).then((value) => {
+				settled = true;
+				return value;
+			});
+			// Real driver I/O does not use fake timers. Let an admitted read finish.
+			await Bun.sleep(10);
+			expect(settled).toBe(false);
+			release.resolve();
+			expect(await outcome).toBe(rollback ? failure : undefined);
+			expect(await read).toBe(rollback ? "committed" : "uncommitted");
+			await store.close();
+			await expect(store.getTaskReport(task.id)).rejects.toThrow();
+		});
+	}
+});
+
+describe("PostgreSQL project discovery", () => {
+	test("registry identities select real project folders without SQLite files", () => {
+		const dir = join(root, "registry-discovery");
+		mkdirSync(join(dir, "registered"), { recursive: true });
+		mkdirSync(join(dir, "unregistered", ".tasks"), { recursive: true });
+		writeFileSync(join(dir, "unregistered", ".tasks", "tasks.db"), "");
+		writeFileSync(join(dir, "not-a-directory"), "");
+		expect(
+			discoverProjects([dir], [], [], ["registered", "not-a-directory"]),
+		).toEqual([join(dir, "registered")]);
+		expect(discoverProjects([dir], [], [], [])).toEqual([]);
+		expect(
+			discoverProjects([dir], [], [join(dir, "registered")], ["registered"]),
+		).toEqual([]);
+		expect(
+			discoverProjects([dir], [join(dir, "registered")], [], ["registered"]),
+		).toEqual([join(dir, "registered")]);
 	});
 });

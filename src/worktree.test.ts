@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import {
 	appendFileSync,
 	chmodSync,
+	chownSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
@@ -18,8 +19,9 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { GIT_AUTH_ENV_RE, gitAuthEnv } from "./gitHosts.ts";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { platform } from "./platform/index.ts";
 import { archReviewDue } from "./scheduler.ts";
 import fc from "./test/properties.ts";
@@ -87,6 +89,10 @@ import {
 	worktreeHusk,
 	worktreeLinked,
 } from "./worktree.ts";
+
+// chown needs root; the ownership-mismatch test below runs only where it can.
+const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+const rootTest = isRoot ? test : test.skip;
 
 describe("gitExe", () => {
 	test("resolves scoop shims and wrapper installs to the native binary", () => {
@@ -202,6 +208,7 @@ describe("serverMergePush", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -284,33 +291,233 @@ describe("serverMergePush", () => {
 				run(f.main, "rev-parse", "refs/heads/main"),
 			);
 			expect(
-				Bun.spawnSync(["git", "rev-parse", "--verify", "main"], { cwd: up })
-					.exitCode,
+				Bun.spawnSync(["git", "rev-parse", "--verify", "main"], {
+					cwd: up,
+					env: fixtureGitEnv(),
+				}).exitCode,
 			).not.toBe(0);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
 	});
 
-	test("no push without proof of the local merge", async () => {
+	test("the server fast-forwards the target itself; planted hooks never run", async () => {
+		// OTTR-987: mergePrompt no longer drives the agent's `git merge --ff-only` in the
+		// main checkout — the agent's shell git would run planted hooks from the
+		// worker-writable common gitdir as root. The fixture plants the hooks and skips
+		// the merge (fixture(false)), the way an agent obeying the new prompt reports.
+		const f = fixture(false);
+		try {
+			const hooks = join(f.main, ".git", "hooks");
+			const marker = join(f.dir, "MARKER");
+			for (const name of [
+				"reference-transaction",
+				"post-merge",
+				"pre-merge-commit",
+			]) {
+				const p = join(hooks, name);
+				writeFileSync(
+					p,
+					`#!/bin/sh\necho "${name} ran uid=$(id -u)" >> ${marker}\n`,
+				);
+				chmodSync(p, 0o755);
+			}
+			const workTip = run(f.wt, "rev-parse", "HEAD");
+			expect(
+				(
+					await serverMergePush(
+						f.main,
+						f.wt,
+						"origin/main",
+						"ott/x",
+						null,
+						f.bare,
+						true,
+					)
+				).status,
+			).toBe("pushed");
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(workTip);
+			expect(run(f.bare, "rev-parse", "main")).toBe(workTip);
+			// No hook fired: the fast-forward ran under git()'s argv pins.
+			expect(existsSync(marker)).toBe(false);
+			// Control: plain shell git in the same gitdir does run the hooks, so the
+			// absence above means the pins held, not a dead fixture.
+			run(f.main, "tag", "control-ref");
+			expect(readFileSync(marker, "utf8")).toContain(
+				"reference-transaction ran",
+			);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the fast-forward waits for an integrated report", async () => {
+		// A needs_you or ask-paused merge turn must not publish its branch: without the
+		// integrated flag the server neither fast-forwards the target nor pushes, and the
+		// old proof gate (the agent's own merge) decides as before.
+		const f = fixture(false);
+		try {
+			const localBefore = run(f.main, "rev-parse", "refs/heads/main");
+			const before = run(f.bare, "rev-parse", "main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.bare,
+			);
+			expect(r.status).toBe("skipped");
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(localBefore);
+			expect(run(f.bare, "rev-parse", "main")).toBe(before);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a local-only target fast-forwards without a push", async () => {
+		// resolveTarget supports "main" for a project with no origin; the prompt forbids
+		// the agent's merge, so the board's fast-forward is the only integration left.
+		const f = fixture(false);
+		try {
+			const workTip = run(f.wt, "rev-parse", "HEAD");
+			const bareBefore = run(f.bare, "rev-parse", "main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"main",
+				"ott/x",
+				null,
+				null,
+				true,
+			);
+			expect(r.status).toBe("skipped"); // no origin target: nothing to push
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(workTip);
+			expect(run(f.bare, "rev-parse", "main")).toBe(bareBefore);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a missing local target branch is created and pushed", async () => {
+		// A newly selected remote branch has no refs/heads/<branch> yet: the server
+		// creates it at the integration head and pushes it.
+		const f = fixture(false);
+		try {
+			run(f.bare, "branch", "develop", "main");
+			run(f.main, "fetch", "-q", "origin", "develop");
+			// precondition: no local branch
+			expect(
+				Bun.spawnSync(["git", "rev-parse", "--verify", "refs/heads/develop"], {
+					cwd: f.main,
+					stdout: "pipe",
+					stderr: "pipe",
+				}).exitCode,
+			).not.toBe(0);
+			const workTip = run(f.wt, "rev-parse", "HEAD");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/develop",
+				"ott/x",
+				null,
+				f.bare,
+				true,
+			);
+			expect(r.status).toBe("pushed");
+			expect(run(f.main, "rev-parse", "refs/heads/develop")).toBe(workTip);
+			expect(run(f.bare, "rev-parse", "develop")).toBe(workTip);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the fast-forward moves the named branch, not the checked-out one", async () => {
+		// The main checkout sits on main while the project target is origin/develop:
+		// `git merge` in the checkout would move main; the ref move must hit develop.
+		const f = fixture(false);
+		try {
+			run(f.bare, "branch", "develop", "main");
+			run(f.main, "fetch", "-q", "origin", "develop");
+			run(f.main, "branch", "develop", "origin/develop");
+			const mainBefore = run(f.main, "rev-parse", "refs/heads/main");
+			const workTip = run(f.wt, "rev-parse", "HEAD");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/develop",
+				"ott/x",
+				null,
+				f.bare,
+				true,
+			);
+			expect(r.status).toBe("pushed");
+			expect(run(f.main, "rev-parse", "refs/heads/develop")).toBe(workTip);
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(mainBefore);
+			expect(run(f.bare, "rev-parse", "develop")).toBe(workTip);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a diverged non-checked-out target branch parks instead of discarding commits", async () => {
+		// branch -f never refuses divergence: the old merge --ff-only parked there, and
+		// the ref move must not silently orphan local-only commits on the target.
 		const f = fixture(false);
 		try {
 			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
-			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "other");
-			const before = run(f.bare, "rev-parse", "main");
+			run(f.bare, "branch", "develop", "main");
+			run(f.main, "fetch", "-q", "origin", "develop");
+			run(f.main, "branch", "develop", "origin/develop");
+			run(f.main, "checkout", "-q", "--detach", "origin/develop");
+			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "divergent");
+			const divergent = run(f.main, "rev-parse", "HEAD");
+			run(f.main, "update-ref", "refs/heads/develop", divergent);
+			const diverged = run(f.main, "rev-parse", "refs/heads/develop");
+			run(f.main, "checkout", "-q", "main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/develop",
+				"ott/x",
+				null,
+				f.bare,
+				true,
+			);
+			expect(r.status).toBe("failed");
 			expect(
-				await serverMergePush(
-					f.main,
-					f.wt,
-					"origin/main",
-					"ott/x",
-					null,
-					f.bare,
-				),
-			).toEqual({
-				status: "skipped",
-			});
+				r.status === "failed" && r.error.includes("cannot fast-forward"),
+			).toBe(true);
+			expect(run(f.main, "rev-parse", "refs/heads/develop")).toBe(diverged);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a worktree head the target cannot fast-forward to parks the push with the reason", async () => {
+		const f = fixture(false);
+		try {
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			// The target moved while the branch sat on the old base: the server's
+			// fast-forward is not possible, and the push parks with git's reason.
+			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "divergent");
+			const before = run(f.bare, "rev-parse", "main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.bare,
+				true,
+			);
+			if (r.status !== "failed")
+				throw new Error(`expected failed, got ${r.status}`);
+			expect(r.error).toMatch(/[Ff]ast-forward/);
 			expect(run(f.bare, "rev-parse", "main")).toBe(before);
+			expect(run(f.main, "rev-parse", "refs/heads/main")).not.toBe(
+				run(f.wt, "rev-parse", "HEAD"),
+			);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
@@ -461,6 +668,16 @@ describe("serverMergePush", () => {
 
 	test("rebaseTargetBranch replays commits with the identity the board pins", async () => {
 		const f = fixture();
+		// Ident env vars beat `-c` config by git's precedence, and a turn env may carry
+		// the board's default identity; the pinned identity must decide on its own.
+		const identVars = [
+			"GIT_AUTHOR_NAME",
+			"GIT_AUTHOR_EMAIL",
+			"GIT_COMMITTER_NAME",
+			"GIT_COMMITTER_EMAIL",
+		] as const;
+		const savedIdent = identVars.map((k) => [k, process.env[k]] as const);
+		for (const k of identVars) delete process.env[k];
 		try {
 			// The Settings identity reaches the automatic push retry: the replayed local
 			// commit carries its committer, even though the fixture repo has no gitconfig.
@@ -490,6 +707,10 @@ describe("serverMergePush", () => {
 			);
 			expect(who).toBe("Board Bot board@ottr.dev");
 		} finally {
+			for (const [k, v] of savedIdent) {
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
 			rmSync(f.dir, { recursive: true, force: true });
 		}
 	});
@@ -518,7 +739,12 @@ describe("serverMergePush", () => {
 			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(before);
 			const rebaseDir = Bun.spawnSync(
 				["git", "rev-parse", "--git-path", "rebase-merge"],
-				{ cwd: f.main, stdout: "pipe", stderr: "pipe" },
+				{
+					cwd: f.main,
+					env: fixtureGitEnv(),
+					stdout: "pipe",
+					stderr: "pipe",
+				},
 			);
 			expect(existsSync(join(f.main, rebaseDir.stdout.toString().trim()))).toBe(
 				false,
@@ -691,19 +917,25 @@ describe("serverMergePush", () => {
 			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "other");
 			run(f.main, "worktree", "remove", f.wt);
 			const before = run(f.bare, "rev-parse", "main");
-			expect(
-				await serverMergePush(
-					f.main,
-					f.wt,
-					"origin/main",
-					"ott/x",
-					null,
-					f.bare,
-				),
-			).toEqual({
-				status: "skipped",
-			});
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.bare,
+				true,
+			);
+			// OTTR-987: the server fast-forwards the target itself, so the unmerged kept
+			// branch is no longer a silent skip — the impossible fast-forward parks the
+			// push with git's reason instead.
+			if (r.status !== "failed")
+				throw new Error(`expected failed, got ${r.status}`);
+			expect(r.error).toMatch(/[Ff]ast-forward/);
 			expect(run(f.bare, "rev-parse", "main")).toBe(before);
+			expect(run(f.main, "rev-parse", "refs/heads/main")).not.toBe(
+				run(f.bare, "rev-parse", "main"),
+			);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
@@ -812,27 +1044,108 @@ describe("serverMergePush", () => {
 		}
 	});
 
-	test("a push whose lease tip is not contained in the local target fails", async () => {
+	test("the hold gate refuses a proposed head that misses the audited tip", async () => {
 		const f = fixture();
 		try {
 			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			// Another party pushes O1 to origin; the card worktree commits on top of the
+			// old base without rebasing, so the proposed head does not contain the
+			// audited origin tip. The gate must park before anything moves.
+			const twin = join(f.dir, "twin");
+			run(f.dir, "clone", "-q", f.bare, twin);
+			run(twin, ...id, "commit", "-q", "--allow-empty", "-m", "O1");
+			run(twin, "push", "-q", "origin", "main");
 			writeFileSync(join(f.wt, "late.txt"), "late");
 			run(f.wt, ...id, "add", ".");
 			run(f.wt, ...id, "commit", "-qm", "late");
+			const auditedTip = run(f.bare, "rev-parse", "main");
 			const before = run(f.bare, "rev-parse", "main");
+			const localBefore = run(f.main, "rev-parse", "refs/heads/main");
 			const r = await serverMergePush(
 				f.main,
 				f.wt,
 				"origin/main",
 				"ott/x",
-				run(f.wt, "rev-parse", "HEAD"),
+				auditedTip,
 				f.bare,
+				true,
 			);
 			expect(r.status).toBe("failed");
 			expect(r.status === "failed" && r.error.includes("not contained")).toBe(
 				true,
 			);
 			expect(run(f.bare, "rev-parse", "main")).toBe(before);
+			// The gate fired before the fast-forward: nothing moved locally either.
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(localBefore);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the hold gate reads the proposed head when the local target lags origin", async () => {
+		// Origin moved past the main checkout (another writer pushed O1) and the board
+		// never moved refs/heads/main: the audited tip is not contained in the stale
+		// local target, but the rebased proposed head holds it, so the held merge lands.
+		const f = fixture(false);
+		try {
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			const twin = join(f.dir, "twin");
+			run(f.dir, "clone", "-q", f.bare, twin);
+			writeFileSync(join(twin, "o.txt"), "O1");
+			run(twin, ...id, "add", ".");
+			run(twin, ...id, "commit", "-qm", "O1");
+			run(twin, "push", "-q", "origin", "main");
+			const auditedTip = run(f.bare, "rev-parse", "main");
+			run(f.wt, "fetch", "-q", "origin");
+			run(f.wt, ...id, "rebase", "-q", "origin/main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				auditedTip,
+				f.bare,
+				true,
+			);
+			expect(r.status).toBe("pushed");
+			expect(run(f.bare, "rev-parse", "main")).toBe(
+				run(f.wt, "rev-parse", "HEAD"),
+			);
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(
+				run(f.bare, "rev-parse", "main"),
+			);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the hold gate reads the proposed head when the local target is missing", async () => {
+		// A newly selected remote branch has no refs/heads/<branch>: merge-base on the
+		// missing ref must not park the held merge before the branch creation runs.
+		const f = fixture(false);
+		try {
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			run(f.bare, "branch", "develop", "main");
+			run(f.main, "fetch", "-q", "origin", "develop");
+			const auditedTip = run(
+				f.main,
+				"rev-parse",
+				"refs/remotes/origin/develop",
+			);
+			run(f.wt, ...id, "rebase", "-q", "origin/develop");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/develop",
+				"ott/x",
+				auditedTip,
+				f.bare,
+				true,
+			);
+			expect(r.status).toBe("pushed");
+			expect(run(f.bare, "rev-parse", "develop")).toBe(
+				run(f.wt, "rev-parse", "HEAD"),
+			);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
@@ -844,6 +1157,7 @@ describe("mergeHoldMismatch", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -854,7 +1168,16 @@ describe("mergeHoldMismatch", () => {
 	const mismatch = async (
 		f: { main: string; base: string; approvedHead: string; bare: string },
 		approvedHead = f.approvedHead,
-	) => mergeHoldMismatch(f.main, "origin/main", f.base, approvedHead, f.bare);
+		proposedHead: string | null = null,
+	) =>
+		mergeHoldMismatch(
+			f.main,
+			"origin/main",
+			f.base,
+			approvedHead,
+			f.bare,
+			proposedHead,
+		);
 	/** Origin (bare), a clone, and a worktree whose branch ott/x holds two file commits on top of
 	 * base. approvedHead is the branch tip the admin approved; origin then moves one commit (O1,
 	 * which rewrites o.txt — a file the branch never touches, so rebases stay clean), so a merge
@@ -908,6 +1231,44 @@ describe("mergeHoldMismatch", () => {
 			run(f.wt, ...id, "rebase", "-q", "origin/main");
 			run(f.main, ...id, "merge", "-q", "--no-ff", "--no-edit", "ott/x");
 			expect((await mismatch(f)).mismatch).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the hold judges the proposed head, not the stale local target", async () => {
+		// OTTR-987: the server fast-forwards the target itself, so at audit time the
+		// local target still sits at the base and the remote holds nothing. Judging the
+		// local branch or the remote would park every valid held merge; judging the
+		// proposed integration head (the rebased worktree HEAD) passes it.
+		const f = fixture();
+		try {
+			run(f.wt, ...id, "rebase", "-q", "origin/main");
+			const proposed = run(f.wt, "rev-parse", "HEAD");
+			const stale = await mismatch(f, f.approvedHead, null);
+			expect(stale.mismatch).toBe(true); // the old judgment: the bug this fixes
+			const r = await mismatch(f, f.approvedHead, proposed);
+			expect(r.mismatch).toBe(false);
+			expect(r.auditedTip).not.toBe(null);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("patches beyond the approval fail the proposed-head audit", async () => {
+		// An exactly-approved local target must not skip the audit: a resumed session's
+		// worktree can carry unapproved patches past the approved head, and the proposed
+		// push set carries them to the gate.
+		const f = fixture();
+		try {
+			run(f.wt, ...id, "rebase", "-q", "origin/main");
+			writeFileSync(join(f.wt, "evil.txt"), "evil");
+			run(f.wt, ...id, "add", ".");
+			run(f.wt, ...id, "commit", "-qm", "evil");
+			const proposed = run(f.wt, "rev-parse", "HEAD");
+			const r = await mismatch(f, f.approvedHead, proposed);
+			expect(r.mismatch).toBe(true);
+			expect(r.pushDiff).toContain("evil");
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
@@ -1147,6 +1508,7 @@ describe("mergeHoldLanded (VELV-89)", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -1232,6 +1594,7 @@ describe("pinned origin URL (OTTR-348)", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -1591,6 +1954,7 @@ describe("branchUnpushed", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -1652,6 +2016,7 @@ describe("checkedOutBranch (OTTR-531)", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -1689,6 +2054,7 @@ describe("resetBranchTo", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -1969,6 +2335,7 @@ async function must(cwd: string, ...args: string[]): Promise<string> {
 	];
 	const r = Bun.spawnSync([gitExe(), ...id, ...args], {
 		cwd,
+		env: fixtureGitEnv(),
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -2326,6 +2693,68 @@ describe("against real repos", () => {
 		});
 	}, 60_000);
 
+	rootTest(
+		"resolveTarget reads a main checkout a foreign uid owns (OTTR-1176)",
+		async () => {
+			// OTTR-994 chowns a project's main checkout to the project's turn uid for
+			// a run; an image roll that recreated the server mid-change failed every
+			// branch read with "detected dubious ownership" until the new boot seeded
+			// the board gitconfig. The pinned safe.directory must carry the trust by
+			// itself, with no global or system config file on the path.
+			const root = mkdtempSync(join(tmpdir(), "ottr-1176-"));
+			const main = join(root, "checkout");
+			try {
+				mkdirSync(main, { recursive: true });
+				await must(main, "init", "-q", "-b", "main");
+				await must(main, "commit", "--allow-empty", "-q", "-m", "m");
+				chownSync(main, 65537, 65537);
+				chownSync(join(main, ".git"), 65537, 65537);
+				// Control: the same spawn without the pin fails, so the fixture repo
+				// really is foreign-owned and no ambient config masks the mismatch.
+				const raw = spawnSync(
+					gitExe(),
+					["symbolic-ref", "--quiet", "--short", "HEAD"],
+					{
+						cwd: main,
+						env: {
+							...fixtureGitEnv(),
+							GIT_CONFIG_GLOBAL: "/dev/null",
+							GIT_CONFIG_SYSTEM: "/dev/null",
+						},
+						stdio: ["ignore", "pipe", "pipe"],
+						windowsHide: true,
+					},
+				);
+				expect(raw.status).not.toBe(0);
+				expect(raw.stderr.toString()).toContain("dubious ownership");
+				// The board helper reads the branch anyway: the pinned -c alone carries
+				// the trust here, with both config scopes empty. The spawn env parameter
+				// strips the scopes per call, so no ambient process.env changes.
+				const pinned = await git(
+					["symbolic-ref", "--quiet", "--short", "HEAD"],
+					main,
+					10_000,
+					undefined,
+					{
+						GIT_CONFIG_GLOBAL: "/dev/null",
+						GIT_CONFIG_SYSTEM: "/dev/null",
+					},
+				);
+				expect(pinned.code).toBe(0);
+				expect(pinned.stdout.trim()).toBe("main");
+				// The incident's API reads the same checkout under the ambient env: the
+				// pin rides every child, so the branch resolves with no env games.
+				expect(await resolveTarget(main)).toMatchObject({
+					target: "main",
+					warning: null,
+				});
+			} finally {
+				rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+			}
+		},
+		60_000,
+	);
+
 	test("resolveTarget stops on an upstream missing from origin instead of using the local branch", async () => {
 		await must(main, "config", "branch.main.merge", "refs/heads/gone");
 		try {
@@ -2643,6 +3072,9 @@ describe("headVersion", () => {
 describe("describeVersion", () => {
 	test("release tag at HEAD, tag-plus-commits form past it, short sha on dev, timestamp without commits", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-desc-"));
+		// A worker's image stamp would win over the fixture's repo state.
+		const old = process.env.OTTR_VERSION;
+		delete process.env.OTTR_VERSION;
 		try {
 			await must(dir, "init", "-q", "-b", "main");
 			expect(await describeVersion(dir)).toMatch(/^\d+$/); // no commits yet: boot-time fallback
@@ -2658,6 +3090,8 @@ describe("describeVersion", () => {
 			await must(dir, "tag", "notarelease");
 			expect(await describeVersion(dir)).toBe(past); // non-release tags are ignored
 		} finally {
+			if (old === undefined) delete process.env.OTTR_VERSION;
+			else process.env.OTTR_VERSION = old;
 			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
 		}
 	}, 60_000);
@@ -2682,9 +3116,14 @@ describe("describeVersion", () => {
 
 	test("a directory without .git falls back to the boot-time stamp (the image shape)", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-nogit-"));
+		// A worker's image stamp would win over the fixture's missing repo.
+		const old = process.env.OTTR_VERSION;
+		delete process.env.OTTR_VERSION;
 		try {
 			expect(await describeVersion(dir)).toMatch(/^\d+$/);
 		} finally {
+			if (old === undefined) delete process.env.OTTR_VERSION;
+			else process.env.OTTR_VERSION = old;
 			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
 		}
 	}, 60_000);
@@ -2742,7 +3181,7 @@ describe("archReviewDelta", () => {
 				stderr: "pipe",
 				windowsHide: true,
 				env: {
-					...process.env,
+					...fixtureGitEnv(),
 					GIT_AUTHOR_DATE: `@${at} +0000`,
 					GIT_COMMITTER_DATE: `@${at} +0000`,
 				},
@@ -3440,14 +3879,28 @@ describe("unlinked worktree guards", () => {
 		// A transient git failure inside the dir (an index lock, dubious ownership): the .git
 		// file's gitdir is alive, so the worktree is not a husk (OTTR-349 — a husk verdict
 		// here let the pre-dispatch guard settle a zero-commit card done on a vacuous proof).
-		const previous = process.env.GIT_DIR;
-		process.env.GIT_DIR = join(main, "no-such-gitdir");
+		// The failure injection flips the repo's format version directly in the config file:
+		// git refuses the repo while the gitdir stays alive. Ambient GIT_DIR can no longer
+		// play this role (OTTR-1162: every git spawn strips repo-relocating env).
+		const cfg = join(main, ".git", "config");
+		writeFileSync(
+			cfg,
+			readFileSync(cfg, "utf8").replace(
+				"repositoryformatversion = 0",
+				"repositoryformatversion = 99",
+			),
+		);
 		try {
 			expect(await worktreeLinked(wt)).toBe(false);
 			expect(await worktreeHusk(wt)).toBe(false);
 		} finally {
-			if (previous === undefined) delete process.env.GIT_DIR;
-			else process.env.GIT_DIR = previous;
+			writeFileSync(
+				cfg,
+				readFileSync(cfg, "utf8").replace(
+					"repositoryformatversion = 99",
+					"repositoryformatversion = 0",
+				),
+			);
 		}
 		expect(await worktreeHusk(wt)).toBe(false);
 		// The deregistered shape keeps its husk verdict: the gitdir is gone.
@@ -4008,6 +4461,7 @@ describe("git", () => {
 		// transport. The fetch itself fails (the fake proxy speaks no git protocol).
 		Bun.spawnSync([gitExe(), "fetch", "--quiet", "origin"], {
 			cwd: main,
+			env: fixtureGitEnv(),
 			stdin: "ignore",
 			stdout: "ignore",
 			stderr: "ignore",
@@ -4024,6 +4478,193 @@ describe("git", () => {
 		const r = await git(["fetch", "origin"], main, 30_000, auth);
 		expect(r.code).not.toBe(0);
 		expect(existsSync(marker)).toBe(false);
+	}, 60_000);
+
+	/**
+	 * Loopback dumb-HTTPS origin and a repo whose config plants the cookie jar at
+	 * <main>/server-only.db. Runs the control fetch first: plain git's libcurl must
+	 * rewrite the planted file, or the plant is dead and the caller's assertions mean
+	 * nothing. https because gitAuthEnv allows https:ssh:file only; sslVerify=false is
+	 * this fixture's self-signed cert. Async control spawn on purpose: must()'s
+	 * spawnSync blocks this process's event loop, and the Bun.serve fixture above
+	 * shares it — the fetch's HTTP client would starve waiting for a response the
+	 * blocked loop never sends.
+	 */
+	async function plantedCookieJar(): Promise<{
+		main: string;
+		jar: string;
+		bytes: string;
+		url: string;
+		stop: () => void;
+	}> {
+		const main = repo();
+		await must(main, "init", "-q", "-b", "main");
+		writeFileSync(join(main, "f.txt"), "one\n");
+		await must(main, "add", "-A");
+		await must(main, "commit", "-q", "-m", "init");
+		const bare = repo();
+		await must(main, "init", "-q", "--bare", "-b", "main", bare);
+		await must(main, "push", "-q", bare, "main");
+		await must(bare, "update-server-info");
+		const certs = repo();
+		const cert = spawnSync(
+			"openssl",
+			[
+				"req",
+				"-x509",
+				"-newkey",
+				"rsa:2048",
+				"-keyout",
+				join(certs, "key.pem"),
+				"-out",
+				join(certs, "cert.pem"),
+				"-days",
+				"2",
+				"-nodes",
+				"-subj",
+				"/CN=127.0.0.1",
+			],
+			{ windowsHide: true },
+		);
+		if (cert.status !== 0)
+			throw new Error(`openssl: ${cert.stderr?.toString()}`);
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			tls: {
+				cert: readFileSync(join(certs, "cert.pem")),
+				key: readFileSync(join(certs, "key.pem")),
+			},
+			fetch(req) {
+				const p = join(bare, decodeURIComponent(new URL(req.url).pathname));
+				if (!p.startsWith(bare + sep))
+					return new Response(null, { status: 404 });
+				try {
+					return new Response(readFileSync(p), {
+						headers: {
+							"content-type": "application/octet-stream",
+							"set-cookie": "plant=1; Path=/",
+						},
+					});
+				} catch {
+					return new Response(null, { status: 404 });
+				}
+			},
+		});
+		const jar = join(main, "server-only.db");
+		const bytes = "SERVER-ONLY-DATA\n";
+		writeFileSync(jar, bytes);
+		const url = `https://127.0.0.1:${server.port}/`;
+		await must(main, "config", "remote.origin.url", url);
+		await must(main, "config", "http.cookieFile", jar);
+		await must(main, "config", "http.saveCookies", "true");
+		// Control: the plant is live — plain git's libcurl rewrites the file as a jar.
+		const control = Bun.spawn(
+			[gitExe(), "-c", "http.sslVerify=false", "fetch", "--quiet", "origin"],
+			{
+				cwd: main,
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "pipe",
+				windowsHide: true,
+			},
+		);
+		const controlErr = await new Response(control.stderr).text();
+		if ((await control.exited) !== 0)
+			throw new Error(`control git fetch: ${controlErr}`);
+		expect(readFileSync(jar, "utf8")).not.toBe(bytes);
+		return { main, jar, bytes, url, stop: () => server.stop(true) };
+	}
+
+	test("never rewrites a planted http.cookieFile jar on a board fetch (R5-1)", async () => {
+		if (process.platform === "win32") return; // the TLS fixture cert needs openssl
+		const f = await plantedCookieJar();
+		try {
+			// Production shape: git() argv overrides and the gitAuthEnv env config together
+			// (pinnedFetch passes the auth env of the project). The per-layer tests below
+			// pin each half on its own, so a deletion in one layer fails its own test.
+			// Per-URL plants too: git's URL match prefers the longest match across sources,
+			// so these would beat both generic overrides if git() did not out-plant every
+			// http(s) URL the call names.
+			for (const key of [f.url, new URL(f.url).origin]) {
+				await must(f.main, "config", `http.${key}.cookieFile`, f.jar);
+				await must(f.main, "config", `http.${key}.saveCookies`, "true");
+			}
+			writeFileSync(f.jar, f.bytes);
+			const before = statSync(f.jar);
+			const r = await git(
+				["-c", "http.sslVerify=false", "fetch", f.url],
+				f.main,
+				30_000,
+				gitAuthEnv({ tokens: [], key: null, knownHosts: "/nonexistent" }),
+			);
+			expect(r.code).toBe(0);
+			expect(readFileSync(f.jar, "utf8")).toBe(f.bytes);
+			expect(statSync(f.jar).ino).toBe(before.ino);
+		} finally {
+			f.stop();
+		}
+	}, 60_000);
+
+	test("the git() cookie overrides alone keep a planted http.cookieFile intact (R5-1)", async () => {
+		if (process.platform === "win32") return; // the TLS fixture cert needs openssl
+		const f = await plantedCookieJar();
+		try {
+			// No authEnv: git() resolves networkGitAuth(cwd), which carries no cookie keys
+			// here — the argv -c pairs (generic plus per-URL for the named fetch URL) are
+			// this fetch's only cookie protection.
+			for (const key of [f.url, new URL(f.url).origin]) {
+				await must(f.main, "config", `http.${key}.cookieFile`, f.jar);
+				await must(f.main, "config", `http.${key}.saveCookies`, "true");
+			}
+			writeFileSync(f.jar, f.bytes);
+			const before = statSync(f.jar);
+			const r = await git(
+				["-c", "http.sslVerify=false", "fetch", f.url],
+				f.main,
+				30_000,
+			);
+			expect(r.code).toBe(0);
+			expect(readFileSync(f.jar, "utf8")).toBe(f.bytes);
+			expect(statSync(f.jar).ino).toBe(before.ino);
+		} finally {
+			f.stop();
+		}
+	}, 60_000);
+
+	test("the gitAuthEnv cookie entries alone keep a planted http.cookieFile intact (R5-1)", async () => {
+		if (process.platform === "win32") return; // the TLS fixture cert needs openssl
+		const f = await plantedCookieJar();
+		try {
+			// Plain git, not the git() under test: the env config is this fetch's only
+			// cookie protection.
+			writeFileSync(f.jar, f.bytes);
+			const before = statSync(f.jar);
+			const r = Bun.spawn(
+				[gitExe(), "-c", "http.sslVerify=false", "fetch", "--quiet", "origin"],
+				{
+					cwd: f.main,
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "pipe",
+					windowsHide: true,
+					env: {
+						...process.env,
+						...gitAuthEnv({
+							tokens: [],
+							key: null,
+							knownHosts: "/nonexistent",
+						}),
+					},
+				},
+			);
+			const err = await new Response(r.stderr).text();
+			if ((await r.exited) !== 0) throw new Error(`git fetch: ${err}`);
+			expect(readFileSync(f.jar, "utf8")).toBe(f.bytes);
+			expect(statSync(f.jar).ino).toBe(before.ino);
+		} finally {
+			f.stop();
+		}
 	}, 60_000);
 
 	test("never runs planted filter, merge or gpg drivers (R5-1)", async () => {
@@ -4076,7 +4717,10 @@ describe("git", () => {
 		await must(main, "status", "--porcelain");
 		expect(existsSync(marker("filter"))).toBe(true);
 		rmSync(marker("filter"));
-		Bun.spawnSync(["git", "commit", "--allow-empty", "-m", "c"], { cwd: main });
+		Bun.spawnSync(["git", "commit", "--allow-empty", "-m", "c"], {
+			cwd: main,
+			env: fixtureGitEnv(),
+		});
 		expect(existsSync(marker("gpg"))).toBe(true);
 		// The control commit may also re-run the planted clean filter: clear every marker.
 		for (const kind of ["filter", "merge", "gpg"])
@@ -4308,7 +4952,7 @@ describe("git", () => {
 		process.env.PATH = `${bin}:${prevPath ?? ""}`;
 		try {
 			// Control: without the pin, plain git runs the planted sshCommand.
-			const plain = { ...process.env } as Record<string, string>;
+			const plain = { ...fixtureGitEnv() } as Record<string, string>;
 			delete plain.GIT_SSH_COMMAND;
 			const ctl = Bun.spawnSync(
 				[gitExe(), "ls-remote", `ssh://ottr-fixture.invalid/${up}`],
@@ -4385,6 +5029,7 @@ describe("git", () => {
 		const plain = (...a: string[]) =>
 			Bun.spawnSync([gitExe(), ...a], {
 				cwd: main,
+				env: fixtureGitEnv(),
 				stdin: "ignore",
 				stdout: "ignore",
 				stderr: "ignore",
@@ -4459,6 +5104,7 @@ describe("git", () => {
 				[gitExe(), "-c", "core.hooksPath=/dev/null", ...(a as string[])],
 				{
 					cwd: main,
+					env: fixtureGitEnv(),
 					stdin: "ignore",
 					stdout: "ignore",
 					stderr: "ignore",
@@ -4539,6 +5185,39 @@ describe("gitEnv", () => {
 		}
 		try {
 			for (const args of [["status"], ["commit", "-m", "x"], ["add", "."]]) {
+				const env = gitEnv(args);
+				for (const n of names) expect(env).not.toHaveProperty(n);
+			}
+		} finally {
+			for (const n of names) {
+				if (saved[n] === undefined) delete process.env[n];
+				else process.env[n] = saved[n];
+			}
+		}
+	});
+
+	test("gitEnv strips ambient ident vars that would beat a -c identity pin (OTTR-1180)", () => {
+		const names = [
+			"GIT_AUTHOR_NAME",
+			"GIT_AUTHOR_EMAIL",
+			"GIT_COMMITTER_NAME",
+			"GIT_COMMITTER_EMAIL",
+		];
+		const saved: Record<string, string | undefined> = {};
+		for (const n of names) {
+			saved[n] = process.env[n];
+			process.env[n] = "Ottr";
+		}
+		try {
+			// Ident env outranks command-line config, so a pair inherited from a turn env
+			// would silently replace the identity a call pins with -c (the board's rebase
+			// replay). The strip covers every subcommand: ident vars only matter for
+			// commit-creating calls, and stripping them everywhere stays uniform.
+			for (const args of [
+				["rebase", "origin/main", "main"],
+				["status", "--porcelain"],
+				["fetch", "origin"],
+			]) {
 				const env = gitEnv(args);
 				for (const n of names) expect(env).not.toHaveProperty(n);
 			}
@@ -4774,6 +5453,7 @@ describe("fetchPrHead (OTTR-755)", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -4982,6 +5662,7 @@ describe("pushBranch destination ref (OTTR-760)", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -5092,6 +5773,7 @@ describe("deleteRemoteBranch (OTTR-800)", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -5218,6 +5900,7 @@ describe("commitMeta (OTTR-763)", () => {
 	const run = (cwd: string, ...args: string[]): string => {
 		const r = Bun.spawnSync(["git", ...args], {
 			cwd,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -5417,6 +6100,7 @@ function saveFixture(): { wt: string; saveDir: string; dataRoot: string } {
 	const mustGit = (...args: string[]): void => {
 		const r = Bun.spawnSync([gitExe(), ...id, ...args], {
 			cwd: wt,
+			env: fixtureGitEnv(),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -5501,6 +6185,7 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		mkdirSync(join(wt, "clone"));
 		const init = Bun.spawnSync([gitExe(), "init", "-q", "clone"], {
 			cwd: wt,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -5540,6 +6225,7 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		const git = (cwd: string, args: string[]): void => {
 			const run = Bun.spawnSync([gitExe(), ...id, ...args], {
 				cwd,
+				env: fixtureGitEnv(),
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -5570,7 +6256,12 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		// Precondition: without the " M sub" row this test exercises nothing.
 		const st = Bun.spawnSync(
 			[gitExe(), "status", "--porcelain", "-z", "--untracked-files=no"],
-			{ cwd: wt, stdout: "pipe", stderr: "pipe" },
+			{
+				cwd: wt,
+				env: fixtureGitEnv(),
+				stdout: "pipe",
+				stderr: "pipe",
+			},
 		);
 		expect(st.exitCode).toBe(0);
 		expect(
@@ -5599,6 +6290,7 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		const id = ["-c", "user.name=ott", "-c", "user.email=ott@example.invalid"];
 		const add = Bun.spawnSync([gitExe(), ...id, "add", "gone.txt"], {
 			cwd: wt,
+			env: fixtureGitEnv(),
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -5627,6 +6319,7 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		const config = (...args: string[]): void => {
 			const run = Bun.spawnSync([gitExe(), ...args], {
 				cwd: wt,
+				env: fixtureGitEnv(),
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -5666,6 +6359,7 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		const config = (...args: string[]): void => {
 			const run = Bun.spawnSync([gitExe(), ...args], {
 				cwd: wt,
+				env: fixtureGitEnv(),
 				stdout: "pipe",
 				stderr: "pipe",
 			});
@@ -5694,4 +6388,30 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		expect(existsSync(marker)).toBe(false);
 		rmSync(join(wt, ".."), { recursive: true, force: true });
 	}, 30_000);
+});
+
+describe("git() ambient env (OTTR-1162)", () => {
+	test("rev-parse reads the cwd repo even with GIT_DIR exported", async () => {
+		const checkout = mkdtempSync(join(tmpdir(), "ott-gitenv-strip-"));
+		try {
+			await must(checkout, "init", "-q", "-b", "main");
+			await must(checkout, "commit", "-q", "--allow-empty", "-m", "init");
+			const previous = process.env.GIT_DIR;
+			process.env.GIT_DIR = join(checkout, "no-such-gitdir");
+			try {
+				// Without the strip, rev-parse reads the exported GIT_DIR (a dead gitdir) and
+				// fails; with it, the call reads the repo the cwd names.
+				const r = await git(["rev-parse", "--absolute-git-dir"], checkout);
+				expect(r.code).toBe(0);
+				expect(r.stdout.trim()).toBe(
+					await must(checkout, "rev-parse", "--absolute-git-dir"),
+				);
+			} finally {
+				if (previous === undefined) delete process.env.GIT_DIR;
+				else process.env.GIT_DIR = previous;
+			}
+		} finally {
+			rmSync(checkout, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}, 60_000);
 });

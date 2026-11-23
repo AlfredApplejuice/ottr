@@ -277,8 +277,18 @@ describe("the bundled alate service shape", () => {
 		expect(alate.volumes).toContain("workspace:/workspace");
 	});
 
+	test("the alate service pins its git config off the shared home", () => {
+		// The service mounts the worker-plantable home at /root and holds ALATE_API_KEY,
+		// which the board strips from every turn's env (src/runner.ts, src/workers.ts).
+		// A planted /root/.gitconfig must never run here: its helpers, insteadOf
+		// redirects and protocol allowances would execute in the container with the key.
+		expect(alate.environment.GIT_CONFIG_GLOBAL).toBe("/dev/null");
+		expect(alate.volumes).toContain("home:/root");
+	});
+
 	test("docs/WORKERS.md documents the alate workspace mount and projectsRoot", () => {
 		expect(workersDoc).toContain("workspace:/workspace");
 		expect(workersDoc).toContain("projectsRoot");
+		expect(workersDoc).toContain("pins `GIT_CONFIG_GLOBAL` to `/dev/null`");
 	});
 });

@@ -4,6 +4,7 @@ import { WORK_CHECK_MAX_SENDBACKS } from "./prompts.ts";
 import type {
 	ArchReview,
 	AskQuestion,
+	CheckRoutingSetting,
 	ListedTask,
 	RecordedFinding,
 	Task,
@@ -11,6 +12,7 @@ import type {
 	WorkCheckBlocker,
 	WorkCheckRun,
 } from "./types.ts";
+import { modelVendor } from "./vendor.ts";
 
 /** A live turn whose card log has not grown for this long may wait on a hung command (ALAT-23
  * sat 25 h on a hung Stryker run with its omp process alive). The card warns; the board never kills. */
@@ -88,6 +90,10 @@ export function liveCard(
 	return liveCardOf(tasks, kind) !== null;
 }
 
+/** How a card says it is a review lead: a store row by its prompt, a board card (no
+ * prompt) by its `lead` mark. */
+export type LeadMark = Pick<Task, "prompt"> | { lead?: true };
+
 /** The fields the review policies read. */
 export type ReviewTask = Pick<
 	Task,
@@ -101,7 +107,8 @@ export type ReviewTask = Pick<
 	| "leadAtDone"
 	| "dependsOn"
 	| "followUpOf"
->;
+> &
+	LeadMark;
 
 /** A review card: a release card, or the Review button's card. Both run the same review
  * (prompts.ts reviewBody); a release publishes after it. */
@@ -159,10 +166,20 @@ export function reviewFindings<T extends ReviewTask>(
 
 /** True while a finding is not done: a cancelled finding counts as done, and a
  * child in `backlog` stage (an unverified lead filed without a check verdict) is
- * optional work, not a commitment, so it never holds the review's Done.
+ * optional work, not a commitment, so it never holds the review's Done. A lead (the
+ * "Needs validation" tag) and a batch validation run never hold it in any stage
+ * (OTTR-1128): a promoted lead and its review would otherwise wait on each other.
  * Shared by findingsOpen and reviewHoldFor so the two open rules cannot drift. */
-function findingOpen(f: Pick<Task, "cancelledAt" | "stage">): boolean {
-	return f.cancelledAt === null && f.stage !== "done" && f.stage !== "backlog";
+function findingOpen(
+	f: Pick<Task, "cancelledAt" | "stage" | "kind"> & LeadMark,
+): boolean {
+	return (
+		f.cancelledAt === null &&
+		f.stage !== "done" &&
+		f.stage !== "backlog" &&
+		!isLead(f) &&
+		f.kind !== "validation"
+	);
 }
 
 function findingsOpen(
@@ -359,20 +376,30 @@ export function findingsSettledAt(
 	return at ?? review.doneAt;
 }
 
-/** Why a new review (Review button or Create release) cannot start, else null. One review at a
- * time, and a review stays open until its findings are done: two open reviews would hold each
- * other's findings and deadlock. */
-export function reviewBlocked(tasks: readonly ReviewTask[]): string | null {
+/** The review card that stops a new review (Review button or Create release), with the reason,
+ * else null. One review at a time, and a review stays open until its findings are done: two open
+ * reviews would hold each other's findings and deadlock. */
+export function blockingReview(
+	tasks: readonly ReviewTask[],
+): { id: string; reason: string } | null {
 	for (const r of tasks) {
 		if (r.cancelledAt !== null || !isReview(r)) continue;
 		if (r.releaseVersion !== null && r.stage !== "done")
-			return "A release is already in progress.";
+			return { id: r.id, reason: "A release is already in progress." };
 		if (r.stage === "todo" || r.stage === "in_progress")
-			return "A review is already in progress.";
+			return { id: r.id, reason: "A review is already in progress." };
 		if (r.stage === "merging" || findingsOpen(tasks, r))
-			return "The last review's findings are not done yet.";
+			return {
+				id: r.id,
+				reason: "The last review's findings are not done yet.",
+			};
 	}
 	return null;
+}
+
+/** Why a new review cannot start, else null; see blockingReview. */
+export function reviewBlocked(tasks: readonly ReviewTask[]): string | null {
+	return blockingReview(tasks)?.reason ?? null;
 }
 
 /** The commit the newest finished review saw (its frozen base), else null: the watermark that the
@@ -456,7 +483,7 @@ export function archReviewView(
 	last: { id: string; base: string } | null,
 	a: { delta: number; reviewed: boolean; anchor: string },
 	cap: number,
-	running: boolean,
+	runningCardId: string | null,
 ): ArchReview {
 	return {
 		delta: a.delta,
@@ -465,7 +492,8 @@ export function archReviewView(
 		reviewCardId: last !== null && last.base === a.anchor ? last.id : null,
 		cap,
 		due: archReviewDue(a.delta, cap, a.reviewed),
-		running,
+		running: runningCardId !== null,
+		runningCardId,
 	};
 }
 
@@ -718,6 +746,8 @@ function workSlotReady(
 	// A trending scout only fills a slot nothing else wanted: pickLowPriority, after every project.
 	if (t.kind === "trending") return false;
 	// Work slots only: todo and in_progress (replies). Needs a rules file before a fresh todo starts.
+	// A lead that waits for a sandbox never runs as a work turn (OTTR-1128): it has no sandbox_run.
+	if (pendingSandboxLead(t)) return false;
 	if (t.stage === "todo" && !o.hasRules && t.kind !== "interview") return false;
 	// A queued card waits until every dependency is done (a cancelled dependency counts as
 	// done, waitingOn); merging cards wait in the merge slot above.
@@ -842,76 +872,79 @@ export function selectFindings(
 	return picked;
 }
 
-/** Model-id tokens that name a vendor, matched after the provider prefix is stripped: Claude
- *  via github-copilot, Bedrock, Vertex, OpenRouter or a gateway is still an Anthropic model.
- *  omp's model catalog cannot say: its entries carry `provider` — the prefix itself, exactly
- *  the signal that misleads — and no vendor field (checked against `omp models --json`). */
-const VENDOR_TOKENS: Record<string, string> = {
-	anthropic: "anthropic",
-	claude: "anthropic",
-	openai: "openai",
-	gpt: "openai",
-	codex: "openai",
-	google: "google",
-	gemini: "google",
-	zai: "zai",
-	zhipu: "zai",
-	glm: "zai",
-	xai: "xai",
-	grok: "xai",
-	deepseek: "deepseek",
-	moonshot: "moonshot",
-	kimi: "moonshot",
-	meta: "meta",
-	llama: "meta",
-	mistral: "mistral",
-	mixtral: "mistral",
-	ministral: "mistral",
-	codestral: "mistral",
-	magistral: "mistral",
-	pixtral: "mistral",
-	devstral: "mistral",
-	qwen: "qwen",
-	alibaba: "qwen",
-	tongyi: "qwen",
-	cohere: "cohere",
-	command: "cohere",
-	amazon: "amazon",
-	nova: "amazon",
-	titan: "amazon",
-};
-/** OpenAI's o-series ids ("o4-mini"): the family prefix is the bare letter and a number. */
-const O_SERIES = /^o\d+$/;
-
-/** The vendor a model selector names, read from the model id after the provider prefix; the
- *  id may carry its own vendor path (OpenRouter's "openrouter/anthropic/claude-x") or dotted
- *  qualifiers (Bedrock's "bedrock/us.anthropic.claude-x"), so every separator-separated token
- *  is tried in order and the first known one decides. Null when no known token shows up.
- *  The `:level` thinking suffix is ignored. Pure. */
-export function modelVendor(selector: string): string | null {
-	const [base] = splitLevel(selector);
-	const slash = base.indexOf("/");
-	const id = slash === -1 ? base : base.slice(slash + 1);
-	for (const token of id.toLowerCase().split(/[./_-]+/)) {
-		if (O_SERIES.test(token)) return "openai";
-		// hasOwn, not a bare member read: an id may hold any token, and "constructor"
-		// must stay an unknown vendor, not Object.prototype's.
-		if (Object.hasOwn(VENDOR_TOKENS, token))
-			return VENDOR_TOKENS[token] as string;
-	}
-	return null;
+/** The check run's model role for a work model: the user-set vendor rules first
+ *  (checkRoutingSetting), else the built-in default rule below. The vendor comes from the
+ *  model id, not the provider prefix (modelVendor), so Claude through another provider is
+ *  still an Anthropic model. Never fails: every path returns a role name. */
+export function checkRoleFor(
+	settings: CheckRoutingSetting | null,
+	roles: Record<string, string>,
+	reviewModel: string | null,
+): string {
+	return routeCheck(settings, roles, reviewModel).role;
 }
 
-/** The check run's model role: a review that ran on an Anthropic model gets a second vendor's
- *  opinion. The vendor comes from the model id, not the provider prefix (modelVendor), so
- *  Claude through another provider still gets the critic role; unknown and other vendors get
- *  the adversary role. */
-export function checkRoleFor(
+/** Why the routing fell back from a user rule or the user fallback to the default rule,
+ *  as one card-log line; null when the route needs no explanation (no setting, a matched
+ *  rule whose role has a configured model, or a fallback with one). Pure. */
+export function checkRoutingNote(
+	settings: CheckRoutingSetting | null,
+	roles: Record<string, string>,
 	reviewModel: string | null,
-): "critic" | "adversary" {
-	return modelVendor(reviewModel ?? "") === "anthropic"
-		? "critic"
-		: "adversary";
+): string | null {
+	return routeCheck(settings, roles, reviewModel).note;
+}
+
+/** The two exports above share this one resolution (docs/specs/check-role-routing.md).
+ *  `roles` is the omp config role map (role -> selector, file order); a null vendor
+ *  (no known token in the model id) counts as the vendor "unknown". Pure. */
+function routeCheck(
+	settings: CheckRoutingSetting | null,
+	roles: Record<string, string>,
+	reviewModel: string | null,
+): { role: string; note: string | null } {
+	const workVendor = modelVendor(reviewModel ?? "");
+	const def = defaultCheckRole(roles, workVendor);
+	if (settings === null) return { role: def, note: null };
+	const vendor = workVendor ?? "unknown";
+	const rule = settings.rules.find((r) => r.vendor === vendor);
+	if (rule !== undefined) {
+		// hasOwn, not a bare member read: a rule may name "constructor", which must
+		// stay an unconfigured role (default rule + note), not Object.prototype's.
+		if (Object.hasOwn(roles, rule.role)) return { role: rule.role, note: null };
+		return {
+			role: def,
+			note: `check routing: rule ${rule.vendor} -> ${rule.role} names no configured role, using the default rule`,
+		};
+	}
+	if (settings.fallback !== "") {
+		if (Object.hasOwn(roles, settings.fallback))
+			return { role: settings.fallback, note: null };
+		return {
+			role: def,
+			note: `check routing: fallback ${settings.fallback} names no configured role, using the default rule`,
+		};
+	}
+	return { role: def, note: null };
+}
+
+/** The built-in routing, also the fallback of every failed user rule: the first configured
+ *  candidate role (critic, adversary, then every other role in config order, except default)
+ *  whose model's vendor differs from the work model's; when none differs, today's rule — an
+ *  Anthropic work model checks with critic, everything else with adversary. Pure. */
+function defaultCheckRole(
+	roles: Record<string, string>,
+	workVendor: string | null,
+): string {
+	const candidates = ["critic", "adversary"];
+	for (const role of Object.keys(roles))
+		if (role !== "default" && role !== "critic" && role !== "adversary")
+			candidates.push(role);
+	for (const role of candidates) {
+		const vendor = modelVendor(roles[role] ?? "");
+		if (vendor !== null && vendor !== workVendor) return role;
+	}
+	return workVendor === "anthropic" ? "critic" : "adversary";
 }
 
 /** Why the check cannot give a second-model opinion: "same model" when the check model is the
@@ -1015,6 +1048,11 @@ export interface WorkCheckVerdict {
 	fixed: { id: number; reason: string }[];
 }
 
+export interface WorkCheckSplit {
+	blockers: WorkCheckBlocker[];
+	notes: string[];
+}
+
 /** The verdict's blockers; null when `r.blockers` exists but is malformed (the run retries). */
 function parseWorkBlockers(
 	r: Record<string, unknown>,
@@ -1099,9 +1137,8 @@ export function parseWorkCheck(text: string): WorkCheckVerdict | null {
 	return { blockers, notes, fixed };
 }
 
-/** The blockers a card still owes a fix: those of the last blockers run without a status. Every
- * older run's blockers carry a status by then (turn.ts marks uncited ones fixed when the next
- * check completes), so this never double-counts one problem. Pure. */
+/** Open blockers from the latest blockers run. Earlier runs remain as history,
+ * so recurring quotes count once. Pure. */
 export function openWorkBlockers(
 	log: readonly WorkCheckRun[],
 ): WorkCheckBlocker[] {
@@ -1111,6 +1148,31 @@ export function openWorkBlockers(
 		return run.blockers.filter((b) => b.status === undefined);
 	}
 	return [];
+}
+
+/** Rejects a verdict unless each earlier blocker has an explicit fix or a grounded recurrence. Pure. */
+export function workCheckAccountingError(
+	verdict: WorkCheckVerdict,
+	open: readonly WorkCheckBlocker[],
+	blockers: readonly WorkCheckBlocker[],
+): string | null {
+	const fixed = new Set<number>();
+	for (const f of verdict.fixed) {
+		if (
+			!Number.isInteger(f.id) ||
+			f.id < 1 ||
+			f.id > open.length ||
+			f.reason.trim() === ""
+		)
+			return "the work check used an invalid fixed blocker ID or an empty fix reason";
+		fixed.add(f.id);
+	}
+	const requoted = new Set(blockers.map((b) => b.quote));
+	for (const [i, b] of open.entries()) {
+		if (!fixed.has(i + 1) && !requoted.has(b.quote))
+			return `the work check did not account for earlier blocker ${i + 1}`;
+	}
+	return null;
 }
 
 /** Opening of the needs_you reason the work-check block at the send-back cap sets; the reply
@@ -1142,6 +1204,7 @@ export function workCheckAsk(
 			],
 			multi: false,
 			recommended: 0,
+			text: false,
 		},
 	];
 }
@@ -1208,6 +1271,18 @@ export const WORK_CHECK_ASK_CANCEL = "Cancel";
 export const LEAD_APPLIES_OPTION = "Yes, the risk applies";
 export const LEAD_NOT_APPLY_OPTION = "No, it does not apply";
 
+/** OTTR-1128: the needs_you reason of a started lead the board cannot move back to the
+ * backlog: its branch holds commits from an earlier work turn (or git could not count
+ * them). The card stays as it is, so no work is lost; the user decides. */
+export const LEAD_COMMITS_REASON =
+	"This Needs validation lead holds commits from an earlier work turn, so the board did not move it back to the backlog. A work turn has no sandbox_run: move the card to the backlog to validate it in its review's batch run, or cancel it.";
+
+/** OTTR-1128: the needs_you reason of a started lead with no live review to validate it:
+ * no review link, or a missing, cancelled or non-review parent. Only a review's batch
+ * validation run can prove a lead, so the board cannot route it; the user decides. */
+export const LEAD_NO_REVIEW_REASON =
+	"This Needs validation lead has no open review, so no batch validation run can take it, and a work turn has no sandbox_run. Cancel it, or remove the Needs validation tag from its prompt to run it as normal work.";
+
 /** The question card a review files for its deployment-fact leads; the reply route
  * recognizes it by this prompt prefix plus a non-null `asked`. */
 export const LEAD_QUESTIONS_PROMPT_PREFIX =
@@ -1232,6 +1307,40 @@ export function leadBlocker(prompt: string): LeadBlocker {
 	return m[1] === "deployment fact"
 		? { kind: "deployment", question: (m[2] ?? "").trim() }
 		: { kind: "sandbox", control: (m[2] ?? "").trim() };
+}
+
+/** A review lead: a card whose prompt carries the "Needs validation" tag. The review's
+ * question card ("Needs-validation lead questions ...") is not one. Pure. */
+export function isLead(t: LeadMark): boolean {
+	return "prompt" in t
+		? t.prompt.startsWith("Needs validation")
+		: t.lead === true;
+}
+
+/** OTTR-1128: a lead only a batch validation run can prove — never validated, with a
+ * sandbox blocker. A work turn has no sandbox_run, so the scheduler never starts one
+ * for it and the routing tick returns it to its review's batch. A deployment-fact
+ * lead the user answered and a validated lead stay normal work. Pure. */
+export function pendingSandboxLead(
+	t: Pick<Task, "prompt" | "validatedAt">,
+): boolean {
+	return (
+		isLead(t) &&
+		t.validatedAt === null &&
+		leadBlocker(t.prompt).kind === "sandbox"
+	);
+}
+
+/** True for a review whose leads a batch validation run may take: a done review, or one
+ * held at merging for its findings (OTTR-1128), so a release validates before it ships. */
+export function validatableReview(
+	t: Pick<Task, "kind" | "releaseVersion" | "cancelledAt" | "stage" | "state">,
+): boolean {
+	return (
+		isReview(t) &&
+		t.cancelledAt === null &&
+		(t.stage === "done" || (t.stage === "merging" && t.state === "idle"))
+	);
 }
 
 /** The needs_you reason for a diverging loop: the blocker counts per round, then the rule(s)
@@ -1289,6 +1398,7 @@ export function workCheckDivergeAsk(
 			],
 			multi: false,
 			recommended: 0,
+			text: false,
 		},
 	];
 }
@@ -1344,7 +1454,7 @@ export function demoteUnquoted(
 	diffText: string,
 	reportText: string,
 	transcriptText: string,
-): { blockers: WorkCheckBlocker[]; notes: string[] } {
+): WorkCheckSplit {
 	const blockers: WorkCheckBlocker[] = [];
 	const demoted: string[] = [];
 	for (const b of verdict.blockers) {

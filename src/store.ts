@@ -9,6 +9,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { leadCardTitle, retitleBareLeadTitles } from "./auditLeads.ts";
 import { mkdirBelow, writeBelow } from "./confine.ts";
 import {
 	closeLocked,
@@ -18,6 +19,16 @@ import {
 } from "./dblock.ts";
 import type { PerfFacts } from "./perf.ts";
 import { platform } from "./platform/index.ts";
+import { databaseConfig } from "./postgresConfig.ts";
+import {
+	getPostgresDatabase,
+	PostgresDatabase,
+	type StoreDatabase,
+} from "./postgresDriver.ts";
+import {
+	initializeProjectSchema,
+	projectSchemaName,
+} from "./postgresSchema.ts";
 import { derivedTaskPrefix } from "./prefix.ts";
 import {
 	ARCH_REVIEW_MARKER,
@@ -89,14 +100,17 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	forkMergeHold: true,
 	retroSince: null,
 	retroFilter: true,
+	retroAutoStart: false,
 	forkResearch: false,
 	trendingScout: false,
 	prReviews: false,
 	prReviewNotify: true,
 	prReviewApprove: false,
 	prReviewRequestChanges: false,
+	prReviewManualPost: true,
 	prMode: false,
 	issueWatch: false,
+	codeScanWatch: false,
 	issueWatchSince: null,
 	ompWatch: false,
 	dependabotWarn: true,
@@ -104,7 +118,6 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	setupChecklist: false,
 	targetBranch: null,
 	originUrl: null,
-	pushSyncCommits: false,
 	taskIdPrefix: null,
 	jiraConnection: null,
 	jiraLastJql: null,
@@ -147,7 +160,8 @@ const TASKS_DDL = `CREATE TABLE IF NOT EXISTS tasks (
   push_sha TEXT,
   update_ids TEXT NOT NULL DEFAULT '[]',
   update_merge_approved INTEGER NOT NULL DEFAULT 0,
-  revision INTEGER NOT NULL DEFAULT 1
+  revision INTEGER NOT NULL DEFAULT 1,
+  insertion_ordinal INTEGER
 )`;
 /** The pr_review_runs table DDL, kept separate so the shape migration below reuses the exact shape. */
 const PR_REVIEW_RUNS_DDL = `CREATE TABLE IF NOT EXISTS pr_review_runs (
@@ -158,7 +172,9 @@ const PR_REVIEW_RUNS_DDL = `CREATE TABLE IF NOT EXISTS pr_review_runs (
   done INTEGER NOT NULL DEFAULT 0,
   blocking INTEGER NOT NULL DEFAULT 1
 )`;
-const SCHEMA = `
+/** The application tables DDL: exported so the PostgreSQL migration-surface test can
+ *  compare the SQLite columns against the numbered PG steps (AGENTS.md hard stop 2). */
+export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ${TASKS_DDL};
 CREATE TABLE IF NOT EXISTS turns (
@@ -240,6 +256,7 @@ CREATE TABLE IF NOT EXISTS pr_review (
   posted_url TEXT,
   posted_login TEXT,
   posted_event TEXT,
+  posted_via TEXT,
   state TEXT NOT NULL CHECK (state IN ('open','closed','merged')),
   draft INTEGER NOT NULL,
   title TEXT NOT NULL,
@@ -266,6 +283,21 @@ CREATE TABLE IF NOT EXISTS issue_watch (
   filed_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_issue_watch_filed_at ON issue_watch (filed_at);
+CREATE TABLE IF NOT EXISTS code_scan_alert (
+  number INTEGER PRIMARY KEY,
+  rule TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  url TEXT NOT NULL,
+  message TEXT NOT NULL,
+  skipped INTEGER NOT NULL DEFAULT 0 CHECK (skipped IN (0,1)),
+  filed_at INTEGER NOT NULL,
+  card_filed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_code_scan_alert_task ON code_scan_alert (task_id);
+CREATE INDEX IF NOT EXISTS idx_code_scan_alert_card_filed ON code_scan_alert (card_filed_at);
 CREATE TABLE IF NOT EXISTS review_findings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   card_id TEXT NOT NULL,
@@ -357,6 +389,7 @@ interface TaskRow {
 	source_pr_cross_repo: number;
 	source_pr_dependabot: number;
 	source_pr_superseded: number;
+	source_issue: string | null;
 	follow_up_pr_number: number | null;
 	follow_up_pr_url: string | null;
 	topic: string | null;
@@ -477,6 +510,7 @@ interface PrReviewDbRow {
 	posted_url: string | null;
 	posted_login: string | null;
 	posted_event: string | null;
+	posted_via: string | null;
 	state: string;
 	draft: number;
 	title: string;
@@ -496,6 +530,7 @@ function toPrReview(r: PrReviewDbRow): PrReviewRow {
 		postedUrl: r.posted_url,
 		postedLogin: r.posted_login,
 		postedEvent: r.posted_event ?? null,
+		postedVia: r.posted_via ?? null,
 		state: r.state as PrState,
 		draft: r.draft !== 0,
 		title: r.title,
@@ -504,6 +539,70 @@ function toPrReview(r: PrReviewDbRow): PrReviewRow {
 		commentsUnseen: r.comments_unseen !== 0,
 	};
 }
+
+/** One code_scan_alert row: one open GitHub code scanning alert, grouped onto its rule's card (OTTR-1087). */
+export interface CodeScanAlertRow {
+	/** The GitHub alert number; the table's primary key, so a refetch never files it twice. */
+	number: number;
+	rule: string;
+	/** The rule's backlog card that owns this alert. */
+	taskId: string;
+	severity: string;
+	path: string;
+	line: number;
+	url: string;
+	message: string;
+	/** True when the card was cancelled ("do not file"): the alert waits skipped until a new number re-files the rule. */
+	skipped: boolean;
+	/** Epoch ms of the row's last insert or append. */
+	filedAt: number;
+	/** Epoch ms of the owning card's creation; appends keep the card's value, the daily cap counts on it. */
+	cardFiledAt: number;
+}
+
+/** A fetched alert not yet in the store, ready for fileCodeScanCards or appendCodeScanAlerts. */
+export interface NewCodeScanAlert {
+	number: number;
+	rule: string;
+	severity: string;
+	path: string;
+	line: number;
+	url: string;
+	message: string;
+}
+
+interface CodeScanAlertDbRow {
+	number: number;
+	rule: string;
+	task_id: string;
+	severity: string;
+	path: string;
+	line: number;
+	url: string;
+	message: string;
+	skipped: number;
+	filed_at: number;
+	card_filed_at: number;
+}
+
+function toCodeScanAlert(r: CodeScanAlertDbRow): CodeScanAlertRow {
+	return {
+		number: r.number,
+		rule: r.rule,
+		taskId: r.task_id,
+		severity: r.severity,
+		path: r.path,
+		line: r.line,
+		url: r.url,
+		message: r.message,
+		skipped: r.skipped !== 0,
+		filedAt: r.filed_at,
+		cardFiledAt: r.card_filed_at,
+	};
+}
+
+/** Worst first: the shared severity order for card rows and rule grouping (githubAlerts ALERT_SEVERITY_RANK). */
+const CODE_SCAN_SEVERITY_SQL = `CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END`;
 
 interface TurnRow {
 	id: number;
@@ -591,6 +690,7 @@ function toListedTask(
 		sourcePrCrossRepo: r.source_pr_cross_repo === 1,
 		sourcePrDependabot: r.source_pr_dependabot === 1,
 		sourcePrSuperseded: r.source_pr_superseded === 1,
+		sourceIssue: r.source_issue,
 		followUpPrNumber: r.follow_up_pr_number,
 		followUpPrUrl: r.follow_up_pr_url,
 		topic: r.topic,
@@ -669,7 +769,7 @@ function parseProposalSummary(raw: string | null): ProposalSummary | null {
 	try {
 		const value: unknown = JSON.parse(raw);
 		if (typeof value !== "object" || value === null) return null;
-		const { whatChanges, why, gain, risk, check } = value as Record<
+		const { whatChanges, why, gain, risk, check, decision } = value as Record<
 			string,
 			unknown
 		>;
@@ -686,7 +786,10 @@ function parseProposalSummary(raw: string | null): ProposalSummary | null {
 			!check
 		)
 			return null;
-		return { whatChanges, why, gain, risk, check };
+		// decision is optional: an older summary, or a wrong-shaped one, has none.
+		return typeof decision === "string" && decision !== ""
+			? { whatChanges, why, gain, risk, check, decision }
+			: { whatChanges, why, gain, risk, check };
 	} catch {
 		return null;
 	}
@@ -726,6 +829,11 @@ function parseGate(raw: string | null): PromptGateState | null {
 					typeof a.answer === "string",
 			);
 		if (typeof g.check === "string" && g.check !== "") state.check = g.check;
+		// OTTR-1160: the parked section's context lines ride through when they parse.
+		if (Array.isArray(g.context))
+			state.context = g.context.filter(
+				(l): l is string => typeof l === "string",
+			);
 		// OTTR-941: the duplicate-work gate's stamp rides through when it parses.
 		const dup = parseDupStamp(g.dup);
 		if (dup !== null) state.dup = dup;
@@ -809,10 +917,9 @@ function parseWorkCheckRun(r: unknown): WorkCheckRun | null {
 	return {
 		at: e.at,
 		model: typeof e.model === "string" ? e.model : null,
-		role:
-			e.role === "critic" || e.role === "adversary" || e.role === "default"
-				? e.role
-				: undefined,
+		// The routed check role is user data (any nonempty role name); a non-string
+		// drops, so one corrupt field never erases the run's history.
+		role: typeof e.role === "string" && e.role !== "" ? e.role : undefined,
 		outcome: e.outcome,
 		blockers,
 		notes: e.notes.filter((n): n is string => typeof n === "string"),
@@ -950,6 +1057,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	sourcePrCrossRepo: "source_pr_cross_repo",
 	sourcePrDependabot: "source_pr_dependabot",
 	sourcePrSuperseded: "source_pr_superseded",
+	sourceIssue: "source_issue",
 	followUpPrNumber: "follow_up_pr_number",
 	followUpPrUrl: "follow_up_pr_url",
 	topic: "topic",
@@ -1156,6 +1264,7 @@ export function discoverProjects(
 	roots: string[],
 	extra: string[] = [],
 	removed: string[] = [],
+	registeredProjects?: readonly string[],
 ): string[] {
 	// One path per basename: the board keys projects (and their OTTR_DATA_DIR data dirs) by
 	// folder name, so two roots may not contribute the same name twice. Removed paths drop out
@@ -1163,11 +1272,21 @@ export function discoverProjects(
 	// Explicit extra paths go first — an explicit path wins over a root scan — then first root
 	// hit wins.
 	const byName = new Map<string, string>();
+	const registered =
+		registeredProjects === undefined ? null : new Set(registeredProjects);
 	const add = (dir: string): void => {
 		const abs = resolve(dir);
 		if (removed.some((r) => platform.samePath(r, abs))) return;
-		if (!existsSync(join(serverDirFor(abs), "tasks.db"))) return;
 		const name = basename(abs);
+		if (registered === null) {
+			if (!existsSync(join(serverDirFor(abs), "tasks.db"))) return;
+		} else if (
+			!registered.has(name) ||
+			!existsSync(abs) ||
+			!lstatSync(abs).isDirectory()
+		) {
+			return;
+		}
 		if (!byName.has(name)) byName.set(name, abs);
 	};
 	for (const p of extra) add(resolve(p));
@@ -1189,10 +1308,15 @@ export function discoverProjects(
  * First non-empty trimmed line of the prompt, max 80 chars — the task's title. Skips section
  * labels (Markdown headings with a single word, e.g. "# Goal") and strips leading `#` marks,
  * so a heading like "# Set up agent rules" becomes the bare text. Overlong lines cut at a
- * word boundary (shortTitle), never mid-word. No code matches on the title text (card kind
+ * word boundary (shortTitle), never mid-word. A lead filed with the review prompt's bare tag
+ * line ("Needs validation" alone on line 1, OTTR-1164) titles from its claim instead, so
+ * leads stay tellable apart on the board. No code matches on the title text (card kind
  * is a trusted, server-set field, never derived from prompt text), so this is safe to change.
  */
 function deriveTitle(prompt: string): string {
+	// OTTR-1164: "Needs validation: <subject>" beats the bare tag as the title.
+	const lead = leadCardTitle(prompt);
+	if (lead !== null) return lead;
 	const lines = prompt.split("\n").map((line) => line.trim());
 	const isSectionLabel = (line: string) => /^#{1,6}\s+\S+$/.test(line);
 	const line =
@@ -1251,14 +1375,17 @@ const SETTINGS_SHAPES = {
 	forkMergeHold: "boolean",
 	retroSince: "number",
 	retroFilter: "boolean",
+	retroAutoStart: "boolean",
 	forkResearch: "boolean",
 	trendingScout: "boolean",
 	prReviews: "boolean",
 	prReviewNotify: "boolean",
 	prReviewApprove: "boolean",
 	prReviewRequestChanges: "boolean",
+	prReviewManualPost: "boolean",
 	prMode: "boolean",
 	issueWatch: "boolean",
+	codeScanWatch: "boolean",
 	issueWatchSince: "number",
 	ompWatch: "boolean",
 	dependabotWarn: "boolean",
@@ -1266,7 +1393,6 @@ const SETTINGS_SHAPES = {
 	setupChecklist: "boolean",
 	targetBranch: "string|null",
 	originUrl: "string|null",
-	pushSyncCommits: "boolean",
 	taskIdPrefix: "string|null",
 	jiraConnection: "string|null",
 	jiraLastJql: "string|null",
@@ -1297,6 +1423,18 @@ function parseSetting(
  *  Lives beside the store because its fire-and-forget work (the transcript backfills and the
  *  turn-end captures) has no caller to throw into. */
 const lastStoreErrorAt = new Map<string, number>();
+
+/** Sessions whose transcript was refused as oversize; cost stays NULL and every later
+ * capture in this process skips them. Process-wide by design: session transcripts only
+ * grow, and store instances are created fresh per open, so an instance memo would never
+ * outlive the backfill that needs it. */
+const oversizeSessions = new Set<string>();
+
+/** Clears the oversize-session memo; exists for tests (the memo is process-wide). */
+export function resetOversizeSessions(): void {
+	oversizeSessions.clear();
+}
+
 export function logStoreError(name: string, err: unknown): void {
 	const now = Date.now();
 	if (now - (lastStoreErrorAt.get(name) ?? 0) < 600_000) return;
@@ -1360,7 +1498,7 @@ export class ProjectStore {
 	readonly sessionsDir: string;
 	readonly worktreesDir: string;
 
-	private readonly db: SQLiteDatabase;
+	private readonly db: StoreDatabase;
 	private readonly queue: StoreQueue;
 	/** Settles when open's fire-and-forget transcript backfills (cost columns, done
 	 * context) have landed; rejection-free. Reads that must see the filled columns await
@@ -1368,7 +1506,7 @@ export class ProjectStore {
 	 * migrated database. */
 	backfill: Promise<void> = Promise.resolve();
 
-	private constructor(projectPath: string, db: SQLiteDatabase) {
+	private constructor(projectPath: string, db: StoreDatabase) {
 		this.path = projectPath;
 		this.name = basename(projectPath);
 		this.tasksDir = tasksDirFor(projectPath);
@@ -1378,19 +1516,19 @@ export class ProjectStore {
 		this.worktreesDir = join(projectPath, ".worktrees");
 		this.db = db;
 
-		this.queue = new StoreQueue({
-			begin: async () => {
-				await db.exec("BEGIN");
-			},
-			commit: async () => {
-				await db.exec("COMMIT");
-			},
-			rollback: () => db.rollback(),
-		});
+		this.queue =
+			db instanceof PostgresDatabase
+				? db.createQueue()
+				: new StoreQueue({
+						begin: () => db.exec("BEGIN"),
+						commit: () => db.exec("COMMIT"),
+						rollback: () => db.rollback(),
+					});
 	}
 
 	async transaction<T>(work: () => T | Promise<T>): Promise<T> {
-		return this.queue.transaction(work);
+		// Public callbacks can have external effects. Never repeat them after connection loss.
+		return this.queue.transaction(work, { replay: false });
 	}
 
 	static async init(projectPath: string): Promise<ProjectStore> {
@@ -1404,11 +1542,104 @@ export class ProjectStore {
 		return await ProjectStore.open(root);
 	}
 
-	/** Additive column convergence: adds one column when the (possibly stale) column list
-	 * lacks it, and records the name in the list — the ALTER never updates the PRAGMA
-	 * snapshot, so later readers in the same open (further addColumns, migration gates)
-	 * would otherwise miss a column this open just added and skip work until the next
-	 * restart (OTTR-963's backfill did exactly that). */
+	private static async convergeInsertionOrdinals(
+		db: SQLiteDatabase,
+		cols: string[],
+	): Promise<void> {
+		await db.exec("BEGIN");
+		try {
+			await ProjectStore.addColumn(
+				db,
+				cols,
+				"insertion_ordinal",
+				"ALTER TABLE tasks ADD COLUMN insertion_ordinal INTEGER",
+			);
+			const counter = await db
+				.query<{ value: string }, []>(
+					"SELECT value FROM settings WHERE key = 'task-insertion-ordinal'",
+				)
+				.get();
+			if (counter !== null && !/^[0-9]+$/.test(counter.value))
+				throw new Error("Invalid task insertion ordinal counter");
+			let ordinal = counter === null ? 0n : BigInt(counter.value);
+			if (ordinal > 9223372036854775807n)
+				throw new RangeError("Task insertion ordinal exhausted");
+			const invalid = await db
+				.query<{ id: string }, []>(
+					"SELECT id FROM tasks WHERE insertion_ordinal IS NOT NULL AND (typeof(insertion_ordinal) <> 'integer' OR insertion_ordinal <= 0) LIMIT 1",
+				)
+				.get();
+			if (invalid !== null) throw new Error("Invalid task insertion ordinal");
+			const maximum = await db
+				.query<{ ordinal: number | bigint | null }, []>(
+					"SELECT MAX(insertion_ordinal) AS ordinal FROM tasks",
+				)
+				.get();
+			if (maximum?.ordinal != null && BigInt(maximum.ordinal) > ordinal)
+				ordinal = BigInt(maximum.ordinal);
+			const pending = await db
+				.query<{ id: string }, []>(
+					"SELECT id FROM tasks WHERE insertion_ordinal IS NULL ORDER BY rowid ASC",
+				)
+				.all();
+			for (const row of pending) {
+				ordinal += 1n;
+				if (ordinal > 9223372036854775807n)
+					throw new RangeError("Task insertion ordinal exhausted");
+				await db.run("UPDATE tasks SET insertion_ordinal = ? WHERE id = ?", [
+					ordinal,
+					row.id,
+				]);
+			}
+			await db.run(
+				"INSERT INTO settings (key, value) VALUES ('task-insertion-ordinal', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+				[ordinal.toString()],
+			);
+			await ProjectStore.installInsertionOrdinalTriggers(db);
+			await db.exec("COMMIT");
+		} catch (error) {
+			await db.rollback();
+			throw error;
+		}
+	}
+
+	/** Raw SQLite demo/import inserts share the persistent allocation counter. */
+	private static async installInsertionOrdinalTriggers(
+		db: SQLiteDatabase,
+	): Promise<void> {
+		await db.exec(`
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_insertion_ordinal ON tasks (insertion_ordinal);
+			CREATE TRIGGER IF NOT EXISTS tasks_insertion_ordinal_insert
+			AFTER INSERT ON tasks BEGIN
+				SELECT CASE WHEN NEW.insertion_ordinal IS NULL AND
+					CAST((SELECT value FROM settings WHERE key = 'task-insertion-ordinal') AS INTEGER) = 9223372036854775807
+					THEN RAISE(ABORT, 'Task insertion ordinal exhausted') END;
+				UPDATE settings SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+					WHERE key = 'task-insertion-ordinal' AND NEW.insertion_ordinal IS NULL;
+				UPDATE tasks SET insertion_ordinal = CAST(
+					(SELECT value FROM settings WHERE key = 'task-insertion-ordinal') AS INTEGER)
+					WHERE id = NEW.id AND NEW.insertion_ordinal IS NULL;
+				SELECT CASE WHEN (SELECT insertion_ordinal FROM tasks WHERE id = NEW.id) IS NULL
+					OR (SELECT insertion_ordinal FROM tasks WHERE id = NEW.id) <= 0
+					OR typeof((SELECT insertion_ordinal FROM tasks WHERE id = NEW.id)) <> 'integer'
+					THEN RAISE(ABORT, 'Invalid task insertion ordinal') END;
+				UPDATE settings SET value = CAST(NEW.insertion_ordinal AS TEXT)
+					WHERE key = 'task-insertion-ordinal'
+					AND CAST(value AS INTEGER) < NEW.insertion_ordinal;
+			END;
+			CREATE TRIGGER IF NOT EXISTS tasks_insertion_ordinal_update
+			AFTER UPDATE OF insertion_ordinal ON tasks BEGIN
+				SELECT CASE WHEN NEW.insertion_ordinal IS NULL OR NEW.insertion_ordinal <= 0
+					OR typeof(NEW.insertion_ordinal) <> 'integer'
+					THEN RAISE(ABORT, 'Invalid task insertion ordinal') END;
+				UPDATE settings SET value = CAST(NEW.insertion_ordinal AS TEXT)
+					WHERE key = 'task-insertion-ordinal'
+					AND CAST(value AS INTEGER) < NEW.insertion_ordinal;
+			END;
+		`);
+	}
+
+	/** Add one absent column and refresh the convergence snapshot. */
 	private static async addColumn(
 		db: SQLiteDatabase,
 		cols: string[],
@@ -1433,6 +1664,8 @@ export class ProjectStore {
 		label: string,
 	): Promise<string[] | null> {
 		if (!tasksSql.includes(detect)) return null;
+		if (!names.split(",").some((name) => name.trim() === "insertion_ordinal"))
+			names += ", insertion_ordinal";
 		const count = async (table: string): Promise<number> =>
 			(
 				await db
@@ -1459,6 +1692,7 @@ export class ProjectStore {
 				);
 			await db.exec("DROP TABLE tasks");
 			await db.exec("ALTER TABLE tasks_migrating RENAME TO tasks");
+			await ProjectStore.installInsertionOrdinalTriggers(db);
 			const columns = (
 				await db.query<{ name: string }, []>("PRAGMA table_info(tasks)").all()
 			).map((column) => column.name);
@@ -1632,6 +1866,32 @@ export class ProjectStore {
 		});
 	}
 
+	/** Stamps source_issue on the issue-watch and Jira cards filed before the column
+	 * existed (OTTR-996), so the duplicate gate's outside-text exclusion covers every
+	 * outside-text card, not only cards filed after the upgrade. Only NULL rows match,
+	 * so the pass stays idempotent on every open. */
+	private static async convergeSourceIssues(
+		db: SQLiteDatabase,
+		queue: StoreQueue,
+	): Promise<void> {
+		await queue.transaction(async () => {
+			await db.run(
+				`UPDATE tasks SET source_issue = (
+					SELECT CAST(w.number AS TEXT) FROM issue_watch w WHERE w.task_id = tasks.id
+				)
+				WHERE source_issue IS NULL
+					AND EXISTS (SELECT 1 FROM issue_watch w WHERE w.task_id = tasks.id)`,
+			);
+			await db.run(
+				`UPDATE tasks SET source_issue = (
+					SELECT j.issue_key FROM jira_imports j WHERE j.task_id = tasks.id
+				)
+				WHERE source_issue IS NULL
+					AND EXISTS (SELECT 1 FROM jira_imports j WHERE j.task_id = tasks.id)`,
+			);
+		});
+	}
+
 	/** Rebuilds pr_review_runs when its stored shape predates the current columns: copies
 	 * rows explicitly, verifies the count, swaps — one transaction, so a failure leaves
 	 * the old table untouched. */
@@ -1698,14 +1958,22 @@ export class ProjectStore {
 		const dbPath = join(serverDir, "tasks.db");
 		// Shared PRAGMA + instance-lock sequence (R2-9): one live opener per db file
 		// (incident 2026-10-06); a refused opener throws with the holder named, handle closed.
-		const db = await openLocked(dbPath);
+		const db =
+			databaseConfig().backend === "postgres"
+				? await getPostgresDatabase(projectSchemaName(basename(root)))
+				: await openLocked(dbPath);
 		const store = new ProjectStore(root, db);
 		try {
+			if (db instanceof PostgresDatabase) {
+				await initializeProjectSchema(db, basename(root));
+				return await store.finishOpen();
+			}
 			await store.queue.run(async () => {
 				await db.exec(SCHEMA);
 				let cols = (
 					await db.query<{ name: string }, []>("PRAGMA table_info(tasks)").all()
 				).map((c) => c.name);
+				await ProjectStore.convergeInsertionOrdinals(db, cols);
 				await ProjectStore.addColumn(
 					db,
 					cols,
@@ -2381,6 +2649,20 @@ export class ProjectStore {
 									ORDER BY e.at DESC, e.id DESC LIMIT 1) = 'backlog'
 						)
 				`);
+				// OTTR-1164: leads filed while the review prompt put only the bare tag on
+				// line 1 kept "Needs validation" as their whole title. Retitle the open
+				// cards that still carry the bare title from their stored prompt; a
+				// renamed card (any other title) and done or cancelled cards keep theirs.
+				// Guarded like the backfill above: a tasks table old enough to miss
+				// cancelled_at predates review findings entirely, so it holds no bare-tag
+				// leads. Idempotent: the new title names the claim, so the bare-title
+				// match never fires again.
+				if (
+					["title", "prompt", "stage", "cancelled_at"].every((c) =>
+						cols.includes(c),
+					)
+				)
+					await retitleBareLeadTitles(db);
 				// OTTR-1047: the validation stamp on a backlog lead — set when the validation
 				// settle applies a result to it. ALTER-only after every rebuild, like the
 				// columns above; the validation settle writes it through TaskPatch.
@@ -2408,6 +2690,17 @@ export class ProjectStore {
 					"ci_pr_answered_info",
 					"ALTER TABLE tasks ADD COLUMN ci_pr_answered_info TEXT",
 				);
+				// OTTR-996: the outside issue/ticket a card was filed from (an issue-watch
+				// issue or a Jira ticket). The prompt embeds that author's text, so the
+				// duplicate gate never uses the card as a candidate. ALTER-only after both
+				// CHECK rebuilds, same reason as source_pr_number above.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"source_issue",
+					"ALTER TABLE tasks ADD COLUMN source_issue TEXT",
+				);
+				await ProjectStore.convergeSourceIssues(db, store.queue);
 				await ProjectStore.convergeProposalReasons(db, store.queue);
 				// posted_url landed after the first pr_review release: CREATE TABLE IF NOT EXISTS never
 				// updates a live table, so converge additively like the tasks columns above.
@@ -2484,6 +2777,15 @@ export class ProjectStore {
 					"posted_event",
 					"ALTER TABLE pr_review ADD COLUMN posted_event TEXT",
 				);
+				// posted_via landed with the board's automatic posts (docs/specs/pr-review-auto-post.md):
+				// same additive convergence; null reads as "not posted by this build", the state of
+				// every older row.
+				await ProjectStore.addColumn(
+					db,
+					prCols,
+					"posted_via",
+					"ALTER TABLE pr_review ADD COLUMN posted_via TEXT",
+				);
 				// The comment watch landed with the PR review notifications: same additive
 				// convergence, so an older database still sweeps and alerts without a rebuild.
 				await ProjectStore.addColumn(
@@ -2524,18 +2826,20 @@ export class ProjectStore {
 					"ALTER TABLE pr_review_runs ADD COLUMN blocking INTEGER NOT NULL DEFAULT 1",
 				);
 			});
-			// OTTR-866: the one-time cost and context backfills from the session
-			// transcripts start here, after the migrations, and ride the store's backfill
-			// promise so reads that need the columns can await them (OTTR-884 merge).
-			store.backfill = store.backfillTranscriptData().catch(() => {
-				/* backfill is best-effort; the next open retries */
-			});
-			await store.backfill;
-			return store;
+			return await store.finishOpen();
 		} catch (error) {
 			await store.close();
 			throw error;
 		}
+	}
+
+	private async finishOpen(): Promise<ProjectStore> {
+		// Transcript backfills start only after either backend finishes its migrations.
+		this.backfill = this.backfillTranscriptData().catch(() => {
+			/* backfill is best-effort; the next open retries */
+		});
+		await this.backfill;
+		return this;
 	}
 
 	async logPath(taskId: string): Promise<string> {
@@ -2657,7 +2961,7 @@ export class ProjectStore {
 		const fromSession = firstSessionTitle(this.sessionsDir, task.sessionId);
 		if (fromSession === null) return null;
 		const title = cleanTitle(fromSession);
-		return this.transaction(async () => {
+		return this.queue.transaction(async () => {
 			const current = await this.getTask(task.id);
 			if (current === null) return null;
 			const saved = await this.storedTitle(task.id);
@@ -3206,7 +3510,7 @@ export class ProjectStore {
 			{ ok: true; task: Task } | { ok: false; error: string }
 		>(async () => {
 			const now = o.now ?? Date.now();
-			const res = await this.transaction(
+			const res = await this.queue.transaction(
 				async (): Promise<
 					{ ok: true; id: string } | { ok: false; error: string }
 				> => {
@@ -3385,7 +3689,10 @@ export class ProjectStore {
 				title: o.title,
 				// The prompt embeds the issue's title and body, which a person wrote, so
 				// the card stays user-authored and the prompt gate judges it (OTTR-850).
+				// sourceIssue marks the outside text: the duplicate gate never uses the
+				// card as a candidate (OTTR-996).
 				topic: "github issue",
+				sourceIssue: String(o.number),
 				stage: "backlog",
 				state: "idle",
 				queuedAt: null,
@@ -3443,8 +3750,10 @@ export class ProjectStore {
 					title: item.title,
 					// The prompt embeds the ticket's summary, description and comments,
 					// which people wrote, so the card stays user-authored and the prompt
-					// gate judges it (OTTR-850).
+					// gate judges it (OTTR-850). sourceIssue marks the outside text: the
+					// duplicate gate never uses the card as a candidate (OTTR-996).
 					topic: "jira",
+					sourceIssue: item.key,
 					...(o.stage === "backlog"
 						? { stage: "backlog", state: "idle", queuedAt: null }
 						: {}),
@@ -3487,6 +3796,227 @@ export class ProjectStore {
 				"UPDATE issue_watch SET labelled = 1 WHERE number = ?",
 				[number],
 			);
+		});
+	}
+
+	/** One code_scan_alert row by GitHub alert number, or null. */
+	async getCodeScanAlert(number: number): Promise<CodeScanAlertRow | null> {
+		return this.queue.run(async () => {
+			const r = await this.db
+				.query<CodeScanAlertDbRow, [number]>(
+					"SELECT * FROM code_scan_alert WHERE number = ?",
+				)
+				.get(number);
+			return r ? toCodeScanAlert(r) : null;
+		});
+	}
+
+	/** Count of distinct code scanning cards filed at or after `since` (the daily cap). */
+	async codeScanCardsFiledSince(since: number): Promise<number> {
+		return this.queue.run(async () => {
+			return (
+				(
+					await this.db
+						.query<{ n: number }, [number]>(
+							"SELECT COUNT(DISTINCT task_id) AS n FROM code_scan_alert WHERE card_filed_at >= ?",
+						)
+						.get(since)
+				)?.n ?? 0
+			);
+		});
+	}
+
+	/** A rule's open (skipped = 0) rows grouped by card: taskId, row count, and the card's newest filed_at (the append target). */
+	async codeScanRuleCards(
+		rule: string,
+	): Promise<{ taskId: string; rows: number; newestFiledAt: number }[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<
+						{ task_id: string; rows: number; newestFiledAt: number },
+						[string]
+					>(
+						"SELECT task_id, COUNT(*) AS rows, MAX(filed_at) AS newestFiledAt FROM code_scan_alert WHERE rule = ? AND skipped = 0 GROUP BY task_id",
+					)
+					.all(rule)
+			).map((r) => ({
+				taskId: r.task_id,
+				rows: r.rows,
+				newestFiledAt: r.newestFiledAt,
+			}));
+		});
+	}
+
+	/** Files one backlog card per item and records its alert rows in one transaction; throws when an alert number already has a store row. */
+	async fileCodeScanCards(o: {
+		items: {
+			rule: string;
+			title: string;
+			prompt: string;
+			alerts: NewCodeScanAlert[];
+		}[];
+		now: number;
+	}): Promise<Task[]> {
+		return this.queue.transaction(async () => {
+			const filed: Task[] = [];
+			for (const item of o.items) {
+				// The primary key would throw an opaque constraint error; name the number instead.
+				for (const a of item.alerts) {
+					if ((await this.getCodeScanAlert(a.number)) !== null)
+						throw new Error(
+							`code scanning alert ${a.number} already has a store row`,
+						);
+				}
+				const card = await this.createTask(item.prompt, null, "work");
+				await this.updateTask(card.id, {
+					title: item.title,
+					// The prompt embeds the alerts' GitHub text, which people wrote, so
+					// the card stays user-authored and the prompt gate judges it (OTTR-850).
+					topic: "code scanning",
+					stage: "backlog",
+					state: "idle",
+					queuedAt: null,
+				});
+				for (const a of item.alerts) {
+					await this.db.run(
+						"INSERT INTO code_scan_alert (number, rule, task_id, severity, path, line, url, message, skipped, filed_at, card_filed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+						[
+							a.number,
+							a.rule,
+							card.id,
+							a.severity,
+							a.path,
+							a.line,
+							a.url,
+							a.message,
+							o.now,
+							o.now,
+						],
+					);
+				}
+				const task = await this.getTask(card.id);
+				if (task === null) throw new Error(`unknown task: ${card.id}`);
+				filed.push(task);
+			}
+			return filed;
+		});
+	}
+
+	/** Adds new alert numbers to an existing rule card; rows keep the card's card_filed_at, so appends need no daily-cap slot. */
+	async appendCodeScanAlerts(o: {
+		taskId: string;
+		alerts: NewCodeScanAlert[];
+		now: number;
+	}): Promise<void> {
+		return this.queue.transaction(async () => {
+			const first = await this.db
+				.query<{ card_filed_at: number }, [string]>(
+					"SELECT card_filed_at FROM code_scan_alert WHERE task_id = ? LIMIT 1",
+				)
+				.get(o.taskId);
+			const cardFiledAt = first?.card_filed_at ?? o.now;
+			for (const a of o.alerts) {
+				await this.db.run(
+					"INSERT INTO code_scan_alert (number, rule, task_id, severity, path, line, url, message, skipped, filed_at, card_filed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+					[
+						a.number,
+						a.rule,
+						o.taskId,
+						a.severity,
+						a.path,
+						a.line,
+						a.url,
+						a.message,
+						o.now,
+						cardFiledAt,
+					],
+				);
+			}
+		});
+	}
+
+	/** One card's open alert rows, worst severity first, then alert number. */
+	async codeScanCardRows(taskId: string): Promise<CodeScanAlertRow[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<CodeScanAlertDbRow, [string]>(
+						`SELECT * FROM code_scan_alert WHERE task_id = ? AND skipped = 0 ORDER BY ${CODE_SCAN_SEVERITY_SQL}, number`,
+					)
+					.all(taskId)
+			).map(toCodeScanAlert);
+		});
+	}
+
+	/** Deletes the alert rows of closed alerts and returns the ids of the cards that lost rows; unknown numbers are ignored. */
+	async removeCodeScanAlerts(numbers: number[]): Promise<string[]> {
+		if (numbers.length === 0) return [];
+		return this.queue.transaction(async () => {
+			const marks = numbers.map(() => "?").join(",");
+			const ids = (
+				await this.db
+					.query<{ task_id: string }, number[]>(
+						`SELECT DISTINCT task_id FROM code_scan_alert WHERE number IN (${marks})`,
+					)
+					.all(...numbers)
+			).map((r) => r.task_id);
+			await this.db.run(
+				`DELETE FROM code_scan_alert WHERE number IN (${marks})`,
+				numbers,
+			);
+			return ids;
+		});
+	}
+
+	/** Rewrites a rule card's prompt after its alert set changed (a fix or an append). */
+	async rebuildCodeScanPrompt(taskId: string, prompt: string): Promise<void> {
+		return this.queue.transaction(async () => {
+			await this.db.run("UPDATE tasks SET prompt = ? WHERE id = ?", [
+				prompt,
+				taskId,
+			]);
+		});
+	}
+
+	/** Cancels a rule card when its last alert left; already-cancelled cards stay untouched, so the call is idempotent. */
+	async cancelCodeScanCard(taskId: string, now: number): Promise<void> {
+		return this.queue.transaction(async () => {
+			await this.db.run(
+				"UPDATE tasks SET cancelled_at = ? WHERE id = ? AND cancelled_at IS NULL",
+				[now, taskId],
+			);
+		});
+	}
+
+	/** Marks the alert rows of cancelled cards skipped ("do not file") and returns the distinct card ids it touched. */
+	async skipCancelledCodeScanCards(): Promise<string[]> {
+		return this.queue.transaction(async () => {
+			const where =
+				"skipped = 0 AND task_id IN (SELECT id FROM tasks WHERE cancelled_at IS NOT NULL)";
+			const ids = (
+				await this.db
+					.query<{ task_id: string }, []>(
+						`SELECT DISTINCT task_id FROM code_scan_alert WHERE ${where}`,
+					)
+					.all()
+			).map((r) => r.task_id);
+			if (ids.length > 0)
+				await this.db.run(
+					`UPDATE code_scan_alert SET skipped = 1 WHERE ${where}`,
+				);
+			return ids;
+		});
+	}
+
+	/** Clears the skipped flag of a rule the user cancelled before, so the next tick re-files all open alerts; returns the count. */
+	async resetCodeScanSkipped(rule: string): Promise<number> {
+		return this.queue.transaction(async () => {
+			const r = await this.db.run(
+				"UPDATE code_scan_alert SET skipped = 0 WHERE rule = ? AND skipped = 1",
+				[rule],
+			);
+			return r.changes;
 		});
 	}
 
@@ -3540,25 +4070,30 @@ export class ProjectStore {
 		});
 	}
 
-	/** Stores the posted review's html_url, posting login, and decided event after a successful
-	 * Post; null clears url and login; an undefined event leaves the stored event untouched. */
+	/** Stores the posted review's html_url, posting login, decided event, and who posted it
+	 * after a successful Post; null clears url and login; an undefined event or via leaves the
+	 * stored column untouched. */
 	async setPrPostedUrl(
 		number: number,
 		url: string | null,
 		login: string | null = null,
 		event?: string | null,
+		via?: "user" | "auto",
 	): Promise<void> {
 		return this.queue.run(async () => {
-			if (event === undefined) {
-				await this.db.run(
-					"UPDATE pr_review SET posted_url = ?, posted_login = ? WHERE number = ?",
-					[url, login, number],
-				);
-				return;
+			const sets = ["posted_url = ?", "posted_login = ?"];
+			const args: (string | null)[] = [url, login];
+			if (event !== undefined) {
+				sets.push("posted_event = ?");
+				args.push(event);
+			}
+			if (via !== undefined) {
+				sets.push("posted_via = ?");
+				args.push(via);
 			}
 			await this.db.run(
-				"UPDATE pr_review SET posted_url = ?, posted_login = ?, posted_event = ? WHERE number = ?",
-				[url, login, event, number],
+				`UPDATE pr_review SET ${sets.join(", ")} WHERE number = ?`,
+				[...args, number],
 			);
 		});
 	}
@@ -3816,6 +4351,24 @@ export class ProjectStore {
 		});
 	}
 
+	private async nextInsertionOrdinal(): Promise<bigint> {
+		const row = await this.db
+			.query<{ value: string }, []>(
+				"SELECT value FROM settings WHERE key = 'task-insertion-ordinal'",
+			)
+			.get();
+		if (row === null || !/^[0-9]+$/.test(row.value))
+			throw new Error("Invalid task insertion ordinal counter");
+		const next = BigInt(row.value) + 1n;
+		if (next > 9223372036854775807n)
+			throw new RangeError("Task insertion ordinal exhausted");
+		await this.db.run(
+			"UPDATE settings SET value = ? WHERE key = 'task-insertion-ordinal'",
+			[next.toString()],
+		);
+		return next;
+	}
+
 	async createTask(
 		prompt: string,
 		model: string | null = null,
@@ -3841,9 +4394,10 @@ export class ProjectStore {
 				for (let n = 2; (await this.getTask(usedId)) !== null; n++)
 					usedId = `${id}-${n}`;
 			}
+			const ordinal = await this.nextInsertionOrdinal();
 			await this.db.run(
-				"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at, queued_at, model, kind) VALUES (?, ?, ?, 'todo', 'queued', ?, ?, ?, ?, ?)",
-				[usedId, title, prompt, now, now, now, model, kind],
+				"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at, queued_at, model, kind, insertion_ordinal) VALUES (?, ?, ?, 'todo', 'queued', ?, ?, ?, ?, ?, ?)",
+				[usedId, title, prompt, now, now, now, model, kind, ordinal],
 			);
 			await this.recordEvent("create", usedId, null, "todo", null);
 			await this.recordEvent("state", usedId, null, "queued", null);
@@ -3894,12 +4448,14 @@ export class ProjectStore {
 	 * longer carry it): legacy 'unknown'-steps rows resolve their steps against it
 	 * (OTTR-488) one narrow query at a time. */
 	async getTaskReport(id: string): Promise<string | null> {
-		const row = await this.db
-			.query<{ report: string | null }, [string]>(
-				"SELECT report FROM tasks WHERE id = ?",
-			)
-			.get(id);
-		return row?.report ?? null;
+		return this.queue.run(async () => {
+			const row = await this.db
+				.query<{ report: string | null }, [string]>(
+					"SELECT report FROM tasks WHERE id = ?",
+				)
+				.get(id);
+			return row?.report ?? null;
+		});
 	}
 
 	async listTasks(): Promise<ListedTask[]> {
@@ -3910,7 +4466,7 @@ export class ProjectStore {
 						Omit<TaskRow, "diff_text" | "details" | "report" | "diff_files">,
 						[]
 					>(
-						`SELECT ${TASK_LIST_COLUMNS} FROM tasks ORDER BY created_at DESC, rowid DESC`,
+						`SELECT ${TASK_LIST_COLUMNS} FROM tasks ORDER BY created_at DESC, insertion_ordinal DESC`,
 					)
 					.all()
 			).map((row) => toListedTask(this.name, row));
@@ -4087,20 +4643,86 @@ export class ProjectStore {
 		});
 	}
 
-	/** True iff `order` is an exact permutation of the current queue; then moves each task by writing future queuedAt. */
-	async reorderQueue(order: string[]): Promise<boolean> {
+	/** OTTR-1148: moves one queued card to sit right above `before` (null: to the end of
+	 * the queue) without a full-order round trip, so a drag still lands when cards enter
+	 * or leave the queue while the board reads /api/state. A `before` that has left the
+	 * queue (its turn started, it is done or cancelled) still anchors: the move positions
+	 * by its stored queuedAt, where the card used to sit. An unknown `before` id behaves
+	 * like null (end of the queue). The write touches one row — a queuedAt strictly
+	 * between the neighbours — and renumbers the queue only when no integer slot is free.
+	 * Returns false only when `id` is not a queued, non-cancelled card of the project. */
+	async moveInQueue(id: string, before: string | null): Promise<boolean> {
 		return this.queue.transaction(async () => {
-			const current = await this.queueIds();
-			if (
-				order.length !== current.length ||
-				new Set(order).size !== order.length
-			)
-				return false;
-			const currentSet = new Set(current);
-			if (order.some((id) => !currentSet.has(id))) return false;
+			const tasks = await this.listTasks();
+			const queue = queueOrder(tasks);
+			if (!queue.some((t) => t.id === id)) return false;
+			const key = (t: (typeof queue)[number]): number =>
+				t.queuedAt ?? t.createdAt;
+			const anchorRow =
+				before === null ? undefined : tasks.find((t) => t.id === before);
+			// null anchor: append after the last queued card.
+			const anchor =
+				anchorRow === undefined
+					? null
+					: (anchorRow.queuedAt ?? anchorRow.createdAt);
+			const others = queue.filter((t) => t.id !== id);
+			// The sort key of the queued card directly above the anchor point: the
+			// largest key strictly below it, or — when a card ties on the key but was
+			// created earlier than `before` — the anchor key itself. That card sorts
+			// above `before`, and no integer slot below the anchor lands the moved
+			// card above it, so the tie collapses the gap to 0 and forces the
+			// renumber path below.
+			const prev =
+				anchor === null
+					? null
+					: others.reduce<number | null>(
+							(top, t) =>
+								(key(t) < anchor ||
+									(key(t) === anchor &&
+										t.createdAt < (anchorRow?.createdAt ?? 0))) &&
+								(top === null || key(t) > top)
+									? key(t)
+									: top,
+							null,
+						);
+			if (anchor === null || prev === null || anchor - prev >= 2) {
+				// A free integer slot exists: write only the moved row.
+				const target =
+					anchor === null
+						? others.length === 0
+							? Date.now()
+							: Math.max(...others.map(key)) + 1
+						: prev === null
+							? // Top of the queue: nothing queued sits below the anchor point.
+								anchor - 1
+							: Math.floor((prev + anchor) / 2);
+				await this.updateTask(id, { queuedAt: target });
+				return true;
+			}
+			// No integer slot between the neighbours: renumber the whole queue in the
+			// desired order (the others keep their relative order). The moved card goes
+			// right above the anchor point, so the cards above it are the ones queueOrder
+			// sorts before that point: a lower sort key, or the same key with an earlier
+			// createdAt. When `before` itself is queued, its own position is exact even
+			// among full ties.
+			const queuedAt = others.findIndex((t) => t.id === before);
+			const at =
+				queuedAt >= 0
+					? queuedAt
+					: others.filter(
+							(t) =>
+								key(t) < anchor ||
+								(key(t) === anchor &&
+									t.createdAt < (anchorRow?.createdAt ?? 0)),
+						).length;
+			const next = [
+				...others.slice(0, at),
+				queue.find((t) => t.id === id)!,
+				...others.slice(at),
+			];
 			const now = Date.now();
-			for (const [i, id] of order.entries())
-				await this.updateTask(id, { queuedAt: now + i });
+			for (const [i, t] of next.entries())
+				await this.updateTask(t.id, { queuedAt: now + i });
 			return true;
 		});
 	}
@@ -4155,7 +4777,7 @@ export class ProjectStore {
 	}
 
 	async finishTurnState(turnId: number, patch: TurnPatch): Promise<Turn> {
-		return this.transaction(async () => {
+		return this.queue.transaction(async () => {
 			const sets: string[] = [];
 			const values: (string | number | null)[] = [];
 			for (const key of Object.keys(TURN_COLUMNS) as (keyof TurnPatch)[]) {
@@ -4235,19 +4857,24 @@ export class ProjectStore {
 				? ((await this.getTask(taskId))?.sessionId ?? null)
 				: expectedSessionId;
 		if (sessionId === null) return;
+		if (oversizeSessions.has(sessionId)) return;
 		let sum: UsageSum | null;
 		try {
-			sum = sumUsageIn(
-				await readTranscript(this.sessionsDir, sessionId),
-				startedAt,
-				endedAt,
-			);
+			const texts = await readTranscript(this.sessionsDir, sessionId);
+			if (texts.oversize) {
+				// An over-cap transcript is refused unread, so its cost stays unknown; without
+				// the memo every store open would re-run the refusal, so skip the session for
+				// this process (a restart re-checks once — a stat, not a read).
+				oversizeSessions.add(sessionId);
+				return;
+			}
+			sum = sumUsageIn(texts, startedAt, endedAt);
 		} catch {
 			return;
 		}
 
 		if (sum === null) return;
-		await this.transaction(async () => {
+		await this.queue.transaction(async () => {
 			await this.db.run(
 				`UPDATE turns SET tokens_in = ?, tokens_out = ?, cache_read = ?, cache_write = ?, cost = ?
 				 WHERE id = ? AND task_id = ? AND started_at = ? AND ended_at = ? AND cost IS NULL
@@ -4303,10 +4930,10 @@ export class ProjectStore {
 			expectedContextTokens === undefined
 				? task.context_tokens
 				: expectedContextTokens;
-		await this.transaction(async () => {
+		await this.queue.transaction(async () => {
 			await this.db.run(
-				`UPDATE tasks SET context_tokens = ? WHERE id = ? AND session_id IS ?
-				 AND context_tokens IS ?${doneOnly ? " AND stage = 'done' AND context_tokens IS NULL" : ""}`,
+				`UPDATE tasks SET context_tokens = ? WHERE id = ? AND session_id IS NOT DISTINCT FROM ?
+				 AND context_tokens IS NOT DISTINCT FROM ?${doneOnly ? " AND stage = 'done' AND context_tokens IS NULL" : ""}`,
 				[ctx.promptTokens, taskId, task.session_id, previousContext],
 			);
 		});
@@ -4401,8 +5028,17 @@ export class ProjectStore {
 		turns: Map<string, BoardTurnFacts>;
 		/** Raw stored session_title per task id; frozenTitleFrom applies the cleaning. */
 		titles: Map<string, string | null>;
-		/** Per pr_review card: the draft run stamp and the unseen comment stamp. */
-		pr: Map<string, { draft: number | null; comments: number | null }>;
+		/** Per pr_review card: the draft run stamp, the unseen comment stamp, and the
+		 * board-posted PR number and head while the board's own post is still the current
+		 * one. The head keys the posted occurrence: the same PR URL serves every head. */
+		pr: Map<
+			string,
+			{
+				draft: number | null;
+				comments: number | null;
+				posted: { number: number; head: string } | null;
+			}
+		>;
 	}> {
 		return this.queue.run(async () => {
 			const turns = await this.boardTurnFacts();
@@ -4484,12 +5120,23 @@ export class ProjectStore {
 	/** One grouped query and one row scan per project: the occurrence stamps the board
 	 * build and the alert diff read for pr_review cards. */
 	private async boardPrFacts(): Promise<
-		Map<string, { draft: number | null; comments: number | null }>
+		Map<
+			string,
+			{
+				draft: number | null;
+				comments: number | null;
+				posted: { number: number; head: string } | null;
+			}
+		>
 	> {
 		return this.queue.run(async () => {
 			const pr = new Map<
 				string,
-				{ draft: number | null; comments: number | null }
+				{
+					draft: number | null;
+					comments: number | null;
+					posted: { number: number; head: string } | null;
+				}
 			>();
 			const runs = new Map<number, number>();
 			for (const r of await this.db
@@ -4505,6 +5152,17 @@ export class ProjectStore {
 					comments:
 						row.commentsUnseen && row.commentsAt !== null
 							? row.commentsAt
+							: null,
+					// The board's own post, while it is still the current one: the bell row
+					// and the auto-post occurrence read it
+					// (docs/specs/pr-review-auto-post.md). The posted head keys the
+					// occurrence: the PR URL serves every head, the head does not.
+					posted:
+						row.postedVia === "auto" &&
+						row.postedHead !== null &&
+						row.postedHead === row.reviewedHead &&
+						row.state === "open"
+							? { number: row.number, head: row.postedHead }
 							: null,
 				});
 			}
@@ -4532,7 +5190,7 @@ export class ProjectStore {
 						},
 						[string]
 					>(
-						"SELECT id, error, outcome, exit_code AS exitCode FROM turns WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+						'SELECT id, error, outcome, exit_code AS "exitCode" FROM turns WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1',
 					)
 					.get(taskId)) ?? null
 			);
@@ -4740,14 +5398,20 @@ export class ProjectStore {
 
 	/** Snapshot copy of tasks.db for the backup (docs/specs/db-backup.md); `dest` must not exist. */
 	async backupTo(dest: string): Promise<void> {
+		const db = this.db;
+		if (db instanceof PostgresDatabase)
+			throw new Error(
+				"PostgreSQL backup is operator-owned; SQLite snapshots are unavailable",
+			);
 		return this.queue.run(async () => {
-			await vacuumInto(this.db, dest, ["tasks", "turns"]);
+			await vacuumInto(db, dest, ["tasks", "turns"]);
 		});
 	}
 
 	async close(): Promise<void> {
 		await this.queue.close(async () => {
-			await closeLocked(this.db);
+			if (this.db instanceof PostgresDatabase) await this.db.close();
+			else await closeLocked(this.db);
 		});
 	}
 }

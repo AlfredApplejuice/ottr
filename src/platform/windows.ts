@@ -1,5 +1,6 @@
 // Windows implementation of the Platform contract (see index.ts).
 import { spawnSync } from "node:child_process";
+import { childDatabaseEnv } from "../childEnv.ts";
 import type { CwdProcess, Platform, ProcessInfo } from "./index.ts";
 
 // One parsed JSON entry -> ProcessInfo, or null when the entry is not a real user process.
@@ -37,7 +38,12 @@ function runProcessScan(run: typeof spawnSync) {
 			"-Command",
 			"@(Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine,@{n='Started';e={if ($_.CreationDate) {$_.CreationDate.ToString('o')}}}) | ConvertTo-Json -Compress",
 		],
-		{ windowsHide: true, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+		{
+			windowsHide: true,
+			encoding: "utf8",
+			maxBuffer: 64 * 1024 * 1024,
+			env: childDatabaseEnv(),
+		},
 	);
 }
 
@@ -49,6 +55,7 @@ export const windows = {
 			run("taskkill", ["/PID", String(pid), "/T", "/F"], {
 				windowsHide: true,
 				stdio: "ignore",
+				env: childDatabaseEnv(),
 			});
 		} catch {
 			// killTree never throws

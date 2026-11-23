@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { childDatabaseEnv } from "./childEnv.ts";
 import { configuredGithubHostname, defaultGitUsername } from "./githubHost.ts";
 import type { HostedHooks, GitToken as MintedToken } from "./hosted.ts";
 import {
@@ -69,6 +70,7 @@ async function runTool(
 	stdin?: string,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
 	const proc = Bun.spawn(argv, {
+		env: childDatabaseEnv(),
 		stdin: stdin === undefined ? "ignore" : "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -502,7 +504,12 @@ export function readAmbientHelpers(): [string, string][] {
 	for (const scope of ["--system", "--global"]) {
 		const r = Bun.spawnSync(
 			["git", "config", scope, "--get-regexp", "^credential\\..*helper$"],
-			{ stdout: "pipe", stderr: "pipe", windowsHide: true },
+			{
+				env: childDatabaseEnv(),
+				stdout: "pipe",
+				stderr: "pipe",
+				windowsHide: true,
+			},
 		);
 		if (r.exitCode !== 0) continue;
 		for (const line of r.stdout.toString().split("\n")) {
@@ -550,6 +557,11 @@ export function gitAuthEnv(o: {
 	const config: (readonly [string, string])[] = [
 		["protocol.ext.allow", "never"],
 		["push.gpgSign", "false"],
+		// A planted http.cookieFile + http.saveCookies makes libcurl rewrite that file as a
+		// cookie jar after a successful fetch — a server-only volume file included. The empty
+		// path reads no cookie file and writes no jar.
+		["http.cookieFile", ""],
+		["http.saveCookies", "false"],
 	];
 	// Always: an empty value clears every helper read so far (repo config included), so a
 	// planted helper never runs next to GH_TOKEN or the key path, tokens stored or not.

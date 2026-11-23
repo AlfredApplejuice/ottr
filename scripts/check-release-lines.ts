@@ -7,13 +7,14 @@
  * The rule lives in src/releaseLine.ts and the scan's shared core in
  * src/releaseLineScan.ts (docs/specs/release-line-gate.md).
  */
-import { readFileSync } from "node:fs";
+import { readRegular } from "../src/confine.ts";
 import { RELEASE_LINE_MARKER } from "../src/releaseLine.ts";
 import {
 	AGE_MS,
 	CAP_MS,
 	directNamesOf,
 	fetchReleases,
+	LOCK_MAX_BYTES,
 	type ReleaseLineScan,
 	scanReleaseLines,
 } from "../src/releaseLineScan.ts";
@@ -51,9 +52,12 @@ function baseLockText(): string {
 async function scan(): Promise<number> {
 	const now = Date.now();
 	const scan: ReleaseLineScan = await scanReleaseLines({
-		lockText: readFileSync("bun.lock", "utf8"),
+		// The worktree is worker-writable: bounded reads, never readFileSync.
+		lockText: readRegular("bun.lock", LOCK_MAX_BYTES).toString("utf8"),
 		baseLockText: baseLockText(),
-		directNames: directNamesOf(readFileSync("package.json", "utf8")),
+		directNames: directNamesOf(
+			readRegular("package.json", LOCK_MAX_BYTES).toString("utf8"),
+		),
 		fetch: fetchReleases,
 		now,
 		ageMs: AGE_MS,

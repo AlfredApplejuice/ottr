@@ -1,5 +1,6 @@
 // Pure fork-analysis prompt/parse layer. Untrusted fork content: never instructions, always data.
 
+import { childDatabaseEnv } from "./childEnv.ts";
 import { githubHost } from "./githubHost.ts";
 import { boardOmpEnv } from "./login.ts";
 import type {
@@ -34,17 +35,24 @@ const REDACT_PATTERNS: RegExp[] = [
 	/\b(sk|pk)_live_[A-Za-z0-9]{16,}\b/g,
 	/AIza[0-9A-Za-z_-]{35}/g,
 	/\bxox[baprs]-[A-Za-z0-9-]{10,}/g,
-	/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
-	/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-	/\b\w+:\/\/[^/\s:]+:[^/\s@]{8,}@/g,
+	// OTTR-997: every quantifier before a required literal is bounded, so a failed
+	// start cannot rescan the rest of attacker-written text (quadratic backtracking).
+	// JWT segments: header <=128, payload/signature <=2048 (real tokens are smaller).
+	/eyJ[A-Za-z0-9_-]{10,128}\.[A-Za-z0-9_-]{10,2048}\.[A-Za-z0-9_-]{10,2048}/g,
+	// PEM key: header word <=32 chars, gap <=8 KiB (a real key PEM is smaller).
+	/-----BEGIN [A-Z ]{0,32}PRIVATE KEY-----[\s\S]{0,8192}?-----END [A-Z ]{0,32}PRIVATE KEY-----/g,
+	// URL credentials: every run bounded like the other rules (OTTR-997), so no
+	// accepted span can cross the raw pre-cut with an unbounded prefix.
+	/\b\w{1,64}:\/\/[^/\s:]{1,255}:[^/\s@]{8,512}@/g,
 ];
 
 // Redact QUOTED literal values: `apiKey = whisparr.apiKey` is an identifier copy, a
 // quoted 16+ char value is likely a real secret. Fixture/example values stay visible.
 // A false match must never stop a review (OTTR-942): every other matched value becomes
-// [REDACTED], so the model never sees it.
+// [REDACTED], so the model never sees it. The value run is bounded to 8 KiB like the
+// token shapes, so no accepted match can cross the raw patch pre-cut (OTTR-997).
 const SUSPICIOUS_ASSIGN_RE =
-	/\b(password|passwd|secret|api[_-]?key|access[_-]?token|private[_-]?key)\b\s*[:=]\s*(?:"([^"\n]{16,})"|'([^'\n]{16,})')/gi;
+	/\b(password|passwd|secret|api[_-]?key|access[_-]?token|private[_-]?key)\b\s*[:=]\s*(?:"([^"\n]{16,8192})"|'([^'\n]{16,8192})')/gi;
 const FIXTURE_VALUE_RE =
 	/^(?:fixture|test|example|sample|dummy|placeholder|changeme|redacted)[-_. ]/i;
 
@@ -143,6 +151,28 @@ function commitBlock(c: ForkCommit): string {
 	return lines.join("\n");
 }
 
+/** capPatches' per-patch cap: the longest patches trim to this (min 2000 chars each). */
+function patchCap(commitCount: number): number {
+	return Math.max(2000, Math.floor(PROMPT_CHAR_BUDGET / commitCount));
+}
+
+/** Longest span any redaction rule accepts: PEM block ~8.3 KiB, quoted value
+ * ~8.25 KiB, JWT ~4.2 KiB, URL credentials ~0.8 KiB, stored tokens are short
+ * literals. clean() must see a whole match to redact it, so the raw pre-cut
+ * sits this far past the per-patch cap: a token straddling the trim boundary
+ * is fully inside the cleaned region (OTTR-997). */
+const MAX_TOKEN_LEN = 16_384;
+
+/** clean() does not map cleaned positions back to raw positions: it shrinks
+ * text (each redaction replaces a longer span, stripInvisible deletes chars)
+ * and grows it (a 1-char stored token becomes [REDACTED], a 7-char fence
+ * marker becomes a 22-char replacement). The unredacted prefix a raw cut
+ * leaves behind therefore sits in a variable cleaned-position tail zone; its
+ * cleaned length is bounded by the longest accepted span (~8.3 KiB) times the
+ * worst growth (22/7), so dropping this many cleaned chars removes it wherever
+ * shrinkage put it (OTTR-997). */
+const CLEAN_TAIL_DROP = 32_768;
+
 /** All labelled blocks after stripInvisible + redactSecrets, before budget capping. */
 function cleanBlocks(
 	range: ForkRange,
@@ -155,12 +185,30 @@ function cleanBlocks(
 	upstreamDocs: string;
 	priorSection: string;
 } {
+	const cap = patchCap([...range.commits, ...range.merges].length);
+	const precap = cap + CLEAN_TAIL_DROP + MAX_TOKEN_LEN;
 	return {
 		fork: clean(
 			`owner/name: ${range.fork.owner}/${range.fork.name}\n` +
 				range.heads.map((h) => `${h.branch}: ${h.head}`).join("\n"),
 		),
-		patches: [...range.commits, ...range.merges].map((c) => clean(c.patch)),
+		patches: [...range.commits, ...range.merges].map((c) => {
+			if (c.patch.length <= precap) return clean(c.patch);
+			// OTTR-997: bound clean()'s input. The raw cut can split a token; its
+			// unredacted prefix lands in the cleaned tail zone, so drop that zone
+			// by cleaned length (clamped at zero: a negative slice endpoint counts
+			// from the end), then keep the rest within cap. The pre-cut sits one
+			// CLEAN_TAIL_DROP past cap + MAX_TOKEN_LEN, so without shrinkage a cut
+			// patch still keeps its full cap of benign content.
+			const cleaned = clean(c.patch.slice(0, precap));
+			const kept = cleaned.slice(
+				0,
+				Math.max(0, Math.min(cleaned.length - CLEAN_TAIL_DROP, cap)),
+			);
+			// Appended after clean(): patch text cannot forge or remove it, and
+			// the model learns that content ends early even on an in-budget range.
+			return `${kept}\n[patch truncated]`;
+		}),
 		upstreamCommits: clean(range.upstreamCommits.join("\n")),
 		upstreamFiles: clean(range.upstreamFiles.join("\n")),
 		upstreamDocs: clean(range.upstreamDocs),
@@ -182,7 +230,7 @@ function capPatches(
 	if (total <= PROMPT_CHAR_BUDGET) {
 		return { patches, total, note: "" };
 	}
-	const cap = Math.max(2000, Math.floor(PROMPT_CHAR_BUDGET / commitCount));
+	const cap = patchCap(commitCount);
 	let out = patches;
 	let used = total;
 	const order = out
@@ -269,7 +317,7 @@ export const defaultSpawn: SpawnFn = async (argv, o) => {
 		stdout: "pipe",
 		stderr: "pipe",
 		cwd: o.cwd,
-		env: o.env,
+		env: childDatabaseEnv(o.env),
 		timeout: o.timeoutMs,
 		windowsHide: true,
 	});

@@ -6,7 +6,9 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+	leadCardTitle,
 	leadFingerprint,
+	leadSubject,
 	leadTitleKey,
 	validationResult,
 } from "./auditLeads.ts";
@@ -43,6 +45,81 @@ describe("leadTitleKey", () => {
 			"needs validation: a long title",
 		);
 		expect(leadTitleKey("")).toBe("");
+	});
+});
+
+describe("leadSubject and leadCardTitle", () => {
+	// The shape the current review prompt produces (OTTR-1164): the bare tag on
+	// line 1, the fingerprint on line 2, the claim under "## Claim".
+	const claim =
+		"The setup-secret limiter keys on the first X-Forwarded-For entry, which the client supplies.";
+	test("a bare-tag lead takes the claim line as its subject and title", () => {
+		const prompt = `Needs validation\nFingerprint: fp-1\n## Claim\n${claim}\n\nEvidence follows.`;
+		expect(leadSubject(prompt)).toBe(claim);
+		// The real VELV-239 claim pushes the prefixed title past 80 characters,
+		// so shortTitle cuts it at a word boundary like every other title.
+		expect(leadCardTitle(prompt)).toBe(
+			"Needs validation: The setup-secret limiter keys on the first X-Forwarded-For…",
+		);
+	});
+
+	test("a bare-tag lead without a Claim section falls back to the first content line", () => {
+		const prompt =
+			"Needs validation\nFingerprint: fp-2\nSome claim text in free form.\n## Later\nmore";
+		expect(leadSubject(prompt)).toBe("Some claim text in free form.");
+	});
+
+	test("heading, fingerprint and blank lines never become the subject", () => {
+		expect(
+			leadSubject(
+				"Needs validation\nFingerprint: fp-3\n## Claim\n\n## Evidence\nThe real fact.",
+			),
+		).toBe("The real fact.");
+	});
+
+	test("an old-shape lead and any other prompt read as null", () => {
+		expect(
+			leadSubject("Needs validation: Legacy-layout restore\nFingerprint: fp"),
+		).toBeNull();
+		expect(leadSubject("Fix the login redirect")).toBeNull();
+	});
+
+	test("a tag-only prompt has no subject and keeps the plain tag as title", () => {
+		expect(leadSubject("Needs validation\nFingerprint: fp-4\n")).toBeNull();
+		expect(leadCardTitle("Needs validation\nFingerprint: fp-4\n")).toBeNull();
+	});
+
+	test("an overlong subject title cuts at a word boundary like every title", () => {
+		const long = `${"A".repeat(40)} ${"B".repeat(60)}`;
+		const title = leadCardTitle(`Needs validation\n## Claim\n${long}`)!;
+		expect(title.endsWith("…")).toBe(true);
+		expect(title.length).toBeLessThanOrEqual(81);
+	});
+});
+
+describe("leadTitleKey with the bare tag", () => {
+	test("two fingerprint-less leads with different claims never share a key", () => {
+		const a =
+			"Needs validation\n## Claim\nThe limiter keys on the first entry.";
+		const b = "Needs validation\n## Claim\nThe probe starts Bun in the venv.";
+		expect(leadTitleKey(a)).toBe(
+			"needs validation: the limiter keys on the first entry.",
+		);
+		expect(leadTitleKey(a)).not.toBe(leadTitleKey(b));
+	});
+
+	test("the same claim normalizes to one key across shapes", () => {
+		expect(
+			leadTitleKey(
+				"Needs validation\nFingerprint:  \n## Claim\nThe   limiter  keys.",
+			),
+		).toBe(leadTitleKey("Needs validation\n## Claim\nThe limiter keys."));
+	});
+
+	test("an old-shape lead keys on its first line as before", () => {
+		expect(leadTitleKey("Needs validation: Legacy-layout restore\nbody")).toBe(
+			"needs validation: legacy-layout restore",
+		);
 	});
 });
 

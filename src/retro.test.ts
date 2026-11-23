@@ -102,6 +102,7 @@ function retroTask(p: Partial<Task> = {}): Task {
 		sourcePrCrossRepo: false,
 		sourcePrDependabot: false,
 		sourcePrSuperseded: false,
+		sourceIssue: null,
 		followUpPrNumber: null,
 		followUpPrUrl: null,
 		pushSha: null,
@@ -533,7 +534,8 @@ describe("sumUsageIn", () => {
 		sessionText: string | null,
 		subagentTexts: string[] = [],
 		complete = true,
-	) => ({ sessionText, subagentTexts, complete });
+		oversize = false,
+	) => ({ sessionText, subagentTexts, complete, oversize });
 
 	test("sums assistant usage inside the inclusive window across session and subagents", () => {
 		const session = [

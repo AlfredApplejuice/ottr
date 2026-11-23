@@ -72,9 +72,9 @@ stale `backend: hindsight` line in any `config.yml` has no effect.
 The server checks at boot (after `applyHindsight`) and every 60 s
 (`app.memoryHealthTick`, wired in `src/server.ts` next to the other ticks) —
 never per turn. When `reason` is non-null, the state frame appends
-`omp runs with no memory: <reason>` to the existing `warnings` list, so the
-header warning lines and the "N warnings" count show it with no new UI
-plumbing. `GET/POST /api/settings/hindsight` views gain
+`The omp process runs with no memory: <reason>` to the existing `warnings`
+list, so the header warning lines and the "N warnings" count show it with no
+new UI plumbing. `GET/POST /api/settings/hindsight` views gain
 `{backend, memoryReason}`; the Settings Hindsight section renders the same
 sentence when `memoryReason` is non-null and names the active backend. A save
 triggers one immediate re-check.

@@ -31,6 +31,8 @@ at the top of its drawer. The card itself opens the drawer in the column view.
   gain, risk, check. The tool description text changes (hard stop: the exact text
   went to the user on 2026-11-05). The retro prompt itself (retroPrompt) stays
   unchanged.
+- A sixth optional field, `decision`, comes from `docs/specs/retro-auto-start.md`. The
+  panel shows it first, as "Decision".
 - The runner captures the five fields from the first valid call: required non-empty
   whatChanges/why/gain/check; risk defaults to "none found"; each field capped at
   400 characters (truncated with "…"). A missing required field stores no summary.

@@ -71,7 +71,79 @@ export async function bootstrap(): Promise<void> {
 	// Fabricated running/preparing cards must survive recoverRestarted and sweepLostTurns, and
 	// queued ones must never start: no agent processes exist here. OTTR_DEMO blocks all three.
 	process.env.OTTR_DEMO = "1";
-	process.env.OMP_TRACKER_MAX_TOTAL = "none"; // the header shows n/∞, as on a board with no cap
+	// The quota chips need a usage report; the dev board has no omp sign-in, so fetchQuota
+	// reads this one instead of spawning `omp usage --json`.
+	const hour = 3600_000;
+	process.env.OTTR_DEMO_USAGE = JSON.stringify({
+		reports: [
+			{
+				provider: "anthropic",
+				metadata: { planType: "max" },
+				limits: [
+					{
+						label: "Claude 5 Hour",
+						window: {
+							id: "5h",
+							label: "5 Hour",
+							resetsAt: Date.now() + 2 * hour,
+						},
+						amount: { usedFraction: 0.42 },
+					},
+					{
+						label: "Claude 7 Day",
+						window: {
+							id: "7d",
+							label: "7 Day",
+							resetsAt: Date.now() + 70 * hour,
+						},
+						amount: { usedFraction: 0.81 },
+					},
+				],
+				resetCredits: { availableCount: 0, credits: [] },
+			},
+			{
+				provider: "openai-codex",
+				limits: [
+					{
+						label: "Codex 5 Hour",
+						window: {
+							id: "5h",
+							label: "5 Hour",
+							resetsAt: Date.now() + 4 * hour,
+						},
+						amount: { usedFraction: 0.12 },
+					},
+					// Used up: the picker's "limit · back in …" state, and the reason the demo
+					// card "Tune the presence sensor debounce" waits (scripts/demo-data.ts usageHold).
+					{
+						label: "Codex 7 Day",
+						window: {
+							id: "7d",
+							label: "7 Day",
+							resetsAt: Date.now() + 0.7 * hour,
+						},
+						amount: { usedFraction: 1 },
+					},
+				],
+				resetCredits: {
+					availableCount: 2,
+					credits: [
+						{
+							expiresAt: new Date(Date.now() + 12 * 24 * hour).toISOString(),
+							status: "available",
+						},
+						{
+							expiresAt: new Date(Date.now() + 26 * 24 * hour).toISOString(),
+							status: "available",
+						},
+					],
+				},
+			},
+		],
+	});
+	// The header shows n/∞ by default, as on a board with no cap; an explicit
+	// OMP_TRACKER_MAX_TOTAL (a shot of the Slots meter needs a cap) wins.
+	process.env.OMP_TRACKER_MAX_TOTAL ??= "none";
 	// Opts into Bun's HTML dev server (HMR); see the development flag in server.ts.
 	process.env.NODE_ENV ??= "development";
 	// Dynamic on purpose: server.ts reads the env and scans the roots while it loads, and a static

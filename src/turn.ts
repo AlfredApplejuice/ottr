@@ -13,9 +13,11 @@ import {
 } from "./auditLeads.ts";
 import {
 	copyBelow,
+	isSizeRefusal,
 	readBelow,
 	readRegular,
 	renameBelow,
+	TASK_LOG_MAX_BYTES,
 	trustedAnchor,
 	writeBelow,
 } from "./confine.ts";
@@ -65,8 +67,9 @@ import {
 	gateJudgedPrompt,
 	gateUserText,
 	hasOpenQuestionsSection,
+	matchOpenQuestionIndex,
 	missingCheckQuestion,
-	openQuestionsLines,
+	parseOpenQuestions,
 	promptGateCheck,
 	skillBlock,
 	startAnywayQuestion,
@@ -119,12 +122,17 @@ import {
 	usageLimitResetMs,
 	WORKER_BUSY,
 } from "./runner.ts";
-import type { DepProject, WorkCheckVerdict } from "./scheduler.ts";
+import type {
+	DepProject,
+	WorkCheckSplit,
+	WorkCheckVerdict,
+} from "./scheduler.ts";
 import {
 	applyCheckVerdicts,
 	badDep,
 	checkModelWarning,
 	checkRoleFor,
+	checkRoutingNote,
 	demoteUnquoted,
 	depHold,
 	depProjectOf,
@@ -134,6 +142,8 @@ import {
 	isRetro,
 	isReview,
 	LEAD_APPLIES_OPTION,
+	LEAD_COMMITS_REASON,
+	LEAD_NO_REVIEW_REASON,
 	LEAD_NOT_APPLY_OPTION,
 	LEAD_QUESTIONS_PROMPT_PREFIX,
 	lastReviewBase,
@@ -142,13 +152,16 @@ import {
 	openWorkBlockers,
 	parseCheckVerdicts,
 	parseWorkCheck,
+	pendingSandboxLead,
 	pickLowPriority,
 	pickRunnable,
 	repeatedBugClasses,
 	reviewFindings,
 	selectFindings,
 	UNCHECKED_FINDINGS_HOLD,
+	validatableReview,
 	WORK_CHECK_ASK_BLOCK,
+	workCheckAccountingError,
 	workCheckAsk,
 	workCheckBlockerCounts,
 	workCheckCountsDiverged,
@@ -174,6 +187,7 @@ import { type SkillEntry, skillCatalog } from "./tools.ts";
 import type {
 	ArchReview,
 	AskQuestion,
+	CheckRoutingSetting,
 	DiffFileStat,
 	DupGateStamp,
 	GitFacts,
@@ -182,6 +196,7 @@ import type {
 	Next,
 	OpenPrsView,
 	Outcome,
+	ProjectHomepage,
 	ProjectSettings,
 	PromptGateState,
 	QuotaState,
@@ -221,6 +236,7 @@ import type {
 	fetchPrHead,
 	hasRules,
 	ignoreInMain,
+	integrationSha,
 	isClean,
 	isIntegrated,
 	mergeHoldLanded,
@@ -509,6 +525,10 @@ function readyReportText(outcome: Outcome | null, finalText: string): string {
 		.filter((s) => s !== "")
 		.join("\n\n");
 }
+
+/** OTTR-1128: a batch filing refused inside routeStartedLeads' transaction; thrown to roll
+ * the leads' backlog moves back, then caught by the same pass. */
+class LeadFilingRefused extends Error {}
 
 /** Log marker of the UI-shot guard; a second miss is recognized by finding it in the task log. */
 export const UI_SHOT_WARNING =
@@ -835,6 +855,10 @@ export interface TurnProject {
 	 * scheduler tick (server.ts's refreshOpenPrs), read-only elsewhere. null with no
 	 * GitHub remote, before the first probe, or when gh fails. */
 	openPrs?: OpenPrsView | null;
+	/** Homepage from the current GitHub repository; unset before the first poll. */
+	homepage?: ProjectHomepage | null;
+	/** Repository key associated with homepage; prevents a late probe from restoring stale data. */
+	homepageRepo?: string | null;
 	/** Commits since the last arch review on the target; refreshed by the scheduler tick, read-only elsewhere. */
 	archReview: ArchReview | null;
 }
@@ -876,6 +900,10 @@ export interface TurnOps {
 	workCheck?: () => boolean | Promise<boolean>;
 	/** Role → selector map the check run's model resolves from; overridable for tests. */
 	modelRoles?: typeof modelRoles;
+	/** OTTR-1116: the user-set vendor routing for the check run's role (POST
+	 *  /api/settings/check-routing); null = automatic. Absent counts as null, so test
+	 *  fakes need nothing. */
+	checkRouting?: () => CheckRoutingSetting | null;
 	/** The chat catalog a retro or review run's propose_task checks a model against; overridable for tests. */
 	modelList?: typeof modelList;
 	/** Prepare-phase title generator; overridable for tests. */
@@ -1016,6 +1044,11 @@ export interface TurnOps {
 	pushRetryDelayMs?: number;
 	/** OTTR-274: true when the push set of a hold-approved merge carries patches beyond the approval. */
 	mergeHoldMismatch: typeof mergeHoldMismatch;
+	/** OTTR-987: the head the server's fast-forward would land (the linked worktree's
+	 * HEAD, else the task branch tip); null when neither applies. The hold audits this
+	 * proposed head, not the stale local target: the board integrates itself now.
+	 * Optional: absent falls back to the local target branch's head. */
+	integrationHead?: typeof integrationSha;
 	/** VELV-89: true when a hold-approved merge already landed on the fetched remote target and the approval carries no extra patches. */
 	mergeHoldLanded: typeof mergeHoldLanded;
 	/** OTTR-326: on a mismatch park, moves the main checkout's target branch back to the audited tip. */
@@ -1026,6 +1059,10 @@ export interface TurnOps {
 	/** OTTR-532: parsed once at boot from OTTR_VM_RUNNER_URL; null = no microVM runner. A
 	 * microVM project's eligible turns go here only, never to workerTarget or the server. */
 	vmTarget?: WorkerTarget | null;
+	/** OTTR-1142: one vm-runner /healthz probe into vmState.pool. The settle of an
+	 * accepted microVM run probes before the wake schedule, so a freed slot re-opens
+	 * the pool start gate within one round-trip. */
+	vmProbe?: () => Promise<void>;
 	/** OTTR-532: the board's one per-turn VM token store; startRun issues, settle revokes. */
 	vmTokens?: VmTokens;
 	/** OTTR-532: resets the server worktree to the head a microVM pushed (src/gitHttp.ts). */
@@ -1055,10 +1092,13 @@ export interface TurnOps {
 	 * The turn's env values and listed-but-valueless names (Settings values + env.txt lists): every
 	 * turn, worker dispatched or not. `model` is the worker turn's execution model (null for a
 	 * local run): its provider's sign-in token is lent. A `credentialError` stops the turn.
+	 * `values: false` (the trending scout) omits the Settings values: the scout's env carries
+	 * the lent provider token only (OTTR-1028).
 	 */
 	turnEnv?: (
 		project: string,
 		model: string | null,
+		opts?: { values?: boolean },
 	) => Promise<{
 		env: Record<string, string>;
 		missing: string[];
@@ -1284,6 +1324,8 @@ const MERGE_PUSH_RETRIES = 2;
 const MERGE_PUSH_RETRY_WAIT_MS = 30_000;
 // ponytail: a fixed cap on the archived research report; raise it when a real report hits it.
 const REPORT_MAX_BYTES = 4 * 1024 * 1024;
+// ponytail: a fixed cap on the work check's transcript read; raise it when a real transcript hits it.
+const TRANSCRIPT_MAX_BYTES = 128 * 1024 * 1024;
 /** The park reason of a stopped turn (the board's Esc). */
 const TURN_STOPPED_REASON =
 	"Turn stopped. Reply to continue the session, Resume to rerun it, or cancel the card.";
@@ -1572,16 +1614,28 @@ export interface TurnLoop {
 	scheduleTick(): Promise<void>;
 	runTurn(name: string, id: string): Promise<void>;
 	cancel(e: TurnProject, id: string, force: boolean): Promise<CancelOutcome>;
-	/** OTTR-1047: files at most one batch validation card ({ id }), or { error, status }
+	/** OTTR-1047: files at most one batch validation card ({ id, reset }), or { error, status }
 	 * when nothing files. The manual start route passes the review's id (it overrides a
 	 * cancelled-decline skip) with `strictReview`: it files for that review only and
 	 * refuses when the review has no batchable leads; the done-review and chain triggers
-	 * call it without one and fall back to the next candidate. */
+	 * call it without one and fall back to the next candidate. With `again` (OTTR-1129
+	 * validate-again) the call first clears the stale validatedAt of the review's
+	 * blocked-before-`again.before` sandbox leads inside the same transaction and returns
+	 * their ids in `reset` ([] without the flag). */
 	filePendingValidationRun(
 		e: TurnProject,
 		reviewId?: string,
 		strictReview?: boolean,
-	): Promise<{ id: string } | { error: string; status: number }>;
+		again?: { before: number },
+	): Promise<
+		{ id: string; reset: string[] } | { error: string; status: number }
+	>;
+	/** OTTR-1139: the periodic catch-up sweep, on the supervisor tick's cadence.
+	 * Calls filePendingValidationRun(e) for every project, so a done review whose
+	 * settle event never fired (a deploy gap, a crash between the done write and
+	 * the filing, a 409 from the one-open-run rule) still gets its batch run. A
+	 * refusal ({ error, status }) logs nothing; a thrown error logs one line. */
+	validationSweep(): Promise<void>;
 	/** Stops the running turn without cancelling the task (the board's Esc). */
 	stopTurn(e: TurnProject, id: string): Promise<StopOutcome>;
 	/** Hosted mode: sets the credit hold and stops every turn in flight (work or merge runs like
@@ -1604,6 +1658,8 @@ export interface TurnLoop {
 		workers: Record<string, number>;
 		preparing: number;
 	};
+	/** OTTR-1143: the live slot count the claim gate caps (the running ∪ preparing keys). */
+	slotsUsed(): number;
 	/** OTTR-763: the cross-project checkout guard's ambiguous-change notices for the bell
 	 * (one per change; names the commit and the running cards), oldest first. */
 	checkoutNotices(): string[];
@@ -1664,6 +1720,10 @@ type TurnRunShared = {
 	/** OTTR-708: the other projects' main-checkout snapshots taken just before the run
 	 * started; null when this turn kind is not guarded. The settle re-checks them. */
 	guardBefore: Map<string, { head: string | null; status: string }> | null;
+	/** OTTR-1142: the claim took a microVM inflight count; the finally releases it. */
+	vmClaimed: boolean;
+	/** OTTR-1142: vm-runner accepted this run; its settle probes the pool before the wake. */
+	vmStarted: boolean;
 };
 
 /** The agent run one turn dispatches (ops.startRun's handle). */
@@ -2073,6 +2133,12 @@ export function createTurnLoop(
 	 * The claim also covers a run whose `done` resolved while its settle awaits git (row open,
 	 * `running` entry gone, pid dead): sweepLostTurns leaves it to runTurn. */
 	const preparing = new Set<string>();
+	/** The scheduler's own live slot count: the distinct run keys holding a slot. A live run
+	 *  sits in both `running` and `preparing`, so a sum would double-count; this is the exact
+	 *  number the claim gate compares against maxTotal, and the state frame ships it as
+	 *  slotsUsed (OTTR-1143). */
+	const slotsUsed = (): number =>
+		new Set([...running.keys(), ...preparing]).size;
 	/** Keys a stop-turn request marked, with the park reason: runTurn consumes the mark at
 	 * settle, so a kill from stopTurn settles the card as stopped instead of leaving it to
 	 * cancelTask. */
@@ -2100,7 +2166,9 @@ export function createTurnLoop(
 	const detached = new Map<string, { url: string; runId: string }>();
 	/** OTTR-532: "project/id" → when vm-runner last refused the card's dispatch as busy; the
 	 * pre-claim gate waits VM_BUSY_RETRY_MS before the next try. Cleared by the next dispatch
-	 * vm-runner takes (with the card's vmState.busy mark). */
+	 * vm-runner takes (with the card's vmState.busy mark). OTTR-1142: with a known pool
+	 * size the pool gate replaces this back-off; it stays for a runner without the
+	 * /healthz pool headers. */
 	const vmBusyAt = new Map<string, number>();
 
 	/** The worker token for a runner url: vm-runner's own target when the url is the microVM
@@ -2300,18 +2368,15 @@ export function createTurnLoop(
 					stage: "in_progress",
 					state: "needs_you",
 					needsReason: `The work check was lost: ${error}. Reply to re-run it, or cancel the card.`,
-					workCheckLog: [
-						...cur.workCheckLog,
-						{
-							at: Date.now(),
-							model: null,
-							outcome: "error",
-							blockers: [],
-							notes: [],
-							durationMs: 0,
-							error,
-						},
-					],
+					workCheckLog: appendWorkCheckRun(cur.workCheckLog, {
+						at: Date.now(),
+						model: null,
+						outcome: "error",
+						blockers: [],
+						notes: [],
+						durationMs: 0,
+						error,
+					}),
 				});
 			else
 				await store.updateTask(t.id, {
@@ -2870,60 +2935,6 @@ export function createTurnLoop(
 		return lines;
 	}
 
-	/** OTTR-531: on the false→true edge of an unpushed main, a standing pushSyncCommits
-	 * approval pushes the local target ref once — no edge (a failed push leaves the flag true)
-	 * means no retry storm. */
-	async function syncUnpushedMain(
-		e: TurnProject,
-		branch: string,
-		unpushed: boolean,
-	): Promise<void> {
-		const edge = !e.mainUnpushed && unpushed;
-		e.mainUnpushed = unpushed;
-		if (!edge) return;
-		const settings = await e.store.getSettings();
-		if (!settings.pushSyncCommits) return;
-		void ops
-			.serverMergePush(
-				e.path,
-				e.path,
-				`origin/${branch}`,
-				"",
-				null,
-				settings.originUrl,
-			)
-			.then((p) => {
-				if (p.status === "pushed") {
-					// The hold lifts at once instead of waiting for the next tick.
-					e.mainUnpushed = false;
-					// OTTR-708: record the head this board-made push moved the
-					// main checkout to, so the checkout guard discounts it.
-					void ops
-						.checkoutState(e.path)
-						.then((s) => {
-							if (s.head !== null) boardPushedHeads.set(e.name, s.head);
-						})
-						.catch(() => {});
-					console.log(
-						`${e.store.name}: - pushed ${branch} from the server (push sync commits)`,
-					);
-				} else if (p.status === "skipped") {
-					console.log(
-						`${e.store.name}: ! sync-commit push of ${branch} skipped`,
-					);
-				} else {
-					console.log(
-						`${e.store.name}: ! sync-commit push of ${branch} failed: ${p.error}`,
-					);
-				}
-			})
-			.catch((err: unknown) => {
-				console.log(
-					`${e.store.name}: ! sync-commit push of ${branch} failed: ${errmsg(err)}`,
-				);
-			});
-	}
-
 	/** OTTR-884: one project's scheduler-refreshed flags as the cycle last saw them. The
 	 * previous snapshot starts undefined, so the first cycle after boot compares undefined
 	 * to value, counts that as a change, and the board's first tick still publishes. */
@@ -2965,8 +2976,8 @@ export function createTurnLoop(
 		archReview: e.archReview,
 	});
 
-	/** Per-project flag refresh of the schedule tick: dirty, mainUnpushed (with the standing
-	 * pushSyncCommits approval above), mainBranch, release/arch-review/PR flags. Resolves when
+	/** Per-project flag refresh of the schedule tick: dirty, mainUnpushed (only a click on
+	 * Push to origin pushes it, docs/specs/sync-commit-hygiene.md), mainBranch, release/arch-review/PR flags. Resolves when
 	 * the project's flag ops settle; every op keeps its own failure isolation (a failed op
 	 * keeps the last flag, the next tick retries), so the promise never rejects. True when any
 	 * flag changed against the project's last snapshot (OTTR-884): the cycle publishes only on
@@ -2993,7 +3004,9 @@ export function createTurnLoop(
 			settling.push(
 				ops
 					.branchUnpushed(e.path, branch)
-					.then((unpushed) => syncUnpushedMain(e, branch, unpushed))
+					.then((unpushed) => {
+						e.mainUnpushed = unpushed;
+					})
 					.catch(() => {
 						// git failed: keep the last mainUnpushed flag; the next tick retries.
 					}),
@@ -3152,6 +3165,12 @@ export function createTurnLoop(
 		depProjects: DepProject[],
 	): Promise<boolean> {
 		try {
+			// OTTR-1128: a started lead goes to its review's batch validation, never a work
+			// turn. The dev board's fabricated cards get no writes, like the lost-turn sweep.
+			if (!demoBoard())
+				await routeStartedLeads(e).catch((err) =>
+					logStoreError(e.store.name, err),
+				);
 			if (await dispatchRunnable(e, drained, cap, active, depProjects))
 				return true;
 			if (!drained) void settleReviews(e.store.name);
@@ -3279,7 +3298,7 @@ export function createTurnLoop(
 		// The authoritative claim rechecks this count after each async selection.
 		// The dev board's fabricated cards must never start a real agent, whatever the cap says.
 		const cap = demoBoard() ? 0 : await ops.maxTotalRuns();
-		const active = () => new Set([...running.keys(), ...preparing]).size;
+		const active = slotsUsed;
 		// OTTR-708: the pickers resolve foreign dependsOn ids across the board's projects.
 		const depProjects = await turnDepProjects();
 		for (const e of projects.values()) {
@@ -3731,6 +3750,8 @@ export function createTurnLoop(
 			turn: null,
 			checkTakenOver: false,
 			guardBefore: null,
+			vmClaimed: claim.vm,
+			vmStarted: false,
 		};
 		/** Hosted metering: one entry for each settled agent run of this turn, reported in the finally. */
 		const metered: MeteredRun[] = [];
@@ -4021,6 +4042,7 @@ export function createTurnLoop(
 			preparing.delete(key);
 			creditStopped.delete(key);
 		}
+		if (mx.vmClaimed) vmState.inflight -= 1;
 		publishing.delete(key);
 		for (const interim of interims) interim.close();
 		if (ops.hosted !== undefined && mx.turn !== null) {
@@ -4041,6 +4063,16 @@ export function createTurnLoop(
 		// below, which publishes on entry (OTTR-884). The call is contained: a
 		// rejection (a transient store read in the dispatch) must not become an
 		// unhandled rejection and crash the board process.
+		// OTTR-1142: the settle of an accepted microVM run freed a runner slot, so
+		// probe the pool first: the wake schedule then re-opens the start gate only
+		// when the probe saw a free slot, and exactly the oldest waiting card claims.
+		if (mx.vmStarted && ops.vmProbe !== undefined) {
+			void ops
+				.vmProbe()
+				.then(() => schedule())
+				.catch((err) => logStoreError(e.store.name, err));
+			return;
+		}
 		schedule().catch((err) => logStoreError(e.store.name, err));
 	}
 
@@ -4089,6 +4121,8 @@ export function createTurnLoop(
 		task: Task;
 		key: string;
 		kind: TurnKind;
+		/** True when this claim took a microVM inflight count (OTTR-1142). */
+		vm: boolean;
 	} | null> {
 		const previous = claimQueue;
 		const { promise, resolve: release } = Promise.withResolvers<void>();
@@ -4122,13 +4156,16 @@ export function createTurnLoop(
 			}
 			const hasRules = ops.hasRules(e.path, e.targetRules === true);
 			let reserved = false;
+			/** True when the claim took a microVM inflight count (OTTR-1142); released
+			 * with the claim when the turn never starts. */
+			let claimedVm = false;
 			let task: Task | null;
 			try {
 				task = await store.claimTurn(
 					id,
 					(current, settings, tasks, boardCheckId) => {
 						const cap = demoBoard() ? 0 : ops.maxTotalRuns();
-						const active = new Set([...running.keys(), ...preparing]).size;
+						const active = slotsUsed();
 						if (
 							projects.get(name) !== e ||
 							ops.stopping?.() === true ||
@@ -4154,9 +4191,14 @@ export function createTurnLoop(
 							current.stage === "merging" ? "merge" : "work";
 						const retro = isRetro(current);
 						const boardCheck = boardCheckId === id;
-						if (
-							startGatesHold(settings, current, key, kind, retro, boardCheck)
-						) {
+						const vm = microVmTurn({
+							microVm: settings.microVm === true,
+							kind,
+							retro,
+							boardCheck,
+							task: current,
+						});
+						if (startGatesHold(vm, kind, retro, boardCheck, key)) {
 							const reason = startGateTmpReason(
 								settings,
 								current,
@@ -4171,16 +4213,26 @@ export function createTurnLoop(
 						}
 						preparing.add(key);
 						creditStopped.delete(key);
+						if (vm) {
+							claimedVm = true;
+							vmState.inflight += 1;
+						}
 						reserved = true;
 						return { allow: true };
 					},
 				);
 			} catch (err) {
-				if (reserved) preparing.delete(key);
+				if (reserved) {
+					preparing.delete(key);
+					if (claimedVm) vmState.inflight -= 1;
+				}
 				throw err;
 			}
 			if (task === null) {
-				if (reserved) preparing.delete(key);
+				if (reserved) {
+					preparing.delete(key);
+					if (claimedVm) vmState.inflight -= 1;
+				}
 				return null;
 			}
 			return {
@@ -4189,6 +4241,7 @@ export function createTurnLoop(
 				task,
 				key,
 				kind: task.stage === "merging" ? "merge" : "work",
+				vm: claimedVm,
 			};
 		} finally {
 			release();
@@ -4201,37 +4254,38 @@ export function createTurnLoop(
 	 * here — a "local" hold stops board checks too. Flags read before the claim: they are
 	 * the same ones the worker decision in routeTurnRun makes.
 	 * OTTR-532: an eligible turn of a microVM project goes to vm-runner only. A runner
-	 * that is down, unconfigured or drained, or a card whose last dispatch it refused as
-	 * busy moments ago, leaves the card queued and unclaimed (the board shows vmHoldFor);
-	 * it never falls back to the classic pool or the server. */
+	 * that is down, unconfigured or drained, or a full microVM pool (OTTR-1142), leaves
+	 * the card queued and unclaimed (the board shows vmHoldFor); it never falls back to
+	 * the classic pool or the server. */
 	function startGatesHold(
-		settings: ProjectSettings,
-		task: Task,
-		key: string,
+		vm: boolean,
 		kind: TurnKind,
 		preRetro: boolean,
 		preBoardCheck: boolean,
+		key: string,
 	): boolean {
-		if (
-			microVmTurn({
-				microVm: settings.microVm === true,
-				kind,
-				retro: preRetro,
-				boardCheck: preBoardCheck,
-				task,
-			})
-		)
-			return vmStartGateHolds(key);
+		if (vm) return vmStartGateHolds(key);
 		return poolStartGateHolds(kind, preRetro, preBoardCheck);
 	}
 
-	/** The microVM start gate: a down or unconfigured runner, a drain, or a recent busy
-	 * refusal leaves the card queued and unclaimed. */
+	/** The microVM start gate: a down or unconfigured runner, a drain, or a full pool
+	 * leaves the card queued and unclaimed. */
 	function vmStartGateHolds(key: string): boolean {
 		const vmTarget = ops.vmTarget ?? null;
 		if (vmTarget === null || !vmState.health.ok) return true;
 		if (vmTarget.urls.every((u) => ops.drainedRunner(new URL(u).hostname)))
 			return true;
+		// OTTR-1142: with a known pool size the gate is the pool state — the probe found
+		// every slot taken (or the last busy answer latched it), or this board's own
+		// claims fill every slot. A waiting card holds no preparing claim, so it takes
+		// no maxTotal slot and writes no turn header.
+		if (vmState.pool.max > 0)
+			return (
+				vmState.pool.busy >= vmState.pool.max ||
+				vmState.inflight >= vmState.pool.max
+			);
+		// Unknown pool size (a runner without the /healthz pool headers): the per-card
+		// busy back-off stays.
 		const busyAt = vmBusyAt.get(key);
 		if (busyAt !== undefined && Date.now() - busyAt < VM_BUSY_RETRY_MS)
 			return true;
@@ -4569,6 +4623,7 @@ export function createTurnLoop(
 		const handoff = gateHandoff({
 			prompt: live.prompt,
 			handoffsDir: join(store.tasksDir, "handoffs"),
+			anchor: store.dataRoot,
 		});
 		for (const reason of handoff.reasons)
 			await log(`! prompt gate: handoff not judged: ${reason}`);
@@ -4582,28 +4637,85 @@ export function createTurnLoop(
 			return true;
 		}
 		// Deterministic park: the Deepen rewrite left an Open questions section and no user
-		// answers exist yet. No model call; the section's lines become the ask questions.
+		// answers exist yet. The section parses into questions and context; inline choices
+		// become the ask options and the gate model builds options for the rest (one call,
+		// readiness never judged).
 		if (
 			pending === null &&
 			seen === null &&
 			hasOpenQuestionsSection(live.prompt)
 		) {
-			const lines = openQuestionsLines(live.prompt);
-			const asked = lines.map((question) => ({
-				question,
-				options: [],
+			const parsed = parseOpenQuestions(live.prompt);
+			let asked: AskQuestion[] = parsed.questions.map((q) => ({
+				question: q.question,
+				options: q.options.map((label) => ({ label })),
 				multi: false,
 				recommended: null,
+				text: q.options.length === 0,
 			}));
-			const sig = lines.join("\n");
+			// Questions without inline choices get their options from the gate model (the
+			// same seam the evaluation uses); the call never judges readiness and never
+			// stamps the fingerprint.
+			if (parsed.questions.some((q) => q.options.length === 0)) {
+				try {
+					const check = await (ops.gateCheck ?? promptGateCheck)({
+						prompt: judged,
+						userMessages: null,
+						skills: null,
+					});
+					asked = asked.map((a, i) => {
+						const q = parsed.questions[i]!;
+						if (q.options.length > 0) return a;
+						const m = matchOpenQuestionIndex(q.question, check.questions);
+						if (m < 0) return a;
+						const mq = check.questions[m]!;
+						if (mq.options.length < 2) return a;
+						const rec =
+							mq.default === null
+								? -1
+								: mq.options.findIndex(
+										(o) =>
+											o.trim().toLowerCase() ===
+											mq.default!.trim().toLowerCase(),
+									);
+						return {
+							question: a.question,
+							options: mq.options.map((label) => ({ label })),
+							multi: false,
+							recommended: rec >= 0 ? rec : null,
+							text: false,
+						};
+					});
+				} catch (e) {
+					await log(
+						`! prompt gate: open-question options call failed: ${errmsg(e)}`,
+					);
+				}
+			}
+			const bare = asked.filter((q) => q.options.length === 0);
+			if (bare.length > 0)
+				await log(
+					`! prompt gate: parked without options: ${bare.map((q) => `"${q.question}"`).join("; ")}`,
+				);
+			const sig = [
+				...parsed.questions.map((q) => q.question),
+				...parsed.context,
+			].join("\n");
 			const fails = live.gate?.sig === sig ? live.gate.fails + 1 : 1;
 			await parkGate(
 				store,
 				id,
 				{
 					needsReason: `${GATE_REASON}the prompt still carries an Open questions section`,
-					asked,
-					gate: { hash: null, seen, fails, sig, parked: true },
+					asked: asked.length > 0 ? asked : null,
+					gate: {
+						hash: null,
+						seen,
+						fails,
+						sig,
+						parked: true,
+						...(parsed.context.length > 0 ? { context: parsed.context } : {}),
+					},
 				},
 				log,
 			);
@@ -5530,6 +5642,9 @@ export function createTurnLoop(
 			id,
 			picked.vmTurn,
 			execModel,
+			// OTTR-1028: the scout reads third-party repository text, so it never sees
+			// the project's Settings env values.
+			!idn.scout,
 			log,
 		);
 		if (turnEnv === null) return null;
@@ -5761,17 +5876,23 @@ export function createTurnLoop(
 	/** The env values ride the run env into a worker too (the runner forwards them with the
 	 * rest of the child env), so every turn gets them and every card log names a listed name
 	 * that has no value. A microVM turn is lent nothing: its providers go through the board's
-	 * /llm proxy, so no provider token may ride its env (a null model lends none). Null: a
-	 * credential fault parked the card — fail closed, an empty error message included. */
+	 * /llm proxy, so no provider token may ride its env (a null model lends none).
+	 * `values: false` (the trending scout) omits the Settings values — the scout reads
+	 * third-party text and gets the lent token only — so the missing-names log line drops
+	 * with them. Null: a credential fault parked the card — fail closed, an empty error
+	 * message included. */
 	async function gateTurnEnv(
 		name: string,
 		store: ProjectStore,
 		id: string,
 		vmTurn: boolean,
 		execModel: string | null,
+		values: boolean,
 		log: (line: string) => void | Promise<void>,
 	): Promise<TurnEnvValues | null> {
-		const turnEnv = (await ops.turnEnv?.(name, vmTurn ? null : execModel)) ?? {
+		const turnEnv = (await ops.turnEnv?.(name, vmTurn ? null : execModel, {
+			values,
+		})) ?? {
 			env: {},
 			missing: [],
 		};
@@ -5956,7 +6077,9 @@ export function createTurnLoop(
 		// OTTR-876: the served read-only token joins the run's redaction secrets and, on
 		// worker/VM dispatch, rides githubReadEnv (applied after the strips on the target);
 		// a local run ignores it (docs/specs/turn-read-token.md).
-		const turnRead = (await ops.turnReadToken?.()) ?? null;
+		// OTTR-1028: a scout reads third-party repository text, so it gets no served token
+		// at all — its GitHub reads are the unauthenticated public ones the prompt names.
+		const turnRead = idn.scout ? null : ((await ops.turnReadToken?.()) ?? null);
 		return {
 			meter: ops.hosted !== undefined,
 			auditProvisioned: (sinceMs, rulesAtStart) =>
@@ -6005,6 +6128,8 @@ export function createTurnLoop(
 			},
 			stripBoard: idn.retroCard,
 			stripGithubToken: idn.scout,
+			// OTTR-994: the identity key survives stripBoard on the worker request.
+			project: store.name,
 			...turnRunTools(idn),
 			dataRoot: store.dataRoot,
 			logPath: await store.logPath(id),
@@ -6142,6 +6267,8 @@ export function createTurnLoop(
 		if (route.vmTurn && handle.accepted !== undefined) {
 			const ok = await vmAcceptance(store, id, task, key, handle, log);
 			if (!ok) return null;
+			// OTTR-1142: vm-runner took the run; its settle probes the pool before the wake.
+			mx.vmStarted = true;
 		}
 		const turn = await store.transaction(async () => {
 			await consumeTurnPending(store, id, input);
@@ -6162,7 +6289,9 @@ export function createTurnLoop(
 
 	/** Waits for vm-runner to take a microVM turn before anything records it: a busy answer
 	 * must leave the card exactly as it was before the claim (no turn row, the reply still
-	 * pending, no lost-worker count). Any other non-start (refused, unreachable, killed) falls
+	 * pending, no lost-worker count), latches the pool full, and marks the card for the
+	 * start gate (OTTR-1142), so it waits queued for the next probe that sees a free slot.
+	 * Any other non-start (refused, unreachable, killed) falls
 	 * through and settles like today's worker dispatch. False: busy — the caller stops. */
 	async function vmAcceptance(
 		store: ProjectStore,
@@ -6183,6 +6312,9 @@ export function createTurnLoop(
 		running.delete(key);
 		vmState.busy.add(key);
 		vmBusyAt.set(key, Date.now());
+		// OTTR-1142: the answer just said the pool is full — latch it, so no other card
+		// claims (and writes a turn header) before the next probe sees a free slot.
+		if (vmState.pool.max > 0) vmState.pool.busy = vmState.pool.max;
 		await log(
 			`- ${WORKER_BUSY}; the card waits in the queue for a free microVM`,
 		);
@@ -6745,7 +6877,10 @@ export function createTurnLoop(
 	): Promise<void> {
 		for (const name of st.task.shots) {
 			try {
-				const bytes = readRegular(join(await st.store.imagesDir(st.id), name));
+				const bytes = readRegular(
+					join(await st.store.imagesDir(st.id), name),
+					MAX_IMAGE_BYTES,
+				);
 				seen.add(createHash("sha256").update(bytes).digest("hex"));
 				const gray = pngGray16(bytes);
 				if (gray !== null) stored.push({ name, gray });
@@ -6920,6 +7055,10 @@ export function createTurnLoop(
 			return;
 		}
 		if (st.kind !== "merge" || st.idn.grill || st.idn.releaseCard) return;
+		// OTTR-1182: a superseded report ships nothing — no merge-hold audit and no
+		// server push of the target. The branch's commits are superseded, so the push
+		// state the turn left behind is judged by verifySupersededClose, never shipped.
+		if (st.result.outcome?.status === "superseded") return;
 		if (st.header.settings.prMode === true) await shipPrCard(st);
 		else await auditMergeHold(st);
 	}
@@ -7062,6 +7201,9 @@ export function createTurnLoop(
 						st.task.branch ?? "",
 						st.holdTip,
 						st.header.settings.originUrl,
+						// The board's own fast-forward integrates only a merged-verdict turn: a
+						// needs_you or ask-paused report must not publish its branch (OTTR-987).
+						st.result.outcome?.status === "integrated",
 					)
 					.then(async (p) =>
 						(p.status === "failed" || p.status === "rejected") &&
@@ -7916,8 +8058,18 @@ export function createTurnLoop(
 				: await ops
 						.targetSha(st.e.path, `refs/heads/${branch}`)
 						.catch(() => null);
+		// The board fast-forwards the target itself now (OTTR-987), so at audit time the
+		// local target still sits at its old tip. Judge the head the fast-forward would
+		// land — the worktree's HEAD, else the task branch's tip — and fall back to the
+		// local target when the op is unwired.
+		const proposed =
+			branch === null || approvedHeads.length === 0
+				? null
+				: ((await ops
+						.integrationHead?.(st.loc.wt, st.task.branch ?? "")
+						.catch(() => null)) ?? localHead);
 		if (branch !== null && approvedHeads.length > 0)
-			await holdApprovedHead(st, approvedHeads, branch, localHead);
+			await holdApprovedHead(st, approvedHeads, branch, proposed);
 		// OTTR-326: a park whose branch reset could not run leaves the held patches as the
 		// local tip; no other card may push the branch while that head sits there.
 		st.refused = await heldMergeOnBranchTip(
@@ -7944,9 +8096,9 @@ export function createTurnLoop(
 		st: TurnSettle,
 		approvedHeads: string[],
 		branch: string,
-		localHead: string | null,
+		head: string | null,
 	): Promise<void> {
-		if (localHead !== null && approvedHeads.includes(localHead)) {
+		if (head !== null && approvedHeads.includes(head)) {
 			// the exact head a reply approved: nothing new to judge
 			return;
 		}
@@ -7974,6 +8126,7 @@ export function createTurnLoop(
 					st.header.base,
 					ah,
 					st.header.settings.originUrl,
+					head,
 				)
 				.catch(() => ({
 					mismatch: true,
@@ -7981,7 +8134,7 @@ export function createTurnLoop(
 					auditedTip: null,
 				}));
 			if (mismatch) {
-				await parkHeldMismatch(st, branch, localHead, pushDiff, auditedTip);
+				await parkHeldMismatch(st, branch, head, pushDiff, auditedTip);
 				break;
 			}
 			st.holdTip = auditedTip;
@@ -7996,12 +8149,12 @@ export function createTurnLoop(
 	async function parkHeldMismatch(
 		st: TurnSettle,
 		branch: string,
-		localHead: string | null,
+		head: string | null,
 		pushDiff: string | null,
 		auditedTip: string | null,
 	): Promise<void> {
 		st.holdMismatch = MERGE_HOLD_MISMATCH_REASON;
-		st.holdHead = localHead;
+		st.holdHead = head;
 		// Same cap as the merge-start capture: bigger diffs keep their numstat.
 		st.holdDiff =
 			pushDiff === null
@@ -8013,7 +8166,11 @@ export function createTurnLoop(
 			st.holdDiff === null
 				? null
 				: await ops
-						.diffStat(st.e.path, st.header.target, `refs/heads/${branch}`)
+						.diffStat(
+							st.e.path,
+							st.header.target,
+							head ?? `refs/heads/${branch}`,
+						)
 						.catch(() => null);
 		await st.log("! held merge carries patches beyond the approved head");
 		const reset =
@@ -8281,10 +8438,97 @@ export function createTurnLoop(
 		// The PR-mode ship step owns the card's next state: it never lands, so the done
 		// write below (pushSha pinning, worktree removal, release stamping) is skipped.
 		if (st.prNext !== null) next = st.prNext;
+		// OTTR-1182: a superseded close settles done only when its claims verify — the
+		// follow-up card is linked to this task and the local target branch holds nothing
+		// unpushed. Every failed check parks fail-closed with the worktree intact.
+		if (
+			st.kind === "merge" &&
+			st.result.outcome?.status === "superseded" &&
+			next.stage === "done"
+		)
+			next = await verifySupersededClose(st, next);
 		return {
 			facts,
 			next: await stampReleaseLineHold(st, await stampUsageHold(st, next)),
 		};
+	}
+
+	/** A superseded merge close's park: needs_you at merging, the worktree and branch
+	 * intact, the reason naming the failed claim and the repair. */
+	async function supersededPark(st: TurnSettle, why: string): Promise<Next> {
+		await st.log(`! superseded close refused: ${why}`);
+		return {
+			stage: "merging",
+			state: "needs_you",
+			needsReason: `Reported superseded, but ${why}. File the gap card with create_task, sync the main checkout with ${st.header.target} when it differs, then reply and pass the card id in followUp.`,
+		};
+	}
+
+	/** True when the named card exists and points at this task (followUpOf): in this
+	 * store, or across a project border (create_task filed the gap card into another
+	 * project). Task ids are project-local, so a link counts only when the card's
+	 * followUpOfProject names this board (null = the card's own board) — a same-named
+	 * task in another project never authorizes the close. Every board is scanned, so an
+	 * unrelated card that shares the id never shadows a linked one. A store read failure
+	 * reads as no card — fail closed. */
+	async function supersededFollowUpLinked(
+		st: TurnSettle,
+		id: string,
+	): Promise<boolean> {
+		const boards: ProjectStore[] = [st.store];
+		for (const p of projects.values()) {
+			if (p.store !== st.store) boards.push(p.store);
+		}
+		for (const board of boards) {
+			const t = await board.getTask(id).catch(() => null);
+			if (t === null) continue;
+			if (
+				t.followUpOf === st.id &&
+				(t.followUpOfProject ?? st.store.name) === st.store.name
+			)
+				return true;
+		}
+		return false;
+	}
+
+	/** The superseded close's proof: the outcome's followUp names a card linked to this
+	 * task, and the local target branch tip equals the upstream tip (a merge turn that
+	 * left commits on the target claimed an integration it did not report). The upstream
+	 * tip reads the fully qualified remote-tracking ref refs/remotes/origin/<short>: a
+	 * bare origin/<short> would let a local branch named origin/<short> shadow the
+	 * remote ref and pass this guard with unpushed commits still on the target.
+	 * Non-origin targets skip the tip compare — the board never pushes them
+	 * (serverMergePush preflight skips too). */
+	async function verifySupersededClose(
+		st: TurnSettle,
+		next: Next,
+	): Promise<Next> {
+		const id = (st.result.outcome?.followUp ?? "").trim();
+		if (id === "")
+			return supersededPark(st, "the report carries no follow-up card id");
+		if (!(await supersededFollowUpLinked(st, id)))
+			return supersededPark(
+				st,
+				`no card ${id} is linked to this task (followUpOf)`,
+			);
+		const short = st.header.target.replace(/^origin\//, "");
+		if (st.header.target.startsWith("origin/")) {
+			const [local, origin] = await Promise.all([
+				ops.targetSha(st.e.path, `refs/heads/${short}`).catch(() => null),
+				ops
+					.targetSha(st.e.path, `refs/remotes/origin/${short}`)
+					.catch(() => null),
+			]);
+			if (local === null || local !== origin)
+				return supersededPark(
+					st,
+					`the local ${short} branch does not match ${st.header.target} (or git could not read the tips), so the turn may hold an integration it did not report`,
+				);
+		}
+		await st.log(
+			`- superseded close verified: follow-up ${id} linked, nothing unpushed on ${st.header.target}`,
+		);
+		return next;
 	}
 
 	/** A run the provider stopped at its usage limit continues automatically (classify's
@@ -9164,6 +9408,7 @@ export function createTurnLoop(
 				],
 				multi: false,
 				recommended: null,
+				text: false,
 			}));
 			if (open !== undefined) {
 				const q = await st.store.getTask(open.id);
@@ -9189,13 +9434,89 @@ export function createTurnLoop(
 		return next;
 	}
 
+	/** OTTR-1129 validate-again: clears validatedAt on the review's sandbox leads whose
+	 * newest recorded outcome was "blocked" and whose validatedAt predates `before` (the
+	 * broken-sandbox window). Newest run wins: the review's validation cards newest
+	 * first (createdAt desc, ties by id — the declined helper's comparison), and the
+	 * first parsed result per lead inside a card, like the settle's first-result rule.
+	 * Each reset lead loses the settle's newest marker segment from its details and logs
+	 * one line naming the old result. Runs inside the filing transaction and returns the
+	 * reset lead ids in reset order. */
+	async function resetValidatedLeads(
+		store: ProjectStore,
+		reviewId: string,
+		before: number,
+	): Promise<string[]> {
+		const tasks = await store.listTasks();
+		const newest = new Map<string, { outcome: string; runId: string }>();
+		const cards = tasks
+			.filter((t) => t.followUpOf === reviewId && t.kind === "validation")
+			.sort((a, b) =>
+				a.createdAt !== b.createdAt
+					? a.createdAt > b.createdAt
+						? -1
+						: 1
+					: a.id > b.id
+						? -1
+						: 1,
+			);
+		for (const card of cards)
+			for (const finding of await store.listReviewFindings(card.id)) {
+				const r = validationResult(finding.prompt);
+				if (r !== null && !newest.has(r.leadId))
+					newest.set(r.leadId, { outcome: r.outcome, runId: card.id });
+			}
+		const reset: string[] = [];
+		for (const lead of tasks) {
+			if (
+				lead.followUpOf !== reviewId ||
+				!lead.prompt.startsWith("Needs validation") ||
+				lead.stage !== "backlog" ||
+				lead.cancelledAt !== null ||
+				lead.validatedAt === null ||
+				lead.validatedAt >= before ||
+				leadBlocker(lead.prompt).kind !== "sandbox"
+			)
+				continue;
+			const last = newest.get(lead.id);
+			if (last === undefined || last.outcome !== "blocked") continue;
+			const full = await store.getTask(lead.id);
+			if (full === null) continue;
+			// The settle's marker segment for the cleared run: from its last occurrence
+			// through the next `Validated by ` marker, or the end of the string. No
+			// marker leaves the details unchanged; an empty remainder stores null.
+			const text = full.details ?? "";
+			const start = text.lastIndexOf(
+				`\nValidated by validation run #${last.runId}`,
+			);
+			const patch: TaskPatch = { validatedAt: null };
+			if (start !== -1) {
+				const next = text.indexOf("\nValidated by ", start + 1);
+				const cleared = (
+					text.slice(0, start) + (next === -1 ? "" : text.slice(next))
+				).trim();
+				patch.details = cleared === "" ? null : cleared;
+			}
+			await store.updateTask(lead.id, patch);
+			await appendLog(
+				store,
+				lead.id,
+				`- validation result cleared for re-validation: was "still blocked" (validation run #${last.runId})`,
+			);
+			reset.push(lead.id);
+		}
+		return reset;
+	}
+
 	/** OTTR-1047: files at most one batch validation card per call, in one store
-	 * transaction. The manual start route, the done-review triggers, and the chain of a
-	 * done validation run share this one implementation. Candidate reviews: `isReview`,
-	 * done, not cancelled, with at least one batchable lead (a direct backlog child, not
-	 * cancelled, never validated, a sandbox blocker — deployment-fact leads never enter
-	 * a batch). A review with an open validation card waits; one whose newest validation
-	 * card is cancelled stays declined unless `reviewId` overrides (the manual start).
+	 * transaction. The manual start route, the done-review triggers, the started-lead
+	 * routing (OTTR-1128), and the chain of a done validation run share this one
+	 * implementation. Candidate reviews: `validatableReview` (done, or held at merging
+	 * for its findings, OTTR-1128), not cancelled, with at least one batchable lead (a
+	 * direct backlog child, not cancelled, a pendingSandboxLead — deployment-fact and
+	 * validated leads never enter a batch). A review with an open validation card
+	 * waits; one whose newest validation card is cancelled stays declined unless
+	 * `reviewId` overrides (the manual start).
 	 * One validation run is open per project, so the call files one card only: an open
 	 * card anywhere answers 409. Priority: an explicit `reviewId` first (the chain of the
 	 * run that just finished), then candidate reviews by doneAt ascending. With
@@ -9203,14 +9524,23 @@ export function createTurnLoop(
 	 * when it has no batchable leads, instead of falling back to another candidate. The
 	 * batch is the review's batchable leads in severity order — ascending rank from the
 	 * review's stored findings by exact prompt (missing rank last, ties by card id) —
-	 * capped at `validationBatchSize` (below 1 behaves as 1). */
+	 * capped at `validationBatchSize` (below 1 behaves as 1). With `again` (OTTR-1129
+	 * validate-again) the call first clears the validatedAt of the review's sandbox
+	 * leads whose newest recorded outcome was blocked and whose validatedAt predates
+	 * `again.before`, inside this transaction, and the response carries the cleared
+	 * ids in `reset`. The leads in `first` (OTTR-1128: the ones the user just started)
+	 * sort ahead of the severity order. */
 	async function filePendingValidationRun(
 		e: TurnProject,
 		reviewId?: string,
 		strictReview?: boolean,
-	): Promise<{ id: string } | { error: string; status: number }> {
+		again?: { before: number },
+		first: ReadonlySet<string> = new Set(),
+	): Promise<
+		{ id: string; reset: string[] } | { error: string; status: number }
+	> {
 		return await e.store.transaction(async () => {
-			const tasks = await e.store.listTasks();
+			let tasks = await e.store.listTasks();
 			// One open validation run per project: the manual route's 409 and the
 			// triggers' quiet no-op come from this single check.
 			if (
@@ -9222,18 +9552,29 @@ export function createTurnLoop(
 				)
 			)
 				return { error: "a validation run is already open", status: 409 };
+			// OTTR-1129: validate-again clears the stale validatedAt inside this
+			// transaction, after the open-run 409 and before any other return: past
+			// this point every failure throws, so the rollback keeps the old validated
+			// state; with no matching lead the reset is a no-op and the plain 409s
+			// below still apply.
+			const reset =
+				again !== undefined && reviewId !== undefined
+					? await resetValidatedLeads(e.store, reviewId, again.before)
+					: [];
+			if (reset.length > 0)
+				// The batchable gate reads the fresh list: a reset lead counts like a
+				// never-validated lead.
+				tasks = await e.store.listTasks();
 			const batchableOf = (review: ListedTask): ListedTask[] =>
 				tasks.filter(
 					(t) =>
 						t.followUpOf === review.id &&
-						// A lead, not any backlog child: the review's question card is a
-						// backlog child too, and leadBlocker reads a missing line as a
-						// sandbox blocker, so the tag is what keeps it out of a batch.
-						t.prompt.startsWith("Needs validation") &&
+						// The tag check inside pendingSandboxLead keeps the review's question
+						// card (a backlog child too, and leadBlocker reads its missing line as
+						// a sandbox blocker) out of a batch.
+						pendingSandboxLead(t) &&
 						t.stage === "backlog" &&
-						t.cancelledAt === null &&
-						t.validatedAt === null &&
-						leadBlocker(t.prompt).kind === "sandbox",
+						t.cancelledAt === null,
 				);
 			// The user declined the review's validation by cancelling its newest card;
 			// the explicit reviewId (the manual start, the chain restart) overrides.
@@ -9256,9 +9597,7 @@ export function createTurnLoop(
 			const candidates = tasks
 				.filter(
 					(t) =>
-						isReview(t) &&
-						t.stage === "done" &&
-						t.cancelledAt === null &&
+						validatableReview(t) &&
 						(t.id === reviewId || !declined(t)) &&
 						batchableOf(t).length > 0,
 				)
@@ -9286,6 +9625,8 @@ export function createTurnLoop(
 				if (finding.rank !== null && !ranks.has(finding.prompt))
 					ranks.set(finding.prompt, finding.rank);
 			leads.sort((a, b) => {
+				const fa = first.has(a.id);
+				if (fa !== first.has(b.id)) return fa ? -1 : 1;
 				const ra = ranks.get(a.prompt);
 				const rb = ranks.get(b.prompt);
 				if (ra !== rb) {
@@ -9313,8 +9654,130 @@ export function createTurnLoop(
 				promptAuthor: "board",
 				details: `Batch validation of ${batch.length} lead(s) of review ${review.id}.`,
 			});
-			return { id: card.id };
+			return { id: card.id, reset };
 		});
+	}
+
+	/** OTTR-1139: the periodic catch-up sweep. The filing rules live entirely in
+	 * filePendingValidationRun: same one-open-run-per-project rule, same declined
+	 * rule, same batch cap. A refusal ({ error, status }) logs nothing — the same
+	 * quiet no-op the settle triggers rely on; a thrown error logs one line,
+	 * like the settle triggers' catch. */
+	async function validationSweep(): Promise<void> {
+		for (const e of projects.values())
+			await filePendingValidationRun(e).catch((err) =>
+				logStoreError(e.store.name, err),
+			);
+	}
+
+	/** OTTR-1128: a lead only a sandbox can prove (pendingSandboxLead) never runs a work
+	 * turn: pickRunnable skips it, and this per-tick pass routes a started one (Accept, a
+	 * drag, a reply, or a lead that ran as a work turn before this rule) into its review's
+	 * batch validation. Per started lead that is not in flight:
+	 * - no live review to validate it (no followUpOf, a missing, cancelled or non-review
+	 *   parent): park needs_you with LEAD_NO_REVIEW_REASON;
+	 * - a validation run already open, or a review that cannot take a batch yet (still
+	 *   running): wait — the card keeps its stage and state, so the start is not lost and
+	 *   a later tick routes it;
+	 * - commits beyond its base (or an unreadable branch): park needs_you with
+	 *   LEAD_COMMITS_REASON, never moved;
+	 * - else return to the backlog and file the review's batch with the lead first, in one
+	 *   transaction: a refused filing rolls the move back, so the start waits for a later
+	 *   tick instead of stranding the lead in the backlog.
+	 * Every write rechecks the live row, so a cancel, a claim or a validation result that
+	 * landed during the git read owns the card. No card is deleted. */
+	async function routeStartedLeads(e: TurnProject): Promise<void> {
+		const tasks = await e.store.listTasks();
+		const started = tasks.filter(
+			(t) =>
+				t.cancelledAt === null &&
+				(t.stage === "todo" || t.stage === "in_progress") &&
+				(t.state === "queued" ||
+					t.state === "idle" ||
+					// A lead already parked by this pass costs no reads per tick.
+					(t.state === "needs_you" &&
+						t.needsReason !== LEAD_COMMITS_REASON &&
+						t.needsReason !== LEAD_NO_REVIEW_REASON)) &&
+				pendingSandboxLead(t),
+		);
+		if (started.length === 0) return;
+		const runOpen = tasks.some(
+			(t) =>
+				t.kind === "validation" && t.cancelledAt === null && t.stage !== "done",
+		);
+		// The row as listed still holds: same stage and state, still a pending lead of the
+		// same review. A validation result writes only validatedAt on a started lead, so
+		// the classification is part of the check, not just stage and state.
+		const unchanged = (t: ListedTask, live: Task | null): live is Task =>
+			live !== null &&
+			live.cancelledAt === null &&
+			live.stage === t.stage &&
+			live.state === t.state &&
+			live.followUpOf === t.followUpOf &&
+			pendingSandboxLead(live);
+		const park = (t: ListedTask, reason: string) =>
+			e.store.transaction(async () => {
+				if (unchanged(t, await e.store.getTask(t.id)))
+					await e.store.updateTask(t.id, {
+						state: "needs_you",
+						needsReason: reason,
+					});
+			});
+		const ready = new Map<string, ListedTask[]>();
+		for (const t of started) {
+			const review = tasks.find((r) => r.id === t.followUpOf);
+			if (
+				review === undefined ||
+				review.cancelledAt !== null ||
+				!isReview(review)
+			) {
+				await park(t, LEAD_NO_REVIEW_REASON);
+				continue;
+			}
+			if (runOpen || !validatableReview(review)) continue;
+			const commits =
+				t.branch === null || t.base === null
+					? 0
+					: await ops.revListCount(e.path, t.base, t.branch).catch(() => null);
+			if (commits !== 0) {
+				await park(t, LEAD_COMMITS_REASON);
+				continue;
+			}
+			ready.set(review.id, [...(ready.get(review.id) ?? []), t]);
+		}
+		const date = new Date().toISOString().slice(0, 10);
+		for (const [reviewId, leads] of ready)
+			await e.store
+				.transaction(async () => {
+					const moved = new Set<string>();
+					for (const t of leads) {
+						const live = await e.store.getTask(t.id);
+						if (!unchanged(t, live)) continue;
+						await e.store.updateTask(t.id, {
+							stage: "backlog",
+							state: "idle",
+							queuedAt: null,
+							needsReason: null,
+							asked: null,
+							details: `${live.details ?? ""}\nMoved back to the backlog on ${date}: a Needs validation lead runs in its review's batch validation run, never in a work turn.`,
+						});
+						moved.add(t.id);
+					}
+					if (moved.size === 0) return;
+					const filed = await filePendingValidationRun(
+						e,
+						reviewId,
+						true,
+						undefined,
+						moved,
+					);
+					// The throw rolls the moves back: the leads keep their start and a later
+					// tick routes them (the prechecks above make this a race-only path).
+					if ("error" in filed) throw new LeadFilingRefused(filed.error);
+				})
+				.catch((err: unknown) => {
+					if (!(err instanceof LeadFilingRefused)) throw err;
+				});
 	}
 
 	/** UI-shot guard: a work turn whose diff touches UI files (uiFiles) but attached no
@@ -9344,9 +9807,20 @@ export function createTurnLoop(
 			.catch(() => [] as string[]);
 		const ui = uiFiles(changed);
 		if (ui.length === 0) return next;
-		const priorLog = existsSync(await st.store.logPath(st.id))
-			? readRegular(await st.store.logPath(st.id)).toString("utf8")
-			: "";
+		let priorLog = "";
+		try {
+			priorLog = readRegular(
+				await st.store.logPath(st.id),
+				TASK_LOG_MAX_BYTES,
+			).toString("utf8");
+		} catch (err) {
+			if (isSizeRefusal(err))
+				// an over-cap log cannot show its prior warning, so treat the warning as
+				// present: auto-resuming on an unreadable log would loop forever (the
+				// marker in it is unreadable too)
+				priorLog = UI_SHOT_WARNING;
+			// else: a missing log holds no known prior warning
+		}
 		await appendLog(st.store, st.id, `${UI_SHOT_WARNING}: ${listed(ui)}`);
 		if (next.needsReason !== null || st.steered) return next;
 		if (!priorLog.includes(UI_SHOT_WARNING))
@@ -9387,7 +9861,12 @@ export function createTurnLoop(
 			!st.idn.interview &&
 			!st.idn.scout &&
 			!st.research
-				? await ops.unsavedWork(st.loc.wt, st.header.target)
+				? await ops.unsavedWork(st.loc.wt, st.header.target, {
+						// A superseded close discards the branch's unmerged commits by
+						// definition (the outcome says main's flow covers them), so only
+						// uncommitted changes still keep the tree.
+						ignoreCommits: st.result.outcome?.status === "superseded",
+					})
 				: null;
 	}
 
@@ -9469,18 +9948,17 @@ export function createTurnLoop(
 	/** The done settle's git reads (the settle reads are slow; a cancel landing inside them
 	 * owns the card — its kept path already wrote the final state, and the checks below only
 	 * finish the turn row). Kept files ride a kept or release card; a plain done card keeps
-	 * none (its worktree goes away). */
+	 * none (its worktree goes away). A superseded close merged nothing, so it stamps no
+	 * commit count and no merge head — those anchor release attribution to the card's merge. */
 	async function measureSettleGit(st: TurnSettle, next: Next): Promise<void> {
-		// Stamped with `commits`: the target head at Done anchors the release's late-commit
-		// attribution to this card's merge.
-		st.commits =
-			next.stage === "done"
-				? await ops.targetCommits(st.e.path, st.header.target)
-				: undefined;
-		st.mergeHead =
-			next.stage === "done"
-				? await ops.targetSha(st.e.path, st.header.target).catch(() => null)
-				: undefined;
+		const landed =
+			next.stage === "done" && st.result.outcome?.status !== "superseded";
+		st.commits = landed
+			? await ops.targetCommits(st.e.path, st.header.target)
+			: undefined;
+		st.mergeHead = landed
+			? await ops.targetSha(st.e.path, st.header.target).catch(() => null)
+			: undefined;
 		st.keptFiles =
 			!st.idn.releaseCard && next.stage === "done"
 				? []
@@ -9491,19 +9969,68 @@ export function createTurnLoop(
 
 	/** True when a card descends from a fork-research card: the parent existing implies the
 	 * feature ran, so this is independent of the forkResearch toggle. The hold covers every
-	 * descendant: a card an agent files from a fork-born card (create_task) must not merge
-	 * without approval either. */
+	 * descendant, also across a project border: a card an agent files from a fork-born card
+	 * (create_task with another project) must not merge without approval either. */
 	async function isForkBorn(st: TurnSettle): Promise<boolean> {
 		const seen = new Set<string>([st.task.id]);
 		let up = st.task.followUpOf;
+		// The board that holds the card `up` names: followUpOfProject names a foreign
+		// board, and null means the parent sits on the same board as the card that
+		// holds the link (the settle's own board for the first hop).
+		let upBoard = st.task.followUpOfProject ?? st.store.name;
 		let forkBorn = false;
 		while (up !== null && !seen.has(up) && !forkBorn) {
 			seen.add(up);
-			const anc = await st.store.getTask(up);
+			const anc = await ancestorTask(st, up, upBoard);
 			forkBorn = anc?.topic === "fork research";
 			up = anc?.followUpOf ?? null;
+			// A null followUpOfProject keeps the parent on the board the ancestor
+			// itself was read from, never the destination board.
+			upBoard = anc?.followUpOfProject ?? upBoard;
 		}
 		return forkBorn;
+	}
+
+	/** One followUpOf-chain ancestor: the named foreign store when the link crossed a
+	 * project border, the settle's own store otherwise. A vanished project or a missing
+	 * card reads as no ancestor and ends the walk. */
+	async function ancestorTask(
+		st: TurnSettle,
+		id: string,
+		board: string | null,
+	): Promise<Task | null> {
+		if (board === null || board === st.store.name)
+			return await st.store.getTask(id);
+		return (
+			(await projects
+				.get(board)
+				?.store.getTask(id)
+				.catch(() => null)) ?? null
+		);
+	}
+
+	/** U7 across project borders: the chain behind an update-work card may cross boards,
+	 * and every copied-updateIds link keeps marking the card below it, so each board
+	 * along the followUpOf chain counts: the hold the parent's split-off work lived
+	 * under must not vanish at a border or one hop below it. The own board's setting is
+	 * checked by the caller; a vanished project reads as off, and getSettingsLogged
+	 * keeps a sick foreign store from failing the settle. */
+	async function borderHoldsUpdates(st: TurnSettle): Promise<boolean> {
+		const seen = new Set<string>([st.task.id]);
+		let up = st.task.followUpOf;
+		let board = st.task.followUpOfProject ?? st.store.name;
+		while (up !== null && !seen.has(up)) {
+			seen.add(up);
+			if (board !== st.store.name) {
+				const tp = projects.get(board);
+				if (tp !== undefined && (await getSettingsLogged(tp)).holdUpdateMerges)
+					return true;
+			}
+			const anc = await ancestorTask(st, up, board);
+			up = anc?.followUpOf ?? null;
+			board = anc?.followUpOfProject ?? board;
+		}
+		return false;
 	}
 
 	/** U7: an update card on a hold-update-merges project parks for a human approval; the reply
@@ -9521,7 +10048,9 @@ export function createTurnLoop(
 			st.kind === "work" && (next.stage === "done" || next.stage === "merging");
 		const settings = await st.store.getSettings();
 		const updateHold =
-			readyWork && st.task.updateIds.length > 0 && settings.holdUpdateMerges;
+			readyWork &&
+			st.task.updateIds.length > 0 &&
+			(settings.holdUpdateMerges || (await borderHoldsUpdates(st)));
 		const forkHold =
 			readyWork &&
 			(await isForkBorn(st)) &&
@@ -9852,8 +10381,10 @@ export function createTurnLoop(
 		});
 	}
 
-	/** A retro's proposal is filed as a held card (needs_you, followUpOf this retro): the
-	 * settle recheck above confirmed the card is still ours, so this write is safe.
+	/** A retro's proposal is filed as a card that follows up this retro: held at needs_you,
+	 * or queued when the target project starts proposals without asking and the proposal
+	 * carries no decision (docs/specs/retro-auto-start.md). The settle recheck above
+	 * confirmed the card is still ours, so this write is safe.
 	 * A proposal whose call named a project files on that project's store (OTTR-787):
 	 * a change to rules, skills or AGENTS.md sources targets agent-data, and a card
 	 * there edits that checkout without tripping the cross-project checkout guard.
@@ -9880,6 +10411,7 @@ export function createTurnLoop(
 			store = tp.store;
 		}
 		const proposed = st.result.proposed;
+		const decision = proposed.decision ?? null;
 		const sourceTask = (await st.store.getTask(st.id)) ?? st.task;
 		const turns = await st.store.listTurns(st.id);
 		const parent =
@@ -9887,20 +10419,30 @@ export function createTurnLoop(
 				? null
 				: await st.store.getTask(st.task.followUpOf);
 		const child = await store.transaction(async () => {
-			let openProposals = 0;
-			for (const task of await store.listTasks()) {
-				if (
-					task.cancelledAt === null &&
-					task.state === "needs_you" &&
-					isRetroProposalReason(task.needsReason) &&
-					(await store.listTurns(task.id)).length === 0
-				)
-					openProposals++;
+			// docs/specs/retro-auto-start.md: the filing project's setting decides; a
+			// decision always holds. A started card is no open proposal, so the cap skips it.
+			const held =
+				!(await store.getSettings()).retroAutoStart || decision !== null;
+			if (held) {
+				let openProposals = 0;
+				for (const task of await store.listTasks()) {
+					if (
+						task.cancelledAt === null &&
+						task.state === "needs_you" &&
+						isRetroProposalReason(task.needsReason) &&
+						(await store.listTurns(task.id)).length === 0
+					)
+						openProposals++;
+				}
+				if (openProposals >= 3) return null;
 			}
-			if (openProposals >= 3) return null;
 			const created = await store.createTask(proposed.prompt);
 			const handoffPath = join(store.tasksDir, "handoffs", `${created.id}.md`);
-			return await store.updateTask(created.id, {
+			const summary =
+				proposed.summary === null || decision === null
+					? proposed.summary
+					: { ...proposed.summary, decision };
+			const card = await store.updateTask(created.id, {
 				prompt: followUpPrompt({
 					text: proposed.prompt,
 					title: st.task.title,
@@ -9910,16 +10452,23 @@ export function createTurnLoop(
 				promptAuthor: "board",
 				followUpOfProject: store === st.store ? null : st.store.name,
 				model: proposed.model,
-				state: "needs_you",
-				needsReason: proposedReason(parent ?? { id: st.task.id }),
-				proposalSummary: proposed.summary,
+				// createTask queued it, as Accept would; a held card waits at needs_you.
+				...(held
+					? {
+							state: "needs_you" as const,
+							needsReason: proposedReason(parent ?? { id: st.task.id }),
+						}
+					: {}),
+				proposalSummary: summary,
 			});
+			return { card, held };
 		});
 		if (child === null) {
 			await st.log("retro: proposal dropped: cap of 3 open proposals reached");
 			return;
 		}
-		const handoffPath = join(store.tasksDir, "handoffs", `${child.id}.md`);
+		const { card, held } = child;
+		const handoffPath = join(store.tasksDir, "handoffs", `${card.id}.md`);
 		try {
 			const savedDir = join(st.store.tasksDir, "quarantine", st.id);
 			writeBelow(
@@ -9934,16 +10483,17 @@ export function createTurnLoop(
 			);
 		} catch (err) {
 			await store.transaction(async () => {
-				const current = await store.getTask(child.id);
-				if (current?.revision === child.revision)
-					await store.updateTask(child.id, { prompt: proposed.prompt });
+				const current = await store.getTask(card.id);
+				if (current?.revision === card.revision)
+					await store.updateTask(card.id, { prompt: proposed.prompt });
 			});
 			await st.log(`! handoff write failed: ${errmsg(err)}`);
 		}
+		const where = store === st.store ? "" : ` in project ${store.name}`;
 		await st.log(
-			store === st.store
-				? `- filed proposal ${child.id} (held for approval)`
-				: `- filed proposal ${child.id} in project ${store.name} (held for approval)`,
+			held
+				? `- filed proposal ${card.id}${where} (held for approval)`
+				: `retro: proposal started without asking: ${card.id}${where}`,
 		);
 	}
 
@@ -10037,6 +10587,8 @@ export function createTurnLoop(
 		limitHit: boolean;
 	} | null> {
 		const built = await reviewCheckInput(st, selected);
+		// The routing's fallback explanation, once per check flow, before the first attempt.
+		if (built.note !== null) await st.log(built.note);
 		const loop = await reviewCheckLoop(st, selected, built);
 		if (loop === null) return null;
 		return {
@@ -10065,6 +10617,7 @@ export function createTurnLoop(
 		selector: string | undefined;
 		checkModel: string | null;
 		checkWarn: "same model" | "same vendor" | null;
+		note: string | null;
 	}> {
 		const [openCards, commitsSince] = await Promise.all([
 			Promise.resolve(
@@ -10084,7 +10637,8 @@ export function createTurnLoop(
 				: Promise.resolve([] as string[]),
 		]);
 		const roles = (ops.modelRoles ?? modelRoles)();
-		const checkRole = checkRoleFor(st.result.model);
+		const routing = ops.checkRouting?.() ?? null;
+		const checkRole = checkRoleFor(routing, roles, st.result.model);
 		const selector = roles[checkRole];
 		// A missing role falls back to the board's default role (omp's default
 		// model), which is often the reviewed model itself — shown on the card.
@@ -10101,7 +10655,14 @@ export function createTurnLoop(
 			openCards,
 			commitsSince,
 		});
-		return { input, checkRole, selector, checkModel, checkWarn };
+		return {
+			input,
+			checkRole,
+			selector,
+			checkModel,
+			checkWarn,
+			note: checkRoutingNote(routing, roles, st.result.model),
+		};
 	}
 
 	/** The review check attempts (two, then the user decides: a half-checked review files no
@@ -10263,6 +10824,8 @@ export function createTurnLoop(
 			config: join(dirname(ops.extensionPath), "check.yml"),
 			maxTime: "1800",
 			dataRoot: st.store.dataRoot,
+			// OTTR-994: the check run keeps its project's turn identity on a worker.
+			project: st.store.name,
 			// The check's transcript lands in the card's log, next to the run it checks.
 			logPath: await st.store.logPath(st.id),
 			onLog: () => ops.notifyLog(st.name, st.id),
@@ -10553,6 +11116,7 @@ export function createTurnLoop(
 								],
 								multi: false,
 								recommended: null,
+								text: false,
 							})),
 							needsReason: `Wants your answer: ${n} question${n === 1 ? "" : "s"} about the review's needs-validation leads`,
 						});
@@ -10792,6 +11356,8 @@ export function createTurnLoop(
 	): Promise<boolean> {
 		const built = await workCheckInput(st, cur, head, open, replies);
 		const roles = workCheckRoles(st);
+		// The routing's fallback explanation, once per check flow, before the first attempt.
+		if (roles.note !== null) await st.log(roles.note);
 		return await workCheckAttempts(st, cur, head, open, priorLog, roles, built);
 	}
 
@@ -10827,22 +11393,35 @@ export function createTurnLoop(
 			checkMs += ran.checkMs;
 			const out = workAttemptOutcome(ran.result);
 			if (out.verdict !== null) {
-				await applyWorkCheckVerdict(
-					st,
-					cur,
-					head,
-					roles.checkModel,
-					fromRole,
-					open,
-					priorLog,
-					roles.warn,
-					checkStart,
-					checkMs,
+				const split = demoteUnquoted(
 					out.verdict,
 					built.diff,
+					readyReportText(st.result.outcome, st.result.finalText),
 					built.transcriptText,
 				);
-				return false;
+				const accountingError = workCheckAccountingError(
+					out.verdict,
+					open,
+					split.blockers,
+				);
+				if (accountingError === null) {
+					await applyWorkCheckVerdict(
+						st,
+						cur,
+						head,
+						roles.checkModel,
+						fromRole,
+						open,
+						priorLog,
+						roles.warn,
+						checkStart,
+						checkMs,
+						out.verdict,
+						split,
+					);
+					return false;
+				}
+				out.failed = accountingError;
 			}
 			checkFailed = out.failed;
 			limitHit = out.limitHit;
@@ -10917,10 +11496,22 @@ export function createTurnLoop(
 		const transcriptPath =
 			sessionFile(st.store.sessionsDir, st.result.sessionId) ?? "";
 		let transcriptText = "";
-		try {
-			transcriptText = readRegular(transcriptPath).toString("utf8");
-		} catch {
-			// No transcript file on disk: the check works from the diff alone.
+		if (transcriptPath !== "") {
+			try {
+				// Below the data root, no symlink followed: the sessions dir is
+				// worker-writable (OTTR-989), and a planted symlink at the transcript
+				// path must not feed a server-only file to the quote oracle.
+				transcriptText =
+					readBelow(
+						st.store.dataRoot,
+						resolve(transcriptPath),
+						TRANSCRIPT_MAX_BYTES,
+					)?.toString("utf8") ?? "";
+			} catch (err) {
+				// A refused transcript (a planted symlink, a FIFO, oversized): the
+				// check works from the diff alone, and the checker gets no path.
+				await st.log(`! transcript: ${errmsg(err)}`);
+			}
 		}
 		// The ready report of the run being checked; on a re-check the report the
 		// first completed check judged rides along as the original result.
@@ -10934,7 +11525,7 @@ export function createTurnLoop(
 			sincePreviousCheck,
 			report: readyReport,
 			originalReport: cur.workCheckReport ?? undefined,
-			transcriptPath,
+			transcriptPath: transcriptText === "" ? undefined : transcriptPath,
 			earlier: open.map((b, i) => ({
 				id: i + 1,
 				finding: b.finding,
@@ -10947,15 +11538,19 @@ export function createTurnLoop(
 
 	/** The check's model: the role's selector, else the board's default role (omp's fallback).
 	 * The check must not be the model it checks — same model or vendor goes on the card as a
-	 * warning. */
+	 * warning. The role comes from the user-set vendor routing (ops.checkRouting), else the
+	 * built-in default rule (checkRoleFor); `note` carries the fallback explanation to log
+	 * once before the first attempt. */
 	function workCheckRoles(st: TurnSettle): {
 		selector: string | undefined;
-		checkRole: "critic" | "adversary";
+		checkRole: string;
 		checkModel: string | null;
 		warn: { warn?: string };
+		note: string | null;
 	} {
 		const roles = (ops.modelRoles ?? modelRoles)();
-		const checkRole = checkRoleFor(st.result.model);
+		const routing = ops.checkRouting?.() ?? null;
+		const checkRole = checkRoleFor(routing, roles, st.result.model);
 		const selector = roles[checkRole];
 		const checkModel = selector ?? roles.default ?? null;
 		const checkWarn = checkModelWarning(st.result.model, checkModel);
@@ -10968,7 +11563,13 @@ export function createTurnLoop(
 								? `The check model ${checkModel} is the same model as the run it checks — no second-model opinion.`
 								: `The check model ${checkModel} is from the same vendor as the run it checks — no second-vendor opinion.`,
 					};
-		return { selector, checkRole, checkModel, warn };
+		return {
+			selector,
+			checkRole,
+			checkModel,
+			warn,
+			note: checkRoutingNote(routing, roles, st.result.model),
+		};
 	}
 
 	/** One work-check attempt (the review check shares awaitCheckAttempt): a credit stop
@@ -10988,25 +11589,22 @@ export function createTurnLoop(
 		);
 	}
 
-	/** Applies a valid work-check verdict: earlier blockers resolve three ways — the verdict's
-	 * fixed list (by the prompt's 1-based id) wins; a blocker whose exact quote the new
-	 * blockers re-cite stays open; anything else counts as fixed because the re-check dropped
-	 * it. Copies, never in place. A pass stamps the card (the deferred write below stores
-	 * merging/queued with the check record); blockers go back to the work agent. */
+	/** Applies a valid work-check verdict. Explicit fixes take precedence over repeated quotes.
+	 * Other earlier blockers stay open. Copies, never in place. A pass stamps the card
+	 * (the deferred write below stores merging/queued). Blockers return to the work agent. */
 	async function applyWorkCheckVerdict(
 		st: TurnSettle,
 		cur: Task,
 		head: string | null,
 		checkModel: string | null,
-		checkRole: "critic" | "adversary" | "default",
+		checkRole: string,
 		open: WorkCheckBlocker[],
 		priorLog: WorkCheckRun[],
 		warn: { warn?: string },
 		checkStart: number,
 		checkMs: number,
 		verdict: WorkCheckVerdict,
-		diff: string,
-		transcriptText: string,
+		split: WorkCheckSplit,
 	): Promise<void> {
 		const originalLog = st.log;
 		const lines: string[] = [];
@@ -11032,18 +11630,7 @@ export function createTurnLoop(
 					st.result.outcome,
 					st.result.finalText,
 				);
-				const split = demoteUnquoted(
-					verdict,
-					diff,
-					readyReport,
-					transcriptText,
-				);
-				// Earlier blockers resolve three ways: the verdict's fixed list
-				// (by the prompt's 1-based id) wins; a blocker whose exact quote
-				// the new blockers re-cite stays open; anything else counts as
-				// fixed because the re-check dropped it. Copies, never in place.
 				const fixedById = new Map(verdict.fixed.map((f) => [f.id, f.reason]));
-				const requoted = new Set(split.blockers.map((b) => b.quote));
 				const runs = [...priorLog];
 				const lastIdx = runs.findLastIndex((r) => r.outcome === "blockers");
 				const prev = lastIdx === -1 ? undefined : runs[lastIdx];
@@ -11060,12 +11647,7 @@ export function createTurnLoop(
 									status: "fixed" as const,
 									statusReason: reason,
 								};
-							if (requoted.has(b.quote)) return b;
-							return {
-								...b,
-								status: "fixed" as const,
-								statusReason: "not re-cited by the re-check",
-							};
+							return b;
 						}),
 					};
 				const run: WorkCheckRun = {
@@ -11080,7 +11662,7 @@ export function createTurnLoop(
 					durationMs: checkMs,
 					...warn,
 				};
-				const allRuns = [...runs, run].slice(-20);
+				const allRuns = appendWorkCheckRun(runs, run);
 				await st.log(
 					`- work check: ${split.blockers.length} blocker(s), ${split.notes.length} note(s), ${(checkMs / 1000).toFixed(0)}s`,
 				);
@@ -11106,6 +11688,24 @@ export function createTurnLoop(
 		}
 	}
 
+	/** Keeps the latest unresolved blockers run within the 20-run history cap. */
+	function appendWorkCheckRun(
+		log: readonly WorkCheckRun[],
+		run: WorkCheckRun,
+	): WorkCheckRun[] {
+		const runs = [...log, run];
+		if (runs.length <= 20) return runs;
+		const kept = runs.slice(-20);
+		const latest = runs.findLast((r) => r.outcome === "blockers");
+		if (
+			latest !== undefined &&
+			latest.blockers.some((b) => b.status === undefined) &&
+			!kept.includes(latest)
+		)
+			kept[0] = latest;
+		return kept;
+	}
+
 	/** A work check that failed twice (or hit a usage limit): park needs_you for a re-run, or
 	 * hold the card until the provider's reset. No head stamp: the next ready at this head
 	 * must run the check again. */
@@ -11114,7 +11714,7 @@ export function createTurnLoop(
 		priorLog: WorkCheckRun[],
 		warn: { warn?: string },
 		checkModel: string | null,
-		checkRole: "critic" | "adversary" | "default",
+		checkRole: string,
 		checkStart: number,
 		checkMs: number,
 		checkFailed: string,
@@ -11155,20 +11755,17 @@ export function createTurnLoop(
 								holdAttempts: 0,
 							}
 						: patch),
-					workCheckLog: [
-						...priorLog,
-						{
-							at: checkStart,
-							model: checkModel,
-							role: checkRole,
-							outcome: "error",
-							blockers: [],
-							notes: [],
-							durationMs: checkMs,
-							...warn,
-							error: checkFailed,
-						},
-					],
+					workCheckLog: appendWorkCheckRun(priorLog, {
+						at: checkStart,
+						model: checkModel,
+						role: checkRole,
+						outcome: "error",
+						blockers: [],
+						notes: [],
+						durationMs: checkMs,
+						...warn,
+						error: checkFailed,
+					}),
 				});
 			});
 		} finally {
@@ -11278,9 +11875,16 @@ export function createTurnLoop(
 	 * CI watch: pin the pushed sha only when origin's remote-tracking tip equals the local
 	 * target tip — a merge turn that skipped its push would otherwise pin an older run to
 	 * this card. ponytail: two merges landing between push and capture pin the newer run to
-	 * both cards. */
+	 * both cards. A superseded close merged nothing, so it pins no push sha: a CI failure
+	 * on the shared tip must not reopen a card whose commits never landed, and the release
+	 * stamp's attribution needs an integrated report (OTTR-1182). */
 	async function stampReleaseVersion(st: TurnSettle): Promise<void> {
-		const version = await readReleasedVersion(st);
+		const last = (await st.store.listTurns(st.id)).at(-1);
+		const superseded = last?.outcome === "superseded";
+		const version =
+			last?.outcome === "integrated"
+				? parseReleaseVersion(`${last.summary ?? ""}\n${last.details ?? ""}`)
+				: null;
 		const short = st.header.target.replace(/^origin\//, "");
 		const [local, pushed] = await Promise.all([
 			ops.targetSha(st.e.path, st.header.target).catch(() => null),
@@ -11300,6 +11904,10 @@ export function createTurnLoop(
 				`- no release stamp for ${version}: no tag on the pushed head`,
 			);
 		if (!onOrigin) await st.log("- CI watch skipped: merge push not on origin");
+		if (superseded)
+			await st.log(
+				"- superseded close: no CI-watch pin and no release stamp (nothing merged)",
+			);
 		await st.store.transaction(async () => {
 			const current = await st.store.getTask(st.id);
 			if (
@@ -11310,17 +11918,9 @@ export function createTurnLoop(
 				return;
 			if (version !== null && onOrigin && tagged === pushed)
 				await st.store.updateTask(st.id, { releaseVersion: version });
-			if (onOrigin) await st.store.updateTask(st.id, { pushSha: pushed });
+			if (!superseded && onOrigin)
+				await st.store.updateTask(st.id, { pushSha: pushed });
 		});
-	}
-
-	/** The version this merge turn released, parsed from the settled row's report prose
-	 * (null unless the run reported an integrated outcome). */
-	async function readReleasedVersion(st: TurnSettle): Promise<string | null> {
-		const last = (await st.store.listTurns(st.id)).at(-1);
-		return last?.outcome === "integrated"
-			? parseReleaseVersion(`${last.summary ?? ""}\n${last.details ?? ""}`)
-			: null;
 	}
 
 	/** An interview, grill or trending scout card runs in the main checkout: its worktree must
@@ -11475,6 +12075,10 @@ export function createTurnLoop(
 		// Before any await: from here on, no turn dispatches a model until a fresh gate answer.
 		creditHold = true;
 		creditStops += 1;
+		// The control plane stops the tenant only at zero credit (docs/specs/hosted-mode.md
+		// section 5). Record it at once, so the credits chip names the hard stop instead of
+		// the last gate balance until a queued card runs the gate again.
+		if (ops.hosted !== undefined) ops.hosted.creditBalance.balance = 0;
 		const stops: Promise<boolean>[] = [];
 		for (const e of projects.values()) {
 			try {
@@ -11990,6 +12594,7 @@ export function createTurnLoop(
 		runTurn,
 		cancel,
 		filePendingValidationRun,
+		validationSweep,
 		stopTurn,
 		creditStop,
 		creditRelease,
@@ -11997,6 +12602,7 @@ export function createTurnLoop(
 		recoverRestarted,
 		running,
 		runnerTurns,
+		slotsUsed,
 		checkoutNotices,
 	};
 }

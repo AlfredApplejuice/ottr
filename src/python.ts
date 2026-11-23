@@ -23,6 +23,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { PROJECT } from "./apt.ts";
+import { childDatabaseEnv } from "./childEnv.ts";
 import { resolveAgentLayer } from "./layers.ts";
 
 // One line per package: a pinned name==version plus at least one sha256 hash. No options, no
@@ -155,6 +156,7 @@ type Exec = (argv: string[]) => Promise<string>;
 /** stdout; throws with the stderr tail on a non-zero exit. */
 async function exec(argv: string[]): Promise<string> {
 	const p = Bun.spawn(argv, {
+		env: childDatabaseEnv(),
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",

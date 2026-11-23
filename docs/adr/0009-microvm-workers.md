@@ -22,7 +22,11 @@ oauth dir, mnemopi store) and `/data` (sessions, logs, handoffs). The R5-1
 comments in `docker-compose.yml` and docs/WORKERS.md, Residuals, list what that
 leaves open: a turn can write a main checkout's `.git/config`, plant files in the
 shared home that later turns load, read the provider credentials of the shared
-home, and see every other project's checkout. A worker keeps its state between
+home, and see every other project's checkout. Since OTTR-994 the classic pool
+drops each turn to its project's own uid with its own turn home
+(docs/specs/worker-turn-uid-isolation.md): the cross-project env read and the
+cross-project plant are closed, and the shared credential store stays the
+accepted residual that this ADR's VM mode removes. A worker keeps its state between
 turns, and the pool size is the number of compose blocks. CPU and RAM limits are
 per container, not per turn; disk has no limit.
 
@@ -91,7 +95,9 @@ classic worker pool stays the default and keeps every other turn.
 - The VM mounts none of `/workspace`, `/root` or `/data`. It clones the task branch
   from the board's git endpoint with a per-turn token that can fetch only that
   project and push only `refs/heads/<task branch>`. The board resets the server
-  worktree to each pushed head.
+  worktree to each pushed head. The same endpoint also serves the Git LFS batch
+  API for that token, but only for downloads. The proxy forwards the batch call
+  to the project's pinned origin with the board's own credential.
 - No provider secret enters the VM. omp in the VM sends each provider through the
   board's `/llm` proxy (`transport: pi-native`, `apiKey` = the per-turn token); the
   board forwards to its own `omp auth-gateway serve` on loopback, backed by
@@ -99,6 +105,14 @@ classic worker pool stays the default and keeps every other turn.
   board's `/hindsight` proxy the same way.
 - A microVM project never falls back to the classic pool: while the runner is down
   or full, its work cards wait.
+
+The board rejected a second option for LFS: copy the objects the branch needs into
+the VM at boot. That copy needs an object list per branch before every dispatch,
+and it costs copy time and disk for large repos. It cannot serve a mid-turn
+`git lfs pull` of new objects. It also keeps a second copy of the objects next to
+the board's own checkout. The chosen proxy holds no state per request, matches the
+`/llm` and `/hindsight` proxy pattern, and works for any branch without a scan
+before dispatch.
 
 ## Consequences
 
@@ -131,4 +145,10 @@ classic worker pool stays the default and keeps every other turn.
     written on a WSL2 host without `/dev/kvm`, so no VM booted there. Boot time,
     build and test speed must be measured on a KVM host before the defaults are
     trusted.
+  - The per-turn token can also read the project's LFS objects through this proxy,
+    and the read is scoped to that project. The board checks the project before it
+    contacts the origin, so a token cannot read another project's LFS objects. The
+    object bytes stream through the board, and upstream-signed URLs never reach the
+    VM. The proxy refuses an LFS upload (403), and the server push stays the only
+    upload path (OTTR-1058).
 - Moving the default to microVMs, or dropping the classic pool, needs a new ADR.

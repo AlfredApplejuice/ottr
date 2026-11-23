@@ -103,6 +103,9 @@ export interface ValidateRequest {
 	/** [A-Za-z0-9._-]{1,64}; names the run dir and the /data record. */
 	id: string;
 	project: string;
+	/** The card the job serves (the sandbox run's own card); the runner names it on the
+	 *  System view. Absent = the caller carried no card. */
+	taskId?: string;
 	/** Tar of the target checkout; under <dataRoot>/<project>/ on the runner. */
 	targetTar: string;
 	/** The board's trusted provisioning lists (docs/specs/vm-list-isolation.md); the

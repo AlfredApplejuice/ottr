@@ -22,6 +22,16 @@ const REFRESH_TIMEOUT_MS = 60_000;
 /** omp's "never" for a zai token (`expires "never"` in zai-coding-plan.kdl): the largest Date. */
 const ZAI_NO_EXPIRY = 8_640_000_000_000_000;
 
+/** The env name a turn's card-env note rides under, beside the project's listed names
+ * (docs/specs/env-plain-values.md). It is the signal the tracker extension keys on: its
+ * before_agent_start handler puts the guidance into the session system prompt when this
+ * name is present, because an env entry alone never reaches the model. Not an omp
+ * kernel-env name: the eval kernel's allowlist passes only omp's PI_/LC_/XDG_ namespaces,
+ * so the note stays out of the kernel env. */
+export const CARD_ENV_NOTE_NAME = "OTTR_CARD_ENV_NOTE";
+export const CARD_ENV_NOTE =
+	"Eval cells cannot read the card env values in this env: omp filters the eval kernel env. Read a value from a script run through the bash tool instead.";
+
 /** What the board store holds for a provider: a lendable token, an API key (never lent), or why neither. */
 type Read =
 	| { kind: "token"; access: string; expires: number }
@@ -262,6 +272,8 @@ async function refreshedLent(
  * wins over a Settings value of the same name). A lending error stops the turn (fail closed).
  * `secrets` holds the lent values, which the run redacts from its log. `lend: false` (hosted
  * mode, docs/specs/hosted-mode.md section 3) lends no provider token: model access uses API keys.
+ * `values: false` (a trending scout, OTTR-1028) omits the Settings values: the scout reads
+ * third-party repository text and its env carries the lent provider token only.
  */
 export async function turnEnv(
 	project: string,
@@ -270,6 +282,7 @@ export async function turnEnv(
 	opts: Parameters<typeof lentProviderEnv>[1] & {
 		home?: string;
 		lend?: boolean;
+		values?: boolean;
 	} = {},
 ): Promise<{
 	env: Record<string, string>;
@@ -281,13 +294,22 @@ export async function turnEnv(
 	badModel?: string;
 	secrets: string[];
 }> {
-	const base = turnEnvValues(project, envValues, opts.home);
+	const base =
+		opts.values === false
+			? { env: {}, missing: [] }
+			: turnEnvValues(project, envValues, opts.home);
 	const lent: Lent =
 		opts.lend === false
 			? { env: {}, error: null }
 			: await lentProviderEnv(model, opts);
+	const env = { ...base.env, ...lent.env };
+	// OTTR-1099: omp filters the eval kernel env, so a listed name never reaches an eval
+	// cell (an `os.environ` KeyError there is not a missing value). The entry is the
+	// signal the tracker extension keys on: its before_agent_start handler puts the
+	// guidance into the session system prompt, in front of the model from the first prompt.
+	if (Object.keys(base.env).length > 0) env[CARD_ENV_NOTE_NAME] = CARD_ENV_NOTE;
 	return {
-		env: { ...base.env, ...lent.env },
+		env,
 		missing: base.missing,
 		credentialError: lent.error,
 		busy: lent.busy,

@@ -183,7 +183,7 @@ This inventory records synchronous groups that can interleave after an async con
 | --- | --- | --- |
 | `nextTaskId`, `createTask`, `src/store.ts:3126-3180` | Read/update the ID counter, check an ID, insert the task, write two events, and read the task. | One task-creation operation and transaction. Include ordinal allocation. Reuse the outer context when a transactional caller creates a task. |
 | `runTaskUpdate`, `src/store.ts:3266-3314` | Read the prior task, perform a guarded or unguarded update, read the result, and write stage/state events. | One transaction. Preserve revision conflict behavior and event source values. |
-| `reorderQueue`, `src/store.ts:3317-3326` | Read and validate the queue permutation, then write each queued time. | One transaction. Revalidate against the same queue state and prevent partial order changes. |
+| `moveInQueue`, `src/store.ts:4589-4650` | Read the queue, validate the moved card and anchor, then write the moved queued time (renumbering when no slot is free). | One transaction. Revalidate against the same queue state and prevent partial order changes. |
 | `syncPrCard`, `src/store.ts:3086-3110` | Read PR/task state, derive card state, and update the task. | One operation and transaction. Reuse `savePrDraft`'s context when it calls this operation. |
 | `finishTurn`, `src/store.ts:3368-3402` | Update/read the turn, capture optional transcript-derived data, and record an error event. | Keep the core turn change, result read, and required error event in one transaction. Separate filesystem capture as described below. |
 | `captureTurnCost`, `writeTurnCost`, `src/store.ts:1163-1175,3409-3434` | Read the task session, read/parse a transcript, and write cost fields. | Read files outside the transaction. Apply the result in a guarded store transaction against the same session and turn window. |
@@ -320,6 +320,74 @@ They cover legacy convergence, rollback after a table swap, precise values, gene
 Subprocess tests cover exclusive refusal, PRAGMAs, close, and natural exit. Fixed-seed properties cover signed 64-bit values and snapshot identifiers.
 The README remains correct because SQLite stays the only shipped backend. This card adds no PostgreSQL selection or support claim.
 
+
+### Card D assumptions and refreshed inventory
+
+Card D starts from revision `d4a617f` after a refresh from `origin/main`.
+The existing async store API and caller guards remain unchanged.
+The store paths remain `src/store.ts`, `src/globalStore.ts`, `src/sqliteDriver.ts`, and `src/storeQueue.ts`.
+Startup and backup safety reach `src/server.ts`, `src/backup.ts`, and `src/restore.ts`.
+
+Environment filters reach the runner, workers, VM runner, login children, and LLM gateway.
+The server will pin its selection before child processes start.
+It will then remove the URL from its child environment and startup environment block.
+The existing environment scrubber will protect `/proc` on Linux.
+
+Explicit child environment records will retain their own production-URL filters.
+Bun's implicit child environment retains its boot copy after the scrub.
+Every child launch therefore needs an explicit environment filter, including Git, package tools, service helpers, and VM helpers.
+
+A fresh, fully opened SQLite project has 15 application tables and 194 columns before the insertion ordinal.
+The oracle includes `ask_drafts` and retired `learnings`.
+PostgreSQL step 1 must preserve that oracle except for `learnings`, with the shared ordinal added.
+
+One reserved PostgreSQL session will hold ownership and execute store statements.
+A tenant-wide queue will serialize complete store operations across schemas.
+Each store will retain its queue.
+PostgreSQL queues will share the current transaction scope, including nested calls and error state.
+This stricter connection boundary prevents writes through a session without the ownership lock.
+
+Only complete database transactions can repeat before COMMIT.
+No external effect can enter a transaction that can repeat.
+Read retry also requires one statement with known pure SQL constructs and functions.
+Quoted or unknown functions are not proof of a read-only operation.
+An uncertain reply after such a call follows the unknown-write rule.
+
+Public transaction callbacks can call external services or change nonlocal state.
+Their API remains unchanged, but these callbacks cannot repeat.
+Only store-internal database-only callbacks can use automatic transaction retry.
+Connection loss in a callback without retry permission requires a safe nonzero exit.
+Definite application or constraint rollback retains its normal error behavior.
+
+PostgreSQL project discovery uses exact registry names, not the presence of SQLite files.
+The existing SQLite discovery arguments retain their behavior.
+An optional registry list supplies the PostgreSQL discovery boundary.
+
+C's real connection, query, subprocess, and safe-error tests passed against isolated PostgreSQL 18.4.
+A separate live proof passed reserved-session identity, lock refusal, qualified SQL, commit, rollback, exact bigint values, and Unicode.
+Ripwire found 28 direct ProjectStore importers and 94 affected SQLite-driver test files.
+Its ambiguous and unresolved edges require source review and the full test suite as additional evidence.
+
+The isolated fixture uses PostgreSQL 18.4 binaries from the official PostgreSQL package repository.
+It runs from a temporary data directory, with UTF-8, a free loopback port, and a generated password.
+This uses the gate assumption that a disposable local fixture can replace an unavailable container runtime.
+It does not claim a Docker Compose runtime check.
+
+The credential-guard fault drill removed the production-URL filter from `childDatabaseEnv`.
+The targeted fixed-seed property failed with seed 42.
+The filter was then restored.
+
+```sh
+timeout 30s bun test src/postgresConfig.test.ts --test-name-pattern 'record helpers omit production selection'
+```
+
+The child-launch census includes explicit environment overrides and serialized worker/VM requests.
+It covers runner and worker launches, login and model helpers, Git and release commands, package tools, VM tools, Firecracker, and Unix and Windows process helpers.
+The VM validation job retains its existing environment allowlist.
+Test-variable propagation remains separate from the production-URL filter.
+
+AGEN-108 owns the managed AGENTS schema rule change in the agent-data project.
+Card D must wait for that dependency before delivery.
 
 ### SQL dialect inventory and target behavior
 
@@ -723,7 +791,7 @@ A database transaction covers database work only. Git, network, process, model, 
 - `src/app.ts:4653-4710,4795-4825`: task resolution and edits use task snapshots. `resolveTask` returns the snapshot that handlers use for guards. Preserve those guards in atomic route operations after async conversion.
 - `src/app.ts:6552-6655`: cancel delegates to the early cancel mark and external cleanup flow. Refile reads `listTasks` for duplicates, then synchronously creates and updates a replacement. Extract one atomic refile operation.
 - `src/app.ts:6660-6735,9302-9375`: steer edits, steer cancel, and prompt edits read state and write without an await after the request body completes. Preserve revision checks through `updateTaskIfCurrent` or `editTask` in one atomic operation.
-- `src/app.ts:6860-6900`: `reorderQueue` owns queue validation and mutation. Keep both within that atomic store operation. The handler does not first read the queue.
+- `src/app.ts:6860-6900`: `moveInQueue` owns queue validation and mutation. Keep both within that atomic store operation. The handler does not first read the queue.
 - `src/app.ts:7069-7225`: finish-kept delegates to external Git/filesystem work. Restart-session reads a needs-you task, then synchronously writes its restart prompt and queued state. Make that one atomic operation. Preserve task-state checks for star and edit-start writes.
 - `src/app.ts:8481-8590`: promotion reads the latest grill turn and updates the task. Parking checks and updates task state. Each group needs one atomic operation. Grill reads the task before `await readJson`, then writes from the earlier snapshot. Preserve its current snapshot and guard semantics across that await.
 - `src/app.ts:8676-8845,9168-9250`: steering and replies save images before task updates. Follow-up creation can place image and handoff-file writes between child creation and the final update. Keep those effects separate. Make approval, send-back, ordinary reply, and adjacent child database groups atomic with their current guards.

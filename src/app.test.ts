@@ -38,22 +38,33 @@ import {
 	boardWarnings,
 	dependabotHeadPrefix,
 	type Entry,
+	parseValidateAgainBody,
 	pickEncoding,
 	reconcileLayerUse,
 	storedProjectPaths,
 	tmpFull,
+	tmpFullNotice,
+	tmpSpaceNotice,
 	type WorkerSignInReport,
 	workerSignInWarnings,
 	workerTmpWarnings,
 } from "./app.ts";
-import { hashPassword, signIdentity, signSession } from "./auth.ts";
+import {
+	hashPassword,
+	SESSION_COOKIE,
+	sessionCookieName,
+	signIdentity,
+	signSession,
+} from "./auth.ts";
 import type { DeepenCheck } from "./deepen.ts";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import type { GhFn } from "./forks.ts";
 import { defaultSshDir, GIT_URL_ERROR, type Keyscan } from "./gitHosts.ts";
 import { DEFAULT_COMMIT_EMAIL, DEFAULT_COMMIT_NAME } from "./gitIdentity.ts";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { GlobalStore } from "./globalStore.ts";
 import { MAX_IMAGE_BYTES } from "./images.ts";
+import { acquireLayerUse } from "./layers.ts";
 import { boardOmpEnv, boardOmpHome, type SignIn, signIns } from "./login.ts";
 import { MERMAID_VERSION, mermaidSrc } from "./mermaidVersion.ts";
 import { modelRoles } from "./models.ts";
@@ -64,6 +75,7 @@ import { summarizeCmd } from "./orphans.ts";
 import {
 	gateCompareText,
 	gateFingerprint,
+	hasOpenQuestionsSection,
 	startAnywayQuestion,
 } from "./promptGate.ts";
 import {
@@ -80,6 +92,7 @@ import {
 	WORK_CHECK_SENDBACK_OPENING,
 } from "./prompts.ts";
 import { PR_GATES } from "./prs.ts";
+import { forModel, tightestFor, usageReset } from "./quota.ts";
 import { createRunSink } from "./runner.ts";
 import {
 	archReviewDue,
@@ -98,9 +111,14 @@ import {
 	workCheckDivergeReason,
 } from "./scheduler.ts";
 import { loadSecretBox, type SecretBox } from "./secretBox.ts";
+import { createServiceQuotaHttpReader } from "./serviceQuotaHttp.ts";
 import { ProjectStore } from "./store.ts";
 import { prFeedbackReason } from "./supervisor.ts";
 import fc from "./test/properties.ts";
+import {
+	installSshKeygenStub,
+	removeSshKeygenStub,
+} from "./test/sshKeygenStub.ts";
 import type { TmpDiskSpace } from "./tmpsweep.ts";
 import { formatBytes } from "./tmpsweep.ts";
 import { parseTrending, TRENDING_PAGES } from "./trending.ts";
@@ -110,7 +128,17 @@ import {
 	MERGE_HOLD_MISMATCH_REASON,
 	UPDATE_HOLD_REASON,
 } from "./turn.ts";
-import type { QuotaLimit, QuotaState, TaskCard } from "./types.ts";
+import type {
+	HostedCreditsView,
+	QuotaLimit,
+	QuotaState,
+	ServiceQuotaAdapterDefinition,
+	ServiceQuotaMetric,
+	ServiceQuotaReadResult,
+	ServiceQuotaSourceConfig,
+	StateResponse,
+	TaskCard,
+} from "./types.ts";
 import {
 	type AddProjectResponse,
 	answeredCard,
@@ -124,6 +152,7 @@ import {
 	REVIEW_FOOTER,
 	type Task,
 } from "./types.ts";
+import { shortNoticeText } from "./ui/notice.ts";
 import { isUnread } from "./ui/queue.ts";
 import {
 	UPDATE_HOST_LEASE_MS,
@@ -251,12 +280,21 @@ writeFileSync(
 		"",
 	].join("\n"),
 );
+// bun test runs every file in one process, so this file-scope override would leak
+// into later files: src/test/boardRepoGuard.test.ts builds its git env from
+// process.env and must see the host's global config (its safe.directory
+// exception), not this fixture's insteadOf rewrites. Restored in the file afterAll.
+const hostGitConfigGlobal = process.env.GIT_CONFIG_GLOBAL;
 process.env.GIT_CONFIG_GLOBAL = gitConfigGlobal;
+afterAll(() => {
+	process.env.GIT_CONFIG_GLOBAL = hostGitConfigGlobal;
+});
 /** Local repo the insteadOf rewrite serves for https://github.com/octo/<name>; empty=true skips the commit (gitless clone). */
 const makeFixture = (name: string, empty = false) => {
 	const p = join(fixtureRepos, name);
 	mkdirSync(p, { recursive: true });
-	const run = (cmd: string) => execSync(cmd, { cwd: p, stdio: "ignore" });
+	const run = (cmd: string) =>
+		execSync(cmd, { cwd: p, stdio: "ignore", env: fixtureGitEnv() });
 	run("git init -q -b main");
 	if (!empty) {
 		run("git config user.email t@t && git config user.name t");
@@ -290,6 +328,12 @@ const sshFixture = () => {
 const seedGlobalKey = (dir: string): void => {
 	execSync(`ssh-keygen -t ed25519 -N "" -q -f ${join(dir, "global")}`);
 };
+// OTTR-1180: the real ssh-keygen dies on hosts whose uid has no passwd entry (it runs
+// getpwuid at startup; this worker container's ephemeral uid has none), which fails every
+// fixture above and every key route through production generatePendingKey/keyInfo. The
+// stub from src/test/sshKeygenStub.ts answers the same command lines; the suite env belt
+// restores the ambient PATH after each test.
+beforeEach(installSshKeygenStub);
 /** Servers mounted by the per-describe helpers, and the global stores await mount() opened; the shared afterAll stops and closes them. */
 const mounted: Server<undefined>[] = [];
 const mountStores: GlobalStore[] = [];
@@ -306,6 +350,7 @@ afterAll(async () => {
 	// Windows cannot delete an open db: every store under root must be closed before the rm.
 	for (const g of mountStores) await closeTestStore(g);
 	for (const d of sshTempDirs) rmSync(d, { recursive: true, force: true });
+	removeSshKeygenStub();
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 	// The whole-shutdown sweep (every mounted server's graceful stop, then the root rm) passes
 	// bun's 5 s hook default on a loaded machine (OTTR-548 gate): a ceiling, not a wait.
@@ -360,7 +405,10 @@ let validateLeadsImpl:
 			e: Entry,
 			reviewId: string,
 			strictReview?: boolean,
-	  ) => Promise<{ id: string } | { error: string; status: number }>)
+			again?: { before: number },
+	  ) => Promise<
+			{ id: string; reset: string[] } | { error: string; status: number }
+	  >)
 	| null = null;
 const loopStubs = () => ({
 	cancel: (e: Entry, id: string, force: boolean) => cancelImpl(e, id, force),
@@ -368,10 +416,15 @@ const loopStubs = () => ({
 		finishKeptImpl(e, id, choices),
 	stopTurn: (e: Entry, id: string) => stopTurnImpl(e, id),
 	claimedPids: () => new Set<number>(),
-	validateLeads: (e: Entry, reviewId: string, strictReview?: boolean) => {
+	validateLeads: (
+		e: Entry,
+		reviewId: string,
+		strictReview?: boolean,
+		again?: { before: number },
+	) => {
 		if (!validateLeadsImpl)
 			return Promise.reject(new Error("validateLeads not stubbed"));
-		return validateLeadsImpl(e, reviewId, strictReview);
+		return validateLeadsImpl(e, reviewId, strictReview, again);
 	},
 });
 // Deepen seam: the route tests swap deepenImpl per test; unstubbed calls fail loudly.
@@ -396,6 +449,9 @@ let branchRulesImpl: (url: string, init?: RequestInit) => Promise<Response> =
 		new Response(null, {
 			status: 404,
 		});
+// OTTR-1181: the model route's resume-gate quota report; tests swap it per case. Null
+// answers unknown, so an unset stub keeps every resume at the fail-open default.
+let quotaSnapshotImpl: (() => QuotaState | null) | null = null;
 const app = await createTestApp({
 	gstore,
 	secretBox: testBox(gstore),
@@ -406,6 +462,7 @@ const app = await createTestApp({
 	workersHome: root,
 	projects,
 	...loopStubs(),
+	quotaSnapshot: () => quotaSnapshotImpl?.() ?? null,
 	deepen: (prompt, model) => deepenImpl(prompt, model),
 	deepenCheck: (draft, rewrite, model) => {
 		if (!deepenCheckImpl)
@@ -543,6 +600,8 @@ async function mount(
 		latestRelease?: Parameters<typeof createApp>[0]["latestRelease"];
 		/** Idle-review clock seam (docs/specs/mutation-delta.md §7); defaults to Date.now. */
 		now?: () => number;
+		serviceQuotas?: Parameters<typeof createApp>[0]["serviceQuotas"];
+		prod?: boolean;
 		schedule?: () => void;
 		runnerTurns?: Parameters<typeof createApp>[0]["runnerTurns"];
 		runners?: Parameters<typeof createApp>[0]["runners"];
@@ -560,6 +619,8 @@ async function mount(
 		prReviewSpawn?: Parameters<typeof createApp>[0]["prReviewSpawn"];
 		/** OTTR-1071: the server wiring's next regular PR poll for the state payload. */
 		prPollNextAt?: Parameters<typeof createApp>[0]["prPollNextAt"];
+		/** OTTR-1087: the server wiring's next regular code-scanning poll. */
+		codeScanPollNextAt?: Parameters<typeof createApp>[0]["codeScanPollNextAt"];
 		/** Fetch seam for the weekly trending scan; passed through to createApp. */
 		trendingFetch?: typeof fetch;
 		/** Fetch seam for the re-run-failed-jobs GitHub call; passed through to createApp. */
@@ -578,6 +639,8 @@ async function mount(
 		slowApiMs?: Parameters<typeof createApp>[0]["slowApiMs"];
 		/** Live-run seam for the system sampler (OTTR-793); tests inject to force a sample failure. */
 		liveRuns?: Parameters<typeof createApp>[0]["liveRuns"];
+		/** OTTR-1151: the microVM runner the system sampler polls like a worker row. */
+		vmTarget?: Parameters<typeof createApp>[0]["vmTarget"];
 		/** Test seam (OTTR-866 send-back): awaited at each state build's start; passed
 		 * through to createApp so a test can park builds across a guaranteed window. */
 		stateBuildGate?: Parameters<typeof createApp>[0]["stateBuildGate"];
@@ -610,6 +673,8 @@ async function mount(
 		claimedPids: () => new Set<number>(),
 		schedule: input.schedule ?? (() => {}),
 		now: input.now,
+		serviceQuotas: input.serviceQuotas,
+		prod: input.prod,
 		serverVersion: input.serverVersion ?? "test",
 		port: 0,
 		publicHosts: input.publicHosts ?? [],
@@ -638,6 +703,7 @@ async function mount(
 		releaseSummarySpawn: input.releaseSummarySpawn,
 		prReviewSpawn: input.prReviewSpawn,
 		prPollNextAt: input.prPollNextAt,
+		codeScanPollNextAt: input.codeScanPollNextAt,
 		trendingFetch: input.trendingFetch,
 		rerunFetch: input.rerunFetch,
 		turnTokenFetch: input.turnTokenFetch,
@@ -645,6 +711,7 @@ async function mount(
 		githubTokenExpirySleep: input.githubTokenExpirySleep,
 		slowApiMs: input.slowApiMs,
 		liveRuns: input.liveRuns,
+		vmTarget: input.vmTarget,
 		stateBuildGate: input.stateBuildGate,
 		runnerTurns: input.runnerTurns,
 		runners: input.runners,
@@ -818,6 +885,59 @@ describe(
 	})(),
 );
 
+describe("queue route", () => {
+	test("moves one card by { id, before } while another card leaves the queue", async () => {
+		const a = await store.createTask("a");
+		const b = await store.createTask("b");
+		const c = await store.createTask("c");
+		await store.updateTask(a.id, { queuedAt: 1 });
+		await store.updateTask(b.id, { queuedAt: 2 });
+		await store.updateTask(c.id, { queuedAt: 3 });
+		const mine = async (...ids: string[]) =>
+			(await store.queueIds()).filter((id) => ids.includes(id));
+		const res = await post("/api/projects/p1/queue", {
+			id: c.id,
+			before: a.id,
+		});
+		expect(res.status).toBe(200);
+		expect(await mine(a.id, b.id, c.id)).toEqual([c.id, a.id, b.id]);
+		// A stale move whose named cards still queue lands even after b left the queue.
+		await store.updateTask(b.id, { state: "preparing" });
+		const again = await post("/api/projects/p1/queue", {
+			id: a.id,
+			before: c.id,
+		});
+		expect(again.status).toBe(200);
+		expect(await mine(a.id, c.id)).toEqual([a.id, c.id]);
+	});
+
+	test("a bad body shape is 400 and a not-queued card is 409", async () => {
+		const a = await store.createTask("a");
+		// The old full-order body is now a bad shape.
+		const full = await post("/api/projects/p1/queue", { order: [a.id] });
+		expect(full.status).toBe(400);
+		const missing = await post("/api/projects/p1/queue", { id: a.id });
+		expect(missing.status).toBe(400);
+		const wrongType = await post("/api/projects/p1/queue", {
+			id: a.id,
+			before: 5,
+		});
+		expect(wrongType.status).toBe(400);
+		const unknown = await post("/api/projects/p1/queue", {
+			id: "nope",
+			before: null,
+		});
+		expect(unknown.status).toBe(409);
+		expect(await errorOf(unknown)).toContain("not queued");
+		await store.updateTask(a.id, { state: "preparing" });
+		const notQueued = await post("/api/projects/p1/queue", {
+			id: a.id,
+			before: null,
+		});
+		expect(notQueued.status).toBe(409);
+	});
+});
+
 describe("task routes", () => {
 	test("create returns a queued task with a PREFIX-n id and kicks the scheduler", async () => {
 		const before = calls;
@@ -926,7 +1046,7 @@ describe("task routes", () => {
 		// statusFiles only reports for a linked git worktree, so build a real one.
 		const repo = join(root, "wt-repo");
 		const run = (cmd: string, cwd: string) =>
-			execSync(cmd, { cwd, stdio: "ignore" });
+			execSync(cmd, { cwd, stdio: "ignore", env: fixtureGitEnv() });
 		mkdirSync(repo, { recursive: true });
 		run("git init -q", repo);
 		run("git config user.email t@t && git config user.name t", repo);
@@ -979,6 +1099,82 @@ describe("task routes", () => {
 			(await get(`/api/projects/p1/tasks/${noWt.id}/files?path=mockup.html`))
 				.status,
 		).toBe(404);
+
+		// A worker with write access to the worktree plants a link at a served name:
+		// the viewer must refuse it instead of following it to a server-only file.
+		const outside = join(root, "wt-outside.txt");
+		writeFileSync(outside, "server-only");
+		symlinkSync(outside, join(wt, "leak.html"));
+		const leak = await get(
+			`/api/projects/p1/tasks/${t.id}/files?path=leak.html`,
+		);
+		expect(leak.status).toBe(404);
+		expect(await errorOf(leak)).toBe("unknown file");
+		// A symlinked component inside the tree must not widen the read either.
+		symlinkSync("/", join(wt, "up"));
+		const viaUp = await get(
+			`/api/projects/p1/tasks/${t.id}/files?path=${encodeURIComponent("up/etc/passwd")}`,
+		);
+		expect(viaUp.status).toBe(404);
+		// The worktree entry itself swapped for a link: the viewer refuses it.
+		const realWt = join(root, "wt-real");
+		mkdirSync(realWt, { recursive: true });
+		writeFileSync(join(realWt, "mockup.html"), "<h1>swap</h1>");
+		symlinkSync(realWt, join(root, "wt-link"));
+		const swapped = await store.createTask("swapped worktree");
+		await store.updateTask(swapped.id, { worktree: join(root, "wt-link") });
+		const swapRes = await get(
+			`/api/projects/p1/tasks/${swapped.id}/files?path=mockup.html`,
+		);
+		expect(swapRes.status).toBe(404);
+		expect(await errorOf(swapRes)).toBe("unknown file");
+	});
+
+	test("the log chunker serves the real log and refuses a symlinked one", async () => {
+		const t = await store.createTask("logged");
+		const log = await store.logPath(t.id);
+		mkdirSync(dirname(log), { recursive: true });
+		writeFileSync(log, "real log bytes");
+		const ok = await get(`/api/projects/p1/tasks/${t.id}/log`);
+		expect(ok.status).toBe(200);
+		expect(await ok.text()).toBe("real log bytes");
+		expect(ok.headers.get("x-log-size")).toBe(String("real log bytes".length));
+		const mid = await get(`/api/projects/p1/tasks/${t.id}/log?from=5`);
+		expect(await mid.text()).toBe("log bytes");
+
+		// A worker swaps a log path for a link to a server-only file: the chunker
+		// must refuse it instead of streaming the target's bytes.
+		const outside = join(root, "log-outside.txt");
+		writeFileSync(outside, "server-only");
+		const planted = await store.createTask("planted log");
+		const plantedLog = await store.logPath(planted.id);
+		mkdirSync(dirname(plantedLog), { recursive: true });
+		symlinkSync(outside, plantedLog);
+		const leak = await get(`/api/projects/p1/tasks/${planted.id}/log`);
+		expect(leak.status).toBe(404);
+		expect(await leak.clone().text()).not.toContain("server-only");
+		expect(await errorOf(leak)).toBe("log unavailable");
+	});
+
+	test("the image route serves the stored shot and refuses a symlinked one", async () => {
+		const t = await store.createTask("shots");
+		const dir = await store.imagesDir(t.id);
+		mkdirSync(dir, { recursive: true });
+		const png = Buffer.from("89504e470d0a1a0a", "hex");
+		writeFileSync(join(dir, "1.png"), png);
+		await store.updateTask(t.id, { shots: ["1.png", "2.png"] });
+		const ok = await get(`/api/projects/p1/tasks/${t.id}/images/1.png`);
+		expect(ok.status).toBe(200);
+		expect(new Uint8Array(await ok.arrayBuffer())).toEqual(new Uint8Array(png));
+
+		// A worker plants a link at a member name: the route must refuse it instead
+		// of following it to a server-only file.
+		const outside = join(root, "image-outside.txt");
+		writeFileSync(outside, "server-only");
+		symlinkSync(outside, join(dir, "2.png"));
+		const leak = await get(`/api/projects/p1/tasks/${t.id}/images/2.png`);
+		expect(leak.status).toBe(404);
+		expect(await errorOf(leak)).toBe("unknown image");
 	});
 
 	test("drawer detail lists saved files and serves them safely", async () => {
@@ -1132,13 +1328,15 @@ describe("task routes", () => {
 
 	test("an open card reads its diff live from the branch", async () => {
 		const repo = join(root, "diff-repo");
-		const run = (cmd: string) => execSync(cmd, { cwd: repo, stdio: "ignore" });
+		const run = (cmd: string) =>
+			execSync(cmd, { cwd: repo, stdio: "ignore", env: fixtureGitEnv() });
 		mkdirSync(repo, { recursive: true });
 		run("git init -q -b main");
 		run("git config user.email t@t && git config user.name t");
 		writeFileSync(join(repo, "seed.txt"), "s");
 		run("git add seed.txt && git commit -qm seed");
 		const seed = execSync("git rev-parse HEAD", {
+			env: fixtureGitEnv(),
 			cwd: repo,
 		})
 			.toString()
@@ -1147,6 +1345,7 @@ describe("task routes", () => {
 		run(`git worktree add -q "${wt}" -b card`);
 		writeFileSync(join(wt, "a.txt"), "added\n");
 		execSync('git add a.txt && git commit -qm "card work"', {
+			env: fixtureGitEnv(),
 			cwd: wt,
 			stdio: "ignore",
 		});
@@ -1266,8 +1465,8 @@ describe("task routes", () => {
 				(t) => t.followUpOf === parent.id,
 			)!;
 			expect(child.followUpOfProject).toBe("p1");
-			// The merge hold never crosses a project border.
-			expect(child.updateIds).toEqual([]);
+			// The merge hold crosses the border: the child inherits the parent's hold ids.
+			expect(child.updateIds).toEqual(["x@1"]);
 		});
 
 		test("create with a parent on this board keeps the link local", async () => {
@@ -1334,6 +1533,43 @@ describe("task routes", () => {
 				existsSync(join(p2.store.tasksDir, "handoffs", `${kid.id}.md`)),
 			).toBe(true);
 			expect((await store.listTasks()).length).toBe(before);
+		});
+
+		test("a follow-up inherits the source card's merge hold ids", async () => {
+			const parent = await store.createTask("p1 held parent");
+			await store.updateTask(parent.id, {
+				updateIds: ["x@1"],
+				stage: "done",
+				state: "idle",
+			});
+			const cross = await post(
+				`/api/projects/p1/tasks/${parent.id}/follow-up`,
+				{
+					text: "carry on in p2",
+					project: "p2",
+				},
+			);
+			expect(cross.status).toBe(200);
+			const crossKid = (await p2.store.listTasks()).find(
+				(t) => t.followUpOf === parent.id,
+			)!;
+			expect(crossKid.followUpOfProject).toBe("p1");
+			expect(crossKid.updateIds).toEqual(["x@1"]);
+			const localParent = await store.createTask("p1 held parent, local");
+			await store.updateTask(localParent.id, {
+				updateIds: ["x@1"],
+				stage: "done",
+				state: "idle",
+			});
+			const local = await post(
+				`/api/projects/p1/tasks/${localParent.id}/follow-up`,
+				{ text: "carry on here" },
+			);
+			expect(local.status).toBe(200);
+			const localKid = (await store.listTasks()).find(
+				(t) => t.followUpOf === localParent.id,
+			)!;
+			expect(localKid.updateIds).toEqual(["x@1"]);
 		});
 
 		test("follow-up into an unknown project 404s and files nothing", async () => {
@@ -1807,6 +2043,7 @@ describe("task routes", () => {
 				options: [{ label: "yes" }, { label: "no" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			})),
 		});
 		return t;
@@ -1855,6 +2092,7 @@ describe("task routes", () => {
 					options: [{ label: "yes" }, { label: "no" }],
 					multi: false,
 					recommended: null,
+					text: false,
 				})),
 			});
 		await round(["Old?"]);
@@ -1965,6 +2203,116 @@ describe("task routes", () => {
 		expect(await store.getAskDraft(t.id)).toBeNull();
 	});
 
+	/** A needs-you card with a mixed three-question ask: one single-choice, one
+	 * multi, one text — the drawer answers each with its own wire line. */
+	const mixedAskTask = async (title: string) => {
+		const t = await store.createTask(title);
+		await store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: "the agent asked",
+			asked: [
+				{
+					question: "Which store?",
+					options: [{ label: "SQLite" }, { label: "Postgres" }],
+					multi: false,
+					recommended: 0,
+					text: false,
+				},
+				{
+					question: "Which flags?",
+					options: [
+						{ label: "verbose" },
+						{ label: "dry-run" },
+						{ label: "watch" },
+					],
+					multi: true,
+					recommended: null,
+					text: false,
+				},
+				{
+					question: "Any extra note?",
+					options: [],
+					multi: false,
+					recommended: null,
+					text: true,
+				},
+			],
+		});
+		return t;
+	};
+
+	test("a mixed-form ask reply queues all three answer lines and clears the ask", async () => {
+		const t = await mixedAskTask("mixed ask round trip");
+		const before = calls;
+		// The drawer sends one wire line per question: the picked label, a comma
+		// list for the multi question, and the typed text for the text question.
+		const reply = [
+			askAnswerLine("Which store?", "SQLite"),
+			askAnswerLine("Which flags?", "verbose, watch"),
+			askAnswerLine("Any extra note?", "keep the old key name"),
+		].join("\n");
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: reply,
+		});
+		expect(res.status).toBe(200);
+		const row = await store.getTask(t.id);
+		expect(row?.state).toBe("queued");
+		expect(row?.asked).toBeNull();
+		expect(row?.needsReason).toBeNull();
+		expect(row?.pendingPrompt).toBe(reply);
+		expect(calls).toBe(before + 1);
+	});
+
+	test("a single text question takes the raw answer as the queued turn", async () => {
+		const t = await store.createTask("one text question");
+		await store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: "the agent asked",
+			asked: [
+				{
+					question: "What should the release note say?",
+					options: [],
+					multi: false,
+					recommended: null,
+					text: true,
+				},
+			],
+		});
+		const before = calls;
+		// One question: AskPanel sends the typed text bare, without the wire line.
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: "ships with the pooled client",
+		});
+		expect(res.status).toBe(200);
+		const row = await store.getTask(t.id);
+		expect(row?.state).toBe("queued");
+		expect(row?.asked).toBeNull();
+		expect(row?.needsReason).toBeNull();
+		expect(row?.pendingPrompt).toBe("ships with the pooled client");
+		expect(calls).toBe(before + 1);
+	});
+
+	test("a mixed reply keeps a comma list and a quoted word intact on the queued turn", async () => {
+		const t = await mixedAskTask("mixed ask punctuation");
+		const before = calls;
+		const reply = [
+			askAnswerLine("Which store?", "SQLite"),
+			askAnswerLine("Which flags?", "dry-run, watch"),
+			askAnswerLine("Any extra note?", 'keep the "legacy" name'),
+		].join("\n");
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: reply,
+		});
+		expect(res.status).toBe(200);
+		const row = await store.getTask(t.id);
+		expect(row?.state).toBe("queued");
+		expect(row?.asked).toBeNull();
+		// The session turn carries the reply verbatim: no line lost, no quote mangled.
+		expect(row?.pendingPrompt).toBe(reply);
+		expect(row?.pendingPrompt).toContain('keep the "legacy" name');
+		expect(calls).toBe(before + 1);
+	});
+
 	test("reply and Resume keep a steer queued before the stop", async () => {
 		const t = await store.createTask("stopped while steered");
 		await store.updateTask(t.id, {
@@ -2023,9 +2371,58 @@ describe("task routes", () => {
 				],
 				multi: false,
 				recommended: null,
+				text: false,
 			})),
 		});
 		return { review, lead1: leads[0]!, lead2: leads[1]!, ask };
+	};
+
+	/** The three-question shape: a partial reply renumbers the remaining plain
+	 * forms, so two questions must stay waiting to catch a stale number. */
+	const seedLeadAskThree = async () => {
+		const review = await store.createTask("review", null, "review");
+		const leads = [
+			await store.createTask("Needs validation: confirm the proxy allowlist"),
+			await store.createTask("Needs validation: confirm the cron job env"),
+			await store.createTask("Needs validation: confirm the deploy token"),
+		];
+		for (const lead of leads)
+			await store.updateTask(lead.id, {
+				followUpOf: review.id,
+				stage: "backlog",
+				state: "idle",
+				queuedAt: null,
+			});
+		const ask = await store.createTask(
+			`${LEAD_QUESTIONS_PROMPT_PREFIX}${review.id}: reply with one answer per question, and the board applies each answer to its lead card.`,
+		);
+		await store.updateTask(ask.id, {
+			followUpOf: review.id,
+			stage: "backlog",
+			state: "needs_you",
+			queuedAt: null,
+			needsReason:
+				"Wants your answer: 3 questions about the review's needs-validation leads",
+			asked: leads.map((lead, i) => ({
+				question: `Q ${
+					i === 0 ? "one" : i === 1 ? "two" : "three"
+				}? (card #${lead.id})`,
+				options: [
+					{ label: LEAD_APPLIES_OPTION },
+					{ label: LEAD_NOT_APPLY_OPTION },
+				],
+				multi: false,
+				recommended: null,
+				text: false,
+			})),
+		});
+		return {
+			review,
+			lead1: leads[0]!,
+			lead2: leads[1]!,
+			lead3: leads[2]!,
+			ask,
+		};
 	};
 
 	test("a lead-question reply queues the applies lead, cancels the other, and lands the card Done", async () => {
@@ -2063,7 +2460,7 @@ describe("task routes", () => {
 		expect(await errorOf(again)).toBe("task is not waiting for you");
 	});
 
-	test("a lead-question free-text answer appends to the lead's details and keeps both leads in backlog", async () => {
+	test("a lead-question free-text answer appends to the lead's details and keeps the card waiting for the other question", async () => {
 		const { lead1, lead2, ask } = await seedLeadAsk();
 		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
 			text: askAnswerLine(
@@ -2085,10 +2482,17 @@ describe("task routes", () => {
 		expect(two.state).toBe("idle");
 		expect(two.cancelledAt).toBeNull();
 		expect(two.details).toBeNull();
-		const done = (await store.getTask(ask.id))!;
-		expect(done.stage).toBe("done");
-		expect(done.state).toBe("idle");
-		expect(done.asked).toBeNull();
+		// A partial reply keeps the card at needs_you with only the unanswered question.
+		const card = (await store.getTask(ask.id))!;
+		expect(card.state).toBe("needs_you");
+		expect(card.stage).toBe("backlog");
+		expect(card.doneAt).toBeNull();
+		expect(card.asked).toEqual([
+			expect.objectContaining({ question: `Q two? (card #${lead2.id})` }),
+		]);
+		expect(card.needsReason).toBe(
+			`Waiting for answers to 1 of 2 questions: Q1 "Q two? (card #${lead2.id})"`,
+		);
 	});
 
 	/** The one-question shape: the drawer sends the raw answer text for it, not the
@@ -2123,6 +2527,7 @@ describe("task routes", () => {
 					],
 					multi: false,
 					recommended: null,
+					text: false,
 				},
 			],
 		});
@@ -2182,22 +2587,225 @@ describe("task routes", () => {
 		expect((await store.getTask(ask.id))?.stage).toBe("done");
 	});
 
-	test("a plain reply on a multi-question card reaches every unanswered lead's details", async () => {
+	test("a multi-question reply matching no question is refused and changes nothing", async () => {
 		const { lead1, lead2, ask } = await seedLeadAsk();
 		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
 			text: "it is behind our staging proxy",
 		});
-		expect(res.status).toBe(200);
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			`no answer line matched any of the 2 questions. Answer with one line per question, as: ${askAnswerLine(`Q one? (card #${lead1.id})`, "<answer>")}`,
+		);
 		for (const id of [lead1.id, lead2.id]) {
 			const lead = (await store.getTask(id))!;
 			expect(lead.stage).toBe("backlog");
 			expect(lead.state).toBe("idle");
 			expect(lead.cancelledAt).toBeNull();
-			expect(lead.details).toBe(
-				"\n\nThe user answered the review's question: it is behind our staging proxy",
-			);
+			expect(lead.details).toBeNull();
 		}
-		expect((await store.getTask(ask.id))?.stage).toBe("done");
+		const card = (await store.getTask(ask.id))!;
+		expect(card.state).toBe("needs_you");
+		expect(card.stage).toBe("backlog");
+		expect(card.asked).toHaveLength(2);
+		expect(card.doneAt).toBeNull();
+		expect(card.needsReason).toBe(
+			"Wants your answer: 2 questions about the review's needs-validation leads",
+		);
+	});
+
+	test.each(["Q1: Yes, the risk applies.", "1. Yes, the risk applies"])(
+		"a plain-form reply %s moves its lead and keeps the card waiting for the rest",
+		async (text) => {
+			const { lead1, lead2, ask } = await seedLeadAsk();
+			const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+				text,
+			});
+			expect(res.status).toBe(200);
+			const one = (await store.getTask(lead1.id))!;
+			expect(one.stage).toBe("todo");
+			expect(one.state).toBe("queued");
+			expect(one.queuedAt).not.toBeNull();
+			const two = (await store.getTask(lead2.id))!;
+			expect(two.stage).toBe("backlog");
+			expect(two.state).toBe("idle");
+			expect(two.details).toBeNull();
+			const card = (await store.getTask(ask.id))!;
+			expect(card.state).toBe("needs_you");
+			expect(card.asked).toEqual([
+				expect.objectContaining({ question: `Q two? (card #${lead2.id})` }),
+			]);
+			expect(card.needsReason).toBe(
+				`Waiting for answers to 1 of 2 questions: Q1 "Q two? (card #${lead2.id})"`,
+			);
+		},
+	);
+
+	test("plain-form answers for every question land the card Done", async () => {
+		const { lead1, lead2, ask } = await seedLeadAsk();
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "Q1: Yes, the risk applies\nQ2: no, it does not apply.",
+		});
+		expect(res.status).toBe(200);
+		const one = (await store.getTask(lead1.id))!;
+		expect(one.stage).toBe("todo");
+		expect(one.state).toBe("queued");
+		const two = (await store.getTask(lead2.id))!;
+		expect(two.cancelledAt).not.toBeNull();
+		expect(two.needsReason).toBe(
+			"Cancelled by the user's answer to the review's question: no, it does not apply.",
+		);
+		const done = (await store.getTask(ask.id))!;
+		expect(done.stage).toBe("done");
+		expect(done.state).toBe("idle");
+		expect(done.asked).toBeNull();
+	});
+
+	test("wire lines and plain answers mix in one reply", async () => {
+		const { lead1, lead2, ask } = await seedLeadAsk();
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: `${askAnswerLine(`Q one? (card #${lead1.id})`, LEAD_APPLIES_OPTION)}\n2. ${LEAD_NOT_APPLY_OPTION}`,
+		});
+		expect(res.status).toBe(200);
+		expect(await store.getTask(lead1.id)).toMatchObject({
+			stage: "todo",
+			state: "queued",
+		});
+		expect((await store.getTask(lead2.id))!.cancelledAt).not.toBeNull();
+		expect(await store.getTask(ask.id)).toMatchObject({
+			stage: "done",
+			asked: null,
+		});
+	});
+
+	test("a partial reply finishes on the second reply's remaining question", async () => {
+		const { lead1, lead2, ask } = await seedLeadAsk();
+		const first = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(`Q one? (card #${lead1.id})`, LEAD_APPLIES_OPTION),
+		});
+		expect(first.status).toBe(200);
+		const waiting = (await store.getTask(ask.id))!;
+		expect(waiting.state).toBe("needs_you");
+		expect(waiting.asked).toEqual([
+			expect.objectContaining({ question: `Q two? (card #${lead2.id})` }),
+		]);
+		const second = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(`Q two? (card #${lead2.id})`, LEAD_APPLIES_OPTION),
+		});
+		expect(second.status).toBe(200);
+		const two = (await store.getTask(lead2.id))!;
+		expect(two.stage).toBe("todo");
+		expect(two.state).toBe("queued");
+		const done = (await store.getTask(ask.id))!;
+		expect(done.stage).toBe("done");
+		expect(done.asked).toBeNull();
+	});
+
+	test("after a partial reply the plain forms follow the card's current question order", async () => {
+		const { lead1, lead2, lead3, ask } = await seedLeadAskThree();
+		const first = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(`Q one? (card #${lead1.id})`, LEAD_APPLIES_OPTION),
+		});
+		expect(first.status).toBe(200);
+		// The card names the current number of each question it still asks.
+		expect((await store.getTask(ask.id))!.needsReason).toBe(
+			`Waiting for answers to 2 of 3 questions: Q1 "Q two? (card #${lead2.id})", Q2 "Q three? (card #${lead3.id})"`,
+		);
+		const second = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "Q1: Yes, the risk applies",
+		});
+		expect(second.status).toBe(200);
+		// Q1 now names the original Q2, the first question the card still asks.
+		const two = (await store.getTask(lead2.id))!;
+		expect(two.stage).toBe("todo");
+		expect(two.state).toBe("queued");
+		const three = (await store.getTask(lead3.id))!;
+		expect(three.stage).toBe("backlog");
+		expect(three.state).toBe("idle");
+		expect(three.details).toBeNull();
+		expect((await store.getTask(ask.id))!.asked).toEqual([
+			expect.objectContaining({ question: `Q three? (card #${lead3.id})` }),
+		]);
+	});
+
+	test("a plain line numbered past the waiting questions refuses the whole reply", async () => {
+		const { lead1, lead2, lead3, ask } = await seedLeadAskThree();
+		const first = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(`Q one? (card #${lead1.id})`, LEAD_APPLIES_OPTION),
+		});
+		expect(first.status).toBe(200);
+		// The operator answers from the original numbering: Q3 names nothing now,
+		// so the whole reply is refused and no lead moves.
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "Q2: Yes, the risk applies\nQ3: No, it does not apply",
+		});
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			`answer line "Q3" names no question: 2 questions are waiting, numbered Q1 to Q2. Answer with one line per question, as: ${askAnswerLine(`Q two? (card #${lead2.id})`, "<answer>")}`,
+		);
+		for (const id of [lead2.id, lead3.id]) {
+			const lead = (await store.getTask(id))!;
+			expect(lead.stage).toBe("backlog");
+			expect(lead.state).toBe("idle");
+			expect(lead.cancelledAt).toBeNull();
+			expect(lead.details).toBeNull();
+		}
+		const card = (await store.getTask(ask.id))!;
+		expect(card.state).toBe("needs_you");
+		expect(card.asked).toHaveLength(2);
+	});
+
+	test("a plain line out of range on a fresh card refuses the reply", async () => {
+		const { lead1, ask } = await seedLeadAskThree();
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "Q4: Yes, the risk applies",
+		});
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			`answer line "Q4" names no question: 3 questions are waiting, numbered Q1 to Q3. Answer with one line per question, as: ${askAnswerLine(`Q one? (card #${lead1.id})`, "<answer>")}`,
+		);
+		expect((await store.getTask(ask.id))!.state).toBe("needs_you");
+	});
+
+	test("a stale plain line on a one-question card refuses the reply", async () => {
+		const { lead1, lead2, ask } = await seedLeadAsk();
+		const first = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(`Q one? (card #${lead1.id})`, LEAD_APPLIES_OPTION),
+		});
+		expect(first.status).toBe(200);
+		// One question is left; the operator's stale Q2 names nothing on the card,
+		// so the reply is refused and the last lead stays untouched.
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "Q2: Yes, the risk applies.",
+		});
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			`answer line "Q2" names no question: the card asks 1 question, numbered Q1. Answer with one line per question, as: ${askAnswerLine(`Q two? (card #${lead2.id})`, "<answer>")}`,
+		);
+		const two = (await store.getTask(lead2.id))!;
+		expect(two.stage).toBe("backlog");
+		expect(two.state).toBe("idle");
+		expect(two.cancelledAt).toBeNull();
+		expect(two.details).toBeNull();
+		const card = (await store.getTask(ask.id))!;
+		expect(card.state).toBe("needs_you");
+		expect(card.asked).toHaveLength(1);
+		expect(card.doneAt).toBeNull();
+	});
+
+	test("an out-of-range plain line refuses a fresh one-question card's reply", async () => {
+		const { lead1, ask } = await seedLeadAskOne();
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "Q2: No, it does not apply",
+		});
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			`answer line "Q2" names no question: the card asks 1 question, numbered Q1. Answer with one line per question, as: ${askAnswerLine(`Q one? (card #${lead1.id})`, "<answer>")}`,
+		);
+		const one = (await store.getTask(lead1.id))!;
+		expect(one.stage).toBe("backlog");
+		expect(one.state).toBe("idle");
+		expect(one.details).toBeNull();
+		expect((await store.getTask(ask.id))!.state).toBe("needs_you");
 	});
 
 	test("a started lead cancels through the sanctioned cancel", async () => {
@@ -2336,6 +2944,7 @@ describe("task routes", () => {
 					],
 					multi: false,
 					recommended: null,
+					text: false,
 				},
 			],
 		});
@@ -2842,6 +3451,92 @@ describe("settings routes", () => {
 		expect(state.trendingScan).toBe(true);
 	});
 
+	test("check routing: GET answers null on boot, POST validates and saves, a re-mount restores", async () => {
+		const g = await GlobalStore.open(
+			join(root, `g-check-routing-${Math.random().toString(36).slice(2)}`),
+		);
+		mountStores.push(g);
+		const m = await mount({ gstore: g, projects: new Map() });
+		// A board without the setting runs the automatic routing.
+		const before = await m.call("/api/settings/check-routing");
+		expect(before.status).toBe(200);
+		expect(await before.json()).toEqual({ routing: null });
+
+		// A bad vendor, a bad role, and a bad fallback each refuse with 400.
+		const badVendor = await m.call("/api/settings/check-routing", {
+			rules: [{ vendor: "Zai", role: "reviewer" }],
+			fallback: "",
+		});
+		expect(badVendor.status).toBe(400);
+		const badRole = await m.call("/api/settings/check-routing", {
+			rules: [{ vendor: "zai", role: "1st-reviewer" }],
+			fallback: "",
+		});
+		expect(badRole.status).toBe(400);
+		const badFallback = await m.call("/api/settings/check-routing", {
+			rules: [],
+			fallback: "1st-reviewer",
+		});
+		expect(badFallback.status).toBe(400);
+		// A refusal stores nothing: the GET still answers null.
+		expect(await (await m.call("/api/settings/check-routing")).json()).toEqual({
+			routing: null,
+		});
+
+		// A valid save lands in shared and in the config row, and answers the saved shape.
+		const routing = {
+			rules: [{ vendor: "zai", role: "reviewer" }],
+			fallback: "reviewer",
+		};
+		const save = await m.call("/api/settings/check-routing", routing);
+		expect(save.status).toBe(200);
+		expect(await save.json()).toEqual({ routing });
+		expect(await (await m.call("/api/settings/check-routing")).json()).toEqual({
+			routing,
+		});
+
+		// A re-mount restores the saved routing through restoreRunConfig.
+		const m2 = await mount({ gstore: g, projects: new Map() });
+		expect(await (await m2.call("/api/settings/check-routing")).json()).toEqual(
+			{ routing },
+		);
+
+		// The editor's "Automatic fallback" posts fallback null next to rules; the
+		// route lands it as the empty fallback (the default rule when no rule matches).
+		const auto = await m2.call("/api/settings/check-routing", {
+			rules: [{ vendor: "zai", role: "critic" }],
+			fallback: null,
+		});
+		expect(auto.status).toBe(200);
+		expect(await auto.json()).toEqual({
+			routing: { rules: [{ vendor: "zai", role: "critic" }], fallback: "" },
+		});
+
+		// rules null and fallback null clear the setting, and the clear survives a boot.
+		const clear = await m2.call("/api/settings/check-routing", {
+			rules: null,
+			fallback: null,
+		});
+		expect(clear.status).toBe(200);
+		expect(await clear.json()).toEqual({ routing: null });
+		const m3 = await mount({ gstore: g, projects: new Map() });
+		expect(await (await m3.call("/api/settings/check-routing")).json()).toEqual(
+			{ routing: null },
+		);
+	});
+
+	test("a wrong-shaped stored check routing keeps the default null", async () => {
+		const g = await GlobalStore.open(
+			join(root, `g-check-routing-bad-${Math.random().toString(36).slice(2)}`),
+		);
+		mountStores.push(g);
+		await g.set("config", { checkRouting: { rules: "all", fallback: 7 } });
+		const m = await mount({ gstore: g, projects: new Map() });
+		expect(await (await m.call("/api/settings/check-routing")).json()).toEqual({
+			routing: null,
+		});
+	});
+
 	// OTTR-693: the Commit identity Settings pair validates, saves together, and resets.
 	describe("commit identity", () => {
 		type IdentityState = {
@@ -2945,6 +3640,17 @@ describe("settings routes", () => {
 		}) => {
 			const oldGlobal = process.env.GIT_CONFIG_GLOBAL;
 			const oldSystem = process.env.GIT_CONFIG_SYSTEM;
+			// A turn env may carry the board's default identity as ident env vars; they beat
+			// every config scope, so the assertions need them out of the way.
+			const oldIdent = (
+				[
+					"GIT_AUTHOR_NAME",
+					"GIT_AUTHOR_EMAIL",
+					"GIT_COMMITTER_NAME",
+					"GIT_COMMITTER_EMAIL",
+				] as const
+			).map((k) => [k, process.env[k]] as const);
+			for (const [k] of oldIdent) delete process.env[k];
 			process.env.GIT_CONFIG_GLOBAL = o.global;
 			if (o.system === undefined) delete process.env.GIT_CONFIG_SYSTEM;
 			else process.env.GIT_CONFIG_SYSTEM = o.system;
@@ -2964,6 +3670,7 @@ describe("settings routes", () => {
 				});
 				expect(add.status).toBe(200);
 				return execSync("git log -1 --format=%an%n%ae", {
+					env: fixtureGitEnv(),
 					cwd: join(dir, `identity-proj-${o.label}`),
 				})
 					.toString()
@@ -2973,6 +3680,10 @@ describe("settings routes", () => {
 				else process.env.GIT_CONFIG_GLOBAL = oldGlobal;
 				if (oldSystem === undefined) delete process.env.GIT_CONFIG_SYSTEM;
 				else process.env.GIT_CONFIG_SYSTEM = oldSystem;
+				for (const [k, v] of oldIdent) {
+					if (v === undefined) delete process.env[k];
+					else process.env[k] = v;
+				}
 			}
 		};
 		const hosty = "[user]\n\tname = Hosty\n\temail = hosty@example.invalid\n";
@@ -3059,7 +3770,10 @@ describe("settings routes", () => {
 					const dir = join(root, `identity-proj-${Date.now()}-pw`);
 					mkdirSync(dir, { recursive: true });
 					expect(
-						execSync("git var GIT_AUTHOR_IDENT", { cwd: dir }).toString(),
+						execSync("git var GIT_AUTHOR_IDENT", {
+							cwd: dir,
+							env: fixtureGitEnv(),
+						}).toString(),
 					).toContain("<root@passwd.invalid>");
 					const m = await mount({ projects: new Map(), defaultDir: dir });
 					if (source === "Settings") {
@@ -3072,6 +3786,7 @@ describe("settings routes", () => {
 					const add = await m.call("/api/projects", { name: "identity-proj" });
 					expect(add.status).toBe(200);
 					const log = execSync("git log -1 --format=%an%n%ae", {
+						env: fixtureGitEnv(),
 						cwd: join(dir, "identity-proj"),
 					})
 						.toString()
@@ -3240,6 +3955,15 @@ describe("settings routes", () => {
 		});
 		expect(badFilter.status).toBe(400);
 		expect(await errorOf(badFilter)).toBe("retroFilter must be a boolean");
+		// retroAutoStart saves like the other switches and refuses a non-boolean.
+		await post("/api/projects/p1/settings", { retroAutoStart: true });
+		expect((await store.getSettings()).retroAutoStart).toBe(true);
+		const badStart = await post("/api/projects/p1/settings", {
+			retroAutoStart: "yes",
+		});
+		expect(badStart.status).toBe(400);
+		expect(await errorOf(badStart)).toBe("retroAutoStart must be a boolean");
+		await post("/api/projects/p1/settings", { retroAutoStart: false });
 		const unknown = await post("/api/projects/p1/settings", {
 			retroScope: "everything",
 		});
@@ -3255,6 +3979,7 @@ describe("settings routes", () => {
 		writeFileSync(join(fixtureRepos, "persist-me", "AGENTS.md"), "rules");
 		// Clones carry committed files only: the rules file must be in the fixture's commit.
 		execSync("git add AGENTS.md && git commit -qm rules", {
+			env: fixtureGitEnv(),
 			cwd: join(fixtureRepos, "persist-me"),
 			stdio: "ignore",
 		});
@@ -3318,6 +4043,7 @@ describe("settings routes", () => {
 			),
 		).toBe(false);
 		const head = execSync("git rev-parse HEAD", {
+			env: fixtureGitEnv(),
 			cwd: dir,
 			encoding: "utf8",
 		}).trim();
@@ -3395,6 +4121,7 @@ describe("settings routes", () => {
 		expect(init.status).toBe(200);
 		// The init commit itself is the watermark: reviewed from birth, delta 0.
 		const base = execSync("git rev-parse HEAD", {
+			env: fixtureGitEnv(),
 			cwd: dir,
 			encoding: "utf8",
 		}).trim();
@@ -3405,13 +4132,14 @@ describe("settings routes", () => {
 		});
 		// The rules interview's AGENTS.md commit is the first commit toward the cap: not due.
 		execSync("git config user.email t@t && git config user.name t", {
+			env: fixtureGitEnv(),
 			cwd: dir,
 			stdio: "ignore",
 		});
 		writeFileSync(join(dir, "AGENTS.md"), "rules");
 		execSync(
 			"git add AGENTS.md && git commit -qm 'docs(rules): add AGENTS.md'",
-			{ cwd: dir, stdio: "ignore" },
+			{ cwd: dir, stdio: "ignore", env: fixtureGitEnv() },
 		);
 		const d = await archReviewDelta(dir, "main", null);
 		expect(d).toEqual({ delta: 1, reviewed: true, anchor: base });
@@ -3435,6 +4163,7 @@ describe("settings routes", () => {
 		const p = makeFixture("imported-proj");
 		writeFileSync(join(p, "AGENTS.md"), "rules");
 		execSync("git add AGENTS.md && git commit -qm rules", {
+			env: fixtureGitEnv(),
 			cwd: p,
 			stdio: "ignore",
 		});
@@ -3464,6 +4193,7 @@ describe("settings routes", () => {
 		expect(projects.get("fresh")?.path).toBe(dest);
 		// The handler initialized a repo with a commit, even without a global git identity.
 		const head = execSync("git rev-parse HEAD", {
+			env: fixtureGitEnv(),
 			cwd: dest,
 			encoding: "utf8",
 		}).trim();
@@ -4157,6 +4887,8 @@ describe("alate routes", () => {
 			keySet: false,
 			keyReadable: false,
 			lastProvisionError: null,
+			repo: null,
+			branch: null,
 		});
 	});
 
@@ -4171,6 +4903,8 @@ describe("alate routes", () => {
 			keySet: true,
 			keyReadable: true,
 			lastProvisionError: null,
+			repo: null,
+			branch: null,
 		});
 		const raw = await (await get("/api/alate")).text();
 		expect(raw).not.toContain("alate_secret");
@@ -4819,8 +5553,14 @@ describe("alate routes", () => {
 			checkedAt: iso,
 			updates,
 		});
+		// These tests cover the manual flow (a person files each card): p1 approves updates,
+		// so a refresh files nothing on its own (docs/specs/hands-off-updates.md).
+		beforeAll(async () => {
+			await projects.get("p1")!.store.setSettings({ holdUpdateMerges: true });
+		});
 		afterAll(async () => {
 			// Leave the shared store and closure clean for later describes.
+			await projects.get("p1")!.store.setSettings({ holdUpdateMerges: false });
 			await gstore.set("updateSkips", []);
 			await gstore.set("updates", null);
 			await saveSubs(gstore, []);
@@ -5248,6 +5988,7 @@ describe("alate routes", () => {
 						options: [{ label: "SQLite" }],
 						multi: false,
 						recommended: null,
+						text: false,
 					},
 				],
 				gate: {
@@ -5556,6 +6297,73 @@ describe("alate routes", () => {
 				alateBody = envelope([goodRec, otherRec]);
 			}
 		});
+
+		test("hands-off: with approval off a pull files qualified rows once, never again for a carried id", async () => {
+			const p1 = projects.get("p1")!;
+			p1.github = "https://github.com/Octo/Repo.GIT";
+			await p1.store.setSettings({ holdUpdateMerges: false });
+			const carries = async (id: string) =>
+				(await p1.store.listTasks()).filter((t) => t.updateIds.includes(id));
+			try {
+				const v20 = {
+					...goodRec,
+					id: "octo/repo@v20",
+					latest: "v20",
+					target: "v20",
+				};
+				const young = { ...goodRec, id: "octo/repo@v21", target: null };
+				const managed = {
+					...goodRec,
+					id: "octo/repo@v22",
+					managedBy: "renovate",
+				};
+				const removed = {
+					...goodRec,
+					id: "octo/repo@gone",
+					target: null,
+					removed: true,
+				};
+				const skipped = { ...goodRec, id: "octo/repo@v23", target: "v23" };
+				await gstore.set("updateSkips", [skipped.id]);
+				alateBody = envelope([v20, young, managed, removed, skipped]);
+				await post("/api/updates/refresh", {});
+				const filed = await carries(v20.id);
+				expect(filed).toHaveLength(1);
+				expect(filed[0]!.promptAuthor).toBe("board");
+				for (const id of [young.id, managed.id, removed.id, skipped.id])
+					expect(await carries(id)).toEqual([]);
+				// A second pull files nothing new, even after the card is cancelled.
+				await p1.store.updateTask(filed[0]!.id, { cancelledAt: Date.now() });
+				await post("/api/updates/refresh", {});
+				expect(await carries(v20.id)).toHaveLength(1);
+				// The next version of the same item has a new id and files.
+				const v24 = {
+					...v20,
+					id: "octo/repo@v24",
+					latest: "v24",
+					target: "v24",
+				};
+				alateBody = envelope([v20, v24]);
+				await post("/api/updates/refresh", {});
+				expect(await carries(v24.id)).toHaveLength(1);
+				// With approval on, a pull files nothing.
+				await p1.store.setSettings({ holdUpdateMerges: true });
+				const v25 = {
+					...v20,
+					id: "octo/repo@v25",
+					latest: "v25",
+					target: "v25",
+				};
+				alateBody = envelope([v25]);
+				await post("/api/updates/refresh", {});
+				expect(await carries(v25.id)).toEqual([]);
+			} finally {
+				p1.github = null;
+				await p1.store.setSettings({ holdUpdateMerges: true });
+				await gstore.set("updateSkips", []);
+				alateBody = envelope([goodRec, otherRec]);
+			}
+		});
 	});
 
 	// GET /api/provisioning reads the workers lists from the shared app's workersHome
@@ -5799,6 +6607,8 @@ describe("alate env seeding", () => {
 				keySet: true,
 				keyReadable: true,
 				lastProvisionError: null,
+				repo: null,
+				branch: null,
 			});
 			// Write-only: the view says the key is set, never what it is.
 			expect(await (await m.call("/api/alate")).text()).not.toContain(
@@ -5830,6 +6640,8 @@ describe("alate env seeding", () => {
 			keySet: true,
 			keyReadable: true,
 			lastProvisionError: null,
+			repo: null,
+			branch: null,
 		});
 		expect((await m2.call("/api/alate/provision", {})).status).toBe(502);
 	});
@@ -5850,6 +6662,8 @@ describe("alate env seeding", () => {
 				keySet: true,
 				keyReadable: true,
 				lastProvisionError: null,
+				repo: null,
+				branch: null,
 			});
 			const res = await m.call("/api/alate/provision", {});
 			expect(res.status).toBe(400);
@@ -5891,6 +6705,8 @@ describe("alate url policy", () => {
 				keySet: true,
 				keyReadable: true,
 				lastProvisionError: null,
+				repo: null,
+				branch: null,
 			});
 			const res = await m.call("/api/alate/provision", {});
 			expect(res.status).toBe(400);
@@ -6265,6 +7081,43 @@ describe("agent layer boot reconcile", () => {
 		expect(registry(board)).toEqual(["bbb"]);
 	});
 
+	test("boot keeps a live holder that is absent from open turns", async () => {
+		const suffix = Math.random().toString(36).slice(2, 8);
+		const shared = join(root, `rec-live-${suffix}`);
+		mkdirSync(join(shared, ".alate", "layers", "live"), { recursive: true });
+		const release = acquireLayerUse(shared, "live");
+		const board = join(root, `rec-live-board-${suffix}`);
+		const savedHome = process.env.HOME;
+		const savedBoard = process.env.OTTR_BOARD_OMP_HOME;
+		try {
+			process.env.HOME = shared;
+			process.env.OTTR_BOARD_OMP_HOME = board;
+			await mount(); // createApp reconciles once, with no open turns
+			expect(registry(shared)).toEqual(["live"]);
+		} finally {
+			release();
+			if (savedHome === undefined) delete process.env.HOME;
+			else process.env.HOME = savedHome;
+			if (savedBoard === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+			else process.env.OTTR_BOARD_OMP_HOME = savedBoard;
+		}
+	});
+
+	test("reconcileLayerUse preserves a live holder without an open turn", () => {
+		const home = join(
+			root,
+			`rec-live-direct-${Math.random().toString(36).slice(2, 8)}`,
+		);
+		mkdirSync(join(home, ".alate", "layers", "live"), { recursive: true });
+		const release = acquireLayerUse(home, "live");
+		try {
+			reconcileLayerUse([], [home]);
+			expect(registry(home)).toEqual(["live"]);
+		} finally {
+			release();
+		}
+	});
+
 	test("reconcileLayerUse drops stale and unsafe ids, skips homes without layers", () => {
 		const home = join(
 			root,
@@ -6360,10 +7213,12 @@ describe("idle auto review tick", () => {
 		e.target = "main";
 		const dir = join(root, name);
 		execSync("git config user.email t@t && git config user.name t", {
+			env: fixtureGitEnv(),
 			cwd: dir,
 			stdio: "ignore",
 		});
 		execSync("git commit -q --allow-empty -m work", {
+			env: fixtureGitEnv(),
 			cwd: dir,
 			stdio: "ignore",
 		});
@@ -6376,6 +7231,7 @@ describe("idle auto review tick", () => {
 			cap: 1,
 			due: true,
 			running: false,
+			runningCardId: null,
 		};
 		opened.push(e);
 		return { m, e, dir, projects };
@@ -6392,7 +7248,12 @@ describe("idle auto review tick", () => {
 		expect(cards).toHaveLength(1);
 		expect(cards[0]?.kind).toBe("review");
 		// The review freezes the target head, like a release card.
-		const head = execSync("git rev-parse HEAD", { cwd: dir }).toString().trim();
+		const head = execSync("git rev-parse HEAD", {
+			cwd: dir,
+			env: fixtureGitEnv(),
+		})
+			.toString()
+			.trim();
 		expect(cards[0]?.base).toBe(head);
 		expect(scheduled).toBeGreaterThan(0);
 	});
@@ -6508,6 +7369,20 @@ extensions:
 		// gh api calls; `pending` holds the tree content until the ref moves.
 		let ghCalls: string[][] = [];
 		let pending: { content: string; parent: string } | null = null;
+		// The branch alate's source reports; "" plays a repo source on the default branch.
+		let repoRef = "main";
+		// The branch head GitHub answers for the save's head check; null follows headSha.
+		// A value plays a lying alate whose loaded commit is not the head.
+		let refHead: string | null = null;
+		const REF_HEAD_AHEAD = "0".repeat(40);
+		// Fires after the ref/heads answer is built: a commit landing between the
+		// save's head read and its ref update (the PATCH must refuse, never force).
+		let beforeRefPatch: (() => void) | null = null;
+		// config.yml bytes pinned per commit for the save's parent-blob binding check
+		// (a test plants a doctored entry to play a snapshot that lies about `base`).
+		let blobs: Record<string, string> = {};
+		let blobMissing = false;
+		const blobAt = (s: string) => blobs[s] ?? (s === headSha ? head : ORIGINAL);
 		const reset = () => {
 			head = snapshot = ORIGINAL;
 			headSha = snapSha = BASE;
@@ -6523,6 +7398,11 @@ extensions:
 			puts = [];
 			ghCalls = [];
 			pending = null;
+			repoRef = "main";
+			refHead = null;
+			beforeRefPatch = null;
+			blobs = {};
+			blobMissing = false;
 		};
 		const source = () =>
 			pathMode
@@ -6537,7 +7417,7 @@ extensions:
 						kind: "repo",
 						spec: "o/data",
 						name: "o/data",
-						ref: "main",
+						ref: repoRef,
 						importedSha: snapSha,
 					};
 		const alatePut = async (req: Request): Promise<Response> => {
@@ -6633,6 +7513,26 @@ extensions:
 				stdout: JSON.stringify(body),
 				stderr: "",
 			});
+			if (path.startsWith("repos/o/data/contents/user/omp/agent/config.yml")) {
+				if (blobMissing)
+					return { code: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)" };
+				const refSha = path.split("ref=")[1] ?? "";
+				return ok({
+					content: Buffer.from(blobAt(refSha), "utf8").toString("base64"),
+					encoding: "base64",
+				});
+			}
+			if (path === "repos/o/data") return ok({ default_branch: "main" });
+			if (path.startsWith("repos/o/data/git/ref/heads/")) {
+				const answer = ok({
+					ref: `refs/heads/${path.slice("repos/o/data/git/ref/heads/".length)}`,
+					object: { sha: refHead ?? headSha },
+				});
+				const hook = beforeRefPatch;
+				beforeRefPatch = null;
+				hook?.();
+				return answer;
+			}
 			if (path.startsWith("repos/o/data/git/commits/"))
 				return ok({ sha: path.split("/").at(-1), tree: { sha: "t0" } });
 			if (path === "repos/o/data/git/trees") {
@@ -6798,7 +7698,13 @@ cycleOrder:
 				const b = (await res.json()) as { fields: Record<string, string> };
 				expect(b.fields.default).toBe("unknown model nope/model");
 				expect(b.fields.slow).toStartWith("unknown thinking level");
-				expect(ghCalls).toEqual([]);
+				// The parent-blob read ran (spec step 3, before validation); no write did.
+				expect(ghCalls).toEqual([
+					[
+						"api",
+						`repos/o/data/contents/user/omp/agent/config.yml?ref=${BASE}`,
+					],
+				]);
 			});
 
 			test("a save commits only the changed value line on top of the loaded commit", async () => {
@@ -6827,6 +7733,11 @@ cycleOrder:
 				});
 				expect(head).toBe(want);
 				expect(ghCalls).toEqual([
+					[
+						"api",
+						`repos/o/data/contents/user/omp/agent/config.yml?ref=${BASE}`,
+					],
+					["api", "repos/o/data/git/ref/heads/main"],
 					["api", `repos/o/data/git/commits/${BASE}`],
 					[
 						"api",
@@ -6957,7 +7868,7 @@ cycleOrder:
 				expect(res.status).toBe(409);
 				expect(await res.json()).toEqual({
 					error:
-						"the data repo changed while the roles saved; check the current roles and save again",
+						"the loaded commit is not the head of the data repo branch; check the current roles and save again",
 					base: OTHER,
 					hash: sha(ORIGINAL),
 					roles: {
@@ -6968,9 +7879,24 @@ cycleOrder:
 				});
 				expect(head).toBe(ORIGINAL);
 				expect(headSha).toBe(OTHER);
-				// One refused fast-forward, never retried and never forced.
-				expect(refMoves()).toHaveLength(1);
-				expect(refMoves()[0]).toContain("force=false");
+				// The head read caught the move before any write: no tree, commit
+				// or ref update ever ran, so nothing was retried or forced.
+				expect(refMoves()).toHaveLength(0);
+				expect(
+					ghCalls.filter(
+						(a) =>
+							(a[1] ?? "").startsWith("repos/o/data/git/commits") ||
+							(a[1] ?? "").startsWith("repos/o/data/git/trees") ||
+							a.includes("-X"),
+					),
+				).toEqual([]);
+				expect(ghCalls).toEqual([
+					[
+						"api",
+						`repos/o/data/contents/user/omp/agent/config.yml?ref=${BASE}`,
+					],
+					["api", "repos/o/data/git/ref/heads/main"],
+				]);
 			});
 
 			test("a commit on main before the save leaves config.yml alone and still gives 409 and no write", async () => {
@@ -7407,7 +8333,13 @@ cycleOrder:
 						fallbackFields: Record<string, string>;
 					};
 					expect(Object.keys(b.fallbackFields)).toEqual(Object.keys(fallbacks));
-					expect(ghCalls).toEqual([]);
+					// The parent-blob read ran (spec step 3, before validation); no write did.
+					expect(ghCalls).toEqual([
+						[
+							"api",
+							`repos/o/data/contents/user/omp/agent/config.yml?ref=${BASE}`,
+						],
+					]);
 					expect(head).toBe(CHAINS);
 				}
 				loadChains();
@@ -7452,6 +8384,248 @@ cycleOrder:
 				});
 				expect(ghCalls).toEqual([]);
 			});
+
+			test("a pinned data repository refuses a save whose alate source names another repo", async () => {
+				reset();
+				expect((await m.call("/api/alate", { repo: "o/other" })).status).toBe(
+					200,
+				);
+				const res = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5" },
+				});
+				expect(res.status).toBe(409);
+				expect(await res.json()).toEqual({
+					error:
+						"alate's data source does not match the pinned data repository o/other; check Settings → Alate",
+				});
+				expect(ghCalls).toEqual([]);
+				expect((await m.call("/api/alate", { repo: "" })).status).toBe(200);
+			});
+
+			test("a pinned data repository accepts a matching source and writes", async () => {
+				reset();
+				expect((await m.call("/api/alate", { repo: "o/data" })).status).toBe(
+					200,
+				);
+				const res = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5:high" },
+				});
+				expect(res.status).toBe(200);
+				// The parent-blob read sits before the parent commit read.
+				expect(ghCalls[0]).toEqual([
+					"api",
+					`repos/o/data/contents/user/omp/agent/config.yml?ref=${BASE}`,
+				]);
+				expect((await m.call("/api/alate", { repo: "" })).status).toBe(200);
+			});
+
+			test("a pinned data repository refuses a path source", async () => {
+				reset();
+				pathMode = true;
+				expect((await m.call("/api/alate", { repo: "o/data" })).status).toBe(
+					200,
+				);
+				const res = await m.call("/api/model-roles", {
+					base: null,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5" },
+				});
+				expect(res.status).toBe(409);
+				expect(puts).toEqual([]);
+				expect(ghCalls).toEqual([]);
+				expect((await m.call("/api/alate", { repo: "" })).status).toBe(200);
+			});
+
+			test("a pinned branch refuses a save whose source names another branch", async () => {
+				reset();
+				expect((await m.call("/api/alate", { branch: "live" })).status).toBe(
+					200,
+				);
+				const res = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5:high" },
+				});
+				expect(res.status).toBe(409);
+				expect(await res.json()).toMatchObject({
+					error: "the data repo branch is main, but the pinned branch is live",
+				});
+				// The refusal is a pin mismatch, not a moved-branch conflict: no write ran.
+				expect(
+					ghCalls.filter((a) => (a[1] ?? "").startsWith("repos/o/data/git/")),
+				).toEqual([]);
+				expect((await m.call("/api/alate", { branch: "" })).status).toBe(200);
+			});
+
+			test("a pinned branch compares the resolved default branch when the source names none", async () => {
+				reset();
+				repoRef = "";
+				expect((await m.call("/api/alate", { branch: "live" })).status).toBe(
+					200,
+				);
+				const refused = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5:high" },
+				});
+				expect(refused.status).toBe(409);
+				expect(await refused.json()).toMatchObject({
+					error: "the data repo branch is main, but the pinned branch is live",
+				});
+				// The parent-blob read ran first (spec step 3), then only the
+				// default-branch read; no tree, commit or ref write.
+				expect(ghCalls).toEqual([
+					[
+						"api",
+						`repos/o/data/contents/user/omp/agent/config.yml?ref=${BASE}`,
+					],
+					["api", "repos/o/data"],
+				]);
+				expect((await m.call("/api/alate", { branch: "main" })).status).toBe(
+					200,
+				);
+				const saved = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5:high" },
+				});
+				expect(saved.status).toBe(200);
+				expect((await m.call("/api/alate", { branch: "" })).status).toBe(200);
+			});
+
+			test("a snapshot whose bytes differ from the parent commit's blob gives 409 with the commit's values", async () => {
+				reset();
+				blobs[BASE] = ORIGINAL.replace(
+					"zai/glm-5.3-flash:max",
+					"zai/glm-5.3-flash",
+				);
+				const res = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5:high" },
+				});
+				expect(res.status).toBe(409);
+				expect(await res.json()).toEqual({
+					error:
+						"alate's snapshot does not match the data repo at the loaded commit; check the current roles and save again",
+					base: BASE,
+					hash: sha(blobs[BASE]),
+					roles: {
+						default: "zai/glm-5.3-flash",
+						slow: "anthropic/claude-opus-5-5:medium",
+					},
+					fallbacks: {},
+				});
+				expect(
+					ghCalls.filter((a) => (a[1] ?? "").startsWith("repos/o/data/git/")),
+				).toEqual([]);
+			});
+
+			test("a missing config blob at the loaded commit gives 409 without values", async () => {
+				reset();
+				blobMissing = true;
+				const res = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5:high" },
+				});
+				expect(res.status).toBe(409);
+				expect(await res.json()).toEqual({
+					error:
+						"the data repo has no config.yml at the loaded commit; re-import in alate and load the roles again",
+				});
+				expect(
+					ghCalls.filter((a) => (a[1] ?? "").startsWith("repos/o/data/git/")),
+				).toEqual([]);
+			});
+
+			test("a loaded commit ahead of the branch head is refused before any write", async () => {
+				reset();
+				// Alate reports `base` as its loaded commit while the branch head is
+				// an older commit. The force=false PATCH would still fast-forward and
+				// move main onto the loaded history, so the head read refuses first.
+				refHead = REF_HEAD_AHEAD;
+				const res = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5:high" },
+				});
+				expect(res.status).toBe(409);
+				expect(await res.json()).toMatchObject({
+					error:
+						"the loaded commit is not the head of the data repo branch; check the current roles and save again",
+					base: BASE,
+					hash: sha(ORIGINAL),
+				});
+				expect(
+					ghCalls.filter(
+						(a) =>
+							(a[1] ?? "").startsWith("repos/o/data/git/commits") ||
+							(a[1] ?? "").startsWith("repos/o/data/git/trees") ||
+							a.includes("-X"),
+					),
+				).toEqual([]);
+			});
+
+			test("a move between the head read and the ref update gives the fast-forward 409", async () => {
+				reset();
+				// The head read passes (the head still equals base), but the branch
+				// moves before the ref update: the PATCH refuses, never forces.
+				beforeRefPatch = () => {
+					headSha = OTHER;
+				};
+				const res = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(ORIGINAL),
+					roles: { default: "anthropic/claude-opus-5-5" },
+				});
+				expect(res.status).toBe(409);
+				expect(await res.json()).toMatchObject({
+					error:
+						"the data repo changed while the roles saved; check the current roles and save again",
+					base: OTHER,
+					hash: sha(ORIGINAL),
+				});
+				expect(refMoves()).toHaveLength(1);
+				expect(refMoves()[0]).toContain("force=false");
+			});
+
+			test("an invalid pinned repo or branch is refused with 400 and pins persist", async () => {
+				reset();
+				expect((await m.call("/api/alate", { repo: "no-slash" })).status).toBe(
+					400,
+				);
+				expect((await m.call("/api/alate", { branch: "a..b" })).status).toBe(
+					400,
+				);
+				const cfg = (await (await m.call("/api/alate")).json()) as {
+					repo: string | null;
+					branch: string | null;
+				};
+				expect(cfg.repo).toBeNull();
+				expect(cfg.branch).toBeNull();
+				expect(
+					(await m.call("/api/alate", { repo: "o/data", branch: "main" }))
+						.status,
+				).toBe(200);
+				const pinned = (await (await m.call("/api/alate")).json()) as {
+					repo: string | null;
+					branch: string | null;
+				};
+				expect(pinned).toMatchObject({ repo: "o/data", branch: "main" });
+				expect(
+					(await m.call("/api/alate", { repo: "", branch: "" })).status,
+				).toBe(200);
+				const cleared = (await (await m.call("/api/alate")).json()) as {
+					repo: string | null;
+					branch: string | null;
+				};
+				expect(cleared).toMatchObject({ repo: null, branch: null });
+			});
 		};
 	})(),
 );
@@ -7479,6 +8653,218 @@ describe("model switch route", () => {
 		});
 		expect(res.status).toBe(200);
 		expect((await store.getTask(t.id))!.model).toBe("zai/glm-5.3-flash");
+	});
+
+	test("resume on a usage-held queued card ends the hold with the switch; without it the hold stays", async () => {
+		const held = {
+			holdUntil: Date.now() + 3_600_000,
+			holdProvider: "openai-codex",
+			holdWindow: "7d",
+			holdSetAt: Date.now(),
+			needsReason: "The openai-codex usage limit is reached.",
+		};
+		const t = await store.createTask("held");
+		await store.updateTask(t.id, held);
+		await post(`/api/projects/p1/tasks/${t.id}/model`, {
+			model: "anthropic/claude-sonnet-5-5",
+		});
+		expect((await store.getTask(t.id))!.holdUntil).toBe(held.holdUntil);
+		const res = await post(`/api/projects/p1/tasks/${t.id}/model`, {
+			model: "anthropic/claude-sonnet-5-5",
+			resume: true,
+		});
+		expect(res.status).toBe(200);
+		const after = (await store.getTask(t.id))!;
+		expect(after.model).toBe("anthropic/claude-sonnet-5-5");
+		expect(after).toMatchObject({
+			holdUntil: null,
+			holdProvider: null,
+			holdWindow: null,
+			holdSetAt: null,
+			needsReason: null,
+		});
+		// A card held for something else (an open prompt edit: no provider) keeps its hold;
+		// resume without a live usage-limit hold refuses instead of switching the model.
+		const edit = await store.createTask("edit hold");
+		await store.updateTask(edit.id, { holdUntil: Date.now() + 60_000 });
+		const editRes = await post(`/api/projects/p1/tasks/${edit.id}/model`, {
+			model: "x/y",
+			resume: true,
+		});
+		expect(editRes.status).toBe(409);
+		expect((await store.getTask(edit.id))!.holdUntil).not.toBeNull();
+		expect((await store.getTask(edit.id))!.model).toBeNull();
+	});
+
+	test("resume on an expired usage hold refuses: the card is only waiting for a slot", async () => {
+		const hold = {
+			holdUntil: Date.now() - 60_000,
+			holdProvider: "openai-codex",
+			holdWindow: "7d",
+			holdSetAt: Date.now() - 120_000,
+			needsReason: "The openai-codex usage limit is reached.",
+		};
+		const t = await store.createTask("expired hold");
+		await store.updateTask(t.id, hold);
+		const res = await post(`/api/projects/p1/tasks/${t.id}/model`, {
+			model: "anthropic/claude-sonnet-5-5",
+			resume: true,
+		});
+		// pickRunnable starts holdUntil <= now on its own, so the hold-only action
+		// has nothing to release: refuse, and leave every column untouched.
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe(
+			"the task has no live usage-limit hold to resume from",
+		);
+		const after = (await store.getTask(t.id))!;
+		expect(after.model).toBeNull();
+		expect(after).toMatchObject({
+			holdUntil: hold.holdUntil,
+			holdProvider: hold.holdProvider,
+			holdWindow: hold.holdWindow,
+			holdSetAt: hold.holdSetAt,
+			needsReason: hold.needsReason,
+		});
+	});
+
+	// OTTR-1181: the resume gate reads the quota report through the quotaSnapshot seam;
+	// every case resets it so no later test inherits a blocked report.
+	afterEach(() => {
+		quotaSnapshotImpl = null;
+	});
+
+	test("resume refuses a pick whose provider is still out of quota; model and hold stay", async () => {
+		const resetsAt = Date.now() + 3_600_000;
+		quotaSnapshotImpl = () => ({
+			limits: [
+				{
+					provider: "anthropic",
+					label: "Claude 5 Hour",
+					window: "5h",
+					plan: null,
+					usedPct: 100,
+					resetsAt,
+				},
+			],
+			error: null,
+			at: Date.now(),
+		});
+		const hold = {
+			holdUntil: Date.now() + 3_600_000,
+			holdProvider: "openai-codex",
+			holdWindow: "7d",
+			holdSetAt: Date.now(),
+			needsReason: "The openai-codex usage limit is reached.",
+		};
+		const t = await store.createTask("held and blocked");
+		await store.updateTask(t.id, hold);
+		const before = (await store.getTask(t.id))!;
+		const res = await post(`/api/projects/p1/tasks/${t.id}/model`, {
+			model: "anthropic/claude-sonnet-5-5",
+			resume: true,
+		});
+		expect(res.status).toBe(409);
+		const stamp = new Date(resetsAt)
+			.toISOString()
+			.slice(0, 16)
+			.replace("T", " ");
+		expect(await errorOf(res)).toBe(
+			`anthropic is still out of quota; the limit resets at ${stamp} UTC. Pick another model.`,
+		);
+		const after = (await store.getTask(t.id))!;
+		expect(after.model).toBe(before.model);
+		expect(after.holdUntil).toBe(before.holdUntil);
+		expect(after.holdProvider).toBe("openai-codex");
+		expect(after.holdWindow).toBe("7d");
+		expect(after.holdSetAt).toBe(before.holdSetAt);
+		expect(after.needsReason).toBe(before.needsReason);
+	});
+
+	test("resume still clears the hold when the quota report is absent or stale", async () => {
+		const hold = {
+			holdUntil: Date.now() + 3_600_000,
+			holdProvider: "openai-codex",
+			holdWindow: "7d",
+			holdSetAt: Date.now(),
+			needsReason: "The openai-codex usage limit is reached.",
+		};
+		// No report at all: unknown counts as free, like the start gate's fail-open.
+		const absent = await store.createTask("held without a report");
+		await store.updateTask(absent.id, hold);
+		const res = await post(`/api/projects/p1/tasks/${absent.id}/model`, {
+			model: "anthropic/claude-sonnet-5-5",
+			resume: true,
+		});
+		expect(res.status).toBe(200);
+		expect(await store.getTask(absent.id)).toMatchObject({
+			model: "anthropic/claude-sonnet-5-5",
+			holdUntil: null,
+			holdProvider: null,
+			holdWindow: null,
+			holdSetAt: null,
+			needsReason: null,
+		});
+		// Older than the refresh loop's 300_000 ms window: unknown too.
+		quotaSnapshotImpl = () => ({
+			limits: [
+				{
+					provider: "anthropic",
+					label: "Claude 5 Hour",
+					window: "5h",
+					plan: null,
+					usedPct: 100,
+					resetsAt: Date.now() + 3_600_000,
+				},
+			],
+			error: null,
+			at: Date.now() - 300_001,
+		});
+		const stale = await store.createTask("held with a stale report");
+		await store.updateTask(stale.id, hold);
+		const staleRes = await post(`/api/projects/p1/tasks/${stale.id}/model`, {
+			model: "anthropic/claude-sonnet-5-5",
+			resume: true,
+		});
+		expect(staleRes.status).toBe(200);
+		expect(await store.getTask(stale.id)).toMatchObject({
+			model: "anthropic/claude-sonnet-5-5",
+			holdUntil: null,
+		});
+	});
+
+	test("resume answers 200 when the picked provider reports no limits", async () => {
+		quotaSnapshotImpl = () => ({
+			limits: [
+				{
+					provider: "openai-codex",
+					label: "Codex 5 Hour",
+					window: "5h",
+					plan: null,
+					usedPct: 100,
+					resetsAt: Date.now() + 3_600_000,
+				},
+			],
+			error: null,
+			at: Date.now(),
+		});
+		const t = await store.createTask("held, picking a free provider");
+		await store.updateTask(t.id, {
+			holdUntil: Date.now() + 3_600_000,
+			holdProvider: "openai-codex",
+			holdWindow: "5h",
+			holdSetAt: Date.now(),
+			needsReason: "The openai-codex usage limit is reached.",
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/model`, {
+			model: "zai/glm-5.3-flash",
+			resume: true,
+		});
+		expect(res.status).toBe(200);
+		expect(await store.getTask(t.id)).toMatchObject({
+			model: "zai/glm-5.3-flash",
+			holdUntil: null,
+			holdProvider: null,
+		});
 	});
 
 	test("absent or non-string model is 400", async () => {
@@ -8600,7 +9986,9 @@ describe("release-summary route", () => {
 	// The route plans a real release, so the project needs a git repo; each test builds its
 	// own checkout under root and removes it afterwards (same pattern as the drawer tests).
 	const run = (dir: string, cmd: string): string =>
-		execSync(cmd, { cwd: dir, stdio: "pipe" }).toString().trim();
+		execSync(cmd, { cwd: dir, stdio: "pipe", env: fixtureGitEnv() })
+			.toString()
+			.trim();
 	const commit = (dir: string, file: string, msg: string): string => {
 		writeFileSync(join(dir, file), "x");
 		run(dir, `git add ${file} && git commit -qm '${msg}'`);
@@ -8724,6 +10112,35 @@ describe("release-summary route", () => {
 			expect(b.reason).toBeNull();
 			expect(gw.calls).toHaveLength(1);
 			expect(gw.calls[0]).toBe(RELEASE_SUMMARY_INSTRUCTIONS);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("the model input names the project and its package.json description", async () => {
+		const s = await setup("p-relsum-proj");
+		// The real handler runs readProductDescription on the repo dir, so the
+		// description must come from a real file in that directory.
+		writeFileSync(
+			join(s.dir, "package.json"),
+			JSON.stringify({
+				name: "p-relsum-proj",
+				description: "A quokka counter app",
+			}),
+		);
+		const gw = gateway("## Highlights\n\n- Consolidated");
+		try {
+			const { call } = await mount({
+				projects: s.projects,
+				releaseSummarySpawn: gw.spawn,
+			});
+			const res = await call("/api/projects/p-relsum-proj/release-summary", {
+				sha: run(s.dir, "git rev-parse HEAD"),
+			});
+			expect(res.status).toBe(200);
+			expect(gw.users[0]).toContain("PROJECT: p-relsum-proj");
+			expect(gw.users[0]).toContain("DESCRIPTION: A quokka counter app");
+			expect(gw.calls[0]).not.toContain("Ottr");
 		} finally {
 			s.cleanup();
 		}
@@ -9061,7 +10478,9 @@ describe("release-summary route", () => {
 
 describe("drawer late commits route", () => {
 	const run = (cmd: string): string =>
-		execSync(cmd, { cwd: projectDir, stdio: "pipe" }).toString().trim();
+		execSync(cmd, { cwd: projectDir, stdio: "pipe", env: fixtureGitEnv() })
+			.toString()
+			.trim();
 	const commit = (file: string, msg: string): string => {
 		writeFileSync(join(projectDir, file), "x");
 		run(`git add ${file} && git commit -qm '${msg}'`);
@@ -9071,7 +10490,11 @@ describe("drawer late commits route", () => {
 	test("a waiting release card lists the commits past its base, finding merges marked", async () => {
 		// The route reads the target head without a fetch, so a local branch without upstream
 		// resolves to itself; the repo lives only for this test and is removed afterwards.
-		execSync("git init -q -b main", { cwd: projectDir, stdio: "ignore" });
+		execSync("git init -q -b main", {
+			cwd: projectDir,
+			stdio: "ignore",
+			env: fixtureGitEnv(),
+		});
 		try {
 			run("git config user.email t@t && git config user.name t");
 			commit("seed.txt", "seed");
@@ -9209,6 +10632,9 @@ describe(
 			});
 
 			test("Settings replaces the token; a bad one keeps the old; boot reapplies it", async () => {
+				// The onboarding test's token: the suite env belt restores the env after
+				// each test, so the chain re-asserts its own starting state.
+				process.env.GH_TOKEN = first;
 				const bad = await call("/api/settings/github-token", {
 					token: "short",
 				});
@@ -9638,7 +11064,7 @@ describe("hindsight settings", () => {
 			expect(v.backend).toBe("hindsight");
 			expect(v.memoryReason).toMatch(/did not answer/);
 			expect(await stateWarnings(booted.call)).toContain(
-				`omp runs with no memory: ${v.memoryReason}`,
+				`The omp process runs with no memory: ${v.memoryReason}`,
 			);
 		});
 	});
@@ -9660,7 +11086,7 @@ describe("hindsight settings", () => {
 			expect(v.memoryReason).toMatch(/rejected the key/);
 			expect(v.memoryReason).not.toContain("secret-token-value");
 			expect(await stateWarnings(booted.call)).toContain(
-				`omp runs with no memory: ${v.memoryReason}`,
+				`The omp process runs with no memory: ${v.memoryReason}`,
 			);
 		} finally {
 			rejector.stop(true);
@@ -9683,7 +11109,7 @@ describe("hindsight settings", () => {
 			).json()) as { memoryReason: string | null };
 			expect(v.memoryReason).toBeNull();
 			expect(await stateWarnings(booted.call)).not.toContainEqual(
-				expect.stringMatching(/^omp runs with no memory:/),
+				expect.stringMatching(/^The omp process runs with no memory:/),
 			);
 		} finally {
 			healthy.stop(true);
@@ -9702,7 +11128,7 @@ describe("hindsight settings", () => {
 			).json()) as { memoryReason: string };
 			expect(v.memoryReason).toMatch(/did not answer/);
 			expect(await stateWarnings(booted.call)).toContain(
-				`omp runs with no memory: ${v.memoryReason}`,
+				`The omp process runs with no memory: ${v.memoryReason}`,
 			);
 			return booted;
 		});
@@ -9724,7 +11150,7 @@ describe("hindsight settings", () => {
 				memoryReason: null,
 			});
 			expect(await stateWarnings(booted.call)).not.toContainEqual(
-				expect.stringMatching(/^omp runs with no memory:/),
+				expect.stringMatching(/^The omp process runs with no memory:/),
 			);
 		} finally {
 			healthy.stop(true);
@@ -9943,13 +11369,19 @@ describe("sandbox endpoint", () => {
 	// git archive -- HEAD needs a commit: seed the registered checkout and remove the
 	// repo in the test's finally (the checkout dir is shared with other describes).
 	const seedCommit = () => {
-		execSync("git init -q -b main", { cwd: projectDir, stdio: "ignore" });
+		execSync("git init -q -b main", {
+			cwd: projectDir,
+			stdio: "ignore",
+			env: fixtureGitEnv(),
+		});
 		execSync("git config user.email t@t && git config user.name t", {
+			env: fixtureGitEnv(),
 			cwd: projectDir,
 			stdio: "ignore",
 		});
 		writeFileSync(join(projectDir, "seed.txt"), "s");
 		execSync("git add seed.txt && git commit -qm seed", {
+			env: fixtureGitEnv(),
 			cwd: projectDir,
 			stdio: "ignore",
 		});
@@ -10029,13 +11461,19 @@ describe("sandbox endpoint", () => {
 		});
 		// Seed p2's own checkout: the tar bytes and the runner request must both
 		// name p2, never the calling run's p1.
-		execSync("git init -q -b main", { cwd: projectDir2, stdio: "ignore" });
+		execSync("git init -q -b main", {
+			cwd: projectDir2,
+			stdio: "ignore",
+			env: fixtureGitEnv(),
+		});
 		execSync("git config user.email t@t && git config user.name t", {
+			env: fixtureGitEnv(),
 			cwd: projectDir2,
 			stdio: "ignore",
 		});
 		writeFileSync(join(projectDir2, "seed2.txt"), "s2");
 		execSync("git add seed2.txt && git commit -qm seed2", {
+			env: fixtureGitEnv(),
 			cwd: projectDir2,
 			stdio: "ignore",
 		});
@@ -10340,9 +11778,10 @@ describe("manual validation start route (OTTR-1047)", () => {
 			e: Entry;
 			reviewId: string;
 			strictReview?: boolean;
+			again?: { before: number };
 		}> = [];
-		validateLeadsImpl = async (e, reviewId, strictReview) => {
-			seen.push({ e, reviewId, strictReview });
+		validateLeadsImpl = async (e, reviewId, strictReview, again) => {
+			seen.push({ e, reviewId, strictReview, again });
 			// The seam mimics the loop's filing: createTask lands the card queued.
 			const card = await e.store.createTask(
 				"Batch validation of 1 lead(s) of review.",
@@ -10353,7 +11792,7 @@ describe("manual validation start route (OTTR-1047)", () => {
 				followUpOf: reviewId,
 				promptAuthor: "board",
 			});
-			return { id: card.id };
+			return { id: card.id, reset: [] };
 		};
 		const before = calls;
 		try {
@@ -10369,6 +11808,8 @@ describe("manual validation start route (OTTR-1047)", () => {
 			// The start is strict: it files for this review only and must never
 			// accept a fallback to another candidate review.
 			expect(seen[0]!.strictReview).toBe(true);
+			// OTTR-1129: an empty body keeps the plain start — the seam sees no again.
+			expect(seen[0]!.again).toBeUndefined();
 			const card = (await store.listTasks()).find((t) => t.id === b.id)!;
 			expect(card.kind).toBe("validation");
 			expect(card.followUpOf).toBe(review.id);
@@ -10382,7 +11823,10 @@ describe("manual validation start route (OTTR-1047)", () => {
 		}
 	});
 
-	test("a review that is not done is refused before the filing", async () => {
+	test("a review that is not done or idle at merging is refused before the filing", async () => {
+		// OTTR-1128 widened the rule from "done only": a review idle at merging (held
+		// for its findings) may start a run too. A running review and a review queued
+		// at merging stay refused.
 		const review = await store.createTask(
 			"running review for validation",
 			null,
@@ -10391,17 +11835,23 @@ describe("manual validation start route (OTTR-1047)", () => {
 		let filed = 0;
 		validateLeadsImpl = async () => {
 			filed++;
-			return { id: "nope" };
+			return { id: "nope", reset: [] };
 		};
 		try {
-			const res = await post(
-				`/api/projects/p1/tasks/${review.id}/validate`,
-				{},
-			);
-			expect(res.status).toBe(409);
-			expect(await errorOf(res)).toBe(
-				"only a done review can start a validation run",
-			);
+			for (const patch of [
+				{ stage: "in_progress", state: "running" },
+				{ stage: "merging", state: "queued" },
+			] as const) {
+				await store.updateTask(review.id, patch);
+				const res = await post(
+					`/api/projects/p1/tasks/${review.id}/validate`,
+					{},
+				);
+				expect(res.status).toBe(409);
+				expect(await errorOf(res)).toBe(
+					"only a done review or a review waiting at merging for its findings can start a validation run",
+				);
+			}
 			expect(filed).toBe(0);
 		} finally {
 			validateLeadsImpl = null;
@@ -10409,10 +11859,59 @@ describe("manual validation start route (OTTR-1047)", () => {
 		}
 	});
 
+	test("a review idle at merging with backlog leads files its validation run (OTTR-1128)", async () => {
+		const review = await store.createTask(
+			"merging review for validation",
+			null,
+			"review",
+		);
+		await store.updateTask(review.id, { stage: "merging", state: "idle" });
+		const lead = await store.createTask("Needs validation: a backlog lead");
+		await store.updateTask(lead.id, {
+			followUpOf: review.id,
+			stage: "backlog",
+			state: "idle",
+		});
+		const seen: string[] = [];
+		validateLeadsImpl = async (e, reviewId) => {
+			seen.push(reviewId);
+			const card = await e.store.createTask(
+				"Batch validation of 1 lead(s) of review.",
+				null,
+				"validation",
+			);
+			await e.store.updateTask(card.id, {
+				followUpOf: reviewId,
+				promptAuthor: "board",
+			});
+			return { id: card.id, reset: [] };
+		};
+		try {
+			const res = await post(
+				`/api/projects/p1/tasks/${review.id}/validate`,
+				{},
+			);
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as { id: string };
+			expect(seen).toEqual([review.id]);
+			const runs = (await store.listTasks()).filter(
+				(t) => t.kind === "validation" && t.followUpOf === review.id,
+			);
+			expect(runs.map((t) => t.id)).toEqual([b.id]);
+		} finally {
+			validateLeadsImpl = null;
+			for (const t of await store.listTasks())
+				if (t.kind === "validation" && t.followUpOf === review.id)
+					await store.updateTask(t.id, { cancelledAt: Date.now() });
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
 	test("a non-review card is refused", async () => {
 		const work = await store.createTask("plain work for validation route");
 		await store.updateTask(work.id, { stage: "done", state: "idle" });
-		validateLeadsImpl = async () => ({ id: "nope" });
+		validateLeadsImpl = async () => ({ id: "nope", reset: [] });
 		try {
 			const res = await post(`/api/projects/p1/tasks/${work.id}/validate`, {});
 			expect(res.status).toBe(409);
@@ -10426,7 +11925,7 @@ describe("manual validation start route (OTTR-1047)", () => {
 	test("a cancelled review is refused", async () => {
 		const { review } = await doneReviewWithLead();
 		await store.updateTask(review.id, { cancelledAt: Date.now() });
-		validateLeadsImpl = async () => ({ id: "nope" });
+		validateLeadsImpl = async () => ({ id: "nope", reset: [] });
 		try {
 			const res = await post(
 				`/api/projects/p1/tasks/${review.id}/validate`,
@@ -10460,6 +11959,96 @@ describe("manual validation start route (OTTR-1047)", () => {
 			await store.updateTask(review.id, { cancelledAt: Date.now() });
 			await store.updateTask(lead.id, { cancelledAt: Date.now() });
 		}
+	});
+
+	// OTTR-1129: validate-again. The again body reaches the seam parsed, and the
+	// response wraps the card's view with the seam's reset list.
+	test("the again body reaches the seam and the reset list lands in the response (OTTR-1129)", async () => {
+		const { review, lead } = await doneReviewWithLead();
+		const seen: Array<{ again?: { before: number } }> = [];
+		validateLeadsImpl = async (e, reviewId, _strictReview, again) => {
+			seen.push({ again });
+			const card = await e.store.createTask(
+				"Batch validation of 1 lead(s) of review.",
+				null,
+				"validation",
+			);
+			await e.store.updateTask(card.id, {
+				followUpOf: reviewId,
+				promptAuthor: "board",
+			});
+			return { id: card.id, reset: ["lead-7", "lead-9"] };
+		};
+		try {
+			const res = await post(`/api/projects/p1/tasks/${review.id}/validate`, {
+				again: "blocked",
+				before: "2026-11-17T00:00:00.000Z",
+			});
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as { id: string; reset: string[] };
+			expect(seen).toHaveLength(1);
+			expect(seen[0]!.again).toEqual({
+				before: Date.parse("2026-11-17T00:00:00.000Z"),
+			});
+			// The response carries the seam-provided reset list verbatim.
+			expect(b.reset).toEqual(["lead-7", "lead-9"]);
+			const card = (await store.listTasks()).find((t) => t.id === b.id)!;
+			expect(card.kind).toBe("validation");
+			expect(card.followUpOf).toBe(review.id);
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
+	test("a malformed again body is refused before the filing (OTTR-1129)", async () => {
+		const { review, lead } = await doneReviewWithLead();
+		let filed = 0;
+		validateLeadsImpl = async () => {
+			filed++;
+			return { id: "nope", reset: [] };
+		};
+		try {
+			for (const body of [
+				{ again: "blocked" },
+				{ again: "later", before: "2026-11-17T00:00:00.000Z" },
+				{ again: "blocked", before: "not-a-date" },
+				// A non-string before is refused too.
+				{ again: "blocked", before: 42 },
+			]) {
+				const res = await post(
+					`/api/projects/p1/tasks/${review.id}/validate`,
+					body,
+				);
+				expect(res.status).toBe(400);
+				expect(await errorOf(res)).not.toBe("");
+				// The filing seam never runs for a refused body.
+				expect(filed).toBe(0);
+			}
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
+	// OTTR-1129: the parser's contract, property-checked. Exactly the string
+	// "blocked" with a before Date.parse reads as a finite number wins; every
+	// other shape is an error result, and the parser never throws.
+	test("parseValidateAgainBody accepts only blocked with a parseable before (OTTR-1129)", () => {
+		const props = fc.property(
+			fc.string({ maxLength: 40 }),
+			fc.string({ maxLength: 40 }),
+			(again, before) => {
+				const r = parseValidateAgainBody({ again, before });
+				const at = Date.parse(before);
+				if (again === "blocked" && Number.isFinite(at))
+					expect(r).toEqual({ before: at });
+				else expect("error" in r && r.error.length > 0).toBe(true);
+			},
+		);
+		fc.assert(props);
 	});
 });
 
@@ -11031,7 +12620,10 @@ describe("project settings validation", () => {
 		const add = await post("/api/projects", { name: "target-shape-proj" });
 		expect(add.status).toBe(200);
 		const pe = projects.get("target-shape-proj")!;
-		execSync("git update-ref refs/remotes/origin/develop HEAD", { cwd: dir });
+		execSync("git update-ref refs/remotes/origin/develop HEAD", {
+			cwd: dir,
+			env: fixtureGitEnv(),
+		});
 		const ok = await post("/api/projects/target-shape-proj/settings", {
 			targetBranch: "  develop  ",
 		});
@@ -11056,17 +12648,21 @@ describe("project settings validation", () => {
 		const e = projects.get("target-save-proj")!;
 		// A second branch on origin, different from the checked-out head: only a
 		// targetBranch-aware resolution can land on it.
-		const tree = execSync("git rev-parse HEAD^{tree}", { cwd: dir })
+		const tree = execSync("git rev-parse HEAD^{tree}", {
+			cwd: dir,
+			env: fixtureGitEnv(),
+		})
 			.toString()
 			.trim();
 		const other = execSync(
 			"git -c user.name=ott -c user.email=ott@example.invalid commit-tree " +
 				`${tree} -m feature`,
-			{ cwd: dir },
+			{ cwd: dir, env: fixtureGitEnv() },
 		)
 			.toString()
 			.trim();
 		execSync(`git update-ref refs/remotes/origin/feature ${other}`, {
+			env: fixtureGitEnv(),
 			cwd: dir,
 		});
 		e.target = "origin/main";
@@ -11090,7 +12686,10 @@ describe("project settings validation", () => {
 		const add = await post("/api/projects", { name: "watch-target-proj" });
 		expect(add.status).toBe(200);
 		const e = projects.get("watch-target-proj")!;
-		execSync("git update-ref refs/remotes/origin/feature HEAD", { cwd: dir });
+		execSync("git update-ref refs/remotes/origin/feature HEAD", {
+			cwd: dir,
+			env: fixtureGitEnv(),
+		});
 		const start = Date.parse("2026-03-01T00:00:00Z");
 		const later = start + 60_000;
 		// The clock moves while the route awaits its targetBranch git check: an issue opened
@@ -11138,7 +12737,10 @@ describe("project settings validation", () => {
 		expect((await e.store.getSettings()).targetBranch).toBeNull();
 		expect(e.target).toBe("origin/main");
 		// A resolvable branch still saves normally afterwards.
-		execSync("git update-ref refs/remotes/origin/feature HEAD", { cwd: dir });
+		execSync("git update-ref refs/remotes/origin/feature HEAD", {
+			cwd: dir,
+			env: fixtureGitEnv(),
+		});
 		const ok = await post("/api/projects/target-bad-proj/settings", {
 			targetBranch: "feature",
 		});
@@ -11153,7 +12755,9 @@ describe("push-main route (OTTR-531)", () => {
 	// Real repos: a bare origin plus a clone whose main is one commit ahead. execSync
 	// fixtures only, like the release-summary and behindMain describes.
 	const run = (dir: string, cmd: string): string =>
-		execSync(cmd, { cwd: dir, stdio: "pipe" }).toString().trim();
+		execSync(cmd, { cwd: dir, stdio: "pipe", env: fixtureGitEnv() })
+			.toString()
+			.trim();
 
 	const setup = async (
 		name: string,
@@ -11254,7 +12858,9 @@ describe("push-main route (OTTR-531)", () => {
 // must create the branch (and set the upstream), and the merge hold must lift after.
 describe("push-main on an empty origin (OTTR-605)", () => {
 	const run = (dir: string, cmd: string): string =>
-		execSync(cmd, { cwd: dir, stdio: "pipe" }).toString().trim();
+		execSync(cmd, { cwd: dir, stdio: "pipe", env: fixtureGitEnv() })
+			.toString()
+			.trim();
 
 	const setup = async (name: string) => {
 		const origin = join(root, `${name}-origin`);
@@ -11356,28 +12962,62 @@ describe("push-main on an empty origin (OTTR-605)", () => {
 	});
 });
 
-describe("pushSyncCommits setting and ProjectView fields", () => {
-	test("the settings route accepts the boolean and the view carries mainBranch/mainUnpushed", async () => {
+describe("ProjectView main checkout fields", () => {
+	test("the removed pushSyncCommits key from an old tab is ignored; the view carries mainBranch/mainUnpushed", async () => {
 		const res = await post("/api/projects/p1/settings", {
 			pushSyncCommits: true,
 		});
 		expect(res.status).toBe(200);
 		const b = (await res.json()) as {
-			settings: { pushSyncCommits: boolean };
+			settings: Record<string, unknown>;
 			mainBranch: string | null;
 			mainUnpushed: boolean;
 		};
-		expect(b.settings.pushSyncCommits).toBe(true);
+		expect(b.settings).not.toHaveProperty("pushSyncCommits");
 		expect(b.mainBranch).toBeNull();
 		expect(b.mainUnpushed).toBe(false);
 	});
 
-	test("a non-boolean pushSyncCommits is 400", async () => {
-		const res = await post("/api/projects/p1/settings", {
-			pushSyncCommits: "yes",
-		});
-		expect(res.status).toBe(400);
-		expect(await errorOf(res)).toBe("pushSyncCommits must be a boolean");
+	test("the state project view includes its homepage or null", async () => {
+		const p1 = projects.get("p1")!;
+		const previous = p1.homepage;
+		const previousGithub = p1.github;
+		const previousHomepageRepo = p1.homepageRepo;
+		const readHomepage = async () => {
+			app.publishSoon();
+			const response = await fetch(new URL("/api/state", server.url), {
+				headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
+			});
+			expect(response.status).toBe(200);
+			const body = (await response.json()) as {
+				projects: Array<{ name: string; homepage: unknown }>;
+			};
+			return body.projects.find((project) => project.name === "p1")?.homepage;
+		};
+		try {
+			p1.github = "https://github.com/docs/guide";
+			p1.homepageRepo = "docs/guide";
+			p1.homepage = {
+				url: "https://docs.example.test/guide",
+				domain: "docs.example.test",
+			};
+			expect(await readHomepage()).toEqual({
+				url: "https://docs.example.test/guide",
+				domain: "docs.example.test",
+			});
+			p1.homepageRepo = "other/repo";
+			expect(await readHomepage()).toBeNull();
+			p1.homepageRepo = "docs/guide";
+			delete p1.homepage;
+			expect(await readHomepage()).toBeNull();
+		} finally {
+			if (previous === undefined) delete p1.homepage;
+			else p1.homepage = previous;
+			p1.github = previousGithub;
+			if (previousHomepageRepo === undefined) delete p1.homepageRepo;
+			else p1.homepageRepo = previousHomepageRepo;
+			app.publishSoon();
+		}
 	});
 });
 
@@ -11572,7 +13212,7 @@ describe(
 		mkdirSync(rulesDir, { recursive: true });
 		const rulesStore = await ProjectStore.open(rulesDir);
 		const sh = (cmd: string) =>
-			execSync(cmd, { cwd: rulesDir, stdio: "ignore" });
+			execSync(cmd, { cwd: rulesDir, stdio: "ignore", env: fixtureGitEnv() });
 		// git-init the dir offline exactly like the shared fixture repos: one seed commit,
 		// a github.com origin, and a planted origin/main ref, so refreshRemote resolves the
 		// target with no network.
@@ -11802,6 +13442,24 @@ describe("project icon", () => {
 		},
 	);
 
+	test.skipIf(process.platform !== "linux")(
+		"GET does not serve through a symlinked icon",
+		async () => {
+			const outDir = mkdtempSync(join(tmpdir(), "app-icon-leak-"));
+			try {
+				const outside = join(outDir, "target");
+				writeFileSync(outside, "server-only");
+				symlinkSync(outside, join(store.tasksDir, "icon.png"));
+				const res = await get("/api/projects/p1/icon");
+				expect(res.status).toBe(404);
+				expect(await errorOf(res)).toBe("no icon");
+			} finally {
+				rmSync(outDir, { recursive: true, force: true });
+				rmSync(join(store.tasksDir, "icon.png"), { force: true });
+			}
+		},
+	);
+
 	test("unknown project", async () => {
 		const res = await get("/api/projects/nope/icon");
 		expect(res.status).toBe(404);
@@ -12013,7 +13671,12 @@ describe("arch-review duplicate guard (R1-8)", () => {
 		);
 		expect(live).toHaveLength(1);
 		// The review freezes the target head, like a release card, and reviews it read-only.
-		const head = execSync("git rev-parse HEAD", { cwd: dir }).toString().trim();
+		const head = execSync("git rev-parse HEAD", {
+			cwd: dir,
+			env: fixtureGitEnv(),
+		})
+			.toString()
+			.trim();
 		expect(live[0]?.base).toBe(head);
 		projects.delete("arch-proj");
 		await closeTestStore(e.store);
@@ -12026,17 +13689,21 @@ describe("arch-review duplicate guard (R1-8)", () => {
 		const e = projects.get("target-branch-proj")!;
 		// A second branch on origin, different from the checked-out head: only the
 		// configured target resolves to it.
-		const tree = execSync("git rev-parse HEAD^{tree}", { cwd: dir })
+		const tree = execSync("git rev-parse HEAD^{tree}", {
+			cwd: dir,
+			env: fixtureGitEnv(),
+		})
 			.toString()
 			.trim();
 		const other = execSync(
 			"git -c user.name=ott -c user.email=ott@example.invalid commit-tree " +
 				`${tree} -m feature`,
-			{ cwd: dir },
+			{ cwd: dir, env: fixtureGitEnv() },
 		)
 			.toString()
 			.trim();
 		execSync(`git update-ref refs/remotes/origin/feature ${other}`, {
+			env: fixtureGitEnv(),
 			cwd: dir,
 		});
 		await e.store.setSettings({ targetBranch: "feature" });
@@ -12147,7 +13814,9 @@ describe("review and release cards carry the board's GitHub alerts", () => {
 		);
 		mkdirSync(dir, { recursive: true });
 		const run = (cmd: string): string =>
-			execSync(cmd, { cwd: dir, stdio: "pipe" }).toString().trim();
+			execSync(cmd, { cwd: dir, stdio: "pipe", env: fixtureGitEnv() })
+				.toString()
+				.trim();
 		run("git init -q -b main");
 		run("git config user.email t@t && git config user.name t");
 		writeFileSync(join(dir, "seed.txt"), "x");
@@ -12253,7 +13922,7 @@ describe("how-it-works route", () => {
 		writeFileSync(join(e.path, "docs/how-it-works.md"), "committed");
 		execSync(
 			"git add docs && git -c user.name=t -c user.email=t@t commit -qm d",
-			{ cwd: e.path },
+			{ cwd: e.path, env: fixtureGitEnv() },
 		);
 		// An uncommitted edit stays out: the board shows the target's version.
 		writeFileSync(join(e.path, "docs/how-it-works.md"), "draft");
@@ -13499,6 +15168,7 @@ describe("web push (R1-1, R2-3)", () => {
 			postedUrl: null,
 			postedLogin: null,
 			postedEvent: null,
+			postedVia: null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -13594,6 +15264,7 @@ describe("web push (R1-1, R2-3)", () => {
 			postedUrl: null,
 			postedLogin: null,
 			postedEvent: null,
+			postedVia: null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -13654,6 +15325,7 @@ describe("web push (R1-1, R2-3)", () => {
 			postedUrl: null,
 			postedLogin: null,
 			postedEvent: null,
+			postedVia: null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -14679,6 +16351,100 @@ describe("slim state and done pages (OTTR-965)", () => {
 		expect((await m.call("/api/projects/nope/done?page=1")).status).toBe(404);
 	});
 
+	test("the done endpoint filters by the search query q", async () => {
+		const { st, projects } = await slimBoard("slim-search");
+		const m = await mount({ projects });
+		const base = Date.now();
+		// The three matches land oldest, so the unfiltered page 1 cannot contain
+		// them: only a server-side filter over the whole lane can find them.
+		const prompt1 = await seedDone(st, "fix the prompt handling", base);
+		const prompt2 = await seedDone(st, "prompt drain check", base + 1);
+		const prompt3 = await seedDone(st, "second prompt fix", base + 2);
+		for (let i = 0; i < 57; i++) await seedDone(st, `done ${i}`, base + 10 + i);
+		const matched = new Set([prompt1, prompt2, prompt3]);
+		const promptLanded = (await st.listTasks())
+			.filter((t) => matched.has(t.id))
+			.sort((a, b) => newestLanded(a, b))
+			.map((t) => t.id);
+
+		const hit = (await (
+			await m.call("/api/projects/slim-search/done?q=prompt&page=1")
+		).json()) as { tasks: Array<{ id: string }>; total: number };
+		expect(hit.total).toBe(3);
+		expect(hit.tasks.map((t) => t.id)).toEqual(promptLanded);
+
+		// matchesQuery trims and lowercases, so the raw input finds the same cards.
+		const loose = (await (
+			await m.call(
+				`/api/projects/slim-search/done?q=${encodeURIComponent("  PROMPT  ")}&page=1`,
+			)
+		).json()) as { tasks: Array<{ id: string }>; total: number };
+		expect(loose.total).toBe(3);
+		expect(loose.tasks.map((t) => t.id)).toEqual(promptLanded);
+
+		// An empty q behaves as today: the unfiltered lane with its settled total.
+		const empty = (await (
+			await m.call("/api/projects/slim-search/done?q=&page=2")
+		).json()) as { tasks: Array<{ id: string }>; total: number };
+		const landed = (await st.listTasks())
+			.sort((a, b) => newestLanded(a, b))
+			.map((t) => t.id);
+		expect(empty.total).toBe(60);
+		expect(empty.tasks.map((t) => t.id)).toEqual(
+			landed.slice(DONE_PAGE, 2 * DONE_PAGE),
+		);
+	});
+
+	test("the done search matches a transcript title before any page read persists it", async () => {
+		// The card's display name lives only in its session transcript until a card
+		// build persists it. The search must resolve that name itself, so the same
+		// query answers the same before and after any unfiltered page read
+		// (OTTR-1135): results may not depend on prior reads.
+		const { st, projects } = await slimBoard("slim-q-transcript");
+		const sid = "bbbb0000-0000-0000-0000-0000000003a1";
+		const matched = await seedDone(st, "plan the release", Date.now(), {
+			sessionId: sid,
+		});
+		await seedDone(st, "another done card", Date.now() + 1);
+		mkdirSync(st.sessionsDir, { recursive: true });
+		writeFileSync(
+			join(st.sessionsDir, `2026-01-01T00-00-00-000Z_${sid}.jsonl`),
+			'{"type":"title","v":1,"title":"Repair prompt search"}\n{"type":"session"}\n{"type":"title_change","title":"Repair prompt search"}\n',
+		);
+		const m = await mount({ projects });
+
+		// The search runs first: nothing has read the card, so nothing persisted
+		// the transcript title yet, and the display name must still match.
+		const hit = (await (
+			await m.call("/api/projects/slim-q-transcript/done?q=prompt&page=1")
+		).json()) as { tasks: Array<{ id: string }>; total: number };
+		expect(hit.total).toBe(1);
+		expect(hit.tasks.map((t) => t.id)).toEqual([matched]);
+
+		// An unfiltered read lands between the searches; the answer stays the same.
+		await m.call("/api/projects/slim-q-transcript/done?page=1");
+		const again = (await (
+			await m.call("/api/projects/slim-q-transcript/done?q=prompt&page=1")
+		).json()) as { tasks: Array<{ id: string }>; total: number };
+		expect(again.total).toBe(1);
+		expect(again.tasks.map((t) => t.id)).toEqual([matched]);
+	});
+
+	test("the done endpoint rejects a bad q", async () => {
+		const { st, projects } = await slimBoard("slim-bad-q");
+		const m = await mount({ projects });
+		await seedDone(st, "one done card", Date.now());
+		// Two q values are not one string, and 201 characters is past the query
+		// bound: both answer 400 before the page reads the store.
+		expect((await m.call("/api/projects/slim-bad-q/done?q=a&q=b")).status).toBe(
+			400,
+		);
+		expect(
+			(await m.call(`/api/projects/slim-bad-q/done?q=${"a".repeat(201)}`))
+				.status,
+		).toBe(400);
+	});
+
 	test("the project view carries doneTotal, the settled count", async () => {
 		const { st, projects } = await slimBoard("slim-total");
 		const base = Date.now();
@@ -14957,6 +16723,7 @@ describe("read marks (/api/seen)", () => {
 			postedUrl: null,
 			postedLogin: null,
 			postedEvent: null,
+			postedVia: null,
 			state: "open",
 			draft: false,
 			title: "Fix it",
@@ -15453,7 +17220,7 @@ describe(
 				expect(login.status).toBe(200);
 				// Public host: the session cookie is Secure (HTTPS arrives via tailscale serve).
 				const setCookie = login.headers.get("set-cookie") ?? "";
-				expect(setCookie).toContain("ottr.session=");
+				expect(setCookie).toContain(`${sessionCookieName(0)}=`);
 				expect(setCookie).toContain("Secure");
 				const session = { cookie: setCookie.split(";")[0] ?? "" };
 				expect((await call("/api/state", session)).status).toBe(200);
@@ -15577,7 +17344,7 @@ describe("session registry (OTTR-387)", () => {
 				{ name: "ada", password: "correct horse" },
 			);
 			const cookie = (res.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
-			const parts = cookie.replace("ottr.session=", "").split(".");
+			const parts = cookie.replace(`${sessionCookieName(0)}=`, "").split(".");
 			// token = name.id.exp.mac, so the id sits third from the END.
 			return { res, cookie, id: parts[parts.length - 3] ?? "" };
 		};
@@ -15655,7 +17422,7 @@ describe("session registry (OTTR-387)", () => {
 	test("a legacy three-part token works until rotation kills it", async () => {
 		const { call } = await openBoard("g-sess-legacy");
 		const legacy = {
-			cookie: `ottr.session=${signSession("g-sess-legacy-secret", "ada", 60_000)}`,
+			cookie: `${sessionCookieName(0)}=${signSession("g-sess-legacy-secret", "ada", 60_000)}`,
 		};
 		expect((await call("/api/state", legacy)).status).toBe(200);
 		// Legacy tokens are not listed and cannot be revoked one by one.
@@ -16127,7 +17894,7 @@ describe("update cycle control (OTTR-752)", () => {
 		const token = crypto.randomUUID();
 		const key = crypto.randomUUID();
 		const sessionSecret = crypto.randomUUID();
-		const cookie = `ottr.session=${signSession(sessionSecret, "ada", 60_000)}`;
+		const cookie = `${sessionCookieName(0)}=${signSession(sessionSecret, "ada", 60_000)}`;
 		const g = await GlobalStore.open(join(root, `cycle-auth-${fixture++}`));
 		mountStores.push(g);
 		await g.set("config", { apiKey: key, sessionSecret });
@@ -16146,13 +17913,26 @@ describe("update cycle control (OTTR-752)", () => {
 				"x-api-key": key,
 			},
 			{ "x-board-token": token },
-			{ cookie: "ottr.session=untrusted" },
+			{ cookie: `${sessionCookieName(0)}=untrusted` },
 			{ cookie },
 		];
 		for (const headers of refusedHeaders)
 			expect(
 				(await m.call("/api/update/host", heartbeat(), headers)).status,
 			).toBe(403);
+		// OTTR-983: the cookie name carries the board port, so the same valid token
+		// fails the auth wall under the legacy bare name (401) and passes it under the
+		// derived one. This fixture has no updater, so past the wall the update control
+		// answers its own 409 instead of 202.
+		const wallCookie = (name: string) => ({
+			Host: "board.example",
+			Origin: "https://board.example",
+			cookie: `${name}=${signSession(sessionSecret, "ada", 60_000)}`,
+		});
+		const legacyWall = wallCookie(SESSION_COOKIE);
+		const derivedWall = wallCookie(sessionCookieName(0));
+		expect((await m.call("/api/update", {}, legacyWall)).status).toBe(401);
+		expect((await m.call("/api/update", {}, derivedWall)).status).toBe(409);
 		expect(
 			(
 				await m.call("/api/update/host", heartbeat(), {
@@ -16285,6 +18065,7 @@ describe("update cycle control (OTTR-752)", () => {
 					creditOk: async () => true,
 					gitToken: async () => null,
 				},
+				creditBalance: { balance: 12.5 },
 			},
 		});
 		for (const path of ["/api/update", "/api/update/host"]) {
@@ -16301,8 +18082,15 @@ describe("update cycle control (OTTR-752)", () => {
 			await m.call("/api/state", undefined, {
 				"x-ottr-identity": signIdentity(secret, "acme", "owner"),
 			})
-		).json()) as { updateCycle: UpdateCycleView | null };
+		).json()) as {
+			updateCycle: UpdateCycleView | null;
+			credits?: HostedCreditsView;
+		};
 		expect(state.updateCycle).toBeNull();
+		expect(state.credits).toEqual({
+			balance: 12.5,
+			accountUrl: "http://127.0.0.1:9/account",
+		});
 	});
 
 	test("the real build-commit reader wins and only sha versions provide a fallback", async () => {
@@ -16902,6 +18690,8 @@ describe(
 			// OTTR-1071: the state payload's nextPollAt reads the server wiring's grid;
 			// the test pins it to a known value.
 			prPollNextAt: () => 1234567890,
+			// OTTR-1087: the same pin for the code-scanning watch row.
+			codeScanPollNextAt: () => 1234567890,
 			gh: async (args) => {
 				ghCalls.push(args);
 				const input = args.indexOf("--input");
@@ -16962,6 +18752,7 @@ describe(
 				postedUrl: prev?.postedUrl ?? null,
 				postedLogin: prev?.postedLogin ?? null,
 				postedEvent: prev?.postedEvent ?? null,
+				postedVia: prev?.postedVia ?? null,
 				state: "open",
 				draft: false,
 				title: "Fix it",
@@ -17133,6 +18924,7 @@ describe(
 					postedUrl: prev?.postedUrl ?? null,
 					postedLogin: prev?.postedLogin ?? null,
 					postedEvent: prev?.postedEvent ?? null,
+					postedVia: prev?.postedVia ?? null,
 					state: "open",
 					draft: false,
 					title: "Fix it",
@@ -17365,6 +19157,23 @@ describe(
 				expect((await store.getSettings()).prReviewNotify).toBe(true);
 			});
 
+			test("project settings route accepts prReviewManualPost and rejects non-boolean", async () => {
+				const ok = await post("/api/projects/p1/settings", {
+					prReviewManualPost: true,
+				});
+				expect(ok.status).toBe(200);
+				expect((await store.getSettings()).prReviewManualPost).toBe(true);
+				const bad = await post("/api/projects/p1/settings", {
+					prReviewManualPost: "yes",
+				});
+				expect(bad.status).toBe(400);
+				expect(await errorOf(bad)).toBe("prReviewManualPost must be a boolean");
+				await post("/api/projects/p1/settings", {
+					prReviewManualPost: false,
+				});
+				expect((await store.getSettings()).prReviewManualPost).toBe(false);
+			});
+
 			test("project settings route accepts prMode and rejects non-boolean", async () => {
 				const p1 = projects.get("p1")!;
 				const bad = await post("/api/projects/p1/settings", { prMode: "yes" });
@@ -17430,6 +19239,20 @@ describe(
 				).toBeGreaterThanOrEqual(again);
 			});
 
+			test("codeScanWatch rejects a non-boolean, round trips, and starts off", async () => {
+				const bad = await post("/api/projects/p1/settings", {
+					codeScanWatch: "yes",
+				});
+				expect(bad.status).toBe(400);
+				expect(await errorOf(bad)).toBe("codeScanWatch must be a boolean");
+				// Off is the stored default; a save round trips through the store.
+				expect((await store.getSettings()).codeScanWatch).toBe(false);
+				await post("/api/projects/p1/settings", { codeScanWatch: true });
+				expect((await store.getSettings()).codeScanWatch).toBe(true);
+				await post("/api/projects/p1/settings", { codeScanWatch: false });
+				expect((await store.getSettings()).codeScanWatch).toBe(false);
+			});
+
 			test("project settings route turns microVm on only with a reachable vm-runner", async () => {
 				const saved = vmState.health;
 				try {
@@ -17473,6 +19296,17 @@ describe(
 				expect(res.status).toBe(409);
 				expect(await errorOf(res)).toBe("project has no GitHub remote");
 				const unknown = await post("/api/projects/nope/prs/check", {});
+				expect(unknown.status).toBe(404);
+			});
+
+			test("code-scanning/check refuses an unknown project and one without a GitHub remote", async () => {
+				const res = await post("/api/projects/p1/code-scanning/check", {});
+				expect(res.status).toBe(409);
+				expect(await errorOf(res)).toBe("project has no GitHub remote");
+				const unknown = await post(
+					"/api/projects/nope/code-scanning/check",
+					{},
+				);
 				expect(unknown.status).toBe(404);
 			});
 
@@ -17522,6 +19356,37 @@ describe(
 					expect(second.lastPollAt).toBeGreaterThanOrEqual(first.lastPollAt!);
 				} finally {
 					await prStore.setSettings({ prReviews: false });
+				}
+			});
+
+			test("the state payload carries the code-scanning watch's poll facts", async () => {
+				await prStore.setSettings({ codeScanWatch: true });
+				try {
+					const csWatchOf = async () => {
+						const state = (await (await m.call("/api/state")).json()) as {
+							projects: {
+								name: string;
+								codeScanWatch: {
+									lastPollAt: number | null;
+									lastError: string | null;
+									nextPollAt: number | null;
+								};
+							}[];
+						};
+						return state.projects.find((p) => p.name === "pg")!.codeScanWatch;
+					};
+					// The manual check runs the same tick the hourly poll uses: a
+					// clean poll stamps the view, and the pinned grid fills nextPollAt.
+					ghResult = { code: 0, stdout: "[]", stderr: "" };
+					const res = await m.call("/api/projects/pg/code-scanning/check", {});
+					expect(res.status).toBe(200);
+					expect(await res.json()).toEqual({ ok: true });
+					const first = await csWatchOf();
+					expect(first.lastError).toBe(null);
+					expect(first.nextPollAt).toBe(1234567890);
+					expect(first.lastPollAt).toBeGreaterThan(0);
+				} finally {
+					await prStore.setSettings({ codeScanWatch: false });
 				}
 			});
 
@@ -17628,6 +19493,8 @@ describe(
 				expect(ghCalls).toEqual([expectedArgv(1)]);
 				expect(ghPayloads).toEqual([expectedPayload("Looks good.", H1)]);
 				expect((await row(1)).postedHead).toBe(H1);
+				// The Post click records who posted: the board's own posts stamp "auto".
+				expect((await row(1)).postedVia).toBe("user");
 				// The default gh body is "{}": no parseable html_url, no link.
 				expect((await row(1)).postedUrl).toBeNull();
 				expect((await row(1)).postError).toBeNull();
@@ -17847,6 +19714,7 @@ describe(
 					"rules\n",
 				);
 				execSync("git add AGENTS.md && git commit -qm rules", {
+					env: fixtureGitEnv(),
 					cwd: join(fixtureRepos, "appcheck-recheck"),
 					stdio: "ignore",
 				});
@@ -17860,6 +19728,7 @@ describe(
 				// re-reads it and boardRepos() gains the repo.
 				execSync(
 					`git -C ${join(root, "appcheck-recheck")} remote set-url origin https://github.com/other/appcheck-recheck`,
+					{ env: fixtureGitEnv() },
 				);
 				const saved = await m.call("/api/projects/appcheck-recheck/settings", {
 					targetBranch: "main",
@@ -19006,6 +20875,335 @@ describe(
 	})(),
 );
 
+// --- The automatic post (OTTR-1094, docs/specs/pr-review-auto-post.md): a finished
+// draft run posts by itself when prReviewManualPost is off, through the Post click's
+// code path. Each test mounts its own store: the review runs here would otherwise
+// exhaust the shared 24h daily cap and make the tests order-dependent.
+describe("PR review auto-post routes", () => {
+	const opened: ProjectStore[] = [];
+	afterAll(async () => {
+		for (const s of opened) await closeTestStore(s);
+	});
+	let autoSeq = 0;
+	/** One harness: project "pg-auto" with github acme/widget, a fake gh whose canned
+	 * read-only GETs feed a real watcher tick, and a swappable review answer whose
+	 * verdict line stays the last non-blank line. `setPostAnswer` replaces the gh
+	 * answer of the reviews POST alone, so the GETs and the POST fail independently. */
+	const makeAuto = async () => {
+		const H1 = "a".repeat(40);
+		const dir = join(root, `pg-auto-${autoSeq++}`);
+		mkdirSync(dir, { recursive: true });
+		const store = await ProjectStore.open(dir);
+		opened.push(store);
+		const projects = new Map<string, Entry>();
+		projects.set("pg-auto", {
+			path: dir,
+			name: "pg-auto",
+			store,
+			target: null,
+			gitless: false,
+			github: "acme/widget",
+			protectedTarget: false,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		});
+		const calls: string[][] = [];
+		/** The JSON payload of each `gh api ... --input <file>` call, read inside the
+		 * fake: the route deletes the file after the call. */
+		const payloads: unknown[] = [];
+		const ghResult = { code: 0, stdout: "", stderr: "" };
+		let postAnswer: { code: number; stdout: string; stderr: string } | null =
+			null;
+		/** The open pulls page the tick lists; the seeded row's head must match, so
+		 * the scan never resets the row's firstSeenAt and un-passes the quiet gate. */
+		const pullList = [
+			{
+				number: 4,
+				head: { sha: H1, ref: "patch", repo: { id: 1004 } },
+				draft: false,
+				state: "open",
+				title: "Fix it",
+			},
+		];
+		let spawnAnswer =
+			"## Auto review\nthe change looks correct.\n\n<!-- blocking: no -->";
+		const apiStub = async (
+			args: string[],
+		): Promise<{ code: number; stdout: string; stderr: string } | null> => {
+			if (args.length !== 2 || args[0] !== "api") return null;
+			const path = args[1]!;
+			if (path === "repos/acme/widget/pulls?state=open&per_page=100&page=1")
+				return { code: 0, stdout: JSON.stringify(pullList), stderr: "" };
+			const pull = path.match(/^repos\/acme\/widget\/pulls\/(\d+)$/);
+			if (pull !== null) {
+				const r = await store.getPrReview(Number(pull[1]));
+				return {
+					code: 0,
+					stdout: JSON.stringify({
+						head: { sha: r?.head ?? H1 },
+						body: "Please merge.",
+						title: r?.title ?? "Fix it",
+					}),
+					stderr: "",
+				};
+			}
+			const empty =
+				/^repos\/acme\/widget\/(pulls\/\d+\/(reviews|comments)|issues\/\d+\/comments)(\?|$)/.test(
+					path,
+				);
+			if (empty) return { code: 0, stdout: "[]", stderr: "" };
+			if (
+				/^repos\/acme\/widget\/compare\/[0-9a-f]{40}\.\.\.[0-9a-f]{40}$/.test(
+					path,
+				)
+			)
+				return {
+					code: 0,
+					stdout: JSON.stringify({ commits: [], files: [] }),
+					stderr: "",
+				};
+			return null;
+		};
+		const m = await mount({
+			projects,
+			gh: async (args) => {
+				calls.push(args);
+				const input = args.indexOf("--input");
+				if (input !== -1)
+					payloads.push(JSON.parse(readFileSync(args[input + 1]!, "utf8")));
+				const stubbed = await apiStub(args);
+				if (stubbed !== null) return stubbed;
+				if (args.includes("-X") && postAnswer !== null) return postAnswer;
+				return ghResult;
+			},
+			prReviewSpawn: async () => ({
+				code: 0,
+				stdout: [
+					JSON.stringify({ ready: true }),
+					JSON.stringify({
+						id: 1,
+						status: 200,
+						body: { choices: [{ message: { content: spawnAnswer } }] },
+					}),
+				].join("\n"),
+				stderr: "",
+			}),
+		});
+		await store.setSettings({ prReviews: true });
+		/** Seeds PR 4 the way the watcher's first scan would, with the quiet gate
+		 * already passed (firstSeenAt 0) and no draft yet. */
+		const seed = async (head: string): Promise<void> => {
+			await store.savePrReview({
+				number: 4,
+				taskId: null,
+				head,
+				firstSeenAt: 0,
+				reviewedHead: null,
+				postedHead: null,
+				postedUrl: null,
+				postedLogin: null,
+				postedEvent: null,
+				postedVia: null,
+				state: "open",
+				draft: false,
+				title: "Fix it",
+				postError: null,
+				commentsAt: null,
+				commentsUnseen: false,
+			});
+		};
+		const row = async (): Promise<PrReviewRow> => (await store.getPrReview(4))!;
+		/** The watcher's reviews POSTs: only they carry -X, the reads never do. */
+		const postCalls = () => calls.filter((a) => a.includes("-X"));
+		const expectedArgv = [
+			"api",
+			"repos/acme/widget/pulls/4/reviews",
+			"-X",
+			"POST",
+			"--input",
+			expect.any(String),
+		];
+		return {
+			H1,
+			m,
+			store,
+			payloads,
+			seed,
+			row,
+			expectedArgv,
+			postCalls,
+			tick: () => m.call("/api/projects/pg-auto/prs/check", {}),
+			setSpawn: (s: string) => {
+				spawnAnswer = s;
+			},
+			setPostAnswer: (a: { code: number; stdout: string; stderr: string }) => {
+				postAnswer = a;
+			},
+		};
+	};
+
+	test("manual post on (default): a finished run saves the draft and posts nothing", async () => {
+		const h = await makeAuto();
+		await h.seed(h.H1);
+		expect((await h.tick()).status).toBe(200);
+		// The run saved its draft: the head is reviewed and the card waits.
+		const r = await h.row();
+		expect(r.reviewedHead).toBe(h.H1);
+		expect(r.postedHead).toBeNull();
+		expect(r.taskId).not.toBeNull();
+		const card = (await h.store.getTask(r.taskId!))!;
+		expect(card).toMatchObject({
+			stage: "in_progress",
+			state: "needs_you",
+		});
+		expect(card.details).toBe("## Auto review\nthe change looks correct.");
+		// No reviews POST went out: every gh call is one of the watcher's reads.
+		expect(h.postCalls()).toEqual([]);
+	});
+
+	test("manual post off: the finished run posts the draft by itself as a comment", async () => {
+		const h = await makeAuto();
+		await h.store.setSettings({ prReviewManualPost: false });
+		h.setPostAnswer({
+			code: 0,
+			stdout: JSON.stringify({
+				html_url: "https://github.com/acme/widget/pull/4#pullrequestreview-1",
+			}),
+			stderr: "",
+		});
+		await h.seed(h.H1);
+		expect((await h.tick()).status).toBe(200);
+		// Exactly one reviews POST at the reviewed head, with the saved draft's body.
+		expect(h.postCalls()).toHaveLength(1);
+		expect(h.postCalls()[0]).toEqual(h.expectedArgv);
+		expect(h.payloads).toEqual([
+			{
+				event: "COMMENT",
+				body: `## Auto review\nthe change looks correct.${REVIEW_FOOTER}`,
+				commit_id: h.H1,
+			},
+		]);
+		const r = await h.row();
+		expect(r.postedHead).toBe(h.H1);
+		expect(r.postedVia).toBe("auto");
+		expect(r.postedUrl).toBe(
+			"https://github.com/acme/widget/pull/4#pullrequestreview-1",
+		);
+		// The posted head moved the card out of needs_you for done/idle.
+		const card = (await h.store.getTask(r.taskId!))!;
+		expect(card).toMatchObject({
+			stage: "done",
+			state: "idle",
+			needsReason: null,
+		});
+	});
+
+	test("manual off with approve on: a clean run posts APPROVE", async () => {
+		const h = await makeAuto();
+		await h.store.setSettings({
+			prReviewManualPost: false,
+			prReviewApprove: true,
+		});
+		h.setSpawn("## Auto review\nno blockers found.\n\n<!-- blocking: no -->");
+		await h.seed(h.H1);
+		expect((await h.tick()).status).toBe(200);
+		expect(h.postCalls()).toHaveLength(1);
+		expect(h.payloads).toEqual([
+			{
+				event: "APPROVE",
+				body: `## Auto review\nno blockers found.${REVIEW_FOOTER}`,
+				commit_id: h.H1,
+			},
+		]);
+		expect((await h.row()).postedHead).toBe(h.H1);
+	});
+
+	test("manual off with request-changes on: a blocking run posts REQUEST_CHANGES", async () => {
+		const h = await makeAuto();
+		await h.store.setSettings({
+			prReviewManualPost: false,
+			prReviewRequestChanges: true,
+		});
+		h.setSpawn(
+			"## Auto review\nthe error path swallows failures.\n\n<!-- blocking: yes -->",
+		);
+		await h.seed(h.H1);
+		expect((await h.tick()).status).toBe(200);
+		expect(h.postCalls()).toHaveLength(1);
+		expect(h.payloads).toEqual([
+			{
+				event: "REQUEST_CHANGES",
+				body: `## Auto review\nthe error path swallows failures.${REVIEW_FOOTER}`,
+				commit_id: h.H1,
+			},
+		]);
+		expect((await h.row()).postedHead).toBe(h.H1);
+	});
+
+	test("manual off: a re-review of a posted head saves a draft but posts no second review", async () => {
+		const h = await makeAuto();
+		await h.store.setSettings({ prReviewManualPost: false });
+		h.setPostAnswer({
+			code: 0,
+			stdout: JSON.stringify({
+				html_url: "https://github.com/acme/widget/pull/4#pullrequestreview-1",
+			}),
+			stderr: "",
+		});
+		await h.seed(h.H1);
+		expect((await h.tick()).status).toBe(200);
+		expect(h.postCalls()).toHaveLength(1);
+		const r = await h.row();
+		// The reply runs a fresh draft for the same head, like the drawer's reply box.
+		const res = await h.m.call(
+			`/api/projects/pg-auto/tasks/${r.taskId}/reply`,
+			{
+				text: "look again",
+			},
+		);
+		expect(res.status).toBe(200);
+		await h.m.app.prReviewIdle();
+		// The reply's own run saved its draft: the store counts two runs now.
+		const runs = await h.store.prReviewRunsSince(0);
+		expect(runs).toBe(2);
+		const after = await h.row();
+		expect(after.postedHead).toBe(h.H1);
+		const card = (await h.store.getTask(after.taskId!))!;
+		expect(card.details).toBe("## Auto review\nthe change looks correct.");
+		// The claim refuses the posted head: still exactly one reviews POST.
+		expect(h.postCalls()).toHaveLength(1);
+	});
+
+	test("manual off: a failed auto post parks the card with the error and frees the claim", async () => {
+		const h = await makeAuto();
+		await h.store.setSettings({ prReviewManualPost: false });
+		h.setPostAnswer({ code: 1, stdout: "", stderr: "HTTP 502: upstream" });
+		await h.seed(h.H1);
+		await h.tick();
+		// The attempt went out and GitHub refused it.
+		expect(h.postCalls()).toHaveLength(1);
+		expect(h.postCalls()[0]).toEqual(h.expectedArgv);
+		const r = await h.row();
+		expect(r.postError).toBe("HTTP 502: upstream");
+		// The claim is released: a later draft of the same head can post again.
+		expect(r.postedHead).toBeNull();
+		// The card stays waiting with the draft, so a person can post by hand.
+		const card = (await h.store.getTask(r.taskId!))!;
+		expect(card).toMatchObject({
+			stage: "in_progress",
+			state: "needs_you",
+		});
+		expect(card.details).toBe("## Auto review\nthe change looks correct.");
+		// The failed run was the only attempt: no retry loop inside the tick.
+		expect(h.postCalls()).toHaveLength(1);
+	});
+});
+
 describe("backlog routes", () => {
 	test("grill queues an idle backlog task", async () => {
 		const t = await store.createTask("parked idea");
@@ -19310,6 +21508,69 @@ describe("backlog routes", () => {
 		expect(row.prompt).toContain("Definition of ready (grilled)");
 		expect(row.prompt).toContain("keep the API small");
 		expect(row.prompt).not.toContain("old draft");
+	});
+
+	test("backlog to-todo drops the answered Open questions section before the grill report lands", async () => {
+		const t = await store.createTask("grilled with questions");
+		await store.updateTask(t.id, {
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+			prompt: [
+				"Detect duplicate scene records.",
+				"",
+				"## Open questions",
+				"",
+				"Which dedupe key?",
+				"Which storage?",
+				"",
+				"## Context",
+				"",
+				"TPDB feeds the scene table.",
+			].join("\n"),
+		});
+		const grill = await store.startTurn(t.id, "work", "grill", null);
+		await store.finishTurn(grill.id, {
+			outcome: "ready",
+			details: "dedupe on (source, external id)",
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/backlog`, {
+			to: "todo",
+		});
+		expect(res.status).toBe(200);
+		const row = (await store.getTask(t.id))!;
+		expect(row.stage).toBe("todo");
+		expect(row.state).toBe("queued");
+		expect(row.prompt).toContain("## Definition of ready (grilled)");
+		expect(row.prompt).toContain("dedupe on (source, external id)");
+		// The old body stays; only the answered section goes.
+		expect(row.prompt).toContain("Detect duplicate scene records.");
+		expect(row.prompt).toContain("TPDB feeds the scene table.");
+		expect(row.prompt).not.toContain("Which dedupe key?");
+		// The prompt gate's own rule sees no section, so it cannot park the card.
+		expect(hasOpenQuestionsSection(row.prompt)).toBe(false);
+	});
+
+	test("backlog to-todo without a grill report keeps the prompt unchanged", async () => {
+		const t = await store.createTask("not grilled");
+		const prompt = [
+			"Detect duplicate scene records.",
+			"",
+			"## Open questions",
+			"",
+			"Which dedupe key?",
+		].join("\n");
+		await store.updateTask(t.id, {
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+			prompt,
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/backlog`, {
+			to: "todo",
+		});
+		expect(res.status).toBe(200);
+		expect((await store.getTask(t.id))!.prompt).toBe(prompt);
 	});
 
 	test("backlog to-backlog parks a queued todo task", async () => {
@@ -19937,11 +22198,13 @@ describe("POST /api/projects/:project/tasks/:id/rerun-failed-jobs", () => {
 	const RUN_URL = "https://github.com/ottr-ai/ottr/actions/runs/42313545100";
 
 	/** A fresh app with one project "ci" and a task whose text links a run; saves the
-	 * board token through the settings route (the probe stub keeps it off the network). */
+	 * board token through the settings route (the probe stub keeps it off the network).
+	 * `github` is the project's GitHub remote; null models a project with no remote. */
 	const setup = async (
 		fetchStub?: typeof fetch,
 		prompt = `Fix CI\n${RUN_URL}`,
 		saveToken = true,
+		github: string | null = "https://github.com/ottr-ai/ottr",
 	) => {
 		const dir = mkdtempSync(join(root, "rerun-"));
 		const store = await ProjectStore.open(dir);
@@ -19952,7 +22215,7 @@ describe("POST /api/projects/:project/tasks/:id/rerun-failed-jobs", () => {
 			store,
 			target: null,
 			gitless: false,
-			github: null,
+			github,
 			protectedTarget: false,
 			remote: null,
 			dirty: false,
@@ -20073,6 +22336,73 @@ describe("POST /api/projects/:project/tasks/:id/rerun-failed-jobs", () => {
 		);
 		expect(res.status).toBe(400);
 		expect(await errorOf(res)).toBe("no GitHub Actions run link on this card");
+	});
+
+	test("a card linking another repository's run is a 400 with no fetch", async () => {
+		const calls: { url: string; init?: RequestInit }[] = [];
+		const stub = (async (url: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({ url: String(url), init });
+			return new Response(null, { status: 201 });
+		}) as unknown as typeof fetch;
+		const { m, task } = await setup(
+			stub,
+			"See https://github.com/octocat/other/actions/runs/777",
+		);
+		const res = await m.call(
+			`/api/projects/ci/tasks/${task.id}/rerun-failed-jobs`,
+			undefined,
+			{ method: "POST" },
+		);
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			"this card links a run in octocat/other, not the project's repository ottr-ai/ottr",
+		);
+		expect(calls).toHaveLength(0);
+	});
+
+	test("a project with no GitHub repository is a 409 with no fetch", async () => {
+		const calls: { url: string; init?: RequestInit }[] = [];
+		const stub = (async (url: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({ url: String(url), init });
+			return new Response(null, { status: 201 });
+		}) as unknown as typeof fetch;
+		const { m, task } = await setup(stub, undefined, true, null);
+		const res = await m.call(
+			`/api/projects/ci/tasks/${task.id}/rerun-failed-jobs`,
+			undefined,
+			{ method: "POST" },
+		);
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe(
+			"this project has no GitHub repository to re-run in",
+		);
+		expect(calls).toHaveLength(0);
+	});
+
+	test("the repository binding ignores case and the .git suffix", async () => {
+		const calls: { url: string; init?: RequestInit }[] = [];
+		const stub = (async (url: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({ url: String(url), init });
+			return new Response(
+				JSON.stringify({ message: "Requested", url: RUN_URL }),
+				{ status: 201 },
+			);
+		}) as unknown as typeof fetch;
+		const { m, task } = await setup(
+			stub,
+			undefined,
+			true,
+			"https://github.com/Ottr-AI/Ottr.git",
+		);
+		const res = await m.call(
+			`/api/projects/ci/tasks/${task.id}/rerun-failed-jobs`,
+			undefined,
+			{ method: "POST" },
+		);
+		expect(res.status).toBe(200);
+		expect(calls[0]!.url).toBe(
+			"https://api.github.com/repos/ottr-ai/ottr/actions/runs/42313545100/rerun-failed-jobs",
+		);
 	});
 
 	test("no board token at all is a 400", async () => {
@@ -21373,13 +23703,36 @@ describe("worker /tmp full warnings (OTTR-754)", () => {
 			["worker-d", null], // A failed probe.
 		]);
 		expect(workerTmpWarnings(reports, AMPLE)).toEqual([
-			"/tmp of worker-a is full (512 MiB)",
+			"The temp disk (/tmp) of worker-a is full (512 MiB free)",
 		]);
 		// The local runner joins when its own statfs reads full; never a duplicate.
 		expect(workerTmpWarnings(reports, LOW)).toEqual([
-			"/tmp of worker-a is full (512 MiB)",
-			"/tmp of local is full (512 MiB)",
+			"The temp disk (/tmp) of worker-a is full (512 MiB free)",
+			"The temp disk (/tmp) of local is full (512 MiB free)",
 		]);
+	});
+
+	test("the tmp advisories keep their subject and host in the bell's short line", () => {
+		// OTTR-1097: the bell's collapsed line strips path tokens, so an advisory
+		// that leads with a path loses its subject (the old texts collapsed to
+		// "of <host> is full"). The assertions run against tmpFullNotice's real
+		// output, not a copied literal: a path-led rewording fails here again.
+		const runners = ["worker-a", "127.0.0.1", "local"];
+		for (const runner of runners) {
+			const short = shortNoticeText(tmpFullNotice(runner, 512 * 1024 * 1024));
+			expect(short.startsWith("The temp disk")).toBe(true);
+			expect(short).toContain(runner);
+		}
+		// Both templates lead with words; a leading path token would strip away.
+		const texts = [
+			...runners.map((r) => tmpFullNotice(r, 512 * 1024 * 1024)),
+			...runners.map((r) => tmpSpaceNotice(r, 512 * 1024 * 1024)),
+		];
+		for (const text of texts) {
+			const first = text.split(/\s+/)[0] ?? "";
+			expect(first.startsWith("/")).toBe(false);
+			expect(first).toBe("The");
+		}
 	});
 
 	test("stateResponse warns on a low worker report and clears when space returns", async () => {
@@ -21441,7 +23794,9 @@ describe("worker /tmp full warnings (OTTR-754)", () => {
 		try {
 			await workerApp.workerSignInTick();
 			let warnings = (await state()).warnings;
-			expect(warnings).toContain("/tmp of 127.0.0.1 is full (512 MiB)");
+			expect(warnings).toContain(
+				"The temp disk (/tmp) of 127.0.0.1 is full (512 MiB free)",
+			);
 
 			// Space returns: the advisory warning recomputes away on the next tick.
 			answer = { signIns: [], tmp: AMPLE };
@@ -21518,8 +23873,20 @@ describe(
 		};
 
 		/** One fresh app + server with a counting scan stub: board store 7, project 3. */
-		async function boot(opts: { projectAnswer?: OmpStatsAnswer } = {}) {
+		async function boot(
+			opts: { projectAnswer?: OmpStatsAnswer; scanMs?: number } = {},
+		) {
 			let scans = 0;
+			const answerFor = (dir: string): OmpStatsAnswer => {
+				if (dir === entry.store.sessionsDir)
+					return opts.projectAnswer ?? { stats: projectStats(), error: null };
+				if (dir === join(boardOmpHome(), ".omp", "agent", "sessions"))
+					return { stats: boardStats(), error: null };
+				return {
+					stats: { overall: { ...BASE_STATS }, byModel: [] },
+					error: null,
+				};
+			};
 			const ompApp = await createTestApp({
 				gstore,
 				defaultDir: root,
@@ -21545,14 +23912,13 @@ describe(
 				serverRef: { current: undefined },
 				scanSessionUsage: (dir: string) => {
 					scans++;
-					if (dir === entry.store.sessionsDir)
-						return opts.projectAnswer ?? { stats: projectStats(), error: null };
-					if (dir === join(boardOmpHome(), ".omp", "agent", "sessions"))
-						return { stats: boardStats(), error: null };
-					return {
-						stats: { overall: { ...BASE_STATS }, byModel: [] },
-						error: null,
-					};
+					const answer = answerFor(dir);
+					if (opts.scanMs === undefined) return answer;
+					// Real timers on purpose: the slow-build test asserts wall-clock
+					// behavior, so fake timers cannot drive it.
+					const { promise, resolve } = Promise.withResolvers<OmpStatsAnswer>();
+					setTimeout(() => resolve(answer), opts.scanMs);
+					return promise;
 				},
 			});
 			const srv = Bun.serve({ port: 0, ...ompApp.serveOptions });
@@ -21562,11 +23928,21 @@ describe(
 				fetch(new URL("/api/settings/omp-stats", srv.url), {
 					headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
 				});
-			return { get, scans: () => scans };
+			const call = (path: string) =>
+				fetch(new URL(path, srv.url), {
+					headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
+				});
+			return {
+				get,
+				call,
+				scans: () => scans,
+				ageCache: () => ompApp.ompStatsAgeCache(),
+			};
 		}
 
 		type Body = {
 			at: number;
+			refreshing: boolean;
 			sources: {
 				name: string;
 				answer: {
@@ -21619,6 +23995,49 @@ describe(
 				expect(project?.answer.stats).toBeNull();
 				expect(project?.answer.error).toBe("boom in sessions dir");
 				expect(body.overall.totalRequests).toBe(7);
+			});
+
+			test("a slow build never blocks another route", async () => {
+				// Real timers on purpose: the test asserts wall-clock non-blocking
+				// across a live server and fetch, so fake timers cannot drive it.
+				const b = await boot({ scanMs: 300 });
+				// First build: no cache exists, so the GET waits out the whole scan.
+				const t0 = Date.now();
+				const first = await b.get();
+				expect(Date.now() - t0).toBeGreaterThanOrEqual(300);
+				expect(first.status).toBe(200);
+				const one = (await first.json()) as Body;
+				expect(one.refreshing).toBe(false);
+				const stores = one.sources.length;
+				// Age the report cache past its TTL: the next GET serves the stale
+				// report at once while the slow rebuild holds the single flight.
+				b.ageCache();
+				const t1 = Date.now();
+				const second = await b.get();
+				expect(Date.now() - t1).toBeLessThan(100);
+				const two = (await second.json()) as Body;
+				expect(two.refreshing).toBe(true);
+				expect(two.at).toBe(one.at);
+				expect(two.overall).toEqual(one.overall);
+				// Another route answers while the rebuild runs; the dashboard info
+				// endpoint is a different handler that never touches the scan.
+				const t2 = Date.now();
+				const dash = await b.call("/api/settings/omp-stats/dashboard");
+				expect(Date.now() - t2).toBeLessThan(100);
+				expect(dash.status).toBe(200);
+				// While the rebuild runs a GET answers the stale report; once it
+				// lands, the fresh report answers with refreshing:false and no store
+				// scans a third round.
+				let end: Body;
+				do {
+					// Poll the real signal (the refreshing flag), never a fixed wait.
+					const { promise, resolve } = Promise.withResolvers<void>();
+					setTimeout(resolve, 10);
+					await promise;
+					end = (await (await b.get()).json()) as Body;
+				} while (end.refreshing);
+				expect(b.scans()).toBe(2 * stores);
+				expect(end.overall).toEqual(one.overall);
 			});
 		};
 	})(),
@@ -22179,7 +24598,7 @@ describe(
 describe("behindMain", () => {
 	// Fixtures come from execSync here, never from the code under test.
 	const run = (cmd: string, cwd: string) =>
-		execSync(cmd, { cwd, stdio: "ignore" });
+		execSync(cmd, { cwd, stdio: "ignore", env: fixtureGitEnv() });
 	const setup = () => {
 		const origin = makeFixture(`behind-${Math.random().toString(36).slice(2)}`);
 		const clone = mkdtempSync(join(tmpdir(), "ottr-behind-"));
@@ -22860,7 +25279,9 @@ describe(
 			test("a walled request without a session gets 401 with the board sign-in link", async () => {
 				const peer = fromGateway();
 				try {
-					const res = await call("/", { cookie: "ottr.session=forged.1.x" });
+					const res = await call("/", {
+						cookie: `${sessionCookieName(0)}=forged.1.x`,
+					});
 					expect(res.status).toBe(401);
 					expect(res.headers.get("content-type")).toContain("text/html");
 					expect(await res.text()).toContain('href="http://127.0.0.1:0/"');
@@ -22889,7 +25310,9 @@ describe(
 						apiKey: null,
 					});
 					const token = signSession("stats-secret", "ada", Date.now() + 60_000);
-					const signed = await call("/s", { cookie: `ottr.session=${token}` });
+					const signed = await call("/s", {
+						cookie: `${sessionCookieName(0)}=${token}`,
+					});
 					expect(signed.status).toBe(200);
 					expect(await signed.json()).toMatchObject({
 						path: "/s",
@@ -22952,7 +25375,7 @@ describe(
 
 			test("an authorized GET reaches the child with path and query, without the cookie", async () => {
 				const res = await call("/api/stats/models?range=24h&x=a%20b", {
-					cookie: "ottr.session=whatever; other=1",
+					cookie: `${sessionCookieName(0)}=whatever; other=1`,
 				});
 				expect(res.status).toBe(200);
 				expect(await res.json()).toEqual({
@@ -23620,6 +26043,132 @@ describe("failed system sampler logging (OTTR-793)", () => {
 	});
 });
 
+describe("system sampler vm-runner row (OTTR-1151)", () => {
+	/** A valid vm-runner GET /stats body: the worker shape plus one live VM. */
+	const statsBody = () => ({
+		at: Date.now(),
+		cpuUsageUsec: 1_000,
+		cpuMax: "max",
+		memoryCurrent: 2_000,
+		memoryMax: 4_000,
+		memoryEvents: { max: 0, oom: 0, oomKill: 0 },
+		lock: { exists: false, pid: null, alive: false },
+		runs: [],
+		vms: [
+			{
+				id: "r-1",
+				project: "proj",
+				cardId: "T-9",
+				mode: "turn",
+				vcpus: 2,
+				memMiB: 2048,
+				startedAt: Date.now(),
+				scratchBytes: null,
+			},
+		],
+		max: 4,
+		disk: { base: 100, layers: 200, runs: 300 },
+	});
+
+	/** The vm-runner test server: token-checked /healthz "ok" and /stats. */
+	const vmRunnerServer = (body: unknown) =>
+		Bun.serve({
+			port: 0,
+			fetch: (req) => {
+				if (req.headers.get("x-otwr-token") !== "tok")
+					return new Response("unauthorized", { status: 401 });
+				if (new URL(req.url).pathname === "/healthz") return new Response("ok");
+				return Response.json(body);
+			},
+		});
+
+	const getSystem = async (srv: Server<undefined>) =>
+		(await fetch(new URL("/api/system", srv.url), {
+			headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
+		}).then((r) => r.json())) as Promise<{
+			containers: {
+				name: string;
+				reachable: boolean;
+				unreachableSince: number | null;
+				vm?: {
+					health: { ok: boolean; reason: string | null };
+					max: number | null;
+					vms: {
+						id: string;
+						project: string;
+						cardId: string | null;
+						mode: string;
+						vcpus: number;
+						memMiB: number;
+						startedAt: number;
+						scratchBytes: number | null;
+					}[];
+					disk: { base: number; layers: number; runs: number } | null;
+					busy: { project: string; id: string }[];
+				};
+			}[];
+		}>;
+
+	test("a reachable vm-runner shows its row with the fleet, the disk and the busy cards", async () => {
+		const server = vmRunnerServer(statsBody());
+		const savedHealth = vmState.health;
+		const savedBusy = vmState.busy;
+		vmState.health = { configured: true, ok: true, reason: null };
+		vmState.busy = new Set(["proj/T-9"]);
+		try {
+			const m = await mount({
+				vmTarget: { urls: [`http://127.0.0.1:${server.port}`], token: "tok" },
+			});
+			// sampleStats resolves only once measureSystem and the snapshot landed.
+			await m.app.sampleStats();
+			const system = await getSystem(m.server);
+			// The row is named by the url's hostname, like a worker's.
+			const row = system.containers.find((c) => c.name === "127.0.0.1");
+			expect(row?.reachable).toBe(true);
+			expect(row?.vm?.health).toEqual({ ok: true, reason: null });
+			expect(row?.vm?.max).toBe(4);
+			expect(row?.vm?.vms).toEqual([
+				{
+					id: "r-1",
+					project: "proj",
+					cardId: "T-9",
+					mode: "turn",
+					vcpus: 2,
+					memMiB: 2048,
+					startedAt: expect.any(Number),
+					scratchBytes: null,
+				},
+			]);
+			expect(row?.vm?.disk).toEqual({ base: 100, layers: 200, runs: 300 });
+			// The board's busy set lands on the row, split at the first "/".
+			expect(row?.vm?.busy).toEqual([{ project: "proj", id: "T-9" }]);
+		} finally {
+			vmState.health = savedHealth;
+			vmState.busy = savedBusy;
+			void server.stop(true);
+		}
+	});
+
+	test("an unreachable vm-runner leaves the row unreachable and the request unharmed", async () => {
+		const server = Bun.serve({ port: 0, fetch: () => new Response("ok") });
+		const port = server.port;
+		void server.stop(true); // A port nothing answers: the fetch must fail.
+		const m = await mount({ vmTarget: { urls: [`http://127.0.0.1:${port}`] } });
+		await m.app.sampleStats();
+		const system = await getSystem(m.server);
+		const row = system.containers.find((c) => c.name === "127.0.0.1");
+		expect(row?.reachable).toBe(false);
+		expect(row?.unreachableSince).toBeTypeOf("number");
+	});
+
+	test("no vmTarget means no vm-runner row", async () => {
+		const m = await mount({});
+		await m.app.sampleStats();
+		const system = await getSystem(m.server);
+		expect(system.containers.map((c) => c.name)).toEqual(["server"]);
+	});
+});
+
 describe("concurrent SQLite route writes", () => {
 	const opened: ProjectStore[] = [];
 	afterAll(async () => {
@@ -23843,5 +26392,594 @@ describe("app fixture shutdown", () => {
 		expect(order).toEqual(["fetch", "sample", "close"]);
 		await closeTestStore(g);
 		await closeTestStore(projectStore);
+	});
+});
+
+describe("service quota runtime integration", () => {
+	const interval = 300_000;
+	const metrics: readonly ServiceQuotaMetric[] = [
+		{
+			id: "credits",
+			label: "Credits",
+			kind: "balance",
+			unit: { kind: "currency", code: "USD" },
+			remaining: -2.75,
+			reportedTotal: 12.5,
+			resetsAt: null,
+			providerStatus: null,
+			plan: null,
+		},
+		{
+			id: "generations",
+			label: "Generations",
+			kind: "window",
+			unit: { kind: "count", name: "images" },
+			used: 12,
+			limit: 10,
+			startsAt: null,
+			resetsAt: null,
+		},
+	];
+	const success: ServiceQuotaReadResult = { ok: true, metrics };
+	const source = (id: string): ServiceQuotaSourceConfig => ({
+		id,
+		adapterId: "fixture",
+		label: id,
+		credentialEnv: `fixture-${crypto.randomUUID()}`,
+	});
+	const options = (
+		sources: ServiceQuotaSourceConfig[],
+		createReader: ServiceQuotaAdapterDefinition["createReader"],
+	): NonNullable<Parameters<typeof createApp>[0]["serviceQuotas"]> => ({
+		sources,
+		registry: new Map([["fixture", { id: "fixture", createReader }]]),
+		resolveCredential: () => crypto.randomUUID(),
+	});
+	// Unlike mount.call, this never invalidates the state cache for the code under test.
+	const rawState = async (m: { server: Server<undefined> }) => {
+		const response = await fetch(new URL("/api/state", m.server.url), {
+			headers: { Host: "127.0.0.1:0" },
+		});
+		expect(response.status).toBe(200);
+		return (await response.json()) as StateResponse;
+	};
+	const socketState = (
+		server: Server<undefined>,
+		headers: Record<string, string> = {},
+	) => {
+		const url = new URL("/api/ws", server.url);
+		url.protocol = "ws:";
+		const BunWebSocket = WebSocket as typeof WebSocket & {
+			new (url: string | URL, options: Bun.WebSocketOptions): WebSocket;
+		};
+		const socket = new BunWebSocket(url, {
+			headers: { Origin: server.url.origin, ...headers },
+		});
+		const nextState = (
+			matches: (state: StateResponse) => boolean = () => true,
+		) => {
+			const received = Promise.withResolvers<StateResponse>();
+			const message = (event: MessageEvent) => {
+				const frame = JSON.parse(String(event.data)) as {
+					type: string;
+					state?: StateResponse;
+				};
+				if (frame.type === "state" && frame.state && matches(frame.state))
+					received.resolve(frame.state);
+			};
+			const failed = () =>
+				received.reject(new Error("service state socket failed"));
+			socket.addEventListener("message", message);
+			socket.addEventListener("error", failed);
+			socket.addEventListener("close", failed);
+			// This deadline bounds real socket I/O, not a guessed completion wait.
+			const timer = setTimeout(
+				() => received.reject(new Error("service state socket timed out")),
+				5_000,
+			);
+			return received.promise.finally(() => {
+				clearTimeout(timer);
+				socket.removeEventListener("message", message);
+				socket.removeEventListener("error", failed);
+				socket.removeEventListener("close", failed);
+			});
+		};
+		return { socket, state: nextState(), nextState };
+	};
+
+	test("state requests read only cache and a fast source publishes while a slow source stays active", async () => {
+		const slow = Promise.withResolvers<ServiceQuotaReadResult>();
+		const fast = Promise.withResolvers<ServiceQuotaReadResult>();
+		const reads = [mock(() => slow.promise), mock(() => fast.promise)];
+		let factories = 0;
+		const m = await mount({
+			serviceQuotas: options([source("slow"), source("fast")], () => ({
+				read: reads[factories++]!,
+			})),
+		});
+		const initial = await Promise.all(
+			Array.from({ length: 8 }, () => rawState(m)),
+		);
+		for (const state of initial)
+			expect(state.serviceQuotas?.map((s) => s.status)).toEqual([
+				"pending",
+				"pending",
+			]);
+		expect(reads.map((read) => read.mock.calls.length)).toEqual([0, 0]);
+		expect(m.app.checkServiceQuotas()).toBeUndefined();
+		m.app.checkServiceQuotas();
+		expect(reads.map((read) => read.mock.calls.length)).toEqual([1, 1]);
+		fast.resolve(success);
+		await fast.promise;
+		const updated = await rawState(m);
+		expect(updated.serviceQuotas?.map((s) => s.status)).toEqual([
+			"pending",
+			"ok",
+		]);
+		expect(updated.serviceQuotas?.[1]?.sample?.metrics).toEqual(metrics);
+		await Promise.all(Array.from({ length: 8 }, () => rawState(m)));
+		expect(reads.map((read) => read.mock.calls.length)).toEqual([1, 1]);
+		slow.resolve(success);
+		await slow.promise;
+		expect((await rawState(m)).serviceQuotas?.map((s) => s.status)).toEqual([
+			"ok",
+			"ok",
+		]);
+	});
+
+	test("five-minute expiration publishes during an active refresh and errors retry only when due", async () => {
+		let now = 1_800_000_000_000;
+		const firstAt = now;
+		const attempts = Array.from({ length: 3 }, () =>
+			Promise.withResolvers<ServiceQuotaReadResult>(),
+		);
+		let calls = 0;
+		const m = await mount({
+			now: () => now,
+			serviceQuotas: options([source("account")], () => ({
+				read: () => attempts[calls++]!.promise,
+			})),
+		});
+		m.app.checkServiceQuotas();
+		attempts[0]!.resolve(success);
+		await attempts[0]!.promise;
+		expect((await rawState(m)).serviceQuotas?.[0]?.status).toBe("ok");
+		now += interval - 1;
+		m.app.checkServiceQuotas();
+		expect(calls).toBe(1);
+		now++;
+		m.app.checkServiceQuotas();
+		expect(calls).toBe(2);
+		const expired = (await rawState(m)).serviceQuotas?.[0];
+		expect(expired).toMatchObject({
+			status: "stale",
+			staleReason: "expired",
+			error: null,
+			sample: { observedAt: firstAt, metrics },
+		});
+		m.app.checkServiceQuotas();
+		expect(calls).toBe(2);
+		attempts[1]!.resolve({
+			ok: false,
+			error: { code: "http", httpStatus: 503, retryAfterAt: null },
+		});
+		await attempts[1]!.promise;
+		expect((await rawState(m)).serviceQuotas?.[0]).toMatchObject({
+			status: "stale",
+			staleReason: "refresh_error",
+			lastAttemptAt: now,
+			nextAttemptAt: now + interval,
+			sample: { observedAt: firstAt, metrics },
+			error: { code: "http", httpStatus: 503 },
+		});
+		now += interval - 1;
+		m.app.checkServiceQuotas();
+		expect(calls).toBe(2);
+		now++;
+		m.app.checkServiceQuotas();
+		expect(calls).toBe(3);
+		attempts[2]!.resolve(success);
+		await attempts[2]!.promise;
+		expect((await rawState(m)).serviceQuotas?.[0]).toMatchObject({
+			status: "ok",
+			lastAttemptAt: now,
+			nextAttemptAt: now + interval,
+			sample: { observedAt: now, metrics },
+			error: null,
+		});
+	});
+
+	test("missing credentials preserve configuration order and send zero requests to the bound listener", async () => {
+		let requests = 0;
+		const listener = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch() {
+				requests++;
+				return Response.json(metrics);
+			},
+		});
+		mounted.push(listener);
+		const createReader = mock(({ credential }: { credential: string }) =>
+			createServiceQuotaHttpReader({
+				endpoint: `https://${listener.url.host}/quota`,
+				credential,
+				decode: (body) => body,
+				fetch: Object.assign(
+					(_input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+						fetch(new URL("/quota", listener.url), init),
+					{ preconnect: fetch.preconnect },
+				),
+			}),
+		);
+		const config = options([source("second"), source("first")], createReader);
+		config.resolveCredential = () => undefined;
+		const m = await mount({ serviceQuotas: config });
+		m.app.checkServiceQuotas();
+		m.app.checkServiceQuotas();
+		const state = await rawState(m);
+		expect(state.serviceQuotas?.map((s) => [s.id, s.status])).toEqual([
+			["second", "unconfigured"],
+			["first", "unconfigured"],
+		]);
+		expect(
+			state.serviceQuotas?.every(
+				(s) =>
+					s.sample === null &&
+					s.lastAttemptAt === null &&
+					s.nextAttemptAt === null &&
+					s.error?.code === "configuration",
+			),
+		).toBe(true);
+		expect(createReader).not.toHaveBeenCalled();
+		expect(requests).toBe(0);
+	});
+
+	test("the real HTTP reader publishes raw balance and window metrics without secret data", async () => {
+		const credential = crypto.randomUUID();
+		const configSource = source("account");
+		const endpoint = "https://quota.example.test/v2/balance";
+		const requests: { method: string; url: string }[] = [];
+		const listener = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(req) {
+				expect(req.method).toBe("GET");
+				expect(new URL(req.url).pathname).toBe("/v2/balance");
+				expect(req.headers.get("authorization")).toBe(`Bearer ${credential}`);
+				expect(req.headers.get("accept")).toBe("application/json");
+				expect(await req.text()).toBe("");
+				// Synthetic adapter fixture, not a provider-specific schema decoder.
+				return Response.json(metrics);
+			},
+		});
+		mounted.push(listener);
+		const logs: unknown[][] = [];
+		const log = spyOn(console, "log").mockImplementation((...args) =>
+			logs.push(args),
+		);
+		const error = spyOn(console, "error").mockImplementation((...args) =>
+			logs.push(args),
+		);
+		let readCompleted: Promise<ServiceQuotaReadResult> | undefined;
+		try {
+			const config = options([configSource], ({ credential: bound }) => {
+				const reader = createServiceQuotaHttpReader({
+					endpoint,
+					credential: bound,
+					decode: (body) => body,
+					fetch: Object.assign(
+						(input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+							requests.push({
+								method: init?.method ?? "GET",
+								url: String(input),
+							});
+							expect(String(input)).toBe(endpoint);
+							expect(init?.method).toBe("GET");
+							expect(init?.redirect).toBe("manual");
+							return fetch(new URL("/v2/balance", listener.url), init);
+						},
+						{ preconnect: fetch.preconnect },
+					),
+				});
+				return {
+					read(context) {
+						readCompleted = reader.read(context);
+						return readCompleted;
+					},
+				};
+			});
+			config.resolveCredential = () => credential;
+			const m = await mount({ serviceQuotas: config });
+			m.app.checkServiceQuotas();
+			expect(readCompleted).toBeDefined();
+			await readCompleted;
+			const state = await rawState(m);
+			expect(state.serviceQuotas?.[0]).toMatchObject({
+				status: "ok",
+				sample: { metrics },
+			});
+			expect(requests).toEqual([{ method: "GET", url: endpoint }]);
+			const serialized = JSON.stringify({ state, logs });
+			expect(serialized).not.toContain(credential);
+			expect(serialized).not.toContain(configSource.credentialEnv);
+			expect(serialized).not.toContain("credentialEnv");
+			expect(JSON.stringify(state.serviceQuotas)).not.toContain("revision");
+		} finally {
+			log.mockRestore();
+			error.mockRestore();
+		}
+	});
+
+	test("service labels cannot release model holds, schedule work, or change model selection", async () => {
+		const template = projects.get("p1");
+		if (template === undefined) throw new Error("missing project fixture");
+		const store = await ProjectStore.open(
+			join(root, `service-hold-${crypto.randomUUID()}`),
+		);
+		const entry: Entry = {
+			...template,
+			name: "service-hold",
+			path: store.path,
+			store,
+		};
+		const task = await store.createTask(
+			"model quota hold",
+			"zai/glm-5.3-flash",
+		);
+		const holdUntil = Date.now() + 3_600_000;
+		await store.updateTask(task.id, {
+			holdUntil,
+			holdProvider: "zai",
+			holdWindow: "7d",
+			holdSetAt: Date.now(),
+		});
+		const schedule = mock(() => {});
+		const m = await mount({
+			projects: new Map([[entry.name, entry]]),
+			schedule,
+			serviceQuotas: options([{ ...source("zai"), label: "zai" }], () => ({
+				read: async () => success,
+			})),
+		});
+		const before = await rawState(m);
+		const roles = modelRoles();
+		m.app.checkServiceQuotas();
+		await Promise.resolve();
+		const after = await rawState(m);
+		expect(after.serviceQuotas?.[0]?.status).toBe("ok");
+		expect(after.quota).toEqual(before.quota);
+		expect(after.quota).toBeNull();
+		for (const model of ["zai/glm-5.3-flash", "unknown/model"]) {
+			const limits = after.quota?.limits ?? [];
+			expect(forModel(limits, model)).toEqual([]);
+			expect(tightestFor(limits, model)).toBeNull();
+			expect(usageReset(limits, model, Date.now())).toBeNull();
+		}
+		expect(modelRoles()).toEqual(roles);
+		expect(await store.getTask(task.id)).toMatchObject({
+			model: "zai/glm-5.3-flash",
+			holdUntil,
+			holdProvider: "zai",
+			holdWindow: "7d",
+		});
+		expect(schedule).not.toHaveBeenCalled();
+	});
+
+	test("service reads complete while a statistics sampler request remains active", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const localProjects = new Map<string, Entry>();
+		let hold = false;
+		let finished = false;
+		const read = mock(async () => success);
+		const m = await mount({
+			projects: localProjects,
+			serviceQuotas: options([source("account")], () => ({ read })),
+			githubAppFetch: async () => {
+				if (hold) {
+					entered.resolve();
+					await release.promise;
+				}
+				return new Response("{}", { status: 404 });
+			},
+		});
+		const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+		const key = privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+		expect(
+			(await m.call("/api/git-hosts/github-app", { id: "1234", key })).status,
+		).toBe(200);
+		const template = projects.get("p1");
+		if (template === undefined) throw new Error("missing project fixture");
+		localProjects.set("sampler", {
+			...template,
+			name: "sampler",
+			github: "https://github.com/acme/sampler",
+		});
+		hold = true;
+		const sampling = m.app.sampleStats().then(() => {
+			finished = true;
+		});
+		try {
+			await entered.promise;
+			m.app.checkServiceQuotas();
+			await Promise.resolve();
+			expect((await rawState(m)).serviceQuotas?.[0]?.status).toBe("ok");
+			expect(read).toHaveBeenCalledTimes(1);
+			expect(finished).toBe(false);
+		} finally {
+			release.resolve();
+			await sampling;
+		}
+	});
+
+	test("hosted HTTP and development WebSocket omit sources without resolver, factory, or reader calls", async () => {
+		const secret = crypto.randomUUID();
+		const read = mock(async () => success);
+		const createReader = mock(() => ({ read }));
+		const config = options([source("account")], createReader);
+		const resolveCredential = mock(() => crypto.randomUUID());
+		config.resolveCredential = resolveCredential;
+		const m = await mount({
+			realPort: true,
+			serviceQuotas: config,
+			hosted: {
+				config: {
+					tenant: "service-test",
+					secret,
+					controlUrl: "http://127.0.0.1:9",
+					wording: {
+						workSuffix: "",
+						mergeSuffix: "",
+						resumeSuffix: "",
+						creditReason: "No credit.",
+					},
+				},
+				hooks: {
+					reportUsage: () => {},
+					creditOk: async () => true,
+					gitToken: async () => null,
+				},
+				creditBalance: { balance: null },
+			},
+		});
+		m.app.checkServiceQuotas();
+		const headers = {
+			"x-ottr-identity": signIdentity(secret, "service-test", "owner"),
+		};
+		expect((await m.call("/api/state")).status).toBe(401);
+		const response = await m.call("/api/state", undefined, headers);
+		expect(response.status).toBe(200);
+		const payload = (await response.json()) as StateResponse;
+		expect(payload).not.toHaveProperty("serviceQuotas");
+		// Unknown balance: the chip data ships with a null balance.
+		expect(payload.credits).toEqual({
+			balance: null,
+			accountUrl: "http://127.0.0.1:9/account",
+		});
+		const ws = socketState(m.server, {
+			"x-ottr-identity": signIdentity(secret, "service-test", "owner"),
+		});
+		try {
+			expect(await ws.state).not.toHaveProperty("serviceQuotas");
+			m.app.checkServiceQuotas();
+			expect(resolveCredential).not.toHaveBeenCalled();
+			expect(createReader).not.toHaveBeenCalled();
+			expect(read).not.toHaveBeenCalled();
+		} finally {
+			ws.socket.close();
+		}
+	});
+
+	test("development WebSocket publishes the same cached service sample as HTTP", async () => {
+		const pending = Promise.withResolvers<ServiceQuotaReadResult>();
+		const read = mock(() => pending.promise);
+		const m = await mount({
+			realPort: true,
+			serviceQuotas: options([source("account")], () => ({ read })),
+		});
+		const initial = socketState(m.server);
+		try {
+			expect((await initial.state).serviceQuotas?.[0]?.status).toBe("pending");
+			const next = initial.nextState(
+				(state) => state.serviceQuotas?.[0]?.status === "ok",
+			);
+			m.app.checkServiceQuotas();
+			pending.resolve(success);
+			const published = await next;
+			const response = await fetch(new URL("/api/state", m.server.url));
+			expect(response.status).toBe(200);
+			const state = (await response.json()) as StateResponse;
+			expect(published.serviceQuotas).toEqual(state.serviceQuotas);
+			expect(published.serviceQuotas?.[0]?.sample?.metrics).toEqual(metrics);
+			expect(read).toHaveBeenCalledTimes(1);
+		} finally {
+			initial.socket.close();
+		}
+	});
+
+	test("service state keeps direct-loopback and public auth rules and production WebSocket refusal", async () => {
+		const g = await GlobalStore.open(
+			join(root, `service-auth-${crypto.randomUUID()}`),
+		);
+		mountStores.push(g);
+		const apiKey = crypto.randomUUID();
+		const sessionSecret = crypto.randomUUID();
+		await g.set("config", {
+			apiKey,
+			sessionSecret,
+			admin: { name: "owner", passHash: hashPassword(crypto.randomUUID()) },
+		});
+		const m = await mount({
+			gstore: g,
+			prod: true,
+			publicHosts: ["board.example"],
+			serviceQuotas: options([source("account")], () => ({
+				read: async () => success,
+			})),
+		});
+		m.app.checkServiceQuotas();
+		await Promise.resolve();
+		expect((await rawState(m)).serviceQuotas?.[0]?.status).toBe("ok");
+		const walls: Record<string, string>[] = [
+			{ Host: "board.example" },
+			{ Host: "127.0.0.1:0", "x-forwarded-for": "192.0.2.2" },
+		];
+		for (const headers of walls) {
+			expect((await m.call("/api/state", undefined, headers)).status).toBe(401);
+			const allowed = await m.call("/api/state", undefined, {
+				...headers,
+				"x-api-key": apiKey,
+			});
+			expect(allowed.status).toBe(200);
+			expect(
+				((await allowed.json()) as StateResponse).serviceQuotas?.[0]?.status,
+			).toBe("ok");
+		}
+		const cookie = signSession(sessionSecret, "owner", 60_000);
+		expect(
+			(
+				await m.call("/api/state", undefined, {
+					Host: "board.example",
+					Cookie: `${sessionCookieName(0)}=${cookie}`,
+				})
+			).status,
+		).toBe(200);
+		const refused = await m.call("/api/ws", undefined, {
+			Upgrade: "websocket",
+			Connection: "Upgrade",
+			"Sec-WebSocket-Key": btoa(crypto.randomUUID().slice(0, 16)),
+			"Sec-WebSocket-Version": "13",
+		});
+		expect(refused.status).toBe(404);
+	});
+
+	test("an empty self-hosted configuration publishes an empty source list", async () => {
+		const m = await mount();
+		m.app.checkServiceQuotas();
+		const plain = await rawState(m);
+		expect(plain.serviceQuotas).toEqual([]);
+		// No hosted flag: no credits chip data, the self-hosted payload keeps its shape.
+		expect(plain).not.toHaveProperty("credits");
+	});
+
+	test("closing the app aborts an active source and prevents future reads", async () => {
+		const signals: AbortSignal[] = [];
+		const pending = Promise.withResolvers<ServiceQuotaReadResult>();
+		const read = mock((context: { signal: AbortSignal }) => {
+			signals.push(context.signal);
+			return pending.promise;
+		});
+		const m = await mount({
+			serviceQuotas: options([source("account")], () => ({ read })),
+		});
+		m.app.checkServiceQuotas();
+		expect(signals[0]?.aborted).toBe(false);
+		await m.app.close();
+		expect(signals[0]?.aborted).toBe(true);
+		pending.resolve(success);
+		await pending.promise;
+		m.app.checkServiceQuotas();
+		expect(read).toHaveBeenCalledTimes(1);
 	});
 });

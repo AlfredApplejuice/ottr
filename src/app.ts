@@ -34,10 +34,13 @@ import {
 	alateHealth,
 	alateRotateKey,
 	alateUrlError,
+	BRANCH,
 	commitConfigYml,
+	configBlobAt,
 	ensureAlateProjectsRoot,
 	loadConfigYml,
 	noRedirectFetch,
+	REPO_NAME,
 	readOnlyMountError,
 	refreshAlateSnapshot,
 	saveConfigYml,
@@ -60,6 +63,7 @@ import {
 	type SessionEntry,
 	secretsEqual,
 	sessionCookie,
+	sessionCookieName,
 	sessionLabel,
 	signSession,
 	verifyAdminLogin,
@@ -68,8 +72,9 @@ import {
 } from "./auth.ts";
 import { acceptsGzip, boardBundle, bundleResponse } from "./boardBundle.ts";
 import { lookupBranchRules } from "./branchRules.ts";
+import { createCodeScanWatcher } from "./codeScanWatch.ts";
 import {
-	openRegular,
+	openRegularBelow,
 	readBelow,
 	unlinkBelow,
 	withDir,
@@ -217,10 +222,12 @@ import {
 } from "./notifications.ts";
 import {
 	buildOmpStatsReport,
+	newSessionUsageCache,
 	type OmpStatsAnswer,
 	type OmpStatsReport,
 	type OmpStatsSource,
-	scanSessionUsage,
+	type SessionUsageCache,
+	scanSessionUsageIncremental,
 } from "./ompStats.ts";
 import {
 	forwardToDashboard,
@@ -252,6 +259,7 @@ import {
 	gateJudgedPrompt,
 	gateUserText,
 	isStartAnywayReply,
+	removeOpenQuestionsSection,
 } from "./promptGate.ts";
 import {
 	BOARD_CHECK_PROMPT,
@@ -269,7 +277,12 @@ import {
 } from "./prompts.ts";
 import { createPrWatcher, PR_GATES, postedReviewId, prUrl } from "./prs.ts";
 import { requirementsListPath } from "./python.ts";
-import { fetchQuota, forProvider, providerBlocked } from "./quota.ts";
+import {
+	fetchQuota,
+	forProvider,
+	providerBlocked,
+	providerOf,
+} from "./quota.ts";
 import {
 	cachedLatestGhRelease,
 	includedTasks,
@@ -280,7 +293,7 @@ import {
 	releaseBlocked,
 	runGh,
 } from "./release.ts";
-import { summarizeRelease } from "./releaseSummary.ts";
+import { readProductDescription, summarizeRelease } from "./releaseSummary.ts";
 import {
 	directLoopback,
 	hostMatches,
@@ -297,6 +310,7 @@ import {
 	depProjectOf,
 	depProjectsOf,
 	findingsSettledAt,
+	isLead,
 	isRetro,
 	isReview,
 	LEAD_APPLIES_OPTION,
@@ -316,6 +330,7 @@ import {
 	reviewBlocked,
 	reviewFindings,
 	silentSince,
+	validatableReview,
 	WORK_CHECK_ASK_BLOCK,
 	WORK_CHECK_ASK_CANCEL,
 	WORK_CHECK_ASK_DIVERGE,
@@ -326,6 +341,10 @@ import {
 } from "./scheduler.ts";
 import { migrateSealedConfig, sealStoredConfigRow } from "./sealedConfig.ts";
 import { isSealed, type SecretBox } from "./secretBox.ts";
+import {
+	createServiceQuotaCoordinator,
+	type ServiceQuotaCoordinatorOptions,
+} from "./serviceQuotas.ts";
 import { sessionContext } from "./session.ts";
 import {
 	type AskDraft,
@@ -338,11 +357,13 @@ import { prFeedbackReason } from "./supervisor.ts";
 import { createSystemSampleLog } from "./systemSampleLog.ts";
 import {
 	createSystemSampler,
+	fetchVmRunnerStats,
 	fetchWorkerStats,
 	type LiveRun,
 	type RunnerReading,
 	readCgroup,
 	readVm,
+	type VmRunnerView,
 } from "./systemStats.ts";
 import { formatBytes, type TmpDiskSpace, tmpDiskSpace } from "./tmpsweep.ts";
 import {
@@ -379,6 +400,7 @@ import {
 	type AskQuestion,
 	answeredCard,
 	askAnswerLine,
+	type CheckRoutingSetting,
 	DONE_PAGE,
 	doneReadKey,
 	type ListedTask,
@@ -409,7 +431,7 @@ import {
 	VERSION_RE,
 } from "./types.ts";
 import board from "./ui/index.html";
-import { SLOT_STAGES, slotUse } from "./ui/queue.ts";
+import { matchesQuery, SLOT_STAGES, slotUse } from "./ui/queue.ts";
 import {
 	isUpdateCommit,
 	parseUpdateHostHeartbeat,
@@ -477,11 +499,13 @@ function isStringList(v: unknown, max: number): v is string[] {
 
 const ICON_EXTS = ["png", "jpg", "gif", "webp"] as const;
 
-/** Path of the stored icon in the project's data dir, or null when none exists. */
+/** Path of the stored icon in the project's data dir, or null when none exists. A
+ * symlink at an icon name refuses: lstat never follows it, so a worker-planted link
+ * shows no icon and the GET route never serves the target's bytes. */
 function iconFile(tasksDir: string): string | null {
 	for (const ext of ICON_EXTS) {
 		const file = join(tasksDir, `icon.${ext}`);
-		if (statSync(file, { throwIfNoEntry: false })?.isFile()) return file;
+		if (lstatSync(file, { throwIfNoEntry: false })?.isFile()) return file;
 	}
 	return null;
 }
@@ -500,6 +524,8 @@ function removeIcons(root: string, tasksDir: string): void {
 
 const IMAGE_BODY_BYTES = 32 * 1024 * 1024;
 const LOG_CHUNK_BYTES = 256 * 1024;
+/** The worktree file viewer never serves a worker-written file whole without bound. */
+const WORKTREE_FILE_MAX_BYTES = 64 * 1024 * 1024;
 /** A route param that names a task: legacy 8-hex or the project's `PREFIX-n` handle, either
  * with a retro child suffix `-retro[-k]`. resolveTask reads it; SEEN_ID_RE below repeats it
  * with the optional completion suffix, so change both together. */
@@ -618,7 +644,10 @@ interface AppDeps {
 		e: Entry,
 		reviewId: string,
 		strictReview?: boolean,
-	): Promise<{ id: string } | { error: string; status: number }>;
+		again?: { before: number },
+	): Promise<
+		{ id: string; reset: string[] } | { error: string; status: number }
+	>;
 	stopTurn(e: Entry, id: string): Promise<StopOutcome>;
 	finishKept(
 		e: Entry,
@@ -633,13 +662,23 @@ interface AppDeps {
 		id: string,
 	): { text: string; at?: number } | null;
 	schedule: () => void | Promise<void>;
-	/** Node env style clock for the idle-review logic only; tests inject a fixed clock.
-	 * Defaults to Date.now. */
+	/** Internal service bindings only. The app owns their clock and publication lifecycle. */
+	serviceQuotas?: Omit<ServiceQuotaCoordinatorOptions, "now" | "onChange">;
+	/** Clock for idle reviews and service quota freshness; defaults to Date.now. */
 	now?: () => number;
 	/** OTTR-1071: the server wiring's next regular hourly PR poll (its grid), for the
 	 * Settings watches row. Absent in narrow test mounts, so the state payload then
 	 * reports null. */
 	prPollNextAt?: () => number | null;
+	/** OTTR-1087: the server wiring's next regular hourly code-scanning poll (its
+	 * grid), for the Settings watches row. Absent in narrow test mounts, so the
+	 * state payload then reports null. */
+	codeScanPollNextAt?: () => number | null;
+	/** OTTR-1181: the model route's resume gate reads the cached quota report through
+	 * this seam; unset reads the refresh loop's `quota` closure like production. Tests
+	 * inject a stub so no test spawns `omp usage`; a null answer counts as unknown and
+	 * the resume fails open. */
+	quotaSnapshot?: () => QuotaState | null;
 	serverVersion: string;
 	port: number;
 	publicHosts: string[];
@@ -654,6 +693,10 @@ interface AppDeps {
 		trendingScan: boolean;
 		/** OTTR-693: the commit identity Settings names; null keeps the built-in Ottr default. */
 		commitIdentity: CommitIdentity | null;
+		/** OTTR-1116: the user-set vendor routing for the check run's role (POST
+		 *  /api/settings/check-routing); null = automatic. Optional so the test shared
+		 *  literals need nothing; absent reads as null. */
+		checkRouting?: CheckRoutingSetting | null;
 		removedPaths: string[];
 		projectPaths: string[];
 		/** Project names in board order; names not listed keep discovery order after them. */
@@ -687,6 +730,10 @@ interface AppDeps {
 		workers: Record<string, number>;
 		preparing: number;
 	};
+	/** OTTR-1143: the turn loop's live slot count — the running ∪ preparing keys the claim
+	 * gate caps. Absent in narrow test mounts: the state frame then omits slotsUsed and
+	 * the UI keeps its own card count (the old-server behavior). */
+	slotsUsed?: () => number | Promise<number>;
 	/** OTTR-763: the cross-project checkout guard's ambiguous-change bell notices (one per
 	 * change; names the commit and the running cards); absent = none. */
 	checkoutNotices?: () => string[];
@@ -696,9 +743,16 @@ interface AppDeps {
 	/** OTTR-548: the worker dispatch target parsed from OTTR_WORKER_URLS; workerSignInTick probes its
 	 * urls' GET /signins for the worker sign-in warnings. Null, absent or empty = no workers to probe. */
 	workerTarget?: WorkerTarget | null;
+	/** OTTR-1151: the microVM runner target parsed from OTTR_VM_RUNNER_URL; the /system view polls
+	 * its GET /stats like a worker's and joins the VM fleet onto that row. Null, absent or empty
+	 * = no vm-runner row. */
+	vmTarget?: WorkerTarget | null;
 	/** Only for tests: the transcript usage scan GET /api/settings/omp-stats runs instead of
-	 * scanSessionUsage, so a test can count reads and serve fixture stores. */
-	scanSessionUsage?: (sessionsDir: string) => OmpStatsAnswer;
+	 * the incremental scanner, so a test can count scans and serve fixture stores. The
+	 * answer may be sync or a promise; the report build awaits it either way. */
+	scanSessionUsage?: (
+		sessionsDir: string,
+	) => OmpStatsAnswer | Promise<OmpStatsAnswer>;
 	/**
 	 * Settings -> omp usage -> Launch omp stats dashboard (docs/specs/omp-stats-dashboard.md):
 	 * the proxy listener's port (null + error when disabled) and the on-demand dashboard that
@@ -1274,6 +1328,19 @@ export function tmpFull(freeBytes: number, totalBytes: number): boolean {
 	);
 }
 
+/** The bell's tmp-full advisory for one runner (a worker hostname or "local"). The
+ *  subject leads as words and the path rides in brackets (OTTR-1097): the bell's
+ *  collapsed line strips path tokens, so a leading "/tmp" left a short line that
+ *  named no disk. */
+export function tmpFullNotice(runner: string, freeBytes: number): string {
+	return `The temp disk (/tmp) of ${runner} is full (${formatBytes(freeBytes)} free)`;
+}
+
+/** The free-space line an apt disk-failure reason appends; same subject-first shape. */
+export function tmpSpaceNotice(runner: string, freeBytes: number): string {
+	return `The temp disk (/tmp) of ${runner} has ${formatBytes(freeBytes)} free`;
+}
+
 /**
  * OTTR-754: one bell warning per runner whose /tmp is below the free-space limit — worker
  * hostnames from the sign-ins tick's cache, the local runner from a statfs probe. Advisory:
@@ -1289,7 +1356,7 @@ export function workerTmpWarnings(
 	for (const [host, report] of reports) {
 		if (!report?.tmp) continue; // Unknown /tmp space warns nothing.
 		if (!tmpFull(report.tmp.freeBytes, report.tmp.totalBytes)) continue;
-		const line = `/tmp of ${host} is full (${formatBytes(report.tmp.freeBytes)})`;
+		const line = tmpFullNotice(host, report.tmp.freeBytes);
 		if (!seen.has(line)) {
 			seen.add(line);
 			out.push(line);
@@ -1299,18 +1366,18 @@ export function workerTmpWarnings(
 		localSpace !== null &&
 		tmpFull(localSpace.freeBytes, localSpace.totalBytes)
 	) {
-		const line = `/tmp of local is full (${formatBytes(localSpace.freeBytes)})`;
+		const line = tmpFullNotice("local", localSpace.freeBytes);
 		if (!seen.has(line)) out.push(line);
 	}
 	return out;
 }
 /**
  * Boot reconcile of the layer in-use registries (docs/specs/agent-layer-switch.md, "Record"):
- * rebuilds each home's `<home>/.alate/in-use.json` from `openLayers`, the layer ids the stores'
- * open turns still pin. A home keeps only the ids whose layer folder exists there: alate's
- * clean-up never deletes a layer a crashed-but-live turn reads, and an id whose folder is
- * already gone stops blocking it. Never throws: `rebuildLayerUse` is best-effort, and a home
- * without a `.alate` dir (no layer was ever installed) is left alone.
+ * reconciles each home's registry with `openLayers`, the recovery pins from the stores'
+ * open turns. `rebuildLayerUse` preserves independently live or uncertain holders, prunes
+ * only holders proven ended, and replaces recovery pins from open turns. This function
+ * keeps only safe open-turn ids whose layer folder exists there. A home without `.alate`
+ * is left alone. Never throws: `rebuildLayerUse` warns rather than throwing on errors.
  */
 export function reconcileLayerUse(
 	openLayers: string[],
@@ -1713,18 +1780,20 @@ const BOOLEAN_SETTING_FIELDS = [
 	"holdUpdateMerges",
 	"forkMergeHold",
 	"retroFilter",
+	"retroAutoStart",
 	"forkResearch",
 	"trendingScout",
 	"prReviews",
 	"prReviewNotify",
 	"prReviewApprove",
 	"prReviewRequestChanges",
+	"prReviewManualPost",
 	"prMode",
 	"issueWatch",
+	"codeScanWatch",
 	"dependabotWarn",
 	"ompWatch",
 	"microVm",
-	"pushSyncCommits",
 	"setupChecklist",
 ] as const;
 
@@ -1798,6 +1867,25 @@ function parseTendChurnGlobs(
 	}
 	patch.tendChurnGlobs = globs;
 	return null;
+}
+
+/** OTTR-1129: the validate route's optional body. The again flag must be exactly
+ *  the string "blocked" and `before` an ISO timestamp that Date.parse reads as a
+ *  finite epoch ms; anything else (a non-object body included) is an error result.
+ *  Pure: never throws, and unknown extra keys are ignored. */
+export function parseValidateAgainBody(
+	body: unknown,
+): { before: number } | { error: string } {
+	if (typeof body !== "object" || body === null)
+		return { error: "body must be a JSON object" };
+	const { again, before } = body as Record<string, unknown>;
+	if (again !== "blocked") return { error: `again must be "blocked"` };
+	if (typeof before !== "string")
+		return { error: "before must be an ISO timestamp string" };
+	const at = Date.parse(before);
+	if (!Number.isFinite(at))
+		return { error: "before must be a timestamp Date.parse reads" };
+	return { before: at };
 }
 
 const settingParsers: FieldParser[] = [
@@ -1880,9 +1968,7 @@ function createAppClockDefaults(deps: AppDeps): {
 	slowApiMs: number;
 } {
 	return {
-		// Idle clock (docs/specs/mutation-delta.md §7): only the idle-review logic reads it,
-		// and tests inject a fixed clock. It initializes at createApp, so a board restart
-		// counts as input and never starts a review right after boot.
+		// Idle reviews and service quotas share the app clock. A restart counts as input.
 		now: deps.now ?? Date.now,
 		// OTTR-715: the slow-request log ceiling (see api()).
 		slowApiMs: deps.slowApiMs ?? 500,
@@ -1958,10 +2044,24 @@ class TaskConflict extends Error {
 	}
 }
 
+/** The vendor keys and the role names the check routing accepts; the role rule is the
+ *  same one modelRoles.ts's ROLE_NAME holds (the model-roles editor rule). Module scope,
+ *  not createApp's: boot restores a stored routing before createApp's later consts run,
+ *  and a TDZ read would crash the boot. */
+const CHECK_VENDOR_RE = /^[a-z][a-z0-9_-]*$/;
+const CHECK_ROLE_RE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+
 export async function createApp(deps: AppDeps) {
 	const { gh, latestReleaseOf, githubAppFetch, rerunFetch } =
 		createAppNetworkDefaults(deps);
 	const { now, slowApiMs } = createAppClockDefaults(deps);
+	// The hosted credits chip's link (docs/specs/hosted-mode.md section 7). Computed once:
+	// the state frame reads it each time, and controlUrl is boot-validated without a
+	// trailing slash.
+	const accountUrl =
+		deps.hosted === undefined
+			? ""
+			: new URL("/account", `${deps.hosted.config.controlUrl}/`).toString();
 	let closing = false;
 	let closePromise: Promise<void> | null = null;
 	const internalWork = new Set<Promise<unknown>>();
@@ -1989,6 +2089,9 @@ export async function createApp(deps: AppDeps) {
 	}
 	let lastInputAt = now();
 	const prod = deps.prod === true;
+	// OTTR-983: the session cookie name carries the board port (see sessionCookieName), so
+	// the omp-stats proxy on its own port still consults the same board-port cookie.
+	const cookieName = sessionCookieName(deps.port);
 	const { sshDir, workersHome, keyscan } = createAppPathDefaults(deps);
 	const ambientHelpers = readAmbientHelpers();
 	// Boot reconcile (docs/specs/agent-layer-switch.md, "Record"): the stores' open turns
@@ -2312,6 +2415,8 @@ export async function createApp(deps: AppDeps) {
 					errorText: err.errorText,
 					prDraft: t.prOccurrence?.draft ?? null,
 					prComments: t.prOccurrence?.comments ?? null,
+					prPosted: t.prOccurrence?.posted?.url ?? null,
+					prPostedHead: t.prOccurrence?.posted?.head ?? null,
 					cancelled: t.cancelledAt !== null,
 				};
 			}),
@@ -2320,8 +2425,9 @@ export async function createApp(deps: AppDeps) {
 
 	/** Drops task-derived seen keys whose occurrence is over: a `task:` key no card's current
 	 * needs_you entry carries, `done:<id>` of a card gone or out of done, `error:<id>:<turn>` of a
-	 * card gone or past that turn, and a `pr:<id>:<stamp>` key whose stamp is read or whose card
-	 * is gone. Notice and crit keys stay; the client drops those itself. */
+	 * card gone or past that turn, and a `pr:<id>:<stamp>` key whose stamp is read, whose card
+	 * is gone, or whose board-posted stamp is no longer current. Notice and crit keys stay; the
+	 * client drops those itself. */
 	function pruneInboxSeen(
 		seen: readonly string[],
 		inputs: readonly AlertCardInput[],
@@ -2332,16 +2438,22 @@ export async function createApp(deps: AppDeps) {
 			byId.set(c.id, c);
 			if (c.state === "needs_you") entryKeys.add(taskEntryKey(c));
 		}
-		/** Whether a `pr:<id>:<stamp>` key's stamp is still the card's unseen comment wave. */
+		/** Whether a `pr:<id>:...` key is still live: the card's unseen comment
+		 * wave, or its board-posted occurrence while that exact head is current
+		 * (docs/specs/pr-review-auto-post.md). */
 		function prKeyLive(k: string): boolean {
 			const rest = k.slice("pr:".length);
+			const postedAt = rest.indexOf(":posted:");
+			if (postedAt > 0) {
+				const c = byId.get(rest.slice(0, postedAt));
+				if (c === undefined) return false;
+				return rest.slice(postedAt + ":posted:".length) === c.prPostedHead;
+			}
 			const cut = rest.lastIndexOf(":");
-			const c = cut > 0 ? byId.get(rest.slice(0, cut)) : undefined;
-			return (
-				c !== undefined &&
-				c.prComments !== null &&
-				k === `pr:${c.id}:${c.prComments}`
-			);
+			if (cut <= 0) return false;
+			const c = byId.get(rest.slice(0, cut));
+			if (c === undefined) return false;
+			return c.prComments !== null && k === `pr:${c.id}:${c.prComments}`;
 		}
 		/** Whether a seen key still has its occurrence live: a `task:` key a current needs_you
 		 * entry carries, `done:<id>` of a card in done, `error:<id>:<turn>` of a card on that
@@ -2584,11 +2696,15 @@ export async function createApp(deps: AppDeps) {
 	/** Outgoing public key recovered from a stored vapid row whose private key is unreadable
 	 * (ADR-0011 recovery): covers upgraded/restored boards that predate the push_vapid_key kv. */
 	let previousVapidPublicKey: string | null = null;
-	/** Alate server settings; key is sealed at rest like apiKey (ADR-0011). */
-	let alate: { url: string | null; key: string | null } = {
-		url: null,
-		key: null,
-	};
+	/** Alate server settings; key is sealed at rest like apiKey (ADR-0011). `repo`/`branch`
+	 *  pin the trusted model-role write target (owner/name and branch): a save fails closed
+	 *  when alate's reported source differs. Null means unpinned (alate's source decides). */
+	let alate: {
+		url: string | null;
+		key: string | null;
+		repo: string | null;
+		branch: string | null;
+	} = { url: null, key: null, repo: null, branch: null };
 	/** GitHub token from onboarding or Settings; sealed at rest like apiKey (ADR-0011). */
 	let githubToken: string | null = null;
 	/**
@@ -3023,6 +3139,11 @@ export async function createApp(deps: AppDeps) {
 		log: (msg: string) => console.log(`[pr] ${msg}`),
 		gh,
 		spawn: deps.prReviewSpawn,
+		// OTTR-1094: a finished draft run posts by itself when the project turned the
+		// manual approval off; the seam runs the Post click's steps after the save.
+		postDraft: async ({ project, number }) => {
+			await autoPostPrDraft(project, number);
+		},
 		// OTTR-1071: the quiet-time timer's tick runs under the same background control
 		// as the hourly poll: no new scan once the app closes, close() drains the run,
 		// and a rejection reaches the error log.
@@ -3055,6 +3176,14 @@ export async function createApp(deps: AppDeps) {
 	const issueWatcher = createIssueWatcher({
 		projects: () => deps.projects.values(),
 		log: (msg: string) => console.log(`[issues] ${msg}`),
+		gh,
+	});
+
+	// Code scanning watcher: same live project Map; files GitHub code scanning
+	// alerts as backlog cards, grouped by rule.
+	const codeScanWatcher = createCodeScanWatcher({
+		projects: () => deps.projects.values(),
+		log: (msg: string) => console.log(`[code-scanning] ${msg}`),
 		gh,
 	});
 
@@ -3233,6 +3362,52 @@ export async function createApp(deps: AppDeps) {
 		return [{ project: e.name, id: t.id }];
 	}
 
+	/** Whether any card, in any state, ever carried the update id. A done card whose pin
+	 *  Alate still reports, or a cancelled one, must not make the board file that version again. */
+	async function updateEverFiled(id: string): Promise<boolean> {
+		for (const pe of deps.projects.values())
+			if ((await pe.store.listTasks()).some((t) => t.updateIds.includes(id)))
+				return true;
+		return false;
+	}
+
+	/** Hands-off projects (holdUpdateMerges off): file the qualified rows' cards after a good
+	 *  pull, as a manual Allow would (docs/specs/hands-off-updates.md). A failure logs; the
+	 *  next pull retries. */
+	async function autoFileUpdates(): Promise<void> {
+		const view = await updatesView();
+		if (view === null) return;
+		const picked: Array<{ rec: UpdateRecord; e: Entry }> = [];
+		for (const row of view.rows) {
+			if (row.target === null) continue;
+			let filable: { rec: UpdateRecord; e: Entry };
+			try {
+				filable = fileableUpdate(row.id, false);
+			} catch {
+				continue; // removed, managed, unmapped or gitless: a person decides
+			}
+			if ((await filable.e.store.getSettings()).holdUpdateMerges) continue;
+			if (await updateEverFiled(row.id)) continue;
+			picked.push(filable);
+		}
+		if (picked.length === 0) return;
+		try {
+			const made = await createUpdateCards(picked, false);
+			console.log(
+				`updates: filed ${made.map((c) => `${c.project}/${c.id}`).join(", ")} on hands-off projects`,
+			);
+		} catch (err) {
+			// createUpdateCards throws the route's `{status, error}` objects, not Errors.
+			const reason =
+				err instanceof Error
+					? err.message
+					: typeof err === "object" && err !== null && "error" in err
+						? String(err.error)
+						: String(err);
+			console.log(`updates: hands-off filing failed: ${reason}`);
+		}
+	}
+
 	/** Single-flight pull from the alate provider; failure keeps the last good result. */
 	function refreshUpdates(): Promise<void> {
 		if (updatesInFlight !== null) return updatesInFlight;
@@ -3295,6 +3470,7 @@ export async function createApp(deps: AppDeps) {
 					),
 				};
 				await deps.gstore.set("updates", updates);
+				await autoFileUpdates();
 				if (good.dropped > 0)
 					console.log(
 						`updates: dropped ${good.dropped} invalid record(s) from alate`,
@@ -3315,6 +3491,8 @@ export async function createApp(deps: AppDeps) {
 			keySet: alate.key !== null || keptUnreadable.has("alateKey"),
 			keyReadable: alate.key !== null,
 			lastProvisionError: alateProvisionError,
+			repo: alate.repo,
+			branch: alate.branch,
 		};
 	}
 	/** Maps the provision POST's transport timeout. A TimeoutError alone does not prove
@@ -3774,6 +3952,7 @@ export async function createApp(deps: AppDeps) {
 				idleReviews: deps.shared.idleReviews,
 				trendingScan: deps.shared.trendingScan,
 				commitIdentity: deps.shared.commitIdentity,
+				checkRouting: deps.shared.checkRouting ?? null,
 				removed: deps.shared.removedPaths,
 				projects: deps.shared.projectPaths,
 				projectOrder: deps.shared.projectOrder,
@@ -3800,7 +3979,12 @@ export async function createApp(deps: AppDeps) {
 								},
 				alate:
 					deps.secretBox !== undefined
-						? { url: alate.url, key: sealForStore("alateKey", alate.key) }
+						? {
+								url: alate.url,
+								key: sealForStore("alateKey", alate.key),
+								repo: alate.repo,
+								branch: alate.branch,
+							}
 						: (() => {
 								const storedAlate = stored?.alate;
 								const storedKey =
@@ -3816,6 +4000,8 @@ export async function createApp(deps: AppDeps) {
 										? null
 										: ((keptUnreadable.get("alateKey") as string | undefined) ??
 											storedKey),
+									repo: alate.repo,
+									branch: alate.branch,
 								};
 							})(),
 				githubToken: storedSpot("githubToken", githubToken),
@@ -3989,6 +4175,7 @@ export async function createApp(deps: AppDeps) {
 		envPlain?: unknown;
 		hindsightToken?: unknown;
 		hindsightUrl?: unknown;
+		checkRouting?: unknown;
 	};
 	/** Restores the run cap and the check toggles; a wrong type keeps the default. */
 	function restoreRunConfig(p: StoredConfig): void {
@@ -4013,6 +4200,32 @@ export async function createApp(deps: AppDeps) {
 		if (typeof p.trendingScan === "boolean") {
 			deps.shared.trendingScan = p.trendingScan;
 		}
+		// The vendor routing restores only from a fully valid shape; anything else
+		// (an old database holds no field at all) keeps the default null.
+		const routing = parseCheckRouting(p.checkRouting);
+		if (routing !== null) deps.shared.checkRouting = routing;
+	}
+	/** The stored check-routing value, or null when it is wrong-shaped: restoreRunConfig
+	 *  keeps the default null, so one corrupt field never breaks a boot. Pure. */
+	function parseCheckRouting(v: unknown): CheckRoutingSetting | null {
+		if (typeof v !== "object" || v === null) return null;
+		const o = v as Record<string, unknown>;
+		if (!Array.isArray(o.rules) || typeof o.fallback !== "string") return null;
+		const rules: { vendor: string; role: string }[] = [];
+		for (const r of o.rules) {
+			if (typeof r !== "object" || r === null) return null;
+			const e = r as Record<string, unknown>;
+			if (
+				typeof e.vendor !== "string" ||
+				typeof e.role !== "string" ||
+				!CHECK_VENDOR_RE.test(e.vendor) ||
+				e.role === "" ||
+				!CHECK_ROLE_RE.test(e.role)
+			)
+				return null;
+			rules.push({ vendor: e.vendor, role: e.role });
+		}
+		return { rules, fallback: o.fallback };
 	}
 	/** Restores the commit identity; null keeps the built-in Ottr identity and a bad
 	 * mapping keeps the default (null). */
@@ -4104,7 +4317,12 @@ export async function createApp(deps: AppDeps) {
 			const a = p.alate as Record<string, unknown>;
 			const str = (v: unknown): string | null =>
 				typeof v === "string" ? v : null;
-			alate = { url: str(a.url), key: loadSecret("alateKey", a.key) };
+			alate = {
+				url: str(a.url),
+				key: loadSecret("alateKey", a.key),
+				repo: str(a.repo),
+				branch: str(a.branch),
+			};
 		}
 	}
 	/** Restores the git token rows; a malformed row is dropped, a kept-unreadable sealed token stays as an unusable row (ADR-0011). */
@@ -4966,7 +5184,7 @@ export async function createApp(deps: AppDeps) {
 		if (key !== null && apiKey !== null && secretsEqual(key, apiKey))
 			return true;
 		if (sessionSecret === null) return false;
-		const token = parseCookies(req.headers.get("cookie"))[SESSION_COOKIE];
+		const token = parseCookies(req.headers.get("cookie"))[cookieName];
 		if (token === undefined) return false;
 		const v = verifySession(sessionSecret, token);
 		if (v === null) return false;
@@ -5129,10 +5347,12 @@ export async function createApp(deps: AppDeps) {
 	async function projectView(e: Entry): Promise<ProjectView> {
 		const file = iconFile(e.store.tasksDir);
 		const icon = file
-			? statSync(file, { throwIfNoEntry: false })?.mtimeMs
+			? lstatSync(file, { throwIfNoEntry: false })?.mtimeMs
 			: undefined;
 		const settings = await e.store.getSettings();
+		const homepageRepo = e.github === null ? null : ownerRepo(e.github);
 		const poll = prWatcher.pollStatus(e.name);
+		const csPoll = codeScanWatcher.pollStatus(e.name);
 		// OTTR-965: the Done lane's first "Show more" needs the settled count before any
 		// fetch. One list read counting rows, no card build.
 		const doneTotal = (await e.store.listTasks()).filter(
@@ -5162,12 +5382,22 @@ export async function createApp(deps: AppDeps) {
 			latestImage: e.latestImage,
 			archReview: e.archReview,
 			openPrs: e.openPrs ?? null,
+			homepage:
+				homepageRepo !== null && e.homepageRepo === homepageRepo
+					? (e.homepage ?? null)
+					: null,
 			// OTTR-1071: the PR watch's poll facts for the Settings watches row; null
 			// until this process polled the project (a restart starts empty).
 			prWatch: {
 				lastPollAt: poll?.at ?? null,
 				lastError: poll?.error ?? null,
 				nextPollAt: deps.prPollNextAt?.() ?? null,
+			},
+			// OTTR-1087: the code-scanning watch's poll facts, same shape and rule.
+			codeScanWatch: {
+				lastPollAt: csPoll?.at ?? null,
+				lastError: csPoll?.error ?? null,
+				nextPollAt: deps.codeScanPollNextAt?.() ?? null,
 			},
 			settings,
 			taskPrefix: settings.taskIdPrefix ?? derivedTaskPrefix(e.name),
@@ -5364,6 +5594,32 @@ export async function createApp(deps: AppDeps) {
 		if (ms !== undefined) extra.etaMs = ms;
 		return extra;
 	}
+	/** The board build's PR occurrence stamp: the draft and comment waves, plus the
+	 * board-posted stamp (the PR link) while the board's own review is the current
+	 * one (docs/specs/pr-review-auto-post.md). */
+	function prOccurrenceOf(
+		e: Entry,
+		f: {
+			draft: number | null;
+			comments: number | null;
+			posted: { number: number; head: string } | null;
+		},
+	): NonNullable<TaskCard["prOccurrence"]> {
+		const repo = e.github === null ? null : (ownerRepo(e.github) ?? e.github);
+		return {
+			draft: f.draft,
+			comments: f.comments,
+			...(f.posted !== null && repo !== null
+				? {
+						posted: {
+							url: prUrl(repo, f.posted.number),
+							number: f.posted.number,
+							head: f.posted.head,
+						},
+					}
+				: {}),
+		};
+	}
 	/** One card's TaskCard: per-task turn facts and stored titles batched by the caller
 	 * (two queries per project instead of three statements and a no-op UPDATE per card,
 	 * OTTR-721). */
@@ -5374,7 +5630,14 @@ export async function createApp(deps: AppDeps) {
 			facts: {
 				turns: Map<string, BoardTurnFacts>;
 				titles: Map<string, string | null>;
-				pr: Map<string, { draft: number | null; comments: number | null }>;
+				pr: Map<
+					string,
+					{
+						draft: number | null;
+						comments: number | null;
+						posted: { number: number; head: string } | null;
+					}
+				>;
 			};
 			medians: Map<string, number>;
 			trendingRepos: Map<string, string>;
@@ -5416,16 +5679,18 @@ export async function createApp(deps: AppDeps) {
 			...(t.model === null ? { lastModel: tf?.lastModel ?? null } : {}),
 			...(progress ? { progress: progress.text } : {}),
 			...(silent !== null ? { silentSince: silent } : {}),
+			...(isLead(t) ? { lead: true as const } : {}),
 			...runStartedOf(t, tf, ctx.medians),
 			...(ctx.trendingRepos.has(t.id)
 				? { trendingRepo: ctx.trendingRepos.get(t.id) }
 				: {}),
 			// PR review occurrence stamp: the bell and the event diff read it. A project
-			// with notifications off ships no stamp, so no pr event raises at all.
+			// with notifications off ships no stamp, so no pr event raises at all. The
+			// board-posted stamp rides along as the PR link the bell row opens.
 			...(t.kind === "pr_review" &&
 			ctx.settings.prReviewNotify === true &&
 			ctx.facts.pr.has(t.id)
-				? { prOccurrence: ctx.facts.pr.get(t.id) }
+				? { prOccurrence: prOccurrenceOf(e, ctx.facts.pr.get(t.id)!) }
 				: {}),
 			// OTTR-1073: the draft-run record rides the row, so a run's start and end
 			// change the row an open drawer compares: the drawer refetches its detail
@@ -5615,18 +5880,50 @@ export async function createApp(deps: AppDeps) {
 	/** One page of the project's done and cancelled cards, newest landed first (OTTR-965):
 	 * the same slim cards and landed order the state's Done window ships. `total` is the
 	 * project's whole settled count, so the board's "Show more" knows what stays hidden.
-	 * A page past the end answers an empty list. */
+	 * A non-empty `q` filters the lane first (OTTR-1135), so `total` then counts the
+	 * matches and "Show more" keeps its meaning. A page past the end answers an empty
+	 * list. */
 	async function donePage(
 		e: Entry,
 		page: number,
+		q = "",
 	): Promise<{ tasks: TaskCard[]; total: number }> {
-		const settled = (await e.store.listTasks()).filter(
+		let settled = (await e.store.listTasks()).filter(
 			(t) => t.stage === "done" || t.cancelledAt !== null,
 		);
+		// The board search reads the whole lane, not only the state window's newest
+		// cards: the filter runs before the total and the slice (OTTR-1135). It
+		// resolves each card's display name exactly like the card build does
+		// (frozenTitleFrom: stored title, else the transcript's first title, else the
+		// short prompt line), so a search answers the same on a cold store and after
+		// any page read, and a fetched match survives the board's re-filter.
+		const searchCtx = q === "" ? null : await projectCardCtx(e);
+		if (searchCtx !== null) {
+			const matched: ListedTask[] = [];
+			let scanned = 0;
+			for (const t of settled) {
+				if (
+					matchesQuery(
+						{
+							id: t.id,
+							sessionTitle: await e.store.frozenTitleFrom(
+								t,
+								searchCtx.facts.titles.get(t.id) ?? null,
+							),
+							title: t.title,
+						},
+						q,
+					)
+				)
+					matched.push(t);
+				if (++scanned % 100 === 0) await yieldLoop();
+			}
+			settled = matched;
+		}
 		const total = settled.length;
 		settled.sort((a, b) => newestLanded(a, b));
 		const slice = settled.slice((page - 1) * DONE_PAGE, page * DONE_PAGE);
-		const ctx = await projectCardCtx(e);
+		const ctx = searchCtx ?? (await projectCardCtx(e));
 		const tasks: TaskCard[] = [];
 		let built = 0;
 		for (const t of slice) {
@@ -5713,8 +6010,19 @@ export async function createApp(deps: AppDeps) {
 			},
 			serverVersion: deps.serverVersion,
 			quota,
+			...(deps.hosted === undefined && {
+				serviceQuotas: serviceQuotas?.getState() ?? [],
+			}),
 			// Absent on self-hosted boards, so their payload stays as before.
-			...(deps.hosted !== undefined && { hosted: true }),
+			...(deps.hosted !== undefined && {
+				hosted: true,
+				// Hosted credits chip: the control plane's account page plus the balance the
+				// credit gate last saw (docs/specs/hosted-mode.md section 7).
+				credits: {
+					balance: deps.hosted.creditBalance.balance,
+					accountUrl,
+				},
+			}),
 			// Hosted mode has no admin login: the proxy authenticates, so setup never opens.
 			onboarding: deps.hosted === undefined && admin === null,
 			user: admin?.name ?? null,
@@ -5746,7 +6054,7 @@ export async function createApp(deps: AppDeps) {
 					(w) => w !== null,
 				),
 				...(memoryHealth?.reason !== null && memoryHealth !== null
-					? [`omp runs with no memory: ${memoryHealth.reason}`]
+					? [`The omp process runs with no memory: ${memoryHealth.reason}`]
 					: []),
 			],
 			updates: await updatesView(),
@@ -5756,6 +6064,10 @@ export async function createApp(deps: AppDeps) {
 			restartWait: restartWaitView(),
 			seedFailed: seedFailedView(),
 			updateCycle: cycle,
+			// Read at frame assembly, not at build start: the card loop spans seconds
+			// (OTTR-866), so a count taken early goes stale before the frame ships (OTTR-1143).
+			slotsUsed:
+				deps.slotsUsed === undefined ? undefined : await deps.slotsUsed(),
 		};
 		return { state, tasksBufs, summaries };
 	}
@@ -6796,6 +7108,26 @@ export async function createApp(deps: AppDeps) {
 	async function measureSystem(): Promise<void> {
 		const reading = readCgroup();
 		const target = deps.workerTarget;
+		// OTTR-1151: the vm-runner polls beside the workers, one row like a worker's plus
+		// the VM fleet the cgroup numbers cannot say. A failed fetch still names the row,
+		// so an outage shows as unreachable instead of a vanishing row.
+		const vmTarget = deps.vmTarget;
+		const vmRow = (async (): Promise<RunnerReading[]> => {
+			const url = vmTarget?.urls[0];
+			if (url === undefined) return [];
+			let name: string;
+			try {
+				name = new URL(url).hostname;
+			} catch {
+				return []; // A malformed url names no row.
+			}
+			const stats = await fetchVmRunnerStats(url, vmTarget?.token);
+			return [
+				stats === null
+					? { name, reading: null }
+					: { name, reading: stats.reading, vm: stats.extras },
+			];
+		})();
 		const workers = await Promise.all(
 			(target?.urls ?? []).flatMap((url) => {
 				let name: string;
@@ -6811,26 +7143,73 @@ export async function createApp(deps: AppDeps) {
 				];
 			}),
 		);
-		system.record([{ name: "server", reading }, ...workers], readVm());
+		system.record(
+			[{ name: "server", reading }, ...workers, ...(await vmRow)],
+			readVm(),
+		);
+	}
+
+	/** The vm-runner overlay for the snapshot's containers (OTTR-1151): null without a
+	 *  configured url, else the row's name plus the board's /healthz probe and busy set
+	 *  (src/vmState.ts); the sampler joins it onto the vm-runner's row. */
+	function vmRunnerView(): VmRunnerView | null {
+		const url = deps.vmTarget?.urls[0];
+		if (url === undefined) return null;
+		let name: string;
+		try {
+			name = new URL(url).hostname;
+		} catch {
+			return null; // A malformed url names no row.
+		}
+		return {
+			name,
+			health: { ok: vmState.health.ok, reason: vmState.health.reason },
+			// vmState.busy holds "project/id" entries (src/vmState.ts).
+			busy: [...vmState.busy].map((entry) => {
+				const slash = entry.indexOf("/");
+				return { project: entry.slice(0, slash), id: entry.slice(slash + 1) };
+			}),
+		};
 	}
 
 	// The Settings -> omp usage report. omp's own `stats` command only syncs the default
 	// session store, while tracker turns write their transcripts to each project's
 	// sessions dir (--session-dir) — on the shared volume the server mounts — so the
 	// board sums the transcripts itself: every project's dir plus both default stores.
+	// OTTR-1088: the scan is the async incremental scanner, one cache per store dir —
+	// a scan prunes the entries its walk did not list, so stores cannot share one.
+	// A removed project's dir stops being scanned; its cache entry lingers, bounded
+	// by the project count.
+	const ompStatsScanCaches = new Map<string, SessionUsageCache>();
 	let ompStatsCache: { at: number; report: OmpStatsReport } | null = null;
 	let ompStatsRead: Promise<OmpStatsReport> | null = null;
 	/** One report on demand. The 30 s cache + single-flight keep concurrent Settings
-	 *  tabs from re-walking every transcript at once. */
-	async function ompStatsReportNow(): Promise<OmpStatsReport> {
-		if (ompStatsRead !== null) return ompStatsRead;
-		if (ompStatsCache !== null && Date.now() - ompStatsCache.at < 30_000)
-			return ompStatsCache.report;
+	 *  tabs from re-walking every transcript at once. A build in flight answers the
+	 *  cached report at once with refreshing:true; with no cache it awaits the build. */
+	async function ompStatsReportNow(): Promise<
+		OmpStatsReport & { refreshing: boolean }
+	> {
+		const cached = ompStatsCache;
+		if (ompStatsRead !== null)
+			return cached === null
+				? { ...(await ompStatsRead), refreshing: false }
+				: { ...cached.report, refreshing: true };
+		if (cached !== null && Date.now() - cached.at < 30_000)
+			return { ...cached.report, refreshing: false };
 		const build = (async () => {
-			const scan = deps.scanSessionUsage ?? scanSessionUsage;
-			const sources: OmpStatsSource[] = ompSessionStores(deps.projects).map(
-				(s) => ({ name: s.name, answer: scan(s.dir) }),
-			);
+			const scan =
+				deps.scanSessionUsage ??
+				((dir: string) => {
+					let cache = ompStatsScanCaches.get(dir);
+					if (cache === undefined) {
+						cache = newSessionUsageCache();
+						ompStatsScanCaches.set(dir, cache);
+					}
+					return scanSessionUsageIncremental(dir, cache);
+				});
+			const sources: OmpStatsSource[] = [];
+			for (const s of ompSessionStores(deps.projects))
+				sources.push({ name: s.name, answer: await scan(s.dir) });
 			const report = buildOmpStatsReport(sources, Date.now());
 			ompStatsCache = { at: report.at, report };
 			return report;
@@ -6839,7 +7218,8 @@ export async function createApp(deps: AppDeps) {
 			ompStatsRead = null;
 		});
 		ompStatsRead = pendingReport;
-		return pendingReport;
+		if (cached !== null) return { ...cached.report, refreshing: true };
+		return { ...(await pendingReport), refreshing: false };
 	}
 
 	// Settings -> omp usage -> Launch omp stats dashboard (docs/specs/omp-stats-dashboard.md).
@@ -6924,6 +7304,19 @@ export async function createApp(deps: AppDeps) {
 	}
 	let quota: QuotaState | null = null;
 	let refreshingQuota = false;
+	const serviceQuotas =
+		deps.hosted === undefined && deps.serviceQuotas !== undefined
+			? createServiceQuotaCoordinator({
+					...deps.serviceQuotas,
+					now,
+					onChange: publishSoon,
+				})
+			: null;
+
+	/** Independent of the statistics sampler and model quota refresh guards. */
+	function checkServiceQuotas(): void {
+		if (!closing) serviceQuotas?.checkDue();
+	}
 
 	// Push layer: one WebSocket topic per board tab. Null until the port is bound; every publish
 	// path below must be a no-op before that (boot-time schedule() runs first).
@@ -6983,6 +7376,7 @@ export async function createApp(deps: AppDeps) {
 	function close(): Promise<void> {
 		if (closePromise !== null) return closePromise;
 		closing = true;
+		serviceQuotas?.dispose();
 		if (stateTimer !== null) {
 			clearTimeout(stateTimer);
 			stateTimer = null;
@@ -7375,6 +7769,7 @@ export async function createApp(deps: AppDeps) {
 						deps.liveRuns?.() ?? [],
 						await systemHolds(now),
 						now,
+						vmRunnerView(),
 					);
 					const msg = { type: "system", system: snap } satisfies ServerMessage;
 					lastSystemJson = JSON.stringify(msg);
@@ -7553,9 +7948,18 @@ export async function createApp(deps: AppDeps) {
 		await saveConfig();
 		applyGithubToken();
 		const secure = viaPublicHost(req);
+		// The second Set-Cookie header clears the legacy port-less name a browser may
+		// still hold from before the rename.
 		return withCookie(
-			json({ ok: true, apiKey }),
-			sessionCookie(signSession(sessionSecret, name, SESSION_MS, id), secure),
+			withCookie(
+				json({ ok: true, apiKey }),
+				sessionCookie(
+					cookieName,
+					signSession(sessionSecret, name, SESSION_MS, id),
+					secure,
+				),
+			),
+			clearSessionCookie(SESSION_COOKIE, secure),
 		);
 	}
 
@@ -7610,18 +8014,25 @@ export async function createApp(deps: AppDeps) {
 			exp: now + SESSION_MS,
 		});
 		await saveConfig();
+		const secure = viaPublicHost(req);
+		// The second Set-Cookie header clears the legacy port-less name a browser may
+		// still hold from before the rename.
 		return withCookie(
-			json({ ok: true }),
-			sessionCookie(
-				signSession(sessionSecret, name, SESSION_MS, id),
-				viaPublicHost(req),
-				remember,
+			withCookie(
+				json({ ok: true }),
+				sessionCookie(
+					cookieName,
+					signSession(sessionSecret, name, SESSION_MS, id),
+					secure,
+					remember,
+				),
 			),
+			clearSessionCookie(SESSION_COOKIE, secure),
 		);
 	}
 
 	async function logout(req: Request): Promise<Response> {
-		const token = parseCookies(req.headers.get("cookie"))[SESSION_COOKIE];
+		const token = parseCookies(req.headers.get("cookie"))[cookieName];
 		if (sessionSecret !== null && token !== undefined) {
 			const v = verifySession(sessionSecret, token);
 			if (v !== null && v.id !== null && sessions.some((s) => s.id === v.id)) {
@@ -7629,9 +8040,12 @@ export async function createApp(deps: AppDeps) {
 				await saveConfig();
 			}
 		}
+		const secure = viaPublicHost(req);
+		// The second Set-Cookie header clears the legacy port-less name a browser may
+		// still hold from before the rename.
 		return withCookie(
-			json({ ok: true }),
-			clearSessionCookie(viaPublicHost(req)),
+			withCookie(json({ ok: true }), clearSessionCookie(cookieName, secure)),
+			clearSessionCookie(SESSION_COOKIE, secure),
 		);
 	}
 
@@ -7763,6 +8177,80 @@ export async function createApp(deps: AppDeps) {
 				502,
 			);
 		return probed;
+	}
+
+	/** Validates a POST /api/settings/check-routing body; a Response rejects the save.
+	 *  rules null and fallback null clear the setting (back to null); either one alone
+	 *  keeps its empty meaning (no rules, straight to the default rule). A null
+	 *  fallback next to rules is the UI's "Automatic" pick and lands as "". */
+	function checkRoutingTarget(
+		body: Record<string, unknown>,
+	): { error: Response } | { routing: CheckRoutingSetting | null } {
+		const { rules, fallback } = body as {
+			rules?: unknown;
+			fallback?: unknown;
+		};
+		if (rules === undefined || fallback === undefined)
+			return {
+				error: json(
+					{ error: "rules and fallback must be saved together" },
+					400,
+				),
+			};
+		if (rules === null && fallback === null) return { routing: null };
+		const fallbackRole = fallback === null ? "" : fallback;
+		const parsed: { vendor: string; role: string }[] = [];
+		if (rules !== null) {
+			if (!Array.isArray(rules))
+				return {
+					error: json({ error: "rules must be a rule list or null" }, 400),
+				};
+			for (const r of rules) {
+				if (typeof r !== "object" || r === null)
+					return {
+						error: json(
+							{ error: "each rule must be an object with vendor and role" },
+							400,
+						),
+					};
+				const e = r as Record<string, unknown>;
+				if (typeof e.vendor !== "string" || !CHECK_VENDOR_RE.test(e.vendor))
+					return {
+						error: json(
+							{ error: "vendor must be a lowercase vendor key" },
+							400,
+						),
+					};
+				if (
+					typeof e.role !== "string" ||
+					e.role === "" ||
+					!CHECK_ROLE_RE.test(e.role)
+				)
+					return { error: json({ error: "role must be a role name" }, 400) };
+				parsed.push({ vendor: e.vendor, role: e.role });
+			}
+		}
+		if (
+			typeof fallbackRole !== "string" ||
+			(fallbackRole !== "" && !CHECK_ROLE_RE.test(fallbackRole))
+		)
+			return {
+				error: json(
+					{ error: "fallback must be a role name, empty, or null" },
+					400,
+				),
+			};
+		return { routing: { rules: parsed, fallback: fallbackRole } };
+	}
+
+	async function saveCheckRouting(req: Request): Promise<Response> {
+		const r = await readJson(req);
+		if ("error" in r) return r.error;
+		const picked = checkRoutingTarget(r.body);
+		if ("error" in picked) return picked.error;
+		deps.shared.checkRouting = picked.routing;
+		await saveConfig();
+		return json({ routing: deps.shared.checkRouting ?? null });
 	}
 
 	async function saveHindsight(req: Request): Promise<Response> {
@@ -8217,8 +8705,69 @@ export async function createApp(deps: AppDeps) {
 		// card has no live run: the pick pre-stages the model its reply turn spawns with.
 		const model = modelParam(r.body);
 		if (model instanceof Response) return model;
-		const res = await applyUserEdit(e, task, { model }, r.body);
+		// `resume: true` on a queued card held for a usage limit ends the hold with the switch,
+		// so the card starts on the new model; the start gate still checks that model's quota
+		// and holds again when it is used up too. An expired (or absent) hold holds nothing:
+		// the scheduler starts such a card on its own (pickRunnable only drops holdUntil > now),
+		// so the hold-only action refuses instead of switching a model for no reason.
+		const resume =
+			r.body.resume === true &&
+			task.state === "queued" &&
+			task.holdUntil !== null &&
+			task.holdUntil > Date.now() &&
+			task.holdProvider !== null;
+		if (r.body.resume === true && !resume)
+			return json(
+				{ error: "the task has no live usage-limit hold to resume from" },
+				409,
+			);
+		// OTTR-1181: resuming into a provider that is itself out of quota only bounces —
+		// the start gate re-holds the card on the new provider, silently. When the cached
+		// quota report (the refresh loop's `quota`, same 300_000 ms window) is known and
+		// names a blocking window, refuse the pick and write nothing. Absent or stale
+		// counts as unknown and fails open, like the start gate when the report is silent.
+		if (resume) {
+			const provider = providerOf(model);
+			if (provider !== null) {
+				const snapshot = deps.quotaSnapshot ? deps.quotaSnapshot() : quota;
+				if (snapshot !== null && Date.now() - snapshot.at <= 300_000) {
+					const blocked = providerBlocked(
+						snapshot.limits,
+						provider,
+						Date.now(),
+					);
+					if (blocked?.resetsAt != null) {
+						const at = new Date(blocked.resetsAt)
+							.toISOString()
+							.slice(0, 16)
+							.replace("T", " ");
+						return json(
+							{
+								error: `${provider} is still out of quota; the limit resets at ${at} UTC. Pick another model.`,
+							},
+							409,
+						);
+					}
+				}
+			}
+		}
+		const res = await applyUserEdit(
+			e,
+			task,
+			resume
+				? {
+						model,
+						holdUntil: null,
+						holdProvider: null,
+						holdWindow: null,
+						holdSetAt: null,
+						needsReason: null,
+					}
+				: { model },
+			r.body,
+		);
 		if (res instanceof Response) return res;
+		if (resume) await deps.schedule();
 		return json(await taskView(e, res));
 	}
 
@@ -8332,15 +8881,22 @@ export async function createApp(deps: AppDeps) {
 		const file = await found.e.store.logPath(found.task.id);
 		let fd: number;
 		try {
-			fd = openRegular(file);
-		} catch {
-			return new Response("", {
-				headers: {
-					"Content-Type": "text/plain; charset=utf-8",
-					"X-Log-Size": "0",
-					Connection: "close",
-				},
-			});
+			// Anchored at the trusted data root: a worker-planted symlink at the log
+			// path or any component below it refuses, it is never followed.
+			fd = openRegularBelow(found.e.store.dataRoot, file);
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+				// A missing log keeps the empty-log shape the drawer expects.
+				return new Response("", {
+					headers: {
+						"Content-Type": "text/plain; charset=utf-8",
+						"X-Log-Size": "0",
+						Connection: "close",
+					},
+				});
+			}
+			// refused: a symlink at any component or a non-regular entry
+			return json({ error: "log unavailable" }, 404);
 		}
 		try {
 			const size = fstatSync(fd).size;
@@ -8403,12 +8959,23 @@ export async function createApp(deps: AppDeps) {
 			return json({ error: "bad path" }, 400);
 		}
 		if (task.worktree === null) return json({ error: "unknown task" }, 404);
+		// Anchored at the board-created .worktrees entry one level above the
+		// worktree: readBelow refuses a symlink at every component below it, so a
+		// worker-planted link inside the worktree or a swapped worktree entry
+		// cannot widen the read past the worktree. The cap bounds the buffer;
+		// the read never runs unbounded.
 		const file = join(task.worktree, rel);
-		if (!resolve(file).startsWith(resolve(task.worktree) + sep))
-			return json({ error: "bad path" }, 404);
-		const f = Bun.file(file);
-		if (!(await f.exists())) return json({ error: "unknown file" }, 404);
-		return new Response(f, {
+		let bytes: Buffer | null;
+		try {
+			bytes = readBelow(dirname(task.worktree), file, WORKTREE_FILE_MAX_BYTES);
+		} catch {
+			// refused: a symlink at any component or a non-regular entry
+			return json({ error: "unknown file" }, 404);
+		}
+		if (bytes === null) return json({ error: "unknown file" }, 404);
+		const f = Bun.file(file); // extension-based Content-Type only; no disk access
+		// readBelow returns a subarray view; BodyInit wants a standalone buffer.
+		return new Response(new Uint8Array(bytes), {
 			headers: {
 				"Content-Type": f.type || "application/octet-stream",
 				"Content-Security-Policy": "sandbox allow-scripts",
@@ -8467,12 +9034,17 @@ export async function createApp(deps: AppDeps) {
 		const e = deps.projects.get(req.params.project);
 		if (!e) return json({ error: "unknown project" }, 404);
 		if (e.gitless) return json({ error: "init a git repository first" }, 409);
-		const order = r.body.order;
-		if (!Array.isArray(order) || !order.every((id) => typeof id === "string")) {
-			return json({ error: "order must be an array of task ids" }, 400);
-		}
-		if (!(await e.store.reorderQueue(order)))
-			return json({ error: "order does not match the current queue" }, 409);
+		// OTTR-1148: the request names the moved card and the card it lands above, not the
+		// full queue order — a move must survive cards entering or leaving the queue while
+		// the board reads /api/state (the exact permutation check answered 409 on every drag).
+		const { id, before } = r.body;
+		if (
+			typeof id !== "string" ||
+			!(before === null || typeof before === "string")
+		)
+			return json({ error: "body must be { id, before: string | null }" }, 400);
+		if (!(await e.store.moveInQueue(id, before)))
+			return json({ error: "card is not queued" }, 409);
 		await deps.schedule();
 		return json({ ok: true });
 	}
@@ -8491,7 +9063,16 @@ export async function createApp(deps: AppDeps) {
 		const page = raw === null ? 1 : Number(raw);
 		if (page < 1)
 			return json({ error: "page must be a positive integer" }, 400);
-		return json(await donePage(e, page));
+		// One q, at most 200 characters: anything else is not a query the board
+		// search could run server-side (OTTR-1135).
+		const values = new URL(req.url).searchParams.getAll("q");
+		const q = values[0] ?? "";
+		if (values.length > 1 || q.length > 200)
+			return json(
+				{ error: "q must be a string of at most 200 characters" },
+				400,
+			);
+		return json(await donePage(e, page, q));
 	}
 
 	async function handlePOSTProjectsReleaseSummaryByProject(
@@ -8556,6 +9137,8 @@ export async function createApp(deps: AppDeps) {
 			notes: plan.notes,
 			cards,
 			spawn: deps.releaseSummarySpawn,
+			projectName: e.name,
+			projectDescription: readProductDescription(e.path),
 		});
 		// The fallback is a normal outcome, not an error status.
 		return json(result);
@@ -8676,6 +9259,18 @@ export async function createApp(deps: AppDeps) {
 			return json({ error: "project has no GitHub remote" }, 409);
 		// Body optional: a manual run of the same watch the hourly poll uses.
 		await prWatcher.tick({ manual: req.params.project });
+		return json({ ok: true });
+	}
+
+	async function handlePOSTProjectsCodeScanningCheckByProject(
+		req: BunRequest<"/api/projects/:project/code-scanning/check">,
+	): Promise<Response> {
+		const e = deps.projects.get(req.params.project);
+		if (!e) return json({ error: "unknown project" }, 404);
+		if (e.github === null)
+			return json({ error: "project has no GitHub remote" }, 409);
+		// Body optional: a manual run of the same watch the hourly poll uses.
+		await codeScanWatcher.tick({ manual: req.params.project });
 		return json({ ok: true });
 	}
 
@@ -8881,10 +9476,21 @@ export async function createApp(deps: AppDeps) {
 			return json({ error: "unknown image" }, 404);
 		}
 		const file = join(await e.store.imagesDir(task.id), name);
-		const st = statSync(file, { throwIfNoEntry: false });
-		if (!st?.isFile()) return json({ error: "unknown image" }, 404);
-		const f = Bun.file(file);
-		return new Response(f, {
+		// Anchored at the trusted data root: readBelow refuses a symlink at every
+		// component, so a worker-planted link at a member name never serves another
+		// file's bytes. The cap bounds the buffer; stored images pass the same cap
+		// at upload, so a legit shot always fits.
+		let bytes: Buffer | null;
+		try {
+			bytes = readBelow(e.store.dataRoot, file, MAX_IMAGE_BYTES);
+		} catch {
+			// refused: a symlink at any component or a non-regular entry
+			return json({ error: "unknown image" }, 404);
+		}
+		if (bytes === null) return json({ error: "unknown image" }, 404);
+		const f = Bun.file(file); // extension-based Content-Type only; no disk access
+		// readBelow returns a subarray view; BodyInit wants a standalone buffer.
+		return new Response(new Uint8Array(bytes), {
 			headers: {
 				"Content-Type": f.type,
 				"Cache-Control": "private, max-age=31536000, immutable",
@@ -9011,8 +9617,21 @@ export async function createApp(deps: AppDeps) {
 		if (!e) return json({ error: "unknown project" }, 404);
 		const file = iconFile(e.store.tasksDir);
 		if (file === null) return json({ error: "no icon" }, 404);
-		const f = Bun.file(file);
-		return new Response(f, {
+		// Anchored at the trusted data root: readBelow refuses a symlink at every
+		// component, so a worker-planted icon link never serves another file's
+		// bytes. The cap bounds the buffer; uploads pass the same cap, so a stored
+		// icon always fits.
+		let bytes: Buffer | null;
+		try {
+			bytes = readBelow(e.store.dataRoot, file, MAX_IMAGE_BYTES);
+		} catch {
+			// refused: a symlink at any component or a non-regular entry
+			return json({ error: "no icon" }, 404);
+		}
+		if (bytes === null) return json({ error: "no icon" }, 404);
+		const f = Bun.file(file); // extension-based Content-Type only; no disk access
+		// readBelow returns a subarray view; BodyInit wants a standalone buffer.
+		return new Response(new Uint8Array(bytes), {
 			headers: {
 				"Content-Type": f.type,
 				"Cache-Control": "private, max-age=31536000, immutable",
@@ -9378,7 +9997,12 @@ export async function createApp(deps: AppDeps) {
 	async function handleGETSystem(): Promise<Response> {
 		const now = Date.now();
 		return json(
-			system.snapshot(deps.liveRuns?.() ?? [], await systemHolds(now), now),
+			system.snapshot(
+				deps.liveRuns?.() ?? [],
+				await systemHolds(now),
+				now,
+				vmRunnerView(),
+			),
 		);
 	}
 
@@ -9687,7 +10311,9 @@ export async function createApp(deps: AppDeps) {
 		const name = r.body.name;
 		const value = r.body.value;
 		// Listed names already passed parseEnvTxt's ENV_NAME check.
-		const row = listedEnvNames(workersHome).find((row) => row.name === name);
+		const row = (await listedEnvNames(workersHome)).find(
+			(row) => row.name === name,
+		);
 		if (
 			typeof name !== "string" ||
 			row === undefined ||
@@ -9869,7 +10495,7 @@ export async function createApp(deps: AppDeps) {
 			sessions = live;
 			await saveConfig();
 		}
-		const token = parseCookies(req.headers.get("cookie"))[SESSION_COOKIE];
+		const token = parseCookies(req.headers.get("cookie"))[cookieName];
 		const currentId =
 			sessionSecret !== null && token !== undefined
 				? (verifySession(sessionSecret, token)?.id ?? null)
@@ -9910,7 +10536,7 @@ export async function createApp(deps: AppDeps) {
 		if (!r.ok) return json({ error: r.error }, r.status);
 		const prev = alate;
 		try {
-			alate = { url: alate.url, key: r.body.key };
+			alate = { ...alate, key: r.body.key };
 			await saveConfig();
 		} catch (err) {
 			// The assignment mutated the closure before saveConfig read it, so a failed
@@ -10385,20 +11011,7 @@ export async function createApp(deps: AppDeps) {
 	}
 	async function preparePrPost(
 		req: BunRequest<"/api/projects/:project/tasks/:id/pr-review/post">,
-	): Promise<
-		| Response
-		| {
-				e: Entry;
-				task: Task;
-				row: PrReviewRow;
-				head: string;
-				prev: string | null;
-				event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
-				blocking: boolean;
-				draft: ParsedReview;
-				github: string;
-		  }
-	> {
+	): Promise<PrPostPrep | Response> {
 		const picked = await readPrPostDraft(req);
 		if (picked instanceof Response) return picked;
 		const found = await resolveTask(req.params.project, req.params.id);
@@ -10419,14 +11032,40 @@ export async function createApp(deps: AppDeps) {
 			blocking: claimed.blocking,
 			draft: picked.draft,
 			github: storedGithub,
+			via: "user",
 		};
 	}
-	async function handlePOSTProjectsTasksPrPostByProjectAndId(
-		req: BunRequest<"/api/projects/:project/tasks/:id/pr-review/post">,
-	): Promise<Response> {
-		const prep = await preparePrPost(req);
-		if (prep instanceof Response) return prep;
-		const { e, row, head, prev, draft, github } = prep;
+	/** The claimed post inputs: preparePrPost builds them from the request, the
+	 * watcher's automatic post rebuilds them from the saved draft. via names the
+	 * caller: the Post click records "user", the seam records "auto". */
+	interface PrPostPrep {
+		e: Entry;
+		task: Task;
+		row: PrReviewRow;
+		head: string;
+		prev: string | null;
+		event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
+		blocking: boolean;
+		draft: ParsedReview;
+		github: string;
+		via: "user" | "auto";
+	}
+	/** The post core the Post click and the automatic post share: everything after
+	 * the head claim, in the click's order (docs/specs/pr-review-auto-post.md). A
+	 * Response is the failure; the helpers already released the claim and stored
+	 * post_error, so the card stays waiting with the draft. */
+	async function completePrPost(prep: PrPostPrep): Promise<
+		| Response
+		| {
+				ok: true;
+				login: string | null;
+				via: "app" | "token";
+				inline: number;
+				approveSkipped?: string;
+				changesSkipped?: string;
+		  }
+	> {
+		const { e, row, head, prev, draft, github, event } = prep;
 		const repo = ownerRepo(github) ?? github;
 		const slash = repo.indexOf("/");
 		const owner = repo.slice(0, slash);
@@ -10435,10 +11074,6 @@ export async function createApp(deps: AppDeps) {
 			draft.comments.length > 0
 				? { comments: reviewPayloadComments(draft.comments) }
 				: {};
-		// REQUEST_CHANGES when the project opted in and this draft's own run found
-		// blocking findings, APPROVE when opted in and clean; an unknown verdict or
-		// no opt-in posts a plain comment.
-		const event = prep.event;
 		const app = await postReviewViaApp(
 			e,
 			row,
@@ -10522,6 +11157,7 @@ export async function createApp(deps: AppDeps) {
 				approveSkipped !== undefined || changesSkipped !== undefined
 					? "COMMENT"
 					: event,
+				prep.via,
 			);
 			// A skipped review or a failed dismissal must show on the card: the note
 			// lands in post_error, the post itself stays.
@@ -10535,14 +11171,99 @@ export async function createApp(deps: AppDeps) {
 			return null;
 		});
 		if (applied !== null) return applied;
-		return json({
+		return {
 			ok: true,
 			login,
 			via,
 			inline: draft.comments.length,
 			...(approveSkipped !== undefined ? { approveSkipped } : {}),
 			...(changesSkipped !== undefined ? { changesSkipped } : {}),
+		};
+	}
+	async function handlePOSTProjectsTasksPrPostByProjectAndId(
+		req: BunRequest<"/api/projects/:project/tasks/:id/pr-review/post">,
+	): Promise<Response> {
+		const prep = await preparePrPost(req);
+		if (prep instanceof Response) return prep;
+		const result = await completePrPost(prep);
+		if (result instanceof Response) return result;
+		return json(result);
+	}
+	/** The error text of a post refusal or failure Response, for the [pr] log line. */
+	async function prPostErrorResponseText(res: Response): Promise<string> {
+		try {
+			const body: unknown = await res.json();
+			const error =
+				typeof body === "object" && body !== null && "error" in body
+					? body.error
+					: null;
+			return typeof error === "string" && error !== ""
+				? error
+				: `HTTP ${res.status}`;
+		} catch {
+			return `HTTP ${res.status}`;
+		}
+	}
+	/** The watcher's automatic post of one saved draft (docs/specs/pr-review-auto-post.md):
+	 * the Post click's steps without the request. A quiet skip or a refusal logs one
+	 * [pr] line; a failed post leaves the card parked with the stored post_error. */
+	async function autoPostPrDraft(
+		project: string,
+		number: number,
+	): Promise<void> {
+		const entry = deps.projects.get(project);
+		if (entry === undefined) return;
+		const settings = await entry.store.getSettings();
+		if (settings.prReviewManualPost !== false || settings.prReviews !== true)
+			return;
+		const row = await entry.store.getPrReview(number);
+		if (row === null || row.taskId === null) return;
+		const task = await entry.store.getTask(row.taskId);
+		if (task === null || task.cancelledAt !== null || task.details === null)
+			return;
+		// The claim would refuse both: log the reason and skip without claiming.
+		if (row.state !== "open") {
+			console.log(
+				`[pr] ${project}: #${number} auto-post skipped: PR is ${row.state}`,
+			);
+			return;
+		}
+		if (row.postedHead === row.reviewedHead) {
+			console.log(
+				`[pr] ${project}: #${number} auto-post skipped: already posted for this head`,
+			);
+			return;
+		}
+		const draft = parseReviewDraft(task.details);
+		if (draft.body.trim() === "") {
+			console.log(`[pr] ${project}: #${number} auto-post skipped: empty draft`);
+			return;
+		}
+		const claimed = await claimPrPostCard(entry, task, row.reviewedHead);
+		if (claimed instanceof Response) {
+			console.log(
+				`[pr] ${project}: #${number} auto-post failed: ${await prPostErrorResponseText(claimed)}`,
+			);
+			return;
+		}
+		const storedGithub = entry.github;
+		if (storedGithub === null) return;
+		const result = await completePrPost({
+			e: entry,
+			task,
+			row: claimed.row,
+			head: claimed.head,
+			prev: claimed.prev,
+			event: claimed.event,
+			blocking: claimed.blocking,
+			draft,
+			github: storedGithub,
+			via: "auto",
 		});
+		if (result instanceof Response)
+			console.log(
+				`[pr] ${project}: #${number} auto-post failed: ${await prPostErrorResponseText(result)}`,
+			);
 	}
 
 	/** The latest finished grill report's details, or null when none finished. */
@@ -10584,11 +11305,13 @@ export async function createApp(deps: AppDeps) {
 		const model = modelParam(body);
 		if (model instanceof Response) return model;
 		// The latest finished grill report carries the refinement; fold it into the prompt.
+		// The grill retired the card's own Open questions, so the section leaves the
+		// prompt too; keeping it would park the card again (OTTR-1137).
 		await withTask(e, task, async () => {
 			const details = await latestGrillDetails(e, task.id);
 			const refined =
 				details !== null
-					? `${task.prompt}\n\n## Definition of ready (grilled)\n\n${details}`
+					? `${removeOpenQuestionsSection(task.prompt)}\n\n## Definition of ready (grilled)\n\n${details}`
 					: null;
 			await updateSnapshot(e, task, {
 				...(refined !== null ? { prompt: refined } : {}),
@@ -10680,9 +11403,12 @@ export async function createApp(deps: AppDeps) {
 		return await taskResponse(e, task.id);
 	}
 
-	/** OTTR-1047: the manual start of a done review's batch validation run. The card
-	 * itself is filed by the turn loop (deps.validateLeads, filePendingValidationRun);
-	 * the route only gates the input and schedules after the filing. */
+	/** OTTR-1047: the manual start of a review's batch validation run: a done review, or
+	 * (OTTR-1128) one held at merging for its findings. The card itself is filed by the
+	 * turn loop (deps.validateLeads, filePendingValidationRun); the route only gates the
+	 * input and schedules after the filing. OTTR-1129: an optional body adds
+	 * validate-again — `{ again: "blocked", before: <ISO> }` — and the response wraps the
+	 * card's view with the reset list. */
 	async function handlePOSTProjectsTasksValidateByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/validate">,
 	): Promise<Response> {
@@ -10693,18 +11419,54 @@ export async function createApp(deps: AppDeps) {
 			return json({ error: "task is cancelled" }, 404);
 		if (!isReview(task))
 			return json({ error: "only a review card can be validated" }, 409);
-		if (task.stage !== "done")
+		if (!validatableReview(task))
 			return json(
-				{ error: "only a done review can start a validation run" },
+				{
+					error:
+						"only a done review or a review waiting at merging for its findings can start a validation run",
+				},
 				409,
 			);
+		// The optional body. Absent bytes, a JSON null, or {} keep the body-less
+		// behavior byte-for-byte; readJson refuses a null body, so this route reads
+		// its own bytes. The transport errors mirror readJson's.
+		let body: Record<string, unknown> = {};
+		if (
+			(req.headers.get("content-type") ?? "").startsWith("application/json")
+		) {
+			const read = await readBytes(req, MAX_BODY_BYTES);
+			if ("error" in read) return read.error;
+			if (read.bytes.length > 0) {
+				let parsed: unknown;
+				try {
+					parsed = JSON.parse(new TextDecoder().decode(read.bytes));
+				} catch {
+					return json({ error: "invalid JSON body" }, 400);
+				}
+				if (parsed !== null) {
+					if (typeof parsed !== "object" || Array.isArray(parsed))
+						return json({ error: "body must be a JSON object" }, 400);
+					body = parsed as Record<string, unknown>;
+				}
+			}
+		}
+		let again: { before: number } | undefined;
+		if (body.again !== undefined) {
+			const parsed = parseValidateAgainBody(body);
+			if ("error" in parsed) return json({ error: parsed.error }, 400);
+			again = parsed;
+		}
 		const fileRun = deps.validateLeads;
 		if (fileRun === undefined)
 			return json({ error: "validation filing is not wired" }, 500);
-		const filed = await fileRun(e, task.id, true);
+		const filed = await fileRun(e, task.id, true, again);
 		if ("error" in filed) return json({ error: filed.error }, filed.status);
 		await deps.schedule();
-		return await taskResponse(e, filed.id);
+		// OTTR-1129: the response adds the reset list — the ids whose validatedAt
+		// the call cleared, [] without the again flag — around the card's view.
+		const t = await e.store.getTask(filed.id);
+		if (t === null) return json({ error: "unknown task" }, 404);
+		return json({ ...(await taskView(e, t)), reset: filed.reset });
 	}
 
 	/** The steering refusal for a card not in flight; null lets the steer queue. */
@@ -10891,6 +11653,9 @@ export async function createApp(deps: AppDeps) {
 		const patch: TaskPatch = {
 			followUpOf: sourceTask.id,
 			followUpOfProject,
+			// A child of an update card inherits its merge hold, the same rule as
+			// create_task's followUpOf (resolveFollowUpOf).
+			updateIds: sourceTask.updateIds,
 			prompt: followUpPrompt({ text: trimmed, title, handoffPath }),
 			images: names,
 			promptAuthor: trimmed === IMPLEMENT_RECOMMENDATIONS ? "board" : "user",
@@ -11082,7 +11847,16 @@ export async function createApp(deps: AppDeps) {
 	): Promise<Response> {
 		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
-		const { task } = found;
+		const { e, task } = found;
+		// OTTR-1005: card text is external input and never picks the target of a
+		// GH_TOKEN-authorized write. The run must live in the project's own
+		// repository; owner/repo compares case-insensitively, `.git` ignored.
+		const repo = e.github === null ? null : ownerRepo(e.github);
+		if (repo === null)
+			return json(
+				{ error: "this project has no GitHub repository to re-run in" },
+				409,
+			);
 		const token = process.env.GH_TOKEN;
 		if (!token)
 			return json(
@@ -11101,6 +11875,13 @@ export async function createApp(deps: AppDeps) {
 		);
 		if (!match)
 			return json({ error: "no GitHub Actions run link on this card" }, 400);
+		if (`${match[1]}/${match[2]}`.toLowerCase() !== repo.toLowerCase())
+			return json(
+				{
+					error: `this card links a run in ${match[1]}/${match[2]}, not the project's repository ${repo}`,
+				},
+				400,
+			);
 		const url = `https://github.com/${match[1]}/${match[2]}/actions/runs/${match[3]}`;
 		const done = await rerunApiCall(token, match);
 		if (done.status !== 200) return done;
@@ -11390,6 +12171,7 @@ export async function createApp(deps: AppDeps) {
 		const handoff = gateHandoff({
 			prompt: task.prompt,
 			handoffsDir: join(e.store.tasksDir, "handoffs"),
+			anchor: e.store.dataRoot,
 		});
 		await updateSnapshot(e, task, {
 			state: "queued",
@@ -11415,10 +12197,32 @@ export async function createApp(deps: AppDeps) {
 		await deps.schedule();
 		return await taskResponse(e, task.id);
 	}
-	/** One parsed answer per asked question: the drawer's wire line, or — on a
-	 * single-question card, whose drawer sends the raw answer text instead of the
-	 * wire line — the whole reply. The range marks the consumed text, so the reply's
-	 * free text can be recovered afterwards. Pure. */
+	/** The shape of a plain-form answer line: `Q<n>: <answer>` or `<n>. <answer>`. */
+	const PLAIN_ASK_RE = /^\s*(?:Q\s*(\d+)\s*:|(\d+)\.\s+)(.*)$/i;
+	/** One plain-form answer line. Null: the line starts no answer. The number is
+	 * unchecked; callers gate it on the card's current question order. Pure. */
+	function plainAskAnswer(line: string): { n: number; answer: string } | null {
+		const parsed = PLAIN_ASK_RE.exec(line);
+		if (parsed === null) return null;
+		const n = Number(parsed[1] ?? parsed[2]);
+		const answer = (parsed[3] ?? "").trim();
+		return answer === "" ? null : { n, answer };
+	}
+	/** The number of the first plain-form line that names no question of the card,
+	 * or null. Pure. */
+	function plainAskOutOfRangeLine(text: string, count: number): number | null {
+		for (const line of text.split("\n")) {
+			const plain = plainAskAnswer(line);
+			if (plain !== null && (plain.n < 1 || plain.n > count)) return plain.n;
+		}
+		return null;
+	}
+	/** One parsed answer per asked question: the drawer's wire line, a plain
+	 * `Q<n>:`/`<n>.` line by the card's current question order, or — on a
+	 * single-question card, whose
+	 * drawer sends the raw answer text instead of the wire line — the whole reply.
+	 * The range marks the consumed text, so the reply's free text can be recovered
+	 * afterwards. Pure. */
 	function leadAskMatches(
 		asked: AskQuestion[],
 		text: string,
@@ -11439,7 +12243,20 @@ export async function createApp(deps: AppDeps) {
 			const at = text.indexOf(marker);
 			if (at !== -1) {
 				const rest = text.slice(at + marker.length);
-				const stop = rest.indexOf('\nFor "');
+				// The answer ends at the next answer line of any form, so wire lines
+				// and plain lines mix in one reply.
+				let stop = -1;
+				let offset = 0;
+				for (const line of rest.split("\n")) {
+					if (
+						offset > 0 &&
+						(line.startsWith('For "') || plainAskAnswer(line) !== null)
+					) {
+						stop = offset;
+						break;
+					}
+					offset += line.length + 1;
+				}
 				const answer = (stop === -1 ? rest : rest.slice(0, stop)).trim();
 				if (answer !== "")
 					matches.push({
@@ -11448,16 +12265,37 @@ export async function createApp(deps: AppDeps) {
 						start: at,
 						end: at + marker.length + (stop === -1 ? rest.length : stop),
 					});
-				continue;
 			}
-			if (asked.length === 1 && text.trim() !== "")
-				matches.push({
-					question: q.question,
-					answer: text.trim(),
-					start: 0,
-					end: text.length,
-				});
 		}
+		// Plain-form lines fill the questions the wire lines left unmatched. Their
+		// numbers follow the card's current question order.
+		const taken = new Set(matches.map((m) => m.question));
+		let at = 0;
+		for (const line of text.split("\n")) {
+			const plain = plainAskAnswer(line);
+			if (
+				plain !== null &&
+				plain.n >= 1 &&
+				plain.n <= asked.length &&
+				!taken.has(asked[plain.n - 1]!.question)
+			) {
+				taken.add(asked[plain.n - 1]!.question);
+				matches.push({
+					question: asked[plain.n - 1]!.question,
+					answer: plain.answer,
+					start: at,
+					end: at + line.length,
+				});
+			}
+			at += line.length + 1;
+		}
+		if (asked.length === 1 && matches.length === 0 && text.trim() !== "")
+			matches.push({
+				question: asked[0]!.question,
+				answer: text.trim(),
+				start: 0,
+				end: text.length,
+			});
 		return matches;
 	}
 	/** A reply to a review's lead-question card (OTTR-869): the drawer sends one
@@ -11469,8 +12307,14 @@ export async function createApp(deps: AppDeps) {
 	 * lead with the answer as its reason; a started lead cancels through the
 	 * sanctioned cancel (it stops the run, disposes the worktree, deletes the
 	 * branch), never through the bare patch. Free text no question consumed appends
-	 * to the details of every open lead that got no per-question answer. The question
-	 * card lands Done either way, so a second reply is refused. Null: a plain reply. */
+	 * to the details of every open lead that got no per-question answer. A
+	 * multi-question reply that matches no question is refused with 400 before any
+	 * write, and so is a plain-form line whose number names no question (both
+	 * OTTR-1130): a stale number from before a partial reply can not silently drop
+	 * or misapply an answer. A partial reply applies the matched answers and leaves
+	 * the card at needs_you with only the unanswered questions, each named with its
+	 * current number in needsReason; a complete reply lands the card Done, so a
+	 * second reply is refused. Null: a plain reply. */
 	async function reviewLeadAskReply(
 		e: Entry,
 		task: Task,
@@ -11503,7 +12347,33 @@ export async function createApp(deps: AppDeps) {
 		for (const m of [...matches].sort((a, b) => b.start - a.start))
 			free = free.slice(0, m.start) + free.slice(m.end);
 		free = free.trim();
+		// A plain line whose number names no question refuses the whole reply, so a
+		// stale number from before a partial reply can not silently drop or
+		// misapply an answer — also on a card with one question left, where the
+		// whole-text fallback would otherwise take the line as a note (OTTR-1130).
+		const bad = plainAskOutOfRangeLine(text, asked.length);
+		if (bad !== null)
+			return json(
+				{
+					error: `answer line "Q${bad}" names no question: ${asked.length === 1 ? "the card asks 1 question, numbered Q1" : `${asked.length} questions are waiting, numbered Q1 to Q${asked.length}`}. Answer with one line per question, as: ${askAnswerLine(asked[0]!.question, "<answer>")}`,
+				},
+				400,
+			);
+		// OTTR-1130: a multi-question reply matching no question is refused before
+		// anything is written, so a mis-formatted reply cannot land the card Done
+		// with the whole text as a note on every lead.
+		if (asked.length > 1 && matches.length === 0)
+			return json(
+				{
+					error: `no answer line matched any of the ${asked.length} questions. Answer with one line per question, as: ${askAnswerLine(asked[0]!.question, "<answer>")}`,
+				},
+				400,
+			);
 		const remaining = matches.values();
+		// An answer matches an option label case-insensitively, with one trailing
+		// period of the answer ignored (OTTR-1130).
+		const appliesLabel = LEAD_APPLIES_OPTION.toLowerCase();
+		const notApplyLabel = LEAD_NOT_APPLY_OPTION.toLowerCase();
 		type LeadCancellation = { id: string; reason: string; answer: string };
 		let cancelled: (LeadCancellation & { outcome: CancelOutcome }) | null =
 			null;
@@ -11550,7 +12420,8 @@ export async function createApp(deps: AppDeps) {
 						continue;
 					const live = await e.store.getTask(lead.id);
 					if (live === null) continue;
-					if (m.answer === LEAD_APPLIES_OPTION) {
+					const answerLabel = m.answer.trim().replace(/\.$/, "").toLowerCase();
+					if (answerLabel === appliesLabel) {
 						if (live.stage === "backlog" && live.state === "idle")
 							await e.store.updateTask(lead.id, {
 								stage: "todo",
@@ -11562,7 +12433,7 @@ export async function createApp(deps: AppDeps) {
 						answered.add(lead.id);
 						continue;
 					}
-					if (m.answer === LEAD_NOT_APPLY_OPTION) {
+					if (answerLabel === notApplyLabel) {
 						const reason = `Cancelled by the user's answer to the review's question: ${m.answer}`;
 						answered.add(lead.id);
 						if (live.stage !== "backlog" || live.state !== "idle")
@@ -11589,12 +12460,23 @@ export async function createApp(deps: AppDeps) {
 						if (answered.has(lead.id)) continue;
 						await appendDetails(lead.id, free);
 					}
-				await e.store.updateTask(task.id, {
-					stage: "done",
-					state: "idle",
-					asked: null,
-					needsReason: null,
-				});
+				// A complete reply lands the card Done; a partial reply keeps it at
+				// needs_you with only the unanswered questions (OTTR-1130).
+				const left = asked.filter(
+					(q) => !matches.some((m) => m.question === q.question),
+				);
+				if (left.length === 0)
+					await e.store.updateTask(task.id, {
+						stage: "done",
+						state: "idle",
+						asked: null,
+						needsReason: null,
+					});
+				else
+					await e.store.updateTask(task.id, {
+						asked: left,
+						needsReason: `Waiting for answers to ${left.length} of ${asked.length} questions: ${left.map((q, i) => `Q${i + 1} "${q.question}"`).join(", ")}`,
+					});
 				return null;
 			};
 			// A completed external cancel must keep its note, even after another reply wins.
@@ -12193,6 +13075,8 @@ export async function createApp(deps: AppDeps) {
 		const out = await runSandboxJob({
 			project: b.project,
 			checkout: target.path,
+			// The calling run's card: the validate VM names it on the System view.
+			taskId: b.taskId,
 			argv: b.argv,
 			...(b.ref !== undefined ? { ref: b.ref } : {}),
 			...(b.cwd !== undefined ? { cwd: b.cwd } : {}),
@@ -12231,7 +13115,8 @@ export async function createApp(deps: AppDeps) {
 		// the id shape is valid (resolveTask answers 400 for a bad shape
 		// first). Ids are unique per project, not across projects: exactly
 		// one foreign match links and stores the parent's project, several
-		// are ambiguous, and the merge hold never crosses a project border.
+		// are ambiguous. The merge hold follows the link across the border:
+		// the child inherits the parent's updateIds like a local child.
 		const hits = (
 			await Promise.all(
 				[...deps.projects.values()]
@@ -12255,7 +13140,7 @@ export async function createApp(deps: AppDeps) {
 		return {
 			followUpOf: hit.task.id,
 			followUpOfProject: hit.project,
-			updateIds: [],
+			updateIds: hit.task.updateIds,
 		};
 	}
 
@@ -12871,7 +13756,7 @@ export async function createApp(deps: AppDeps) {
 	}
 
 	function validateAlateValue(
-		key: "url" | "key",
+		key: "url" | "key" | "repo" | "branch",
 		v: unknown,
 	): string | null | Response {
 		if (v === null || v === "") return null;
@@ -12882,6 +13767,11 @@ export async function createApp(deps: AppDeps) {
 			return json({ error: `${key} is too long (max 500 chars)` }, 400);
 		if (/[\p{Cc}]/u.test(trimmed))
 			return json({ error: `${key} contains control characters` }, 400);
+		// The pin reaches gh api paths only through the same shapes the source fields use.
+		if (key === "repo" && !REPO_NAME.test(trimmed))
+			return json({ error: "repo must be owner/name" }, 400);
+		if (key === "branch" && !BRANCH.test(trimmed))
+			return json({ error: "branch must be a plain ref name" }, 400);
 		return key === "url" ? validateAlateUrl(trimmed) : trimmed;
 	}
 
@@ -12899,7 +13789,7 @@ export async function createApp(deps: AppDeps) {
 		// key live — health, provision and the turns read the old config until the
 		// whole body validates.
 		const next = { ...alate };
-		for (const key of ["url", "key"] as const) {
+		for (const key of ["url", "key", "repo", "branch"] as const) {
 			const v = body[key];
 			if (v === undefined) continue;
 			const valid = validateAlateValue(key, v);
@@ -13266,16 +14156,21 @@ export async function createApp(deps: AppDeps) {
 			parent as string,
 			content,
 			message,
+			alate.branch ?? undefined,
 		);
 		if (!w.ok) {
+			if (w.pinMismatch) return json({ error: w.error }, 409);
 			if (w.status !== 409) return json({ error: w.error }, w.status);
-			// The data repo moved: show the user its current roles.
+			// The loaded commit is not the branch head (a move since the import,
+			// or alate's base was never the head): show the user the repo's
+			// current roles. The next save re-checks the head against its base.
 			const again = await loadConfigYml(alate, true);
 			if (!again.ok) return json({ error: again.error }, again.status);
 			return json(
 				{
-					error:
-						"the data repo changed while the roles saved; check the current roles and save again",
+					error: w.refMismatch
+						? "the loaded commit is not the head of the data repo branch; check the current roles and save again"
+						: "the data repo changed while the roles saved; check the current roles and save again",
 					base: again.body.base,
 					hash: again.body.hash,
 					roles: readRoles(again.body.content),
@@ -13320,6 +14215,19 @@ export async function createApp(deps: AppDeps) {
 		// stale form sees the current roles even when they already hold its values.
 		const f = await loadConfigYml(alate, true);
 		if (!f.ok) return json({ error: f.error }, f.status);
+		// The pin is the board's own trusted write target, independent of alate's
+		// snapshot: when it is set, alate's source must name that repository — a
+		// path source is a mismatch too. Fail closed before any value or write.
+		if (
+			alate.repo !== null &&
+			(f.body.repo === null || f.body.repo.name !== alate.repo)
+		)
+			return json(
+				{
+					error: `alate's data source does not match the pinned data repository ${alate.repo}; check Settings → Alate`,
+				},
+				409,
+			);
 		const current = readRoles(f.body.content);
 		const currentFallbacks = readFallbacks(f.body.content);
 		if (f.body.base !== base || f.body.hash !== hash)
@@ -13334,6 +14242,41 @@ export async function createApp(deps: AppDeps) {
 				},
 				409,
 			);
+		// Bind the snapshot to the parent commit: the bytes this save edits must be
+		// the bytes GitHub holds at `base`. A mismatch (or a missing blob) means
+		// alate's snapshot does not sit at `base`; fail closed with the parent
+		// commit's values so the rows reload from the repo's truth.
+		if (f.body.repo !== null && f.body.base !== null) {
+			const at = await configBlobAt(gh, f.body.repo, f.body.base);
+			if (!at.ok) return json({ error: at.error }, at.status);
+			const blob = at.body.bytes;
+			const blobBuf =
+				blob === null
+					? null
+					: Buffer.from(blob.buffer, blob.byteOffset, blob.byteLength);
+			if (
+				blobBuf === null ||
+				!blobBuf.equals(Buffer.from(f.body.content, "utf8"))
+			)
+				return json(
+					blobBuf === null
+						? {
+								error:
+									"the data repo has no config.yml at the loaded commit; re-import in alate and load the roles again",
+							}
+						: {
+								error:
+									"alate's snapshot does not match the data repo at the loaded commit; check the current roles and save again",
+								base: f.body.base,
+								hash: new Bun.CryptoHasher("sha256")
+									.update(blobBuf)
+									.digest("hex"),
+								roles: readRoles(blobBuf.toString("utf8")),
+								fallbacks: readFallbacks(blobBuf.toString("utf8")),
+							},
+					409,
+				);
+		}
 		const catalog = new Set(
 			(await (deps.models ?? modelList)()).map((m) => m.selector),
 		);
@@ -13405,7 +14348,18 @@ export async function createApp(deps: AppDeps) {
 		},
 		"/git/*": (req, server) =>
 			vmRoute(req, server, (tokens) =>
-				handleGit(req, { tokens, log: (l) => console.log(`[vm-git] ${l}`) }),
+				handleGit(req, {
+					tokens,
+					log: (l) => console.log(`[vm-git] ${l}`),
+					// The project's pinned origin (settings originUrl); null when unset.
+					// The LFS proxy fails closed on null: no pin, no proxy.
+					originUrl: async (project) => {
+						const e = deps.projects.get(project);
+						return e === undefined
+							? null
+							: (await e.store.getSettings()).originUrl;
+					},
+				}),
 			),
 		"/llm/*": (req, server) =>
 			vmRoute(req, server, (tokens) =>
@@ -13568,7 +14522,7 @@ export async function createApp(deps: AppDeps) {
 			GET: async (req) =>
 				await api(req, async () =>
 					json({
-						names: listedEnvNames(workersHome).map((row) =>
+						names: (await listedEnvNames(workersHome)).map((row) =>
 							row.plain
 								? {
 										...row,
@@ -13647,6 +14601,14 @@ export async function createApp(deps: AppDeps) {
 		"/api/settings/hindsight": {
 			GET: async (req) => await api(req, async () => json(hindsightView())),
 			POST: async (req) => await api(req, async () => await saveHindsight(req)),
+		},
+		"/api/settings/check-routing": {
+			GET: async (req) =>
+				await api(req, async () =>
+					json({ routing: deps.shared.checkRouting ?? null }),
+				),
+			POST: async (req) =>
+				await api(req, async () => await saveCheckRouting(req)),
 		},
 		// --- Web Push (begin) ---
 		"/api/push/config": {
@@ -14358,6 +15320,16 @@ export async function createApp(deps: AppDeps) {
 					},
 				),
 		},
+		"/api/projects/:project/code-scanning/check": {
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsCodeScanningCheckByProject(req),
+					{
+						costly: true,
+					},
+				),
+		},
 		"/api/projects/:project/tasks/:id/pr-review/post": {
 			POST: async (req) =>
 				await api(
@@ -14591,7 +15563,7 @@ export async function createApp(deps: AppDeps) {
 					: (workerSignInReports.get(runner)?.tmp ?? null);
 			if (space === null || !tmpFull(space.freeBytes, space.totalBytes))
 				return null;
-			return `/tmp of ${runner} is full (${formatBytes(space.freeBytes)})`;
+			return tmpFullNotice(runner, space.freeBytes);
 		},
 		// OTTR-754: the free space itself, for an apt disk-failure reason; known space
 		// always reports, so a recovered sweep still explains the failure it caused.
@@ -14600,12 +15572,11 @@ export async function createApp(deps: AppDeps) {
 				runner === "local"
 					? tmpDiskSpace()
 					: (workerSignInReports.get(runner)?.tmp ?? null);
-			return space === null
-				? null
-				: `/tmp of ${runner} has ${formatBytes(space.freeBytes)} free`;
+			return space === null ? null : tmpSpaceNotice(runner, space.freeBytes);
 		},
 		socketCount: () => sockets,
 		sampleStats,
+		checkServiceQuotas,
 		alateProvisionTick: () =>
 			backgroundTick("alate provision", alateProvisionTick),
 		idleReviewTick: () => backgroundTick("idle review", idleReviewTick),
@@ -14613,6 +15584,18 @@ export async function createApp(deps: AppDeps) {
 			backgroundTick("trending scan", () => trendingScanner.tick()),
 		memoryHealthTick: () => backgroundTick("memory health", memoryHealthTick),
 		workerSignInTick: () => backgroundTick("worker sign-ins", workerSignInTick),
+		// OTTR-1088: boot warmup of the transcript usage scan. Fire-and-forget: a request
+		// during the warmup awaits the same single-flight build or reads the last report.
+		ompStatsWarm: (): void => {
+			void ompStatsReportNow().catch((err) =>
+				console.error(`omp usage warmup failed: ${errmsg(err)}`),
+			);
+		},
+		// Only for tests: age the report cache past its 30 s TTL, so a test can watch a
+		// stale report serve with refreshing:true while the next scan runs.
+		ompStatsAgeCache: (): void => {
+			if (ompStatsCache !== null) ompStatsCache.at -= 60_000;
+		},
 		refreshUpdates: () => backgroundTick("updates refresh", refreshUpdates),
 		tokenReminderTick: () =>
 			backgroundTick("token reminder", tokenReminderTick),
@@ -14624,6 +15607,8 @@ export async function createApp(deps: AppDeps) {
 			backgroundTick("PR review drain", () => prWatcher.reviewIdle()),
 		issueWatchTick: (opts?: { manual?: string }) =>
 			backgroundTick("issue watch", () => issueWatcher.tick(opts)),
+		codeScanWatchTick: (opts?: { manual?: string }) =>
+			backgroundTick("code scanning watch", () => codeScanWatcher.tick(opts)),
 		ompWatchTick: () => backgroundTick("omp watch", () => ompWatcher.tick()),
 		dependabotTick: () => backgroundTick("dependabot", () => dependabotTick()),
 	};

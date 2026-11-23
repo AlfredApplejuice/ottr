@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import fc from "../test/properties.ts";
+import type { ServiceQuotaSourceState } from "../types.ts";
 import {
 	connectLive,
 	connectPolling,
+	latestQuota,
 	liveEvents,
 	type OfflineInfo,
 	parseServerMessage,
@@ -255,6 +257,49 @@ describe("reconnectDelay", () => {
 	});
 });
 
+const SERVICE_QUOTAS: readonly ServiceQuotaSourceState[] = [
+	{
+		id: "service-account",
+		adapterId: "service-v2",
+		label: "anthropic",
+		status: "ok",
+		lastAttemptAt: 1_000,
+		nextAttemptAt: 61_000,
+		sample: {
+			observedAt: 1_000,
+			metrics: [
+				{
+					id: "credits",
+					label: "Credits",
+					kind: "balance",
+					unit: { kind: "currency", code: "USD" },
+					remaining: -0.125,
+					reportedTotal: null,
+					resetsAt: null,
+					providerStatus: null,
+					plan: null,
+				},
+			],
+		},
+		error: null,
+	},
+];
+
+const MODEL_QUOTA = {
+	at: 1_000,
+	error: null,
+	limits: [
+		{
+			provider: "anthropic",
+			label: "Model window",
+			window: null,
+			plan: null,
+			usedPct: 42,
+			resetsAt: null,
+		},
+	],
+};
+
 // connectLive only touches browser globals inside its callbacks, so tests swap in a fake
 // WebSocket, a fixed origin, and a manual clock: no real 5 s/15 s waits, no network.
 class FakeWebSocket {
@@ -394,6 +439,32 @@ describe("connectLive", () => {
 		};
 		return { h, calls };
 	};
+
+	test("state frames pass service quotas through but lastQuota stays model-only", () => {
+		const { h } = makeHandlers();
+		const received: unknown[] = [];
+		const dispose = connectLive({
+			...h,
+			onState: (state) => received.push(state),
+		});
+		try {
+			socketAt(0).open();
+			for (const quota of [MODEL_QUOTA, null]) {
+				const state = {
+					tasks: [],
+					projects: [],
+					serverVersion: "v",
+					quota,
+					serviceQuotas: SERVICE_QUOTAS,
+				};
+				socketAt(0).message(JSON.stringify({ type: "state", state }));
+				expect(received.at(-1)).toEqual(state);
+				expect(latestQuota()).toEqual(quota);
+			}
+		} finally {
+			dispose();
+		}
+	});
 
 	test("reconnects after close with doubling backoff, reset by a successful open", () => {
 		const { h, calls } = makeHandlers();
@@ -686,6 +757,30 @@ describe("connectPolling", () => {
 		expect(seen.behind).toBe(3);
 		expect(seen.commits).toEqual(["feat: a"]);
 		dispose();
+	});
+
+	test("polling passes service quotas through but lastQuota stays model-only", async () => {
+		let state = {
+			...STATE,
+			quota: MODEL_QUOTA as typeof MODEL_QUOTA | null,
+			serviceQuotas: SERVICE_QUOTAS,
+		};
+		routes["/api/state"] = () => ok(state);
+		routes["/api/system"] = () => ok(SYSTEM);
+		const { h, seen } = makeHandlers();
+		const dispose = connectPolling(h);
+		try {
+			await drain();
+			expect(seen.state).toEqual(state);
+			expect(latestQuota()).toEqual(MODEL_QUOTA);
+			state = { ...state, quota: null };
+			advance(5000);
+			await drain();
+			expect(seen.state).toEqual(state);
+			expect(latestQuota()).toBeNull();
+		} finally {
+			dispose();
+		}
 	});
 
 	test("failure and recovery: rejected fetch goes offline, next poll recovers", async () => {

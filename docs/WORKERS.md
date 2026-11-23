@@ -69,7 +69,10 @@ Unlike desktop loopback, the board asks for the admin login (or the API key)
 there: the published port arrives from the Docker gateway, not loopback, and
 worker turns reach it too (`host.docker.internal`). Only processes in the
 board's own container (merge turns, `docker compose exec server ...`) keep
-zero-auth access.
+zero-auth access. The board's own agent runs (checks, merge turns, retro, the
+board check, release) read worker-written content, so the server starts them
+with the read tool's URL fetch off (`extension/no-fetch.yml`): an injected
+read of a loopback `/api` URL must not pass the auth wall.
 
 Each container keeps at most 30 MB of logs: the `local` log driver keeps 3 files of 10 MB.
 Each container also has a RAM limit. The default is `8g` for the server and for each
@@ -339,7 +342,8 @@ omp. Two parts do the work:
    open and an entry whose newest write happened after a live turn started. Each
    worker self-reports its `/tmp` space on `GET /signins` (`tmp`); a runner below
    the free-space limit (1 GiB or 5%) gets no new turn, and the bell shows one
-   `/tmp of <runner> is full (<free>)` notice until the space is back.
+   `The temp disk (/tmp) of <runner> is full (<free> free)` notice until the
+   space is back.
 
    When the board is too old for the runner API (`GET /api/drain` answers
    nothing), the script keeps the old whole-board rule, with the old hold-first
@@ -582,17 +586,19 @@ folder and compares the two trees. A changed, added or removed file stops the tu
 and the error names the folder to remove. A kept copy that fails the hash is
 downloaded again, so an install from before this check costs one download.
 A reused link folder must hold exactly the turn's links. A planted or changed
-entry stops the turn too. The reason: a turn can write the shared home, so an
-installed tool must never run from a planted file (OTTR-953).
+entry stops the turn too. The reason: the link folder is worker-side writable
+state (each project's turn home since OTTR-994, the shared home on a legacy
+non-root daemon), so an installed tool must never run from a planted file
+(OTTR-953).
 
 A turn that runs in the server (a merge turn, or a work turn with no worker) does
 not use the shared home volume for tools. The server reads `tools.json` and
 installs the tools under its own home (`OTTR_BOARD_OMP_HOME`, `/etc/ottr/home` on
 compose). The seed installs the lists into the board home's layers
 ([The agent layers](#the-agent-layers)), and the board reads them from the current
-layer at read time. The reason is R5-1: a
-worker turn can write the shared home, so a binary there must never run in the
-server. Until a seed runs, server-side turns get no tools. The VM bake path
+layer at read time. The reason is R5-1: worker-side writable state must never
+serve a binary that runs in the server (a project's turn home today, the
+shared home on a legacy non-root daemon). Until a seed runs, server-side turns get no tools. The VM bake path
 follows the same rule: the board puts the project's lists on the vm dispatch
 from its own home, and the bake installs from those texts only, never from the
 shared home. The pinned agent layer copy (`vm.layerDir`) still reads the shared
@@ -610,8 +616,9 @@ keep it. When one listing of a name lacks `plain`, the name stays a secret. Spec
 A listed name with no value does not stop the turn; the card log names it.
 The board reads these lists only from its own home (`OTTR_BOARD_OMP_HOME`,
 `/etc/ottr/home` on compose), never from the shared home volume. The reason is
-R5-1: a turn can write the shared home, and a list there could give the secrets
-of project A to project B. The seed installs the lists into the board home's
+R5-1: a list in worker-side writable state could give the secrets of project A
+to project B — the shared home before OTTR-994, a project's own turn home
+today — so the board carries the lists on the request instead. The seed installs the lists into the board home's
 layers ([The agent layers](#the-agent-layers)); the hourly deploy runs it when
 it seeds the board ("Seed the board
 config"). The 5-minute board seed schedule above runs the same seed sooner when the
@@ -774,6 +781,70 @@ keep the profile off on a Podman host. On a host with `/dev/kvm`, the upgrade
 path is [podman inside the Firecracker VM](#microvm-workers), where a VM owns a
 real podman.
 
+## Turn identity (per-project uid and home)
+
+On the classic pool, every turn of every project used to run as the worker
+daemon's own root uid with one shared home. A turn of project A could read
+the process env of a running turn of project B — its Settings env values and
+the lent provider token — and plant files into the shared home that a later
+turn of project B loads (R5-1). Since OTTR-994 the worker daemon drops each
+turn to its project's own uid. The uid comes from the project name
+(`projectTurnUid` in `src/turnUid.ts`), so every worker of the pool and every
+restart computes the same identity. The project rides the run request as
+`project`, so retro and proposal runs keep their identity even when the turn
+env strips `OTTR_PROJECT`.
+
+Each project gets a turn home, `<OTTR_TURN_HOMES>/<project>` (compose: the
+`turn-homes` volume). Its layout keeps root and the turn uid out of each
+other's way: `home/` is the project uid's writable HOME (mode `0700`),
+`layers/` holds the project's own copies of the pinned agent layer, and
+`ottr/` holds what provisioning installs (tools, python venv, PATH link
+dirs, root-owned, readable by the turn). A turn's HOME is `home/` — with the
+flat identity linked in (`.omp`, git, gh, ssh, claude state) when the stack
+runs without a layer pin — or the project's own layer copy. The copy keeps
+the shared-state links of the pin (`agent.db`, `sessions`, `oauth`, `logs`)
+pointed at the flat shared home and moves the cache links (`.cache`, `.npm`,
+`.bun`, `.local`) into `home/`; the turn creates the cache dirs itself
+through those links, so one project's caches are not another project's
+write surface. Everything root touches in the turn home lives under the
+root-owned shell dirs, and every recursive chown anchors its listings and
+chowns to `/proc/self/fd` descriptors of the directories it opened once, so
+a turn cannot redirect a root chown by renaming or planting symlinks
+mid-walk.
+
+The daemon also closes the project's dirs on the shared volumes: the project
+dir under `/workspace` and the whole `/data/<project>` tree get the project
+uid and mode `0700`, and the run's cwd plus the project's git dir
+(`<workspace>/<project>/.git`, never the worktree's planted `.git` pointer)
+become uid-owned, so the turn's git can write. A turn can no longer read
+another project's process env, traverse another project's checkout or task
+data, or plant anything a different project's turn later loads.
+
+What stays shared, on purpose: the credential store (`agent.db`), the pinned
+agent layer tree that alate provisions, and the sticky `.omp/agent`,
+`sessions` and `logs` dirs the pin links back to the flat home (`1733`:
+write-only for others, each uid keeps its own entries private). One stack,
+one store — the spec's residuals list what that leaves open, including the
+mounted-store case: when `agent.db` is a host bind mount, the boot skips its
+mode change and a turn-side store write degrades to the cause omp reports.
+When the build profile is on, the boot also gives the BuildKit client key and
+certs a turn-readable mode, which the root-only image previously withheld. A
+project's own turns share one uid and one home: one project is one trust
+domain. A daemon that does not run as root keeps the legacy identity and
+logs one `turn-uid: off` line at boot. Any identity step that fails fails
+the run, so a run never falls back to a root turn.
+
+The server's own git (merge, release, review) runs as root inside the
+uid-owned worktrees, so the board gitconfig that the entry script seeds
+carries `[safe] directory = *`, added idempotently on every boot. Every git
+spawn of the board also pins `safe.directory = *` on the command line, so a
+read of a uid-owned checkout survives a roll that recreates the server
+before the new boot seeds the gitconfig (OTTR-1176). Host-side
+tools see the turn uid numbers on the volume files; backups run on the
+server as root and stay unaffected.
+
+Spec: [docs/specs/worker-turn-uid-isolation.md](specs/worker-turn-uid-isolation.md).
+
 ## Env settings
 
 - Server: `OTTR_WORKER_URLS` (comma-separated, e.g.
@@ -810,6 +881,11 @@ real podman.
   value from the host shell or the compose env file and passes it to the
   server only; workers never use it. Refer to the "GitHub host" row in
   [docs/configuration.md](configuration.md).
+- Worker: `OTTR_TURN_HOMES` (default `/turn-homes`) is the root of the
+  per-project turn homes ("Turn identity" above). Compose mounts the
+  `turn-homes` volume there, so the per-project tool, venv and cache installs
+  survive a worker recreation; the daemon creates the dir itself when no
+  volume is mounted.
 - Unset `OTTR_WORKER_URLS` = local spawn on the server host (the default;
   `runner.startRun` stays the reference implementation). When the variable is
   set, a work turn never runs on the server: if a worker is down or answers
@@ -843,7 +919,9 @@ real podman.
 - The `alate` profile runs a bundled Alate server next to the stack:
   `docker compose --profile alate up -d` (or `COMPOSE_PROFILES=alate` in the
   env file). The service serves its dashboard on `127.0.0.1:4570` on the host
-  and `http://alate:4570` on the compose network. Its state lives on the
+  and `http://alate:4570` on the compose network. Open the dashboard at
+  `http://localhost:4570` when the board runs at `127.0.0.1`, because the
+  browser sends a host's cookies to every port on that host. Its state lives on the
   `alate-state` volume, and it provisions the workers through the shared
   `home` volume, as layers under `/root/.alate`
   ([The agent layers](#the-agent-layers)). `ALATE_URL` and `ALATE_API_KEY` pair the board with it: the
@@ -853,7 +931,12 @@ real podman.
   hex bytes); the alate container itself requires the same key. The board
   never logs the key, and the runner strips it from every turn's env, since
   no turn calls alate. Compose waits for the bundled service's `/health` before starting
-  the board. A user whose Alate server already runs on another host
+  the board. The service pins `GIT_CONFIG_GLOBAL` to `/dev/null`. The
+  workers share the `home` volume and can plant `/root/.gitconfig` there. A
+  planted credential helper, `insteadOf` redirect or protocol allowance must
+  not run in the container that holds `ALATE_API_KEY`. The home holds no
+  legitimate git config (the entry script never copies from it), so the pin
+  removes only the plant vector. A user whose Alate server already runs on another host
   omits the profile and saves the URL and key under **Settings -> Alate**.
   The service also mounts the stack's `workspace` volume at `/workspace`
   (`workspace:/workspace` in `docker-compose.yml`), the same volume the board
@@ -983,6 +1066,14 @@ the vm dispatch, never this mount. It never mounts
   a delete, or a compressed push body is refused. The VM pushes every 60 s while HEAD
   moves and once at the end; after each push the board resets the server worktree to the
   branch tip, never to a sha the VM reports.
+- Git LFS: the board's git endpoint also serves the LFS batch API for the per-turn
+  token, download only. It checks the same token rules as the git service, and
+  proxies the batch call to the project's pinned origin with the board's own
+  credential. The board rewrites the object links to board URLs, so no
+  upstream-signed URL or provider credential enters the VM. An upload batch gets
+  `403`, because the server push after a merge does the LFS uploads (OTTR-1058).
+  The board checks the project before it contacts the origin, so a token of one
+  project gets `403` for another project's LFS objects.
 - Provider credentials: none enter the VM. omp in the VM sends each provider through the
   board's `/llm` proxy (`transport: pi-native`, with the per-turn token as the key). The
   board forwards to its own `omp auth-gateway serve`, which resolves OAuth sign-ins and
@@ -1053,8 +1144,12 @@ killed those VMs already.
   The board records a turn only after `vm-runner` accepts it, so a busy answer writes no
   turn, keeps the pending reply, and counts no lost turn. The card stays queued with the
   hold **waiting for a free microVM**, its log gets one line ("every microVM was busy;
-  the card waits in the queue for a free microVM"), and the scheduler tries again after
-  10 s.
+  the card waits in the queue for a free microVM"), and it holds no scheduler slot while
+  it waits. While the pool is full, no microVM card of the board claims or starts a turn,
+  and every queued card of the project shows the same hold on the board.
+  A freed slot wakes the queue: the settle of a board VM run probes the runner at once,
+  the 30 s health probe keeps the count fresh, and the next tick then starts the oldest
+  waiting card, one card per free slot.
 - Down: while `vm-runner` does not answer its health probe, the project's work cards
   stay queued with **waiting for the microVM runner: <reason>**. They never fall back to
   the classic pool.
@@ -1183,8 +1278,8 @@ turns get the overlay, so the whole compose topology runs one backend.
 
 The server checks memory health at boot and every 60 seconds. When the check fails, the
 board header and the Settings Hindsight section show the sentence
-`omp runs with no memory: <reason>` — for example an unreachable Hindsight URL or a
-mnemopi store that refuses writes.
+`The omp process runs with no memory: <reason>` — for example an unreachable
+Hindsight URL or a mnemopi store that refuses writes.
 
 The Hindsight server requires its tenant API key on every request. Set it under
 **Settings -> Hindsight** (the same place holds the server address): the board saves a
@@ -1256,8 +1351,15 @@ run as a command — never does. Every board git also passes explicit
 --no-textconv` to `diff`, `log` and `show`, so a planted `remote.<name>.uploadpack`,
 `receivepack`, `diff.external` or textconv driver does not run. These flags do not reach
 the child git of a submodule, so board git also never recurses into submodules
-(`--submodule=short`, `--no-recurse-submodules`, `--recurse-submodules=no`). Residual limit: a planted
-`http.<url>.proxy` with
+(`--submodule=short`, `--no-recurse-submodules`, `--recurse-submodules=no`). Every board
+git also clears `http.cookieFile` and `http.saveCookies`: a planted cookie path would
+make libcurl rewrite that file as a cookie jar after a successful fetch, and the file
+may be a server-only one. A network call that names an http(s) URL also gets a per-URL
+clear for that exact URL (`http.<url>.cookieFile` / `http.<url>.saveCookies`): git's URL
+match prefers the longest match across sources, so a planted per-URL key would beat both
+generic overrides. Residual limit: a call that names a remote instead of a URL reads the
+URL from the repo config, so a per-URL cookie key matching that URL can still win there,
+and a planted `http.<url>.proxy` with
 `http.<url>.sslVerify=false` can also see a token, because git prefers the most
 specific URL match over the env value. No turn's shell sees
 them.
@@ -1296,8 +1398,8 @@ release tag push therefore run a scan before they push: plain git
 inside the range still shows; `cat-file --batch-check` for sizes; then
 `cat-file --batch` for only the blobs under the 1 KiB pointer ceiling) lists
 the LFS pointer oids, and only when the list is not empty does the server run
-`git lfs push <originUrl> <ref>` for the same ref with the same credential
-plumbing as the push (git() classifies `lfs` as network git). A repo whose
+`git lfs push <originUrl> <ref>` for the same ref with the same
+credential plumbing as the push (git() classifies `lfs` as network git). A repo whose
 pushed range holds no LFS pointers runs no git lfs command, and the scan never
 reads a big blob's bytes, so the read stays bounded on a large history. The
 release tag's scan base is the target's tracking tip when it is an ancestor of
@@ -1305,10 +1407,17 @@ the tag — the release's normal state, the tag riding the tip the merge push
 landed — so a release of any repo scans an empty range and runs no LFS step at
 all; a tag on a commit the origin does not hold scans only what the tag adds.
 The upload runs only for origins whose endpoint can be pinned: an http(s) origin
-gets `-c lfs.url=<originUrl>/info/lfs` on the command line, which outranks a
-planted `lfs.url` (an empty `-c lfs.url=` fails the push, verified against
-git-lfs 3.6.1) and the URL argument means `remote.<name>.lfsurl` is never
-read; a local-path origin becomes a `file://` URL and git-lfs's built-in
+gets `-c lfs.url=<endpoint>` and `-c lfs.<endpoint>.locksverify=false` on the
+command line, where `<endpoint>` mirrors git-lfs's own derivation —
+`<originUrl>.git/info/lfs` when the URL lacks the `.git` suffix,
+`<originUrl>/info/lfs` when it carries one. OTTR-1109: the bare
+`<originUrl>/info/lfs` form lands on a different server route, and GitHub
+answers 422 to the locks/verify call and to the batch alike there (MYST-34).
+The pins outrank a planted `lfs.url` (an empty `-c lfs.url=` fails the push,
+verified against git-lfs 3.6.1), the URL argument means `remote.<name>.lfsurl`
+is never read, and the lock pin turns the locking API off: the board never uses
+LFS locks, and on github hosts git-lfs verifies locks by default, so a locking
+endpoint's error response must not fail an upload whose batch endpoint works; a local-path origin becomes a `file://` URL and git-lfs's built-in
 standalone file transfer ignores endpoint config entirely, storing the objects
 in the bare repo itself. Any other scheme runs no LFS step: for `ssh://` the
 https endpoint git-lfs authenticates over ssh cannot be derived offline, so no
@@ -1346,7 +1455,13 @@ remote name, only the server-pinned origin URL (docs/specs/pinned-origin-url.md)
 board git call also sets
 `commit.gpgSign=false` and `tag.gpgSign=false`, and sets `gpg.program`, `gpg.x509.program`
 and `gpg.ssh.program` to `false`. Thus a planted signing or `log.showSignature` setting
-cannot run a program.
+cannot run a program. The target's fast-forward runs on the server too (OTTR-987): the
+merge prompt no longer drives the agent's `git merge --ff-only` in the main checkout,
+because the agent's shell git reads the worker-writable common gitdir and env config
+pins cannot be scoped to git alone — every child of the turn, the project's `bun test`
+included, would inherit them and break suites whose control tests plant hooks or an
+fsmonitor and require them to fire. `serverMergePush` fast-forwards the target through
+git()'s pinned argv after the turn reports integrated, then pushes.
 
 Filter drivers (`filter.<driver>.clean`, `smudge`, `process`) need one more step. The
 driver name comes from attributes, so no `-c` can clear the driver. Also, git reads
@@ -1471,21 +1586,24 @@ not layer content (OTTR-453 moves the pick to the deployment): the pin never rew
 the layer's `config.yml`. The entry script keeps its boot-time flip of the flat homes
 for the no-layer era and for spawns that stay flat.
 
-The board records each pinned layer id in `H/.alate/in-use.json` for the run's life and
-removes it when the run settles. Alate deletes a layer folder only when it is not
-`current`, not the layer `current` named before the last switch, and absent from
-`in-use.json`. A corrupt `in-use.json` never fails a run, and clean-up then still keeps
-the last two layers. The bound a pinned run can hit: a turn that outlives two switches
-(a 9 h mutation run can) loses its layer, the turn fails, and classification requeues it
-once, then parks it for a human.
+The board records live layer holders in `H/.alate/in-use.json`. The public file keeps the
+`{"layers":[{"id": string, "since": epoch-ms}]}` shape. Private owner data stays separate.
+Each run releases only its own holder. The worker child has a separate holder until it
+exits, even if the run detaches. An acquisition failure stops the spawn.
 
-Error cases: no layer yet (no `current` link, or an alate that still writes flat) runs
-the flat home, exactly as before; a broken `current` link falls back to the flat home and
-logs a warning into the run log, and the next provision repairs the switch; a shared-state
-link that cannot be written falls back the same way, so a run never fails because of
-pinning. The provision tick installs a layer whenever the alate server reports layer
-support (`layers: true` in `GET /health`), with no idle wait; while it does not, the tick
-keeps the old idle gate, because that server writes the flat home under a running turn.
+A failed release retains protection and reports a warning. At boot, open turns supply
+recovery pins. Reconcile preserves live or uncertain holders and replaces recovery pins
+from open turns. It removes a holder only when its lock proves that the holder ended.
+Alate deletes a layer folder only when it is not `current`, not the layer named before the
+last switch, and absent from `in-use.json`. The current and previous layers remain
+retention rules, not lease limits.
+
+If no `current` link exists, the run uses the flat home.
+A broken `current` link or failed shared-state link preparation also uses the flat home and records a warning.
+The next provision repairs a broken switch.
+
+The provision tick installs a layer without an idle wait when Alate reports `layers: true` in `GET /health`.
+Otherwise, the tick keeps the idle gate because that Alate server writes the flat home under a live turn.
 
 #### Seed the board config
 
@@ -1612,7 +1730,18 @@ writes, ref updates), so no read-only mount can wall the config off without brea
 inside the worktrees, and projects are onboarded at run time, so compose cannot pre-mount
 each config. The board's network subcommands still read `credential.helper`,
 `core.sshCommand` and `url.*.insteadOf` from that file. Turn processes run shell git with
-whatever the turn's env holds. Closing the board's repo-config reads fully is code-side
+whatever the turn's env holds: no env-scope git pin exists, because a pin cannot be
+scoped to the turn's git alone — the project's `bun test` inherits it, and suites whose
+control tests plant hooks or an fsmonitor and require them to fire go red. The
+integration git is the server's instead: after a merge turn reports integrated,
+`serverMergePush` fast-forwards the target through git()'s pinned argv (OTTR-987) and
+pushes, so the merge prompt's old `git merge --ff-only` in the main checkout — the one
+shell git that read planted hooks as root — is gone. The remaining server-side residual:
+a merge turn still re-runs the project's verification and any git inside its card
+worktree in the server container, by design of the merge prompt (`mergePrompt` in
+`src/prompts.ts`); worker-written test and build code runs as root there, and the docs
+accept that for the gates the merge turn must re-run. Closing the board's repo-config
+reads fully is code-side
 work in `src/worktree.ts` (per-call `-c` overrides and the `sealedGit` stub gitdir), not
 topology. The stub copies only these probed keys from the repo config:
 `core.filemode`, `symlinks`, `ignorecase`, `precomposeunicode`, `autocrlf` and `eol`. These
@@ -1644,6 +1773,19 @@ its flat home: the board home (or its layer) for the board's own runs, the share
 sha256, so the homes share the data dir but never the file — every run reads and
 converges only its own home's list (the ensure step runs before the spawn, the same
 guard as the memory overlay).
+
+Custom tools have no such gate in the pinned omp line (18.15.0): omp imports every
+module under the worktree's `.omp/tools`, `.omp/plugins`, `.claude/tools`,
+`.claude/plugins` and `.codex/tools` at session start, before any model call, and no
+flag or config key turns that off (OTTR-990; verified on omp 18.15.0). So every local
+run (`startLocalRun`, the runs in the server container) renames these five dirs to
+siblings with a `.ottr-boardrun` suffix before the spawn and restores them when the run
+settles. The rename stays inside the parent dir, so git sees only the move while the
+park holds. A park error aborts the run before the spawn, and undoes the renames that
+did happen. A crash between the rename and the restore leaves the suffix behind; the
+next local run restores such a leftover before it parks again. Worker and VM turns keep
+loading project custom tools: they run inside the worker sandbox, where this code
+execution is the point.
 
 ### The data boundary
 
@@ -1750,6 +1892,9 @@ Restore in the compose stack:
    - The tool renames each existing database to `<file>.before-restore-<stamp>`. It deletes
      nothing.
    - The tool stops and replaces no database when a live board holds a database.
+   - The tool follows no symlink below a target root. A project dir that is a symlink, or a
+     link planted at `<target>.restoring` or at the target, fails that database with exit
+     code 1, and nothing is written through the link.
    - When the snapshot is incomplete, the list line ends with `; incomplete:` and the
      databases that failed. The tool restores the databases that the snapshot holds. For
      each missing database it prints an error line with the newest snapshot that holds a

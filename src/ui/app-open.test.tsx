@@ -2,12 +2,14 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { type Node as HappyNode, Window } from "happy-dom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { perfMetrics } from "../perf.ts";
 import type {
 	ContainerRow,
 	ProjectView,
 	StateResponse,
 	SystemSnapshot,
 	TaskCard,
+	TaskView,
 } from "../types.ts";
 import { refreshState } from "./socket.ts";
 
@@ -179,14 +181,50 @@ const state = {
 	deadSignIns: [],
 } as unknown as StateResponse;
 
+// --- per-test overrides -------------------------------------------------------
+// The shared answers above stay fixed; a test swaps the frame the poll reads or
+// serves its own fetch answers (older Done pages, the single-card route, failures).
+// Every test clears what it set in its finally block.
+let stateOverride: StateResponse | null = null;
+let fetchTest: ((url: string) => Response | Promise<Response> | null) | null =
+	null;
+const setFrame = (s: StateResponse | null): void => {
+	stateOverride = s;
+};
+const setFetch = (
+	fn: ((url: string) => Response | Promise<Response> | null) | null,
+): void => {
+	fetchTest = fn;
+};
+
 const fetchMock = (async (input: RequestInfo | URL) => {
 	const url = String(input);
+	// A test's answers win; null falls through to the shared answers.
+	if (fetchTest !== null) {
+		const served = fetchTest(url);
+		if (served !== null) return served;
+	}
 	let body: unknown = {};
 	if (url === "/api/boot")
 		body = { onboarding: false, version: "vtest", live: false };
-	else if (url === "/api/state") body = state;
+	else if (url === "/api/state") body = stateOverride ?? state;
 	else if (url === "/api/update") body = { behind: 0, commits: [] };
-	else if (url === "/api/system")
+	else if (url === "/api/provisioning")
+		body = {
+			server: null,
+			workers: [],
+			userLayer: { skills: [], plugins: [], rules: [], mcp: [] },
+		};
+	else if (url === "/api/performance?range=all") {
+		const perf = perfMetrics({ tasks: [], turns: [] }, "all", 0);
+		body = {
+			range: "all",
+			bucketMs: perf.bucketMs,
+			seriesStart: perf.seriesStart,
+			fleet: perf.metrics,
+			projects: [],
+		};
+	} else if (url === "/api/system")
 		body = {
 			at: 1,
 			containers: [],
@@ -301,6 +339,136 @@ const cardEl = (id: string): Element | null =>
 	document.querySelector(`.card[data-task-id="${id}"]`);
 const drawer = (): Element | null => document.querySelector("dialog.drawer");
 const drawerOpen = (): boolean => drawer()?.hasAttribute("open") === true;
+
+const oldTask = card({
+	id: "OTTR-441",
+	title: "Old done task",
+	sessionTitle: "Old done task",
+	project: "alpha",
+	state: "idle",
+	stage: "done",
+	createdAt: 1,
+	doneAt: 100,
+});
+const oldTaskView = {
+	...oldTask,
+	prompt: "The older task prompt.",
+	summary: null,
+	details: null,
+	report: null,
+	diffFiles: null,
+	turns: [],
+	workCheckLog: [],
+	workCheckReport: null,
+	gate: null,
+	worktreeFiles: [],
+	shots: [],
+	images: [],
+	pendingImages: [],
+	keptFiles: [],
+	lateCommits: [],
+} as unknown as TaskView;
+const oldTaskPath = "/projects/alpha/tasks/OTTR-441";
+const oldTaskDetailUrl = "/api/projects/alpha/tasks/OTTR-441";
+const oldDonePageUrl = "/api/projects/alpha/done?page=2";
+
+const jsonResponse = (body: unknown, status = 200): Response =>
+	new Response(JSON.stringify(body), {
+		status,
+		headers: { "Content-Type": "application/json" },
+	});
+
+async function withOldTaskFixture(
+	respondToDetail: (attempt: number) => Promise<Response>,
+	run: (counts: {
+		detailRequests: () => number;
+		stateRequests: () => number;
+	}) => Promise<void>,
+): Promise<void> {
+	const alpha = projects[0]!;
+	const previousDoneTotal = alpha.doneTotal;
+	const previousFetch = host.fetch;
+	let detailRequests = 0;
+	let stateRequests = 0;
+	alpha.doneTotal =
+		tasks.filter((task) => task.project === alpha.name && task.stage === "done")
+			.length + 1;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		const url = String(input);
+		if (url === oldDonePageUrl)
+			return jsonResponse({ tasks: [oldTask], total: alpha.doneTotal });
+		if (url === oldTaskDetailUrl) return respondToDetail(++detailRequests);
+		if (url === "/api/state") stateRequests++;
+		return fetchMock(input);
+	}) as typeof fetch;
+	try {
+		await run({
+			detailRequests: () => detailRequests,
+			stateRequests: () => stateRequests,
+		});
+	} finally {
+		try {
+			await unmountApp();
+		} finally {
+			alpha.doneTotal = previousDoneTotal;
+			host.fetch = previousFetch;
+		}
+	}
+}
+
+const drawerHasTitle = (title: string): boolean =>
+	drawerOpen() && drawer()?.querySelector("h2")?.textContent === title;
+const oldTaskDrawerLoaded = (): boolean =>
+	drawerHasTitle(oldTask.sessionTitle ?? oldTask.title) &&
+	(drawer()?.textContent?.includes("The older task prompt.") ?? false);
+
+const openCard = async (id: string): Promise<void> => {
+	const open = cardEl(id)?.querySelector("a.card-open");
+	expect(open).not.toBeNull();
+	await click(open!);
+};
+
+const openOlderDoneCard = async (): Promise<void> => {
+	const more = document.querySelector<HTMLButtonElement>("button.lane-more");
+	expect(more).not.toBeNull();
+	await click(more!);
+	await waitFor(() => cardEl(oldTask.id) !== null);
+	await openCard(oldTask.id);
+};
+
+const appErrorRow = (): Element | null =>
+	document.querySelector('#inbox .notif-line[data-inbox-key^="crit:"]');
+
+async function expectOldTaskRetryAfter(
+	fail: () => Promise<Response>,
+): Promise<void> {
+	await withOldTaskFixture(
+		(attempt) =>
+			attempt === 1 ? fail() : Promise.resolve(jsonResponse(oldTaskView)),
+		async ({ detailRequests }) => {
+			await mountAt("/projects/alpha");
+			await openOlderDoneCard();
+			await waitFor(() => appErrorRow() !== null);
+			expect(appErrorRow()?.textContent?.trim().length ?? 0).toBeGreaterThan(0);
+			const drawerTitle = drawer()?.querySelector("h2")?.textContent;
+			expect(drawerTitle === undefined || drawerTitle === oldTask.title).toBe(
+				true,
+			);
+			expect(drawer()?.textContent ?? "").not.toContain(
+				"The older task prompt.",
+			);
+			expect(window.location.pathname).toBe(oldTaskPath);
+
+			await openCard("AL-1");
+			await waitFor(() => drawerHasTitle("Alpha work"));
+			await openCard(oldTask.id);
+			await waitFor(oldTaskDrawerLoaded);
+			expect(detailRequests()).toBeGreaterThanOrEqual(2);
+		},
+	);
+}
+
+// --- old Done task details --------------------------------------------------
 
 // --- tests ------------------------------------------------------------------
 
@@ -476,6 +644,434 @@ test("a pasted card URL loads that project's board with the drawer open", async 
 	} finally {
 		await unmountApp();
 	}
+});
+
+test("an initial legacy hash URL opens its project", async () => {
+	await mountAt("/#alpha");
+	try {
+		expect(header()).toBe("Alpha");
+		expect(window.location.pathname).toBe("/projects/alpha");
+		expect(window.location.hash).toBe("");
+	} finally {
+		await unmountApp();
+	}
+});
+
+test("Show more opens an older done task at its canonical URL", async () => {
+	await withOldTaskFixture(
+		async () => jsonResponse(oldTaskView),
+		async () => {
+			await mountAt("/projects/alpha");
+			await openOlderDoneCard();
+			await waitFor(oldTaskDrawerLoaded);
+			expect(window.location.pathname).toBe(oldTaskPath);
+			expect(drawerOpen()).toBe(true);
+			expect(drawer()?.querySelector("h2")?.textContent).toBe("Old done task");
+			expect(drawer()?.textContent).toContain("The older task prompt.");
+		},
+	);
+});
+
+test("a pasted old task URL opens its drawer", async () => {
+	await withOldTaskFixture(
+		async () => jsonResponse(oldTaskView),
+		async () => {
+			await mountAt(oldTaskPath);
+			await waitFor(oldTaskDrawerLoaded);
+			expect(window.location.pathname).toBe(oldTaskPath);
+			expect(drawerOpen()).toBe(true);
+			expect(drawer()?.querySelector("h2")?.textContent).toBe("Old done task");
+			expect(drawer()?.textContent).toContain("The older task prompt.");
+		},
+	);
+});
+
+test("a slim state refresh keeps an older task drawer open", async () => {
+	await withOldTaskFixture(
+		async () => jsonResponse(oldTaskView),
+		async ({ stateRequests }) => {
+			await mountAt("/projects/alpha");
+			await openOlderDoneCard();
+			await waitFor(oldTaskDrawerLoaded);
+			const before = stateRequests();
+			await act(async () => {
+				refreshState();
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setTimeout(resolve, 10);
+				await promise;
+			});
+			expect(stateRequests()).toBeGreaterThan(before);
+			expect(oldTaskDrawerLoaded()).toBe(true);
+		},
+	);
+});
+
+test("an old pinned task stays open when its state row disappears", async () => {
+	const pinned = card({ ...oldTask, starred: true });
+	const pinnedView = { ...oldTaskView, ...pinned } as TaskView;
+	const pendingDetail = Promise.withResolvers<Response>();
+	const releaseDetail = pendingDetail.resolve;
+	const previousTasks = state.tasks;
+	state.tasks = [...previousTasks, pinned];
+	try {
+		await withOldTaskFixture(
+			(attempt) =>
+				attempt === 1
+					? Promise.resolve(jsonResponse(pinnedView))
+					: pendingDetail.promise,
+			async ({ detailRequests, stateRequests }) => {
+				try {
+					await mountAt("/projects/alpha");
+					await openCard(pinned.id);
+					await waitFor(() => detailRequests() === 1 && oldTaskDrawerLoaded());
+					const selectedDialog = drawer();
+					expect(selectedDialog).not.toBeNull();
+					const workSteps = selectedDialog!.querySelector<HTMLButtonElement>(
+						'button[aria-controls="drawer-steps"]',
+					);
+					expect(workSteps).not.toBeNull();
+					await click(workSteps!);
+					expect(workSteps!.getAttribute("aria-expanded")).toBe("true");
+					const expectPinnedDrawer = () => {
+						expect(drawer()).toBe(selectedDialog);
+						expect(drawerOpen()).toBe(true);
+						expect(drawerHasTitle(pinned.sessionTitle ?? pinned.title)).toBe(
+							true,
+						);
+						expect(selectedDialog!.textContent).toContain(
+							"The older task prompt.",
+						);
+						expect(workSteps!.getAttribute("aria-expanded")).toBe("true");
+					};
+
+					const before = stateRequests();
+					state.tasks = previousTasks;
+					await act(async () => {
+						refreshState();
+						const { promise, resolve } = Promise.withResolvers<void>();
+						setTimeout(resolve, 10);
+						await promise;
+					});
+					expect(stateRequests()).toBeGreaterThan(before);
+					expect(drawer()).toBe(selectedDialog);
+
+					await waitFor(() => detailRequests() === 2);
+					expectPinnedDrawer();
+
+					releaseDetail(jsonResponse(pinnedView));
+					await act(async () => {
+						const { promise, resolve } = Promise.withResolvers<void>();
+						setTimeout(resolve, 10);
+						await promise;
+					});
+					expectPinnedDrawer();
+				} finally {
+					releaseDetail(jsonResponse(pinnedView));
+				}
+			},
+		);
+	} finally {
+		state.tasks = previousTasks;
+	}
+});
+
+test("a late old task detail cannot replace a newly opened task", async () => {
+	const delayedOldDetail = Promise.withResolvers<Response>();
+	const releaseOldDetail = delayedOldDetail.resolve;
+	await withOldTaskFixture(
+		(attempt) =>
+			attempt === 1
+				? delayedOldDetail.promise
+				: Promise.resolve(jsonResponse(oldTaskView)),
+		async ({ detailRequests }) => {
+			try {
+				await mountAt("/projects/alpha");
+				await openOlderDoneCard();
+				await waitFor(() => detailRequests() === 1);
+				await openCard("AL-1");
+				await waitFor(() => drawerHasTitle("Alpha work"));
+				expect(window.location.pathname).toBe("/projects/alpha/tasks/AL-1");
+
+				releaseOldDetail(jsonResponse(oldTaskView));
+				await act(async () => {
+					const { promise, resolve } = Promise.withResolvers<void>();
+					setTimeout(resolve, 10);
+					await promise;
+				});
+				expect(drawerHasTitle("Alpha work")).toBe(true);
+				expect(drawer()?.textContent ?? "").not.toContain(
+					"The older task prompt.",
+				);
+				expect(window.location.pathname).toBe("/projects/alpha/tasks/AL-1");
+			} finally {
+				releaseOldDetail(jsonResponse(oldTaskView));
+			}
+		},
+	);
+});
+
+test("a late old task detail after Back keeps the board closed", async () => {
+	const pendingDetail = Promise.withResolvers<Response>();
+	const releaseDetail = pendingDetail.resolve;
+	await withOldTaskFixture(
+		() => pendingDetail.promise,
+		async ({ detailRequests }) => {
+			try {
+				await mountAt("/projects/alpha");
+				await openOlderDoneCard();
+				await waitFor(() => detailRequests() === 1);
+				expect(window.location.pathname).toBe(oldTaskPath);
+
+				await act(async () => {
+					window.history.back();
+				});
+				await waitFor(
+					() => window.location.pathname === "/projects/alpha" && !drawerOpen(),
+				);
+				releaseDetail(jsonResponse(oldTaskView));
+				await act(async () => {
+					const { promise, resolve } = Promise.withResolvers<void>();
+					setTimeout(resolve, 10);
+					await promise;
+				});
+				expect(drawerOpen()).toBe(false);
+				expect(window.location.pathname).toBe("/projects/alpha");
+			} finally {
+				releaseDetail(jsonResponse(oldTaskView));
+			}
+		},
+	);
+});
+
+test("a current state task keeps its title over a late old detail", async () => {
+	const pendingDetail = Promise.withResolvers<Response>();
+	const releaseDetail = pendingDetail.resolve;
+	const currentTask = card({
+		...oldTask,
+		title: "Current frame title",
+		sessionTitle: "Current frame title",
+		updatedAt: 200,
+	});
+	const currentTaskView: TaskView = {
+		...oldTaskView,
+		title: currentTask.title,
+		sessionTitle: currentTask.sessionTitle,
+	};
+	const previousTaskCount = state.tasks.length;
+	await withOldTaskFixture(
+		(attempt) =>
+			attempt === 1
+				? pendingDetail.promise
+				: Promise.resolve(jsonResponse(currentTaskView)),
+		async ({ detailRequests, stateRequests }) => {
+			try {
+				await mountAt("/projects/alpha");
+				await openOlderDoneCard();
+				await waitFor(() => detailRequests() === 1);
+				const before = stateRequests();
+				state.tasks.push(currentTask);
+				await act(async () => {
+					refreshState();
+					const { promise, resolve } = Promise.withResolvers<void>();
+					setTimeout(resolve, 10);
+					await promise;
+				});
+				expect(stateRequests()).toBeGreaterThan(before);
+				await waitFor(() => drawerHasTitle("Current frame title"));
+
+				releaseDetail(jsonResponse(oldTaskView));
+				await act(async () => {
+					const { promise, resolve } = Promise.withResolvers<void>();
+					setTimeout(resolve, 10);
+					await promise;
+				});
+				expect(drawerHasTitle("Current frame title")).toBe(true);
+				expect(window.location.pathname).toBe(oldTaskPath);
+			} finally {
+				state.tasks.length = previousTaskCount;
+				releaseDetail(jsonResponse(oldTaskView));
+			}
+		},
+	);
+});
+
+test("a newer current row stays selected after an old task leaves state", async () => {
+	const currentTask = card({
+		...oldTask,
+		title: "Current frame title",
+		sessionTitle: "Current frame title",
+		updatedAt: 200,
+	});
+	const currentTaskView = { ...oldTaskView, ...currentTask } as TaskView;
+	let currentDetail: TaskView = oldTaskView;
+	const pendingDetail = Promise.withResolvers<Response>();
+	const releaseDetail = pendingDetail.resolve;
+	const previousTasks = state.tasks;
+	let afterEviction = false;
+	try {
+		await withOldTaskFixture(
+			() =>
+				afterEviction
+					? pendingDetail.promise
+					: Promise.resolve(jsonResponse(currentDetail)),
+			async ({ detailRequests, stateRequests }) => {
+				try {
+					await mountAt("/projects/alpha");
+					await openOlderDoneCard();
+					await waitFor(oldTaskDrawerLoaded);
+					const selectedDialog = drawer();
+					expect(selectedDialog).not.toBeNull();
+					const expectCurrentDrawer = () => {
+						expect(drawer()).toBe(selectedDialog);
+						expect(drawerOpen()).toBe(true);
+						expect(drawerHasTitle("Current frame title")).toBe(true);
+						expect(selectedDialog!.textContent).toContain(
+							"The older task prompt.",
+						);
+					};
+					currentDetail = currentTaskView;
+
+					const before = stateRequests();
+					state.tasks = [...previousTasks, currentTask];
+					await act(async () => {
+						refreshState();
+						const { promise, resolve } = Promise.withResolvers<void>();
+						setTimeout(resolve, 10);
+						await promise;
+					});
+					expect(stateRequests()).toBeGreaterThan(before);
+					await waitFor(() => drawerHasTitle("Current frame title"));
+					expectCurrentDrawer();
+
+					const detailsBeforeEviction = detailRequests();
+					const stateBeforeEviction = stateRequests();
+					afterEviction = true;
+					state.tasks = previousTasks;
+					await act(async () => {
+						refreshState();
+						const { promise, resolve } = Promise.withResolvers<void>();
+						setTimeout(resolve, 10);
+						await promise;
+					});
+					expect(stateRequests()).toBeGreaterThan(stateBeforeEviction);
+					expect(drawer()).toBe(selectedDialog);
+					await waitFor(() => detailRequests() > detailsBeforeEviction);
+					expectCurrentDrawer();
+
+					releaseDetail(jsonResponse(currentTaskView));
+					await act(async () => {
+						const { promise, resolve } = Promise.withResolvers<void>();
+						setTimeout(resolve, 10);
+						await promise;
+					});
+					expectCurrentDrawer();
+				} finally {
+					releaseDetail(jsonResponse(currentTaskView));
+				}
+			},
+		);
+	} finally {
+		state.tasks = previousTasks;
+	}
+});
+
+test("Back and Forward restore old task URLs and Close exits the drawer", async () => {
+	await withOldTaskFixture(
+		async () => jsonResponse(oldTaskView),
+		async () => {
+			await mountAt(oldTaskPath);
+			await waitFor(oldTaskDrawerLoaded);
+			await openCard("AL-1");
+			await waitFor(() => drawerHasTitle("Alpha work"));
+			expect(window.location.pathname).toBe("/projects/alpha/tasks/AL-1");
+
+			await act(async () => {
+				window.history.back();
+			});
+			await waitFor(
+				() => window.location.pathname === oldTaskPath && oldTaskDrawerLoaded(),
+			);
+			await act(async () => {
+				window.history.forward();
+			});
+			await waitFor(
+				() =>
+					window.location.pathname === "/projects/alpha/tasks/AL-1" &&
+					drawerHasTitle("Alpha work"),
+			);
+
+			await act(async () => {
+				window.history.back();
+			});
+			await waitFor(
+				() => window.location.pathname === oldTaskPath && oldTaskDrawerLoaded(),
+			);
+			const close = drawer()?.querySelector<HTMLButtonElement>(
+				'button[aria-label="Close"]',
+			);
+			expect(close).not.toBeNull();
+			await click(close!);
+			await waitFor(
+				() => !drawerOpen() && window.location.pathname === "/projects/alpha",
+			);
+			expect(drawerOpen()).toBe(false);
+			expect(window.location.pathname).toBe("/projects/alpha");
+		},
+	);
+});
+
+test.each(["/", "/#alpha"])(
+	"Back and Forward restore a legacy task entry at %s",
+	async (legacyPath) => {
+		await mountAt("/projects/beta/tasks/BE-1");
+		try {
+			window.history.pushState({ ompTask: "AL-1" }, "", legacyPath);
+			await openCard("BE-2");
+			await waitFor(() => drawerHasTitle("Beta follow-up"));
+
+			await act(async () => {
+				window.history.back();
+			});
+			await waitFor(() => drawerHasTitle("Alpha work"));
+			expect(appErrorRow()).toBeNull();
+
+			await act(async () => {
+				window.history.back();
+			});
+			await waitFor(() => drawerHasTitle("Beta needs you"));
+			await act(async () => {
+				window.history.forward();
+			});
+			await waitFor(() => drawerHasTitle("Alpha work"));
+			expect(appErrorRow()).toBeNull();
+
+			await act(async () => {
+				window.history.forward();
+			});
+			await waitFor(() => drawerHasTitle("Beta follow-up"));
+			expect(window.location.pathname).toBe("/projects/beta/tasks/BE-2");
+		} finally {
+			await unmountApp();
+		}
+	},
+);
+
+test("a missing old task detail shows an error and can retry", async () => {
+	await expectOldTaskRetryAfter(async () =>
+		jsonResponse({ error: "Task not found" }, 404),
+	);
+});
+
+test("a server error for an old task detail can retry", async () => {
+	await expectOldTaskRetryAfter(async () =>
+		jsonResponse({ error: "Task unavailable" }, 500),
+	);
+});
+
+test("a transport error for an old task detail can retry", async () => {
+	await expectOldTaskRetryAfter(async () => {
+		throw new Error("Network unavailable");
+	});
 });
 
 test("opening a card of the current project keeps the mounted lanes", async () => {
@@ -788,6 +1384,261 @@ test("the System view's Turns cell shows each worker turn's memory and CPU", asy
 			"2.5 GiB · peak 3.0 GiB · 87 % CPU · 3 min CPU time",
 		);
 		expect(items[1]?.querySelector(".sys-sub")).toBeNull();
+	} finally {
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
+test("the System view's vm-runner row shows health, fleet, disk, VM facts, and busy cards", async () => {
+	const vmRunner: ContainerRow = {
+		name: "vm-runner",
+		reachable: true,
+		unreachableSince: null,
+		cpuPct: 12,
+		cpuShare: 4,
+		memUsed: 1024 ** 3,
+		memLimit: 8 * 1024 ** 3,
+		memMaxHits: 0,
+		oomKills: 0,
+		memMaxHitsHour: null,
+		oomKillsHour: null,
+		history: [],
+		cards: [
+			{
+				project: "alpha",
+				id: "V-1",
+				usage: {
+					mem: 0.5 * 1024 ** 3,
+					memPeak: 0.6 * 1024 ** 3,
+					cpuPct: 40,
+					cpuSec: 30,
+				},
+			},
+			// The validate run the runner has not weighed yet: the VM facts alone.
+			{ project: "beta", id: "V-2", usage: null },
+		],
+		lock: { holderPid: null, holderCard: null, waiters: [] },
+		warnings: [],
+		vm: {
+			health: { ok: true, reason: null },
+			max: 10,
+			vms: [
+				{
+					id: "run-1",
+					project: "alpha",
+					cardId: "V-1",
+					mode: "turn",
+					vcpus: 2,
+					memMiB: 512,
+					startedAt: 1000,
+					scratchBytes: 2 * 1024 ** 3,
+				},
+				{
+					id: "val-1",
+					project: "beta",
+					cardId: "V-2",
+					mode: "validate",
+					vcpus: 1,
+					memMiB: 1024,
+					startedAt: 1000,
+					scratchBytes: null,
+				},
+			],
+			disk: { base: 1024 ** 3, layers: 2 * 1024 ** 3, runs: 0.5 * 1024 ** 3 },
+			busy: [{ project: "alpha", id: "V-3" }],
+		},
+	};
+	const realFetch = host.fetch;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) !== "/api/system")
+			return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+				input,
+			);
+		const base = (await (
+			await (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+				input,
+			)
+		).json()) as SystemSnapshot;
+		return new Response(JSON.stringify({ ...base, containers: [vmRunner] }), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}) as typeof fetch;
+	window.history.replaceState(null, "", "/system");
+	container = window.document.createElement("div") as unknown as HTMLDivElement;
+	window.document.body.appendChild(container as unknown as HappyNode);
+	root = createRoot(container);
+	try {
+		await act(async () => {
+			root?.render(<App />);
+		});
+		await waitFor(() => document.querySelector("ul.sys-turns") !== null);
+		const text = document.body.textContent!;
+		expect(text).toContain("vm-runner ok");
+		expect(text).toContain("2 / 10 VMs");
+		expect(text).toContain(
+			"vm-state 3.5 GiB allocated (base 1.0 · layers 2.0 · runs 0.5)",
+		);
+		const items = [...document.querySelectorAll("ul.sys-turns > li")];
+		expect(items.map((li) => li.querySelector("a")?.textContent)).toEqual([
+			"V-1",
+			"V-2",
+		]);
+		// Second sub-line of the first item: the VM facts under the usage line.
+		expect(items[0]?.querySelectorAll(".sys-sub")[1]?.textContent).toContain(
+			"turn · 2 vCPU · 512 MiB guest · scratch 2.0 GiB allocated · since",
+		);
+		// No usage on the validate run, so its only sub-line is the VM facts —
+		// and with no scratch disk yet, the scratch part is gone.
+		expect(items[1]?.querySelector(".sys-sub")?.textContent).toContain(
+			"validate · 1 vCPU · 1024 MiB guest · since",
+		);
+		expect(items[1]?.querySelector(".sys-sub")?.textContent).not.toContain(
+			"scratch",
+		);
+		expect(text).toContain("waiting for a free VM:");
+		expect(
+			[...document.querySelectorAll("a")].some((a) => a.textContent === "V-3"),
+		).toBe(true);
+	} finally {
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
+test("an unreachable vm-runner row keeps the gap cell, the health reason, and busy cards", async () => {
+	const down: ContainerRow = {
+		name: "vm-runner",
+		reachable: false,
+		unreachableSince: 1000,
+		cpuPct: null,
+		cpuShare: null,
+		memUsed: null,
+		memLimit: null,
+		memMaxHits: null,
+		oomKills: null,
+		memMaxHitsHour: null,
+		oomKillsHour: null,
+		history: [],
+		cards: [{ project: "alpha", id: "V-4", usage: null }],
+		lock: { holderPid: null, holderCard: null, waiters: [] },
+		warnings: [],
+		vm: {
+			health: { ok: false, reason: "no answer from http://vm-runner:8399" },
+			max: null,
+			vms: [],
+			disk: null,
+			busy: [{ project: "alpha", id: "V-5" }],
+		},
+	};
+	const realFetch = host.fetch;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) !== "/api/system")
+			return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+				input,
+			);
+		const base = (await (
+			await (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+				input,
+			)
+		).json()) as SystemSnapshot;
+		return new Response(JSON.stringify({ ...base, containers: [down] }), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}) as typeof fetch;
+	window.history.replaceState(null, "", "/system");
+	container = window.document.createElement("div") as unknown as HTMLDivElement;
+	window.document.body.appendChild(container as unknown as HappyNode);
+	root = createRoot(container);
+	try {
+		await act(async () => {
+			root?.render(<App />);
+		});
+		await waitFor(() => document.querySelector("td.sys-gap") !== null);
+		expect(document.querySelector("td.sys-gap")!.textContent).toContain(
+			"not reachable since",
+		);
+		const text = document.body.textContent!;
+		expect(text).toContain("no answer from http://vm-runner:8399");
+		// No reachable reading: no fleet count and no disk line at all.
+		expect(text).not.toContain("VMs");
+		expect(text).not.toContain("allocated");
+		expect(text).toContain("waiting for a free VM:");
+		expect(
+			[...document.querySelectorAll("a")].some((a) => a.textContent === "V-5"),
+		).toBe(true);
+		// The listed card has no usage and no live VM behind it: the bare link.
+		const items = [...document.querySelectorAll("ul.sys-turns > li")];
+		expect(items[0]?.querySelector("a")?.textContent).toBe("V-4");
+		expect(items[0]?.querySelector(".sys-sub")).toBeNull();
+	} finally {
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
+test("a board without a vm-runner row renders containers as before", async () => {
+	const server: ContainerRow = {
+		name: "server",
+		reachable: true,
+		unreachableSince: null,
+		cpuPct: 5,
+		cpuShare: 4,
+		memUsed: 1024 ** 3,
+		memLimit: 8 * 1024 ** 3,
+		memMaxHits: 0,
+		oomKills: 0,
+		memMaxHitsHour: null,
+		oomKillsHour: null,
+		history: [],
+		cards: [
+			{
+				project: "alpha",
+				id: "AL-1",
+				usage: {
+					mem: 2.5 * 1024 ** 3,
+					memPeak: 3 * 1024 ** 3,
+					cpuPct: 87.4,
+					cpuSec: 150,
+				},
+			},
+		],
+		lock: { holderPid: null, holderCard: null, waiters: [] },
+		warnings: [],
+	};
+	const realFetch = host.fetch;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) !== "/api/system")
+			return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+				input,
+			);
+		const base = (await (
+			await (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+				input,
+			)
+		).json()) as SystemSnapshot;
+		return new Response(JSON.stringify({ ...base, containers: [server] }), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	}) as typeof fetch;
+	window.history.replaceState(null, "", "/system");
+	container = window.document.createElement("div") as unknown as HTMLDivElement;
+	window.document.body.appendChild(container as unknown as HappyNode);
+	root = createRoot(container);
+	try {
+		await act(async () => {
+			root?.render(<App />);
+		});
+		await waitFor(() => document.querySelector("ul.sys-turns") !== null);
+		expect(document.body.textContent!.includes("vm-runner")).toBe(false);
+		const items = [...document.querySelectorAll("ul.sys-turns > li")];
+		expect(items[0]?.querySelector("a")?.textContent).toBe("AL-1");
+		expect(items[0]?.querySelector(".sys-sub")?.textContent).toBe(
+			"2.5 GiB · peak 3.0 GiB · 87 % CPU · 3 min CPU time",
+		);
 	} finally {
 		host.fetch = realFetch;
 		await unmountApp();
@@ -1341,5 +2192,244 @@ test("five card references clamp to three links and expand in place", async () =
 	} finally {
 		restore();
 		await unmountApp();
+	}
+});
+
+// --- OTTR-1136: cards outside the state frame ---------------------------------
+
+/** One JSON answer for the per-test fetch override. */
+const jsonRes = (body: unknown, status = 200): Response =>
+	new Response(JSON.stringify(body), {
+		status,
+		headers: { "Content-Type": "application/json" },
+	});
+
+/** The wide TaskView shape the drawer's detail fetch reads, built over a slim row. */
+const wideOf = (row: TaskCard): unknown => ({
+	...row,
+	prompt: "work",
+	summary: null,
+	gate: null,
+	workCheckReport: null,
+	turns: [],
+	details: null,
+	report: null,
+	diffFiles: null,
+	worktreeFiles: [],
+	workCheckLog: [],
+});
+
+/** A Done window the state frame carries (the newest DONE_PAGE cards) with a
+ * doneTotal that names five more, so the lane offers "Show more". */
+const doneWindow = (): {
+	win: StateResponse;
+	alpha: ProjectView;
+} => {
+	const alpha = { ...projects[0], doneTotal: 25 } as ProjectView;
+	const held = Array.from({ length: 20 }, (_, j) =>
+		card({
+			id: `D-${j}`,
+			title: `Held ${j}`,
+			sessionTitle: `Held ${j}`,
+			stage: "done",
+			state: "idle",
+			doneAt: 2000 - j,
+			revision: 1,
+		}),
+	);
+	const win = {
+		...state,
+		projects: [alpha, projects[1]],
+		tasks: held,
+	} as unknown as StateResponse;
+	return { win, alpha };
+};
+
+/** A fetched Done page card that sits outside the state frame. */
+const oldCard = (over: Partial<TaskCard>): TaskCard =>
+	card({
+		title: "Older nine",
+		sessionTitle: "Older nine",
+		id: "OLD-9",
+		project: "alpha",
+		stage: "done",
+		state: "idle",
+		doneAt: 90,
+		revision: 1,
+		...over,
+	});
+
+test("a Show more card outside the state window opens in the drawer", async () => {
+	const { win } = doneWindow();
+	const page2 = [oldCard({})];
+	setFetch((url) => {
+		if (url === "/api/projects/alpha/done?page=2")
+			return jsonRes({ tasks: page2, total: 21 });
+		if (url === "/api/projects/alpha/tasks/OLD-9")
+			return jsonRes(wideOf(page2[0]!));
+		return null;
+	});
+	setFrame(win);
+	await mountAt("/projects/alpha");
+	try {
+		const more = document.querySelector<HTMLButtonElement>("button.lane-more");
+		expect(more).not.toBeNull();
+		await click(more!);
+		await waitFor(() => cardEl("OLD-9") !== null);
+		const link = cardEl("OLD-9")!.querySelector("a.card-open");
+		expect(link).not.toBeNull();
+		await click(link!);
+		await waitFor(drawerOpen);
+		expect(drawer()?.querySelector("h2")?.textContent).toBe("Older nine");
+	} finally {
+		await unmountApp();
+		setFetch(null);
+		setFrame(null);
+	}
+});
+
+test("a deep link to a done card outside the window opens it after the fetch", async () => {
+	const deep = oldCard({
+		id: "DEEP-1",
+		title: "Deep old card",
+		sessionTitle: "Deep old card",
+		doneAt: 5,
+	});
+	let gated = false;
+	const { promise: gate, resolve: release } = Promise.withResolvers<void>();
+	setFetch((url) => {
+		if (url === "/api/projects/alpha/tasks/DEEP-1") {
+			// The first fetch waits, so the drawer's loading state renders.
+			if (gated) return jsonRes(wideOf(deep));
+			gated = true;
+			return gate.then(() => jsonRes(wideOf(deep)));
+		}
+		return null;
+	});
+	await mountAt("/projects/alpha/tasks/DEEP-1");
+	try {
+		await waitFor(drawerOpen);
+		expect(
+			drawer()?.querySelector('[aria-label="Loading the card"]'),
+		).not.toBeNull();
+		release();
+		await waitFor(
+			() => drawer()?.querySelector("h2")?.textContent === "Deep old card",
+		);
+		expect(drawerOpen()).toBe(true);
+	} finally {
+		release();
+		await unmountApp();
+		setFetch(null);
+	}
+});
+
+test("an unknown id shows not-found and a failed fetch offers Retry", async () => {
+	let brokenCalls = 0;
+	const healed = oldCard({
+		id: "BROKEN-7",
+		title: "Broken card",
+		sessionTitle: "Broken card",
+	});
+	setFetch((url) => {
+		if (url === "/api/projects/alpha/tasks/GONE-1")
+			return jsonRes({ error: "unknown task" }, 404);
+		if (url === "/api/projects/alpha/tasks/BROKEN-7") {
+			brokenCalls++;
+			return brokenCalls === 1
+				? jsonRes({ error: "no" }, 500)
+				: jsonRes(wideOf(healed));
+		}
+		return null;
+	});
+	await mountAt("/projects/alpha/tasks/GONE-1");
+	try {
+		await waitFor(
+			() =>
+				document.body.textContent?.includes("Card not found: GONE-1") === true,
+		);
+		const close = [...document.querySelectorAll("dialog.drawer button")].find(
+			(b) => b.textContent?.trim() === "Close",
+		);
+		expect(close).toBeDefined();
+		await click(close!);
+		await waitFor(() => !drawerOpen());
+
+		// A failed fetch shows the retry shell; the retry then opens the card.
+		await unmountApp();
+		await mountAt("/projects/alpha/tasks/BROKEN-7");
+		await waitFor(
+			() =>
+				document.body.textContent?.includes("Loading the card failed.") ===
+				true,
+		);
+		const retry = [...document.querySelectorAll("dialog.drawer button")].find(
+			(b) => b.textContent?.trim() === "Retry",
+		);
+		expect(retry).toBeDefined();
+		await click(retry!);
+		await waitFor(
+			() => drawer()?.querySelector("h2")?.textContent === "Broken card",
+		);
+		expect(drawerOpen()).toBe(true);
+		// The retry's own fetch plus the drawer's detail fetch and the row refresh
+		// all read the same route; the drawer opening proves the retry healed it.
+		expect(brokenCalls).toBeGreaterThanOrEqual(2);
+	} finally {
+		await unmountApp();
+		setFetch(null);
+	}
+});
+
+test("an open older card stays open across frames and follows changes", async () => {
+	const { win } = doneWindow();
+	const v1 = oldCard({});
+	const v2 = oldCard({
+		title: "Older nine, revised",
+		sessionTitle: "Older nine, revised",
+		revision: 2,
+	});
+	let frame2 = false;
+	setFetch((url) => {
+		if (url === "/api/projects/alpha/done?page=2")
+			return jsonRes({ tasks: [v1], total: 21 });
+		if (url === "/api/projects/alpha/tasks/OLD-9")
+			return jsonRes(wideOf(frame2 ? v2 : v1));
+		return null;
+	});
+	setFrame(win);
+	await mountAt("/projects/alpha");
+	try {
+		const more = document.querySelector<HTMLButtonElement>("button.lane-more");
+		await click(more!);
+		await waitFor(() => cardEl("OLD-9") !== null);
+		const link = cardEl("OLD-9")!.querySelector("a.card-open");
+		await click(link!);
+		await waitFor(
+			() => drawer()?.querySelector("h2")?.textContent === "Older nine",
+		);
+		// A new frame that still lacks the card must not close the drawer.
+		frame2 = true;
+		const moved = { ...win.tasks[0]!, title: "Held 0 v2" };
+		setFrame({
+			...win,
+			tasks: [moved, ...win.tasks.slice(1)],
+		} as unknown as StateResponse);
+		refreshState();
+		await waitFor(
+			() => document.body.textContent?.includes("Held 0 v2") === true,
+		);
+		// The frame still lacks the card, but the drawer stays open.
+		expect(drawerOpen()).toBe(true);
+		// The frame refetch of the open row carries the revision bump into the drawer.
+		await waitFor(
+			() =>
+				drawer()?.querySelector("h2")?.textContent === "Older nine, revised",
+		);
+		expect(drawerOpen()).toBe(true);
+	} finally {
+		await unmountApp();
+		setFetch(null);
+		setFrame(null);
 	}
 });

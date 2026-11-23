@@ -1,8 +1,10 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { childDatabaseEnv } from "./childEnv.ts";
 import { gitAuthEnv, parseGitToken, parseGitUrl } from "./gitHosts.ts";
 import { ghEnvFor, githubHost, hostMatcher } from "./githubHost.ts";
+import { stripRepoRelocatingEnv } from "./gitRepoEnv.ts";
 import { platform } from "./platform/index.ts";
 import { type ReviewTask, reviewBlocked } from "./scheduler.ts";
 import type { LateCommit, LatestImage, ReleasePlan, Task } from "./types.ts";
@@ -1087,14 +1089,15 @@ function releaseArgv(command: string): string[] {
 	return argv;
 }
 
-/** The command's env: the process env minus the hosted secret, plus the release facts. */
-function releaseEnv(o: {
+/** The release command's child env: the command's git names its repos with path arguments,
+ * so the ambient repo-relocating vars are stripped (OTTR-1162). Exported for the strip test. */
+export function releaseEnv(o: {
 	sha: string;
 	version: string;
 	notesFile: string;
 	archReview?: { delta: number } | null;
 }): Record<string, string | undefined> {
-	return {
+	const env = {
 		// The hosted signing key never reaches the tenant's command (hosted-mode spec).
 		...withoutHostedSecret(process.env),
 		OTTR_RELEASE_VERSION: o.version,
@@ -1102,6 +1105,10 @@ function releaseEnv(o: {
 		OTTR_RELEASE_NOTES_FILE: o.notesFile,
 		...(o.archReview ? { OTTR_ARCH_REVIEW: String(o.archReview.delta) } : {}),
 	};
+	// OTTR-1162: the command's git names its repos with path arguments, so an inherited
+	// GIT_DIR (a git-hook launch) would redirect its tag/commit into a foreign repository.
+	stripRepoRelocatingEnv(env);
+	return childDatabaseEnv(env);
 }
 
 /** Spawns the command's process tree; a missing binary names the command in the error. */

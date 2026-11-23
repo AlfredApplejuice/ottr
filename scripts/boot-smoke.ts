@@ -133,6 +133,9 @@ const spawnServer = () =>
 			OMP_TRACKER_ROOTS: roots,
 			// Scratch state: the smoke server must never lock the checkout's live tracker.db.
 			OTTR_STATE_DIR: join(roots, "state"),
+			// The omp stats dashboard binds a fixed port by default; "0" disables it, so the
+			// smoke never fights the host board's own dashboard for 3848 in a shared container.
+			OTTR_OMP_STATS_PORT: "0",
 		}),
 		stdout: "ignore",
 		stderr: "pipe",

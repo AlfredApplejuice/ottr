@@ -116,11 +116,13 @@ describe("mergePrompt PR variant", () => {
 		);
 	});
 
-	test("the default path (pr falsy) still names the ff-merge", () => {
+	test("the default path names the server-side integration, not an agent merge", () => {
 		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
 		expect(p).not.toContain("opens the pull request");
 		expect(p).not.toContain("prBody");
-		expect(p).toContain("git merge --ff-only ott/x");
+		expect(p).toContain("Do not run git in the main checkout");
+		expect(p).toContain("the server fast-forwards main to the head of ott/x");
+		expect(p).not.toContain("git merge --ff-only");
 	});
 });
 
@@ -138,37 +140,46 @@ describe("summary requirement", () => {
 	});
 });
 
-describe("mergePrompt fast-forward step", () => {
-	test("names the ff-merge of the branch in the main checkout", () => {
+describe("mergePrompt server-side fast-forward step", () => {
+	test("hands the target fast-forward to the server, not the agent", () => {
 		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
-		expect(p).toContain("git merge --ff-only ott/x");
-		expect(p).toContain("main checkout");
+		expect(p).toContain("Do not run git in the main checkout");
+		expect(p).toContain("the server fast-forwards main to the head of ott/x");
+		expect(p).toContain("with its own pinned git");
+		expect(p).not.toContain("git merge --ff-only");
 	});
 
 	test("derives the checkout branch from a non-main target", () => {
 		const p = mergePrompt({ branch: "ott/x", target: "origin/develop" });
-		expect(p).toContain("fast-forward develop to origin/develop");
-		expect(p).toContain("so develop holds the head of ott/x");
+		expect(p).toContain(
+			"the server fast-forwards develop to the head of ott/x",
+		);
 	});
 
 	test("keeps the origin/main text byte-identical to the literal-main wording", () => {
 		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
-		expect(p).toContain("fast-forward main to origin/main");
-		expect(p).toContain("so main holds the head of ott/x");
+		expect(p).toContain("the server fast-forwards main to the head of ott/x");
 	});
 
 	test("passes an unprefixed target through as the checkout branch", () => {
 		const p = mergePrompt({ branch: "ott/x", target: "main" });
-		expect(p).toContain("fast-forward main to main");
+		expect(p).toContain("the server fast-forwards main to the head of ott/x");
+	});
+
+	test("supersedes project AGENTS.md integration rules", () => {
+		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
+		expect(p).toContain(
+			"An AGENTS.md rule that names different integration commands is superseded by this step",
+		);
 	});
 });
 
 describe("security and cleanup steps", () => {
-	test("the merge turn runs diff-security-review before it integrates", () => {
+	test("the merge turn runs diff-security-review before the server integrates", () => {
 		const p = mergePrompt({ branch: "ott/x", target: "origin/main" });
 		expect(p.indexOf("diff-security-review")).toBeGreaterThan(-1);
 		expect(p.indexOf("diff-security-review")).toBeLessThan(
-			p.indexOf("git merge --ff-only"),
+			p.indexOf("Do not run git in the main checkout"),
 		);
 	});
 
@@ -701,6 +712,13 @@ describe("workCheckPrompt", () => {
 		expect(prompt).not.toContain("Human messages to the work agent");
 	});
 
+	test("a check with no readable transcript names no transcript path", () => {
+		const prompt = workCheckPrompt({ ...input, transcriptPath: undefined });
+		expect(prompt).not.toContain("read it in ranges");
+		expect(prompt).not.toContain("/data/sessions/123_sess.jsonl");
+		expect(prompt.endsWith("diff --git a/src/w.ts b/src/w.ts")).toBe(true);
+	});
+
 	test("a re-check numbers the earlier blockers and demands per-blocker confirmations", () => {
 		const prompt = workCheckPrompt({
 			...input,
@@ -916,7 +934,7 @@ describe("retro prompts", () => {
 			"You run the retro of a completed task. The handoff below holds the task, its outcome, the facts that Ottr computed, the open and declined proposals, and the lessons of earlier retros.",
 		);
 		expect(lines).toContain(
-			"Propose at most one improvement with the propose_task tool. Ottr files it as a card that waits until the user accepts, edits or declines it. Do not propose what the handoff lists as open or declined.",
+			"Propose at most one improvement with the propose_task tool. Ottr files it as a card. The card waits until the user accepts, edits or declines it, unless the project starts proposals without asking. Do not propose what the handoff lists as open or declined.",
 		);
 		expect(p).toContain("End details with the line `topic: retro`.");
 		const oneShot =
@@ -1023,7 +1041,7 @@ describe("retro prompts", () => {
 
 	test("PROPOSE_TOOL_DESCRIPTION verbatim", () => {
 		expect(PROPOSE_TOOL_DESCRIPTION).toBe(
-			"Propose ONE improvement task from this retro. Ottr files it as a held card when the retro ends: it starts only after the user accepts it. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. End the prompt with a section headed 'Acceptance' that holds at least one observable check (a command to run or a result to see); the tool refuses a prompt without one. model: optional model for the task. summary: five short strings the board shows next to the prompt, each the same fact as its prompt part: whatChanges: the file or setting and the edit, in one sentence; why: the cause and the evidence, with the card ids; gain: the saving in concrete units; risk: what can break, or \"none found\"; check: how the result is verified.",
+			"Propose ONE improvement task from this retro. Ottr files it as a card when the retro ends: it starts after the user accepts it, or at once when the project starts proposals without asking. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. End the prompt with a section headed 'Acceptance' that holds at least one observable check (a command to run or a result to see); the tool refuses a prompt without one. model: optional model for the task. summary: five short strings the board shows next to the prompt, each the same fact as its prompt part: whatChanges: the file or setting and the edit, in one sentence; why: the cause and the evidence, with the card ids; gain: the saving in concrete units; risk: what can break, or \"none found\"; check: how the result is verified. decision: optional; the question the user must answer before this task can start, for example a choice between two designs or a scope call. Leave it out when the task needs no decision. A proposal with a decision always waits for the user.",
 		);
 	});
 
@@ -1086,6 +1104,7 @@ describe("handoffMarkdown research report", () => {
 		sourcePrCrossRepo: false,
 		sourcePrDependabot: false,
 		sourcePrSuperseded: false,
+		sourceIssue: null,
 		followUpPrNumber: null,
 		followUpPrUrl: null,
 		pushSha: null,

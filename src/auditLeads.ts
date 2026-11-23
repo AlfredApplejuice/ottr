@@ -1,3 +1,5 @@
+import { shortTitle } from "./prompts.ts";
+
 // The review lead prompt contract (docs/specs/review-findings-persistence.md §4).
 // A lead is a `Needs validation` finding the review pass records through
 // propose_task, the turn's own result channel; the board reads the prompt's
@@ -26,14 +28,88 @@ export function leadFingerprint(prompt: string): string | null {
 	return value === "" ? null : value;
 }
 
-/** A lead card's title key for the fingerprint-less dedupe: the prompt's first
- * line, lower-cased, with runs of whitespace collapsed to one space and trimmed
- * (docs/specs/review-findings-persistence.md "Lead title dedupe"). */
+/** The review prompt's bare lead tag line (OTTR-1164): "Needs validation"
+ * alone on line 1. The older shape put the subject on line 1
+ * ("Needs validation: <subject>"); the current prompt wording produces the
+ * bare tag and the "## Claim" section below it. */
+const LEAD_TAG = "Needs validation";
+
+/** The subject of a lead whose prompt carries the bare tag line: the first
+ * content line of the "## Claim" section, else the first line that is not the
+ * tag, a `Fingerprint:` line, a heading, or blank (docs/specs/
+ * review-findings-persistence.md "Lead title"). Null: any other prompt shape —
+ * for example the older "Needs validation: <subject>" first line — or a
+ * bare-tag prompt with no content line at all; the caller keeps the plain
+ * first-line title then. */
+export function leadSubject(prompt: string): string | null {
+	const lines = prompt.split("\n").map((line) => line.trim());
+	if (lines[0] !== LEAD_TAG) return null;
+	const isContent = (line: string) =>
+		line !== "" && !line.startsWith("#") && !line.startsWith("Fingerprint: ");
+	const claim = lines.findIndex(
+		(line, index) => index > 0 && /^#{1,6}\s+Claim$/.test(line),
+	);
+	if (claim !== -1) {
+		const subject = lines.slice(claim + 1).find(isContent);
+		if (subject !== undefined) return subject;
+	}
+	return lines.slice(1).find(isContent) ?? null;
+}
+
+/** A bare-tag lead's board title: "Needs validation: <subject>", cut with
+ * shortTitle at 80 characters like every other prompt-derived title. Null: no
+ * subject — the plain tag stays the title (docs/specs/
+ * review-findings-persistence.md "Lead title"). */
+export function leadCardTitle(prompt: string): string | null {
+	const subject = leadSubject(prompt);
+	return subject === null ? null : shortTitle(`${LEAD_TAG}: ${subject}`, 80);
+}
+
+/** A lead card's title key for the fingerprint-less dedupe: the subject title
+ * for a bare-tag lead, else the prompt's first line; lower-cased, with runs of
+ * whitespace collapsed to one space and trimmed (docs/specs/
+ * review-findings-persistence.md "Lead title dedupe"). The subject keeps two
+ * fingerprint-less leads with different claims on different keys, so neither
+ * dedupes the other away (OTTR-1164). */
 export function leadTitleKey(prompt: string): string {
-	return (prompt.split("\n")[0] ?? "")
-		.toLowerCase()
-		.replace(/\s+/g, " ")
-		.trim();
+	const subject = leadSubject(prompt);
+	const line =
+		subject === null
+			? (prompt.split("\n")[0] ?? "")
+			: `${LEAD_TAG}: ${subject}`;
+	return line.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/** The minimal query surface both store backends expose (the SQLite wrapper
+ * the store opens and the PostgreSQL wrapper in postgresDriver.ts share the
+ * shape). */
+interface LeadStoreDb {
+	run(text: string, ...params: unknown[]): Promise<unknown>;
+	query<Row, Params extends unknown[]>(
+		text: string,
+	): {
+		all: (...params: Params) => Promise<Row[]>;
+	};
+}
+
+/** OTTR-1164: leads filed while the review prompt put only the bare tag on
+ * line 1 kept "Needs validation" as their whole title. Both store backends run
+ * this step on open: every open card (not done, not cancelled) whose title is
+ * exactly the bare tag gets the subject title derived from its stored prompt.
+ * A card the user renamed — any other title — keeps its title, and so do done
+ * and cancelled cards. Idempotent: the new title names the claim, so the
+ * bare-title match never fires again. */
+export async function retitleBareLeadTitles(db: LeadStoreDb): Promise<void> {
+	const rows = await db
+		.query<{ id: string; prompt: string }, []>(
+			"SELECT id, prompt FROM tasks WHERE title = 'Needs validation' AND stage != 'done' AND cancelled_at IS NULL",
+		)
+		.all();
+	for (const row of rows) {
+		const title = leadCardTitle(row.prompt);
+		if (title === null) continue;
+		await db.run("UPDATE tasks SET title = ? WHERE id = ?", [title, row.id]);
+	}
 }
 
 /** A validation run's per-lead result, read from the recorded prompt's exact

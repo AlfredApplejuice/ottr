@@ -5,6 +5,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { sessionCookieName } from "./auth.ts";
 import {
 	createOmpStatsDashboard,
 	type DashboardChild,
@@ -515,7 +516,7 @@ describe("forwardToDashboard", () => {
 		const res = await forwardToDashboard(
 			request("/api/stats/models?range=24h&x=%20y", {
 				headers: {
-					cookie: "ottr.session=secret",
+					cookie: `${sessionCookieName(3848)}=secret`,
 					authorization: "Bearer t",
 					"x-api-key": "k",
 					"x-forwarded-for": "10.0.0.1",

@@ -1,6 +1,6 @@
 import type { KeyboardEvent, ReactNode, RefObject } from "react";
 import { Fragment, useEffect, useId, useRef, useState } from "react";
-import { Icon, Skeleton } from "./kit.tsx";
+import { Icon, modelPace, Skeleton, useQuota } from "./kit.tsx";
 import { type ModelRow, stepIndex } from "./models.ts";
 
 /** The mechanics one shared model menu instance needs: its popover id, the
@@ -152,7 +152,9 @@ export function ModelMenuTrigger({
 
 /** The popover itself: a search box that filters `rows` (the caller pre-filters with
     modelMatches), the n/total note while a filter is on, and one button per row.
-    `after` renders caller-specific rows behind the list (New task's Thinking menu). */
+    `after` renders caller-specific rows behind the list (New task's Thinking menu).
+    Each provider heading and each omp role row carries its provider's quota pace (modelPace),
+    so the pick can follow the quota; `defaultModel` resolves the Default row's "" selector. */
 export function ModelMenuBody({
 	menu,
 	query,
@@ -163,6 +165,7 @@ export function ModelMenuBody({
 	onPick,
 	loading = false,
 	after,
+	defaultModel,
 }: {
 	menu: ModelMenu;
 	query: string;
@@ -173,7 +176,20 @@ export function ModelMenuBody({
 	onPick: (selector: string) => void;
 	loading?: boolean;
 	after?: ReactNode;
+	defaultModel?: string;
 }) {
+	const limits = useQuota()?.limits ?? [];
+	const now = Date.now();
+	const pace = (selector: string): ReactNode => {
+		const p = selector === "" ? null : modelPace(limits, selector, now);
+		return (
+			p !== null && (
+				<span className="model-pace qt-pace" data-pace={p.pace}>
+					{p.label}
+				</span>
+			)
+		);
+	};
 	return (
 		<div
 			id={menu.popId}
@@ -229,7 +245,12 @@ export function ModelMenuBody({
 					rows.map((r) => (
 						<Fragment key={r.key}>
 							{r.divider && <hr className="model-divider" />}
-							{r.heading && <div className="model-heading">{r.heading}</div>}
+							{r.heading && (
+								<div className="model-heading">
+									<span>{r.heading}</span>
+									{pace(`${r.heading}/`)}
+								</div>
+							)}
 							<button
 								type="button"
 								className="model-option"
@@ -238,7 +259,12 @@ export function ModelMenuBody({
 								onKeyDown={menu.keys}
 							>
 								<span>{r.label}</span>
-								{r.pressed && <Icon name="check" size={14} />}
+								<span className="model-option-end">
+									{/* The role rows sit above every provider heading: each names its own pace. */}
+									{r.key.startsWith("role-") &&
+										pace(r.selector === "" ? (defaultModel ?? "") : r.selector)}
+									{r.pressed && <Icon name="check" size={14} />}
+								</span>
 							</button>
 						</Fragment>
 					))

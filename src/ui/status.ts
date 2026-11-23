@@ -1,3 +1,4 @@
+import { isProposalReason } from "../prompts.ts";
 import {
 	type DepIndex,
 	depHold,
@@ -8,7 +9,7 @@ import {
 	type ReviewTask,
 	reviewFindings,
 } from "../scheduler.ts";
-import type { Task, TaskCard } from "../types.ts";
+import type { ProjectView, Task, TaskCard } from "../types.ts";
 import { duration, until } from "./time.ts";
 
 /** "about X left" for a live turn against its project/kind/model median turn length, in the
@@ -228,7 +229,7 @@ export function statusLine(
 /** The card's state mark. A card idle short of done (a review parked while its findings land)
  * waits like a queued one: only a done card earns the check; a cancelled card earns the x. */
 export function cardMark(
-	t: Pick<Task, "cancelledAt" | "state" | "stage" | "asked">,
+	t: Pick<Task, "cancelledAt" | "state" | "stage" | "asked" | "needsReason">,
 ):
 	| "needs"
 	| "asked"
@@ -238,9 +239,22 @@ export function cardMark(
 	| "done"
 	| "cancelled" {
 	if (t.cancelledAt !== null) return "cancelled";
+	// A proposal is a suggestion, not a fault: it waits like a card not started yet.
+	if (isProposal(t)) return "queued";
 	if (t.state === "needs_you") return t.asked !== null ? "asked" : "needs";
 	if (t.state === "running" || t.state === "preparing") return t.state;
 	return t.state === "queued" || t.stage !== "done" ? "queued" : "done";
+}
+
+/** A retro or fork proposal waiting for the operator's decision: not started, never an alarm. */
+export function isProposal(
+	t: Pick<Task, "state" | "cancelledAt" | "needsReason">,
+): boolean {
+	return (
+		t.state === "needs_you" &&
+		t.cancelledAt === null &&
+		isProposalReason(t.needsReason)
+	);
 }
 
 /** The hold statusLine shows for `t`, over the whole project (`tasks` spans every lane): a
@@ -305,7 +319,8 @@ export function releaseHolding(
 }
 
 /** The alarm split the overview, the areas nav and the notifications share: plain needs_you
- * cards, needs_you cards with an outstanding ask, and live work (preparing counts as running). */
+ * cards, needs_you cards with an outstanding ask, and live work (preparing counts as running).
+ * A proposal is in none of them: it waits for a decision, it does not need action. */
 export function splitAlarms(tasks: readonly TaskCard[]): {
 	needs: TaskCard[];
 	asks: TaskCard[];
@@ -315,10 +330,37 @@ export function splitAlarms(tasks: readonly TaskCard[]): {
 	const asks: TaskCard[] = [];
 	const running: TaskCard[] = [];
 	for (const t of tasks) {
+		if (isProposal(t)) continue;
 		if (t.state === "needs_you") (t.asked !== null ? asks : needs).push(t);
 		else if (t.state === "running" || t.state === "preparing") running.push(t);
 	}
 	return { needs, asks, running };
+}
+
+/** The bell's rows for PR review cards: plain needs-you cards, unseen comment stamps,
+ *  and the board's own posted-review stamps, minus projects whose PR review notifications
+ *  are off (docs/specs/pr-review-auto-post.md). `needs` is splitAlarms' needs split, still
+ *  to quiet-filter. */
+export function bellAlarms(
+	tasks: readonly TaskCard[],
+	needs: readonly TaskCard[],
+	projects: readonly ProjectView[],
+): { needsShown: TaskCard[]; activity: TaskCard[]; posted: TaskCard[] } {
+	const quiet = (t: TaskCard): boolean =>
+		t.kind === "pr_review" &&
+		projects.find((p) => p.name === t.project)?.settings.prReviewNotify ===
+			false;
+	return {
+		needsShown: needs.filter((t) => !quiet(t)),
+		activity: tasks.filter(
+			(t) =>
+				t.kind === "pr_review" && t.prOccurrence?.comments != null && !quiet(t),
+		),
+		posted: tasks.filter(
+			(t) =>
+				t.kind === "pr_review" && t.prOccurrence?.posted != null && !quiet(t),
+		),
+	};
 }
 
 /** One-line alarm summary for the bell/title; "" when nothing needs attention. */

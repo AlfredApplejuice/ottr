@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { boardOmpHome } from "./login.ts";
 import fc from "./test/properties.ts";
-import { lentProviderEnv, turnEnv } from "./tokens.ts";
+import { CARD_ENV_NOTE, lentProviderEnv, turnEnv } from "./tokens.ts";
 
 // A stand-in for the board store (omp's auth_credentials) and for `omp token <provider>
 // --force-refresh`. The fake logs each run's argv and env, then acts by the mode file in its
@@ -523,7 +523,11 @@ describe("turnEnv", () => {
 				{ dbPath: path, now: NOW, command, home: h },
 			),
 		).toEqual({
-			env: { ANTHROPIC_OAUTH_TOKEN: "access-1", SHARED: "s" },
+			env: {
+				ANTHROPIC_OAUTH_TOKEN: "access-1",
+				SHARED: "s",
+				OTTR_CARD_ENV_NOTE: CARD_ENV_NOTE,
+			},
 			missing: ["ABSENT"],
 			credentialError: null,
 			secrets: ["access-1"],
@@ -539,7 +543,7 @@ describe("turnEnv", () => {
 			{ SHARED: "s", ANTHROPIC_OAUTH_TOKEN: "settings-value" },
 			{ dbPath: path, now: NOW, command, home: h },
 		);
-		expect(env.env).toEqual({ SHARED: "s" });
+		expect(env.env).toEqual({ SHARED: "s", OTTR_CARD_ENV_NOTE: CARD_ENV_NOTE });
 		expect(env.missing).toEqual([]);
 		expect(env.credentialError).toBeString();
 	});
@@ -550,10 +554,83 @@ describe("turnEnv", () => {
 		expect(
 			await turnEnv("proj", null, { SHARED: "s" }, { dbPath: path, home: h }),
 		).toEqual({
-			env: { SHARED: "s" },
+			env: { SHARED: "s", OTTR_CARD_ENV_NOTE: CARD_ENV_NOTE },
 			missing: [],
 			credentialError: null,
 			secrets: [],
 		});
+	});
+
+	test("values: false (a scout) lends the token but omits every Settings value", async () => {
+		const path = store();
+		addRow(path, "anthropic", {
+			access: "access-1",
+			refresh: "refresh-1",
+			expires: NOW + 8 * HOUR,
+		});
+		const h = home(path, ["ANTHROPIC_OAUTH_TOKEN", "SHARED", "ABSENT"]);
+		expect(
+			await turnEnv(
+				"proj",
+				"anthropic/claude-opus-5-5",
+				{ ANTHROPIC_OAUTH_TOKEN: "settings-value", SHARED: "s" },
+				{ dbPath: path, now: NOW, command, home: h, values: false },
+			),
+		).toEqual({
+			env: { ANTHROPIC_OAUTH_TOKEN: "access-1" },
+			missing: [],
+			credentialError: null,
+			secrets: ["access-1"],
+		});
+	});
+
+	test("a project that lists no name gets no note", async () => {
+		const path = store();
+		const h = home(path, []);
+		expect(
+			await turnEnv("proj", null, { SHARED: "s" }, { dbPath: path, home: h }),
+		).toEqual({
+			env: {},
+			missing: [],
+			credentialError: null,
+			secrets: [],
+		});
+	});
+
+	test("the note is the only added name: no mirror defeats omp's kernel-env drops", async () => {
+		// omp drops provider keys from the eval kernel env on purpose; Ottr must not
+		// hand the kernel a renamed copy, so the turn env gains the note and nothing else.
+		const path = store();
+		const h = home(path, ["OPENAI_API_KEY"]);
+		const { env } = await turnEnv(
+			"proj",
+			null,
+			{ OPENAI_API_KEY: "sk-set" },
+			{ dbPath: path, home: h },
+		);
+		expect(env).toEqual({
+			OPENAI_API_KEY: "sk-set",
+			OTTR_CARD_ENV_NOTE: CARD_ENV_NOTE,
+		});
+	});
+
+	test("the documented path reaches the value: a bash child of the turn env reads it", async () => {
+		// The live path the note names: bash children inherit the full turn env, so a
+		// script run through bash reads a listed value an eval cell cannot see.
+		const path = store();
+		const h = home(path, ["PIXELLAB_API_KEY"]);
+		const { env } = await turnEnv(
+			"proj",
+			null,
+			{ PIXELLAB_API_KEY: "lab-key" },
+			{ dbPath: path, home: h },
+		);
+		const child = Bun.spawnSync(
+			["/bin/bash", "-c", 'printf %s "$PIXELLAB_API_KEY"'],
+			{
+				env: { ...env, PATH: process.env.PATH ?? "" },
+			},
+		);
+		expect(child.stdout.toString()).toBe("lab-key");
 	});
 });

@@ -54,8 +54,11 @@ export interface Spec {
 	deps?: number[];
 	/** Index of the done task this follow-up continues. */
 	followUpOf?: number;
-	/** Open question shown on the card; stored as the ask tool's JSON shape. */
-	asked?: { q: string; options: string[] };
+	/** Open questions shown on the card; stored as the ask tool's JSON shape. A
+	 *  question without options is a free-text question (the ask tool's mixed forms). */
+	asked?: {
+		questions: Array<{ q: string; options?: string[]; multi?: boolean }>;
+	};
 	research?: boolean;
 	release?: { version: string; notes: string };
 	/** Sets the trusted review kind on the card; the ARCH_REVIEW_MARKER prompt stays for realism. */
@@ -64,6 +67,14 @@ export interface Spec {
 	retro?: boolean;
 	/** Index of the retro card this pending proposal continues; seeds the proposal reason and lineage link. */
 	proposalOf?: number;
+	/** A queued card held by the start gate at its model's exhausted quota (turn.ts
+	 *  gateUsageStart): the picked model, its provider and window, and minutes to the reset. */
+	usageHold?: {
+		model: string;
+		provider: string;
+		window: string;
+		inMin: number;
+	};
 }
 
 export interface ProjectSpec {
@@ -141,8 +152,20 @@ const POOL: ProjectSpec[] = [
 				needs:
 					"Wants your answer: keep the local-only token or move to the OAuth device flow?",
 				asked: {
-					q: "Which auth flow should the dashboard use for thermostat control?",
-					options: ["A local-only token", "The OAuth device flow"],
+					questions: [
+						{
+							q: "Which auth flow should the dashboard use for thermostat control?",
+							options: ["A local-only token", "The OAuth device flow"],
+						},
+						{
+							q: "Which data may the token read?",
+							options: ["Live temperature", "Schedules", "Energy history"],
+							multi: true,
+						},
+						{
+							q: "Which release tag should the migration land under?",
+						},
+					],
 				},
 			},
 			{
@@ -204,6 +227,28 @@ const POOL: ProjectSpec[] = [
 				state: "needs_you",
 				age: 1.4,
 				proposalOf: 12,
+			},
+			{
+				title: "Tune the presence sensor debounce for hallway lights",
+				stage: "todo",
+				state: "queued",
+				age: 0.2,
+				// Mirrors the demo usage report's used-up Codex 7 Day window (src/dev.ts OTTR_DEMO_USAGE).
+				usageHold: {
+					model: "openai-codex/gpt-6-sol",
+					provider: "openai-codex",
+					window: "7d",
+					inMin: 42,
+				},
+			},
+			{
+				// Lineage and a dependency on one card: the drawer shows both rails.
+				title: "Carry the legend contrast fix over to the energy charts",
+				stage: "todo",
+				state: "queued",
+				age: 0.3,
+				followUpOf: 10,
+				deps: [4],
 			},
 		],
 	},
@@ -403,14 +448,25 @@ export function insertEvent(
 // The ask tool's shape (parseAsked → askQuestions): a bare string parses to null.
 function askedJson(t: Spec): string | null {
 	if (!t.asked) return null;
-	return JSON.stringify([
-		{
-			question: t.asked.q,
-			options: t.asked.options.map((label) => ({ label })),
-			multi: false,
-			recommended: 0,
-		},
-	]);
+	return JSON.stringify(
+		t.asked.questions.map((q) =>
+			q.options === undefined
+				? {
+						question: q.q,
+						options: [],
+						multi: false,
+						recommended: null,
+						text: true,
+					}
+				: {
+						question: q.q,
+						options: q.options.map((label) => ({ label })),
+						multi: q.multi === true,
+						recommended: q.multi === true ? null : 0,
+						text: false,
+					},
+		),
+	);
 }
 
 function taskDoneAt(t: Spec, now: number): number | null {
@@ -508,7 +564,18 @@ export function insertTaskRow(
 	);
 	// A proposal links its retro; a follow-up links the card it continues.
 	const { followUpOf, proposalReason } = seedLinks(prefix, project, t);
-	const needs = proposalReason ?? t.needs ?? null;
+	const hold = t.usageHold;
+	const holdUntil = hold === undefined ? null : now + hold.inMin * MIN;
+	const holdAt =
+		holdUntil === null
+			? ""
+			: new Date(holdUntil).toISOString().slice(0, 16).replace("T", " ");
+	const needs =
+		proposalReason ??
+		t.needs ??
+		(hold === undefined
+			? null
+			: `The ${hold.provider} usage limit is reached. The board starts the task again after the limit resets at ${holdAt} UTC. Send a message to run it now, or cancel the card.`);
 	// queued_at marks cards that sit in a queue right now.
 	const queuedAt = t.state === "queued" ? createdAt : null;
 	const updatedAt =
@@ -517,8 +584,9 @@ export function insertTaskRow(
 		`INSERT INTO tasks (id, title, prompt, stage, state, needs_reason, pending_prompt,
 			 research, asked, release_version, release_notes, follow_up_of, depends_on,
 			 created_at, updated_at, queued_at, cancelled_at, done_at, commits,
-			 session_id, session_title, kind)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 session_id, session_title, kind, model, hold_until, hold_provider, hold_window,
+			 hold_set_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			id,
 			t.retro ? retroPrompt.slice(0, 80) : t.title.slice(0, 80),
@@ -542,6 +610,11 @@ export function insertTaskRow(
 			`demo-${id}`,
 			(t.retro ? retroPrompt : t.title).slice(0, 60),
 			taskKind(t),
+			hold?.model ?? null,
+			holdUntil,
+			hold?.provider ?? null,
+			hold?.window ?? null,
+			hold === undefined ? null : now - 10 * MIN,
 		],
 	);
 	return { id, prompt, createdAt, isDone, spec: t };
@@ -596,7 +669,7 @@ function insertWorkTurn(
 			closed.exitCode,
 			closed.outcome,
 			closed.summary,
-			t.asked?.q ?? null,
+			t.asked?.questions[0]?.q ?? null,
 			t.crashed ? STALE_ERROR : null,
 		],
 	);
@@ -727,6 +800,25 @@ async function seedProject(
 		"-m",
 		"chore: bootstrap",
 	);
+
+	// The boot sweep (src/server.ts) anchors a done release card on refs/tags/<version>^{commit}
+	// and strips releaseVersion when the tag does not resolve, so each release spec seeds its
+	// tag at HEAD. A resolved tag is a no-op, so a reseed never moves an existing one.
+	for (const t of spec.tasks) {
+		if (!t.release) continue;
+		const probe = Bun.spawnSync(
+			[
+				"git",
+				"rev-parse",
+				"--verify",
+				"--quiet",
+				`refs/tags/${t.release.version}^{commit}`,
+			],
+			{ cwd: dir },
+		);
+		if (probe.exitCode === 0) continue;
+		git(dir, "tag", t.release.version, "HEAD");
+	}
 
 	// Raw handle on purpose: pre-boot seeding, no ProjectStore lock held.
 	const db = new Database(join(dir, ".tasks", "tasks.db"));
@@ -864,7 +956,9 @@ const MUTATION_TURN_PROMPT = /mutation (?:gate|testing)/i;
 /** Store slice the map builder reads; ProjectStore satisfies it structurally. */
 interface DemoStore {
 	transaction<T>(work: () => T | Promise<T>): Promise<T>;
-	listTasks(): Promise<Array<{ id: string; state: string }>>;
+	listTasks(): Promise<
+		Array<{ id: string; state: string; cancelledAt: number | null }>
+	>;
 	listTurns(taskId: string): Promise<
 		Array<{
 			kind: string;
@@ -896,6 +990,25 @@ export async function demoProgressMap(
 		});
 	}
 	return lines;
+}
+
+/** Slot count the demo board's state frame ships (OTTR-1143): the seeded pool's live claims.
+ * The loop's own count stays 0 because OTTR_DEMO runs no agents (see demoProgressMap). */
+export async function demoSlotsUsed(
+	projects: Iterable<[string, { store: DemoStore }]>,
+): Promise<number> {
+	let used = 0;
+	for (const [, { store }] of projects) {
+		await store.transaction(async () => {
+			for (const t of await store.listTasks())
+				if (
+					t.cancelledAt === null &&
+					(t.state === "running" || t.state === "preparing")
+				)
+					used += 1;
+		});
+	}
+	return used;
 }
 
 /** Make sure the board has an admin login; an existing one always wins. The plain password

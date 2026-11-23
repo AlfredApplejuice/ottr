@@ -75,9 +75,11 @@ Session cookies and `X-API-Key` give no access in hosted mode. Provider sign-ins
 are off, and the board lends no provider OAuth token to turns (`LENT_ENV`): hosted model access
 uses API keys only.
 
-The state payload carries `hosted: true`, and `onboarding` is always false. The `/api/boot`
-payload also carries `hosted: true`, so the UI knows the mode before the first state frame.
-When the flag is off, the `/api/boot` payload has no `hosted` key.
+The state payload carries `hosted: true`, and `onboarding` is always false. It also carries
+`credits` (`{ balance, accountUrl }`), and `balance` is null until a `/credit` answer carried
+one. The `/api/boot` payload also carries `hosted: true`, so the UI knows the mode before the
+first state frame. When the flag is off, the `/api/boot` payload has no `hosted` key, and a
+state payload has no `credits` key.
 
 ## 4. Control-plane calls (tenant to control plane)
 
@@ -89,8 +91,13 @@ status. Thus the signed header and the body go to the configured origin only.
 | Call | Body | Answer | Use |
 |---|---|---|---|
 | `POST /metering` | `MeteringRecord` (JSON) | any 2xx | The cumulative usage of one agent run: interim records while the run is active, then one final record at turn settle. Fire-and-forget: a failure is logged and never blocks the run or the settle. The board does not retry. |
-| `GET /credit` | — | `{"ok": boolean}` | The pre-claim credit gate. |
+| `GET /credit` | — | `{"ok": boolean, "balance"?: number}` | The pre-claim credit gate. |
 | `POST /git-token` | `{"project": string, "remote": string}` | `{"token": string, "expiresAt": ISO-8601}`, or 404 when the project has no token | The per-project git credential (section 6). |
+
+The `/credit` answer may carry `balance`, the tenant's remaining credits. The field is a
+contract extension that waits on a matching ottr-cloud card, so today's control plane sends
+none and the chip stays hidden until it lands. A finite number records the new balance. Any
+other value keeps the last balance.
 
 `MeteringRecord`:
 
@@ -106,8 +113,8 @@ status. Thus the signed header and the body go to the configured origin only.
 
 - `kind`: the turn kind (`work`, `merge`, and the other turn kinds).
 - `role`: the model role that resolved the run's model. The work or merge run uses `default`
-  (also when the card or session names its own model). The second-model check run uses its check role
-  (`critic` or `adversary`).
+  (also when the card or session names its own model). The second-model check run uses its routed
+  check role (the role name the routing picked, or `default`).
 - `run`: the index of the run in its turn. The first agent run of the turn is `0`, the next
   is `1`, and so on (a check retry is a new run). `(project, taskId, turnId, kind, role, run)`
   names one agent run, and each record of that run has the same key.
@@ -157,7 +164,8 @@ usage that it saw for the run, so a late or repeated record never counts twice. 
   The answer is `{"stopped": <count>}`, with all three types in the count. After the credit
   park, no later write of the turn changes the reason or puts the card back in the queue. A
   marked turn that settles before a dispatch point (for example, its run ended before the
-  kill) settles with its own outcome.
+  kill) settles with its own outcome. The stop also records balance 0 in the board's credits
+  state, so the credits chip names the hard stop at once. The next gate answer overwrites it.
 - Credit hold: the stop also sets a hold for the board. While the hold is set, no turn starts
   a model run: before each work or merge run, each check attempt (also the second attempt),
   and each title call, a turn that sees the hold parks `needs_you` with the credit reason. A
@@ -213,7 +221,7 @@ When hosted mode is on, the UI hides these host-level surfaces:
   identity (global SSH key, commit identity), the three whole cards. Hosted git uses only the
   per-project control-plane tokens (section 6), so no setting on these cards has an effect.
 - Access and usage → API key, Session, omp usage.
-- Project → Merging, Watches and Proposals (merge holds, PR mode, push sync commits, PR
+- Project → Merging, Watches and Proposals (merge holds, PR mode, PR
   reviews, issue watch, fork research, omp watch, retro, trending scout), and the "Run work
   turns in microVMs" switch on the Runners card.
 - The provider quota in the app bar and in its detail popover. Provider quota is the
@@ -246,6 +254,19 @@ Details:
   status line still names an update hold.
 - A lost session shows the offline banner, not the login page. The account menu has no
   "Signed in as" line and no Sign out.
+
+### Credits chip
+
+In hosted mode the top bar shows a credits chip. It shows the balance with one decimal, or
+"Out of credit — work stopped" at zero or below. The chip links to the control plane's
+`/account` page. The page URL comes from `OTTR_HOSTED_CONTROL_URL`, with no new env var.
+
+The balance updates when the credit gate answers `GET /credit`. The value reaches the chip on
+the state refresh the board already does, so the board adds no polling of its own. A credit
+stop records balance 0 at once, so the chip names the hard stop before the next gate answer
+reaches a state frame. The chip renders only when a balance is known. With the flag off, the
+payload has no `credits` key, no chip DOM exists, and the board sends no new request
+(self-hosted stays byte-identical).
 
 ## 8. Forwarded GitHub events
 
@@ -289,7 +310,8 @@ Watches:
 ## 9. Non-goals
 
 - No change to `src/prompts.ts`.
-- No credit ledger, prices, or balance display in ottr: the control plane owns them (M6).
+- No credit ledger or prices in ottr: the control plane owns them (M6). The credits chip
+  (section 7) shows the balance the control plane reports; ottr never computes one.
 - No GitHub App install flow: the control plane mints the tokens (M4).
 - No change to the boot-token and per-turn VM token paths.
 - No payload slimming or event filtering beyond `repository.full_name` — the control plane

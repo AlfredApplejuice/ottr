@@ -95,7 +95,10 @@ history and settings (OTTR-736, topics 83 and 84).
    stop the restore.
 4. For each file, the tool copies the snapshot file to `<target>.restoring` and runs
    `PRAGMA integrity_check` on the copy. A copy that fails the check is an error for
-   that file, and the target stays as it was.
+   that file, and the target stays as it was. The tool follows no symlink below the
+   target's root. A target dir that is a symlink, or a symlink planted at
+   `<target>.restoring` or at the target, fails that file instead of writing through
+   the link.
 5. The tool deletes no data. It renames a target that exists, and its `-wal` and `-shm`
    files, to `<file>.before-restore-<stamp of the restore time>`. Then it renames the
    checked copy to the target.

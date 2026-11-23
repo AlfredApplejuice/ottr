@@ -259,6 +259,37 @@ test("seed covers every display shape with clean checkouts", () => {
 	}
 });
 
+// The boot sweep (src/server.ts) strips a done release card's releaseVersion when the
+// repo does not resolve refs/tags/<version>^{commit}, so the seeded release repo must
+// carry the tag at HEAD, and the pool's non-release repos must stay tagless (OTTR-1168).
+test("the seeded release repo anchors the tag the boot sweep probes", () => {
+	const lumen = join(root, "lumen");
+	const probe = Bun.spawnSync([
+		"git",
+		"-C",
+		lumen,
+		"rev-parse",
+		"--verify",
+		"refs/tags/1.4.0^{commit}",
+	]);
+	expect(probe.exitCode).toBe(0);
+	const head = Bun.spawnSync(["git", "-C", lumen, "rev-parse", "HEAD"]);
+	expect(probe.stdout.toString().trim()).toBe(head.stdout.toString().trim());
+	// Lumen's pool spec holds exactly one release, so exactly one tag.
+	expect(
+		Bun.spawnSync(["git", "-C", lumen, "tag", "--list"]).stdout.toString(),
+	).toBe("1.4.0\n");
+	expect(
+		Bun.spawnSync([
+			"git",
+			"-C",
+			join(root, "hollowpine"),
+			"tag",
+			"--list",
+		]).stdout.toString(),
+	).toBe("");
+});
+
 // The pool seeds one retro with a pending proposal: the shapes the lineage rail and the
 // proposal box read (store.ts createTask's retro child id, prompts.ts proposedReason).
 test("the seeded retro files a proposal that waits for a decision", () => {
@@ -318,7 +349,7 @@ test("the seeded retro files a proposal that waits for a decision", () => {
 			"SELECT value FROM settings WHERE key = 'next-task-num'",
 		)
 		.get()!.value;
-	expect(JSON.parse(counter)).toBe(14);
+	expect(JSON.parse(counter)).toBe(16);
 });
 
 // The dev board shows the mutation meter only when progress parses as a Stryker line, so

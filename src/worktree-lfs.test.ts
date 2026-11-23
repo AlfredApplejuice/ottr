@@ -69,11 +69,22 @@ function serveGitLfs(
 	dir: string,
 	bare: string,
 	batchStatus = 200,
-): { url: string; storeFile: string; close: () => void } {
+	requireAuth = false,
+): {
+	url: string;
+	storeFile: string;
+	/** Every LFS API request as "<method> <path>", in arrival order. */
+	requests: string[];
+	/** The Authorization header of every batch request, in arrival order. */
+	authHeaders: string[];
+	close: () => void;
+} {
 	const storeFile = join(dir, "lfs-store.txt");
 	writeFileSync(storeFile, "");
 	const storeDir = join(dir, "lfs-store");
 	mkdirSync(storeDir);
+	const requests: string[] = [];
+	const authHeaders: string[] = [];
 	const server = Bun.serve({
 		port: 0,
 		async fetch(req) {
@@ -117,7 +128,24 @@ function serveGitLfs(
 					headers: { "Content-Type": `application/x-git-${svc}-result` },
 				});
 			}
+			// OTTR-1109: a locking endpoint that answers like GitHub answers a token it
+			// will not process (422). With the lock-check pin git-lfs never calls it;
+			// `requests` is the proof.
+			if (req.method === "POST" && p.endsWith("/info/lfs/locks/verify")) {
+				requests.push(`POST ${p}`);
+				return new Response("no locking here", { status: 422 });
+			}
 			if (req.method === "POST" && p.endsWith("/info/lfs/objects/batch")) {
+				requests.push(`POST ${p}`);
+				authHeaders.push(req.headers.get("authorization") ?? "");
+				// GitHub answers an unauthenticated batch with a 401 challenge, and
+				// git-lfs authenticates only after one; requireAuth models that, so the
+				// helper-driven Authorization retry is observable.
+				if (requireAuth && authHeaders[authHeaders.length - 1] === "")
+					return new Response("", {
+						status: 401,
+						headers: { "WWW-Authenticate": `Basic realm="git-lfs"` },
+					});
 				if (batchStatus !== 200)
 					return new Response("broken", { status: batchStatus });
 				const { objects } = (await req.json()) as {
@@ -167,6 +195,8 @@ function serveGitLfs(
 	return {
 		url: `http://127.0.0.1:${server.port}/origin.git`,
 		storeFile,
+		requests,
+		authHeaders,
 		close: () => server.stop(true),
 	};
 }
@@ -208,7 +238,12 @@ async function commitSprite(main: string, wt: string): Promise<string> {
 
 /** A clone of a smart-HTTP origin whose local main holds the worktree branch's LFS sprite commit. */
 async function fixture(
-	o: { lfs?: boolean; batchStatus?: number } = {},
+	o: {
+		lfs?: boolean;
+		batchStatus?: number;
+		origin?: string;
+		requireAuth?: boolean;
+	} = {},
 ): Promise<{
 	dir: string;
 	bare: string;
@@ -218,15 +253,23 @@ async function fixture(
 	storeFile: string;
 	/** The sprite pointer's LFS oid; "" when the fixture has no LFS file. */
 	oid: string;
+	/** Every LFS API request as "<method> <path>", in arrival order. */
+	requests: string[];
+	/** The Authorization header of every batch request, in arrival order. */
+	authHeaders: string[];
 	close: () => void;
 }> {
 	const dir = mkdtempSync(join(tmpdir(), "ottr-lfs-"));
 	const bare = join(dir, "origin.git");
 	await run(dir, "init", "-q", "--bare", "-b", "main", bare);
-	const git = serveGitLfs(dir, bare, o.batchStatus);
+	const git = serveGitLfs(dir, bare, o.batchStatus, o.requireAuth === true);
+	// The origin name is the URL's last path segment: "origin.git" (a normal clone
+	// URL) or a name without the .git suffix, for the endpoint-derivation test.
+	const origin = o.origin ?? "origin.git";
+	const url = git.url.replace(/\/origin\.git$/, `/${origin}`);
 	writeLfsPreReceive(bare, git.storeFile);
 	const main = join(dir, "main");
-	await run(dir, "-c", "init.defaultBranch=main", "clone", "-q", git.url, main);
+	await run(dir, "-c", "init.defaultBranch=main", "clone", "-q", url, main);
 	await run(main, ...id, "commit", "-q", "--allow-empty", "-m", "base");
 	await run(main, "push", "-q", "origin", "main");
 	const wt = join(dir, "wt");
@@ -245,12 +288,14 @@ async function fixture(
 		bare,
 		main,
 		wt,
-		url: git.url,
+		url,
 		storeFile: git.storeFile,
 		oid:
 			o.lfs !== false
 				? await pointerOid(main, "assets/art/props/tree_oak/oak.png")
 				: "",
+		requests: git.requests,
+		authHeaders: git.authHeaders,
 		close: git.close,
 	};
 }
@@ -355,6 +400,105 @@ describe("serverMergePush with Git LFS", () => {
 			} finally {
 				hostile.stop(true);
 			}
+		} finally {
+			cleanup(f.dir, f.close);
+		}
+	});
+
+	test("pins the endpoint with git-lfs's own derivation for an origin URL without .git (OTTR-1109)", async () => {
+		// OTTR-1058 pinned <originUrl>/info/lfs verbatim; git-lfs's own derivation
+		// appends .git to a URL that lacks the suffix (lfsapi/endpoint_finder.go
+		// NewEndpointFromCloneURL). GitHub answers the bare form 422 on the locking
+		// and batch routes alike (MYST-34), so the pin must name the .git form.
+		const f = await fixture({ lfs: true, origin: "origin" });
+		try {
+			const local = await run(f.main, "rev-parse", "refs/heads/main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.url,
+			);
+			expect(r.status).toBe("pushed");
+			expect(readFileSync(f.storeFile, "utf8")).toContain(f.oid);
+			// The exact request list: one batch, at the .git endpoint git-lfs itself
+			// would derive, and the locking API stays silent.
+			expect(f.requests).toEqual(["POST /origin.git/info/lfs/objects/batch"]);
+			expect(await run(f.bare, "rev-parse", "main")).toBe(local);
+		} finally {
+			cleanup(f.dir, f.close);
+		}
+	});
+
+	test("a 422 locking endpoint never runs: no locks/verify call, one batch call (OTTR-1109)", async () => {
+		// MYST-34: on github hosts git-lfs verifies locks by default, and the board
+		// token's locks/verify call answered 422, failing the whole upload before the
+		// batch. The push pins lfs.<endpoint>.locksverify=false, so a locking endpoint
+		// that answers 422 must never see a request and the upload must still land.
+		const f = await fixture({ lfs: true });
+		try {
+			const local = await run(f.main, "rev-parse", "refs/heads/main");
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.url,
+			);
+			expect(r.status).toBe("pushed");
+			expect(readFileSync(f.storeFile, "utf8")).toContain(f.oid);
+			expect(f.requests.filter((p) => p.includes("/locks/verify"))).toEqual([]);
+			expect(
+				f.requests.filter((p) => p.includes("/objects/batch")),
+			).toHaveLength(1);
+			expect(await run(f.bare, "rev-parse", "main")).toBe(local);
+		} finally {
+			cleanup(f.dir, f.close);
+		}
+	});
+});
+
+describe("pushLfsObjects authentication", () => {
+	test("the upload authenticates exactly as the board's credential helper answers (OTTR-1109)", async () => {
+		// gitAuthEnv (gitHosts.ts) plants the per-host helper the board's pushes run
+		// with: an empty-helper reset, then a printf of the env-fed username/password
+		// pair. The default username for a github host is x-access-token (githubHost.ts,
+		// Dockerfile.worker's system helper), so git-lfs must send exactly Basic
+		// base64("x-access-token:<token>") to the LFS API — the Authorization form this
+		// test pins against the same helper body.
+		const f = await fixture({ lfs: true, requireAuth: true });
+		try {
+			const host = new URL(f.url).host;
+			const token = "board-lfs-token-1234567890";
+			const authEnv: Record<string, string> = {
+				GIT_TERMINAL_PROMPT: "0",
+				GIT_ASKPASS: "",
+				GIT_CONFIG_COUNT: "2",
+				GIT_CONFIG_KEY_0: "credential.helper",
+				GIT_CONFIG_VALUE_0: "",
+				GIT_CONFIG_KEY_1: `credential.http://${host}.helper`,
+				GIT_CONFIG_VALUE_1: `!f() { test "$1" = get || exit 0; printf 'username=%s\\npassword=%s\\n' "$OTTR_GIT_USER_0" "$OTTR_GIT_TOKEN_0"; }; f`,
+				OTTR_GIT_USER_0: "x-access-token",
+				OTTR_GIT_TOKEN_0: token,
+			};
+			const base = await run(f.bare, "rev-parse", "main");
+			const tip = await run(f.main, "rev-parse", "refs/heads/main");
+			expect(
+				await pushLfsObjects(f.main, f.url, "main", tip, base, authEnv),
+			).toBeNull();
+			// git-lfs sends the first batch unauthenticated, retries it after the
+			// server's 401 challenge with the helper's answer.
+			expect(f.requests).toEqual([
+				"POST /origin.git/info/lfs/objects/batch",
+				"POST /origin.git/info/lfs/objects/batch",
+			]);
+			expect(f.authHeaders).toEqual([
+				"",
+				`Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`,
+			]);
 		} finally {
 			cleanup(f.dir, f.close);
 		}

@@ -221,7 +221,7 @@ It copies your omp settings, MCP servers, plugins and skills into the data repo'
 
 The Alate lines in the quick start write `COMPOSE_PROFILES`, `ALATE_URL`, and `ALATE_API_KEY` into `.env`, and start the bundled Alate server (compose profile `alate`) together with the board. The board reads `ALATE_URL` and `ALATE_API_KEY` at boot and seeds **Settings → Alate** with them. A value saved under Settings wins over the env at every boot. A user whose Alate server already runs omits the Alate block and pairs the board under **Settings → Alate** instead.
 
-The board never takes its config from the worker-writable home volume. With the Alate profile on, first open the Alate dashboard on <http://127.0.0.1:4570>. The alate container binds every interface, so the dashboard asks for the key: sign in with the `ALATE_API_KEY` value from `.env`. Then set the data repo there, and seed the board's own agent layer from your data repo once (see [Seed the board config](WORKERS.md#seed-the-board-config)). The seed installs a layer and switches it in place, so no restart is needed. Replace `OWNER/NAME` with your data repo. The line is the same in bash and PowerShell:
+The board never takes its config from the worker-writable home volume. With the Alate profile on, first open the Alate dashboard on <http://localhost:4570>. Open the dashboard on a different hostname from the board (the board runs on <http://127.0.0.1:8080>), because the browser sends a host's cookies to every port on that host. The alate container binds every interface, so the dashboard asks for the key: sign in with the `ALATE_API_KEY` value from `.env`. Then set the data repo there, and seed the board's own agent layer from your data repo once (see [Seed the board config](WORKERS.md#seed-the-board-config)). The seed installs a layer and switches it in place, so no restart is needed. Replace `OWNER/NAME` with your data repo. The line is the same in bash and PowerShell:
 
 ```sh
 docker compose run --rm board-seed --repo OWNER/NAME
@@ -264,11 +264,24 @@ bun install
 bun start
 ```
 
-Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`, `git@host:…`, `ssh://host[:port]/…`) or creates a new project, sets up `.tasks/` and `.worktrees/`, and walks a setup dialog (automation, runners, project settings, rules). Projects on hosts other than GitHub work with plain git; the GitHub extras (releases, CI watch, Dependabot cards, fork research, GHCR) stay GitHub-only and hide for other hosts. The dialog's last step files a rules interview card for a project without `AGENTS.md`; the card writes one with you. A dialog closed early leaves the same start on the setup checklist. Keep projects in a project folder: after a restart the board finds projects in Ottr's parent folder or in `OMP_TRACKER_ROOTS`.
+Open <http://127.0.0.1:4747>. **Add project** opens a wizard with Source as its first step. Select **New** or **Git URL** (`https://…`, `git@host:…`, `ssh://host[:port]/…`). **Next** and **Back** retain your drafts. Before **Finish**, **Cancel**, the close button, or Escape discard those drafts without a project or clone.
+
+**Finish** creates or clones the project, prepares `.tasks/` and `.worktrees/`, and saves the settings you explicitly change. It then starts a rules interview card if needed. For a project without `AGENTS.md`, the card writes the file with you. An existing project's **Open setup** still offers **Finish later**.
+
+Projects on hosts other than GitHub work with plain git. The GitHub extras (releases, CI watch, Dependabot cards, fork research, GHCR) stay GitHub-only and hide for other hosts.
+
+Keep projects in a project folder. After a restart, the board finds projects in Ottr's parent folder or in `OMP_TRACKER_ROOTS`.
 
 ## Alate
 
 [Alate](https://github.com/ottr-ai/alate) is the provisioning side of the pair. It installs agent rules, skills, plugins and the omp user layer from a data repo onto this machine and into Ottr's Docker workers, so every agent and worker runs the same setup. Ottr integrates with it under **Settings → Alate**: point it at the alate server URL and API key, and **Provision** (or the automatic check every 5 minutes) installs pending imports; an alate that reports layer support provisions while cards run, and an older alate defers the check while cards run. With the URL set, Ottr also pulls the provider's update list each hour and offers upstream updates through the header bell. When an import waits longer than 30 minutes, the bell also shows "Alate is waiting to provision an import" with a link to the Settings section. The Overview page shows the provisioning state at a glance: the server's version and probe result, and which project lists (packages, tools, env) alate provisioned, under **Provisioning**.
+
+Each project decides how its upstream updates land, with **Approve upstream provisioning updates before they merge** in **Settings → Merging** (also in the Automation step of the add-project wizard):
+
+- **Off (the default):** the project is hands-off. After each hourly pull, the board files the update cards for every version that passed the 7-day rule, and the cards merge with no approval. The bell does not count these rows. The board never files a version again after a card carried it, also when you cancel that card.
+- **On:** you file each update card from the **Upstream updates** list that the bell opens, and a ready card waits for your reply before it merges.
+
+Rows removed upstream always show in the bell, because a person must file a remove card or skip the row. A row that maps to no board project shows too. See `docs/specs/hands-off-updates.md`.
 
 The alate URL carries the API key on every call, so the board refuses a plain `http://` URL for anything the public internet can reach. **Settings → Alate** and the `ALATE_URL` env seed accept `http://` only for loopback (`localhost`, `127.0.0.0/8`, `[::1]`), private-network addresses (RFC 1918 `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`; link-local `169.254.0.0/16` and `fe80::/10`; the CGNAT range `100.64.0.0/10`, which covers Tailscale) and single-label host names (the compose service name `alate`). Every other host — a public DNS name, a public IP, an IPv6 address outside the list — needs `https://`. A URL saved under an older board keeps its stored value, and each alate call answers with the reason instead of sending the key; the fix is to switch the URL to `https://`, or to one of the http-allowed hosts above.
 

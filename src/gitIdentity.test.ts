@@ -10,6 +10,7 @@ import {
 	parseCommitField,
 	probeGitIdent,
 } from "./gitIdentity.ts";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 
 describe("identityArgs", () => {
 	test("null keeps the built-in Ottr identity", () => {
@@ -135,7 +136,7 @@ describe("probeGitIdent", () => {
 				cwd: dir,
 				stdout: "pipe",
 				stderr: "pipe",
-				env: { PATH: process.env.PATH ?? "" },
+				env: { ...fixtureGitEnv(), PATH: process.env.PATH ?? "" },
 			});
 			if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed`);
 		};

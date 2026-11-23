@@ -9,6 +9,13 @@ import {
 } from "node:crypto";
 
 export const SESSION_COOKIE = "ottr.session";
+/**
+ * The name carries the board port: browser cookies ignore ports, so a bare name shared one
+ * value across every loopback service on the host.
+ */
+export function sessionCookieName(port: number): string {
+	return `${SESSION_COOKIE}.${port}`;
+}
 /** 30 days, in the seconds the cookie's Max-Age wants and the ms signSession wants. */
 export const SESSION_MAX_AGE = 2592000;
 export const SESSION_MS = SESSION_MAX_AGE * 1000;
@@ -396,21 +403,17 @@ export function parseCookies(header: string | null): Record<string, string> {
 
 /** `Secure` only on public hosts: loopback is plain http, HTTPS arrives via tailscale serve. remember=false emits a session cookie (no Max-Age); it dies with the browser session. */
 export function sessionCookie(
+	name: string,
 	token: string,
 	secure: boolean,
 	remember = true,
 ): string {
-	const parts = [
-		`${SESSION_COOKIE}=${token}`,
-		"HttpOnly",
-		"Path=/",
-		"SameSite=Lax",
-	];
+	const parts = [`${name}=${token}`, "HttpOnly", "Path=/", "SameSite=Lax"];
 	if (remember) parts.push(`Max-Age=${SESSION_MAX_AGE}`);
 	if (secure) parts.push("Secure");
 	return parts.join("; ");
 }
 
-export function clearSessionCookie(secure: boolean): string {
-	return `${SESSION_COOKIE}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0${secure ? "; Secure" : ""}`;
+export function clearSessionCookie(name: string, secure: boolean): string {
+	return `${name}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0${secure ? "; Secure" : ""}`;
 }

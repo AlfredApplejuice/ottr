@@ -22,7 +22,11 @@ mkdirSync(join(root, "oauth"), { recursive: true });
 writeFileSync(join(root, "oauth", "creds.json"), "{}");
 afterAll(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
 
-const IDENTITY = "[user]\n\tname = Ottr\n\temail = ottr@localhost\n";
+const IDENTITY =
+	// OTTR-994: the board gitconfig carries safe.directory = * (added idempotently
+	// by `git config --file`, which writes no blank line between sections), so the
+	// server's own git (root) keeps working inside worker-uid-owned worktrees.
+	"[user]\n\tname = Ottr\n\temail = ottr@localhost\n[safe]\n\tdirectory = *\n";
 const MNEMOPI = "memory:\n  backend: mnemopi\n";
 const HINDSIGHT = "memory:\n  backend: hindsight\n";
 const PLANT = "[credential]\n\thelper = !touch planted\n";
@@ -139,7 +143,11 @@ describe.skipIf(process.platform === "win32")("ottr-entry.sh", () => {
 		);
 		expect(r.code).toBe(0);
 		expect(r.stdout).toBe("ran\n");
-		expect(readFileSync(f.gitconfig, "utf8")).toBe(CUSTOM);
+		// OTTR-994: the existing custom gitconfig keeps its content and gains the
+		// idempotent safe.directory line the server's root git needs.
+		expect(readFileSync(f.gitconfig, "utf8")).toBe(
+			`${CUSTOM}[safe]\n\tdirectory = *\n`,
+		);
 		expect(readFileSync(join(f.agent, "config.yml"), "utf8")).toBe(MNEMOPI);
 		expect(
 			readFileSync(join(f.home, ".omp", "agent", "config.yml"), "utf8"),

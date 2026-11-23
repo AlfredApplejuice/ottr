@@ -2,11 +2,14 @@ import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import {
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
+	readFileSync,
 	rmSync,
 	statSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -449,5 +452,66 @@ describe("runRestore", () => {
 		expect(run.err[0]).toStartWith("projects/demo/tasks.db failed: ");
 		expect(readdirSync(join(server, "demo"))).toEqual([]);
 		expect(await kIn(d.state)).toBe("one");
+	});
+
+	test("a symlinked project dir fails the restore and writes nothing through the link", async () => {
+		const d = dirs("symlink-dir");
+		const data = join(d.base, "data");
+		const other = join(d.base, "other");
+		mkdirSync(data);
+		mkdirSync(other);
+		writeFileSync(join(other, "keep.txt"), "sentinel");
+		symlinkSync(other, join(data, "q"));
+		await snapshot(d.dir, T0, "v0", ["q"]);
+
+		// Only OTTR_DATA_DIR is set: the data dir is the project anchor.
+		const run = await runRestore(["latest"], { ...d.env, OTTR_DATA_DIR: data });
+		expect(run.code).not.toBe(0);
+		expect(run.err.some((line) => /refusing/.test(line))).toBe(true);
+		expect(existsSync(join(other, "tasks.db"))).toBe(false);
+		expect(readFileSync(join(other, "keep.txt"), "utf8")).toBe("sentinel");
+		expect(lstatSync(join(data, "q")).isSymbolicLink()).toBe(true);
+	});
+
+	test("a planted tasks.db.restoring symlink is replaced, never followed", async () => {
+		const d = dirs("planted-copy");
+		const data = join(d.base, "data");
+		const q = join(data, "q");
+		mkdirSync(q, { recursive: true });
+		const victim = join(q, "victim");
+		writeFileSync(victim, "sentinel bytes");
+		symlinkSync(victim, join(q, "tasks.db.restoring"));
+		await snapshot(d.dir, T0, "v0", ["q"]);
+
+		const run = await runRestore(["latest"], { ...d.env, OTTR_DATA_DIR: data });
+		expect(run.code).toBe(0);
+		expect(run.err).toEqual([]);
+		expect(readFileSync(victim, "utf8")).toBe("sentinel bytes");
+		const restored = lstatSync(join(q, "tasks.db"));
+		expect(restored.isSymbolicLink()).toBe(false);
+		expect(restored.isFile()).toBe(true);
+		expect(existsSync(join(q, "tasks.db.restoring"))).toBe(false);
+	});
+
+	test("a planted target symlink is replaced by the restored db, never followed", async () => {
+		const d = dirs("planted-target");
+		const data = join(d.base, "data");
+		const q = join(data, "q");
+		mkdirSync(q, { recursive: true });
+		const victim = join(q, "victim");
+		writeFileSync(victim, "sentinel bytes");
+		symlinkSync(victim, join(q, "tasks.db"));
+		await snapshot(d.dir, T0, "v0", ["q"]);
+
+		const run = await runRestore(["latest"], { ...d.env, OTTR_DATA_DIR: data });
+		expect(run.code).toBe(0);
+		expect(run.err).toEqual([]);
+		expect(readFileSync(victim, "utf8")).toBe("sentinel bytes");
+		const restored = lstatSync(join(q, "tasks.db"));
+		expect(restored.isSymbolicLink()).toBe(false);
+		expect(restored.isFile()).toBe(true);
+		expect(restored.size).toBe(
+			statSync(join(d.dir, S0, "projects", "q", "tasks.db")).size,
+		);
 	});
 });

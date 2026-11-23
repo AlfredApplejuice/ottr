@@ -16,6 +16,7 @@ import {
 	type SessionEntry,
 	secretsEqual,
 	sessionCookie,
+	sessionCookieName,
 	sessionLabel,
 	signSession,
 	verifyAdminLogin,
@@ -207,25 +208,27 @@ describe("cookies", () => {
 		expect(parseCookies(null)).toEqual({});
 	});
 	test("cookie attributes: HttpOnly, Lax, 30d, Secure only on public hosts", () => {
-		const c = sessionCookie("tok", true);
-		expect(c).toContain(`${SESSION_COOKIE}=tok`);
+		expect(sessionCookieName(8080)).toBe("ottr.session.8080");
+		const name = sessionCookieName(8080);
+		const c = sessionCookie(name, "tok", true);
+		expect(c).toContain(`${name}=tok`);
 		expect(c).toContain("HttpOnly");
 		expect(c).toContain("SameSite=Lax");
 		expect(c).toContain("Max-Age=2592000");
 		expect(c).toContain("Secure");
-		expect(sessionCookie("tok", true)).toBe(
-			`${SESSION_COOKIE}=tok; HttpOnly; Path=/; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}; Secure`,
+		expect(sessionCookie(name, "tok", true)).toBe(
+			`${name}=tok; HttpOnly; Path=/; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}; Secure`,
 		);
-		expect(sessionCookie("tok", false)).toBe(
-			`${SESSION_COOKIE}=tok; HttpOnly; Path=/; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}`,
+		expect(sessionCookie(name, "tok", false)).toBe(
+			`${name}=tok; HttpOnly; Path=/; SameSite=Lax; Max-Age=${SESSION_MAX_AGE}`,
 		);
-		expect(sessionCookie("tok", false)).not.toContain("Secure");
-		const session = sessionCookie("tok", true, false);
+		expect(sessionCookie(name, "tok", false)).not.toContain("Secure");
+		const session = sessionCookie(name, "tok", true, false);
 		expect(session).toContain("HttpOnly");
 		expect(session).toContain("SameSite=Lax");
 		expect(session).toContain("Secure");
 		expect(session).not.toContain("Max-Age");
-		const cleared = clearSessionCookie(true);
+		const cleared = clearSessionCookie(name, true);
 		expect(cleared).toContain("Max-Age=0");
 		expect(cleared).toContain("Secure");
 	});

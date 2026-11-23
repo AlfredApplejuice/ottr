@@ -3,11 +3,19 @@ import {
 	type SpawnOptions,
 	spawn,
 } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+	existsSync,
+	lstatSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	statSync,
+} from "node:fs";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { aptListPath } from "./apt.ts";
 import { mkdirBelow, touchBelow, writeBelow } from "./confine.ts";
+import { errmsg } from "./errmsg.ts";
 import {
 	type CommitIdentity,
 	commitIdentityEnv,
@@ -16,11 +24,11 @@ import {
 	type IdentProbeEnv,
 	probeGitIdent,
 } from "./gitIdentity.ts";
+import { stripRepoRelocatingEnv } from "./gitRepoEnv.ts";
 import type { TokenUsage } from "./hosted.ts";
 import {
-	addLayerUse,
+	acquireLayerUse,
 	pinnedAgentLayer,
-	removeLayerUse,
 	resolveAgentLayer,
 } from "./layers.ts";
 import {
@@ -38,6 +46,7 @@ import { LOST_SESSION } from "./prompts.ts";
 import { requirementsListPath } from "./python.ts";
 import { PROGRESS_EVENT, watchProgress } from "./stryker.ts";
 import { formatBytes } from "./tmpsweep.ts";
+import { CARD_ENV_NOTE_NAME } from "./tokens.ts";
 import { toolsListPath } from "./tools.ts";
 import { projectTrustedLists } from "./trustedLists.ts";
 import type {
@@ -111,6 +120,10 @@ export function childEnv(o: {
 	delete env.ALATE_API_KEY;
 	// The hosted identity-signing key: a holder forges owner/control/tenant headers.
 	delete env.OTTR_HOSTED_SECRET;
+	// The SecretBox master key unseals the whole sealed credential store
+	// (docs/configuration.md); no turn ever needs it, and a holder could decrypt
+	// the stored tokens offline.
+	delete env.OTTR_SECRET_KEY;
 	// Same strip in serveWorker: a corporate proxy URL with credentials
 	// (http://user:pass@proxy:8080) must not sit in a turn's env; the host and
 	// port stay, so the proxy still routes the turn's network calls.
@@ -153,6 +166,19 @@ export const NO_DISCOVERY_CONFIG = resolve(
 	"..",
 	"extension",
 	"no-discovery.yml",
+);
+
+/**
+ * Overlay that turns off the read tool's URL fetch (OTTR-982): the board's own runs read
+ * worker-written content inside the server container, next to the board's zero-auth
+ * loopback API, so an injected URL read must not pass the auth wall. startLocalRun
+ * appends it; worker and VM runs keep URL reads.
+ */
+export const NO_FETCH_CONFIG = resolve(
+	import.meta.dir,
+	"..",
+	"extension",
+	"no-fetch.yml",
 );
 
 /** `images` are absolute paths; omp attaches each `@<path>` to the user message of the stdin prompt. */
@@ -330,10 +356,18 @@ function renderAsk(args: unknown): string | null {
 	const qs = askQuestions(args);
 	if (qs === null) return null;
 	return `\n▸ ask\n${qs
-		.map(
-			(q) =>
-				`  ? ${q.question}\n${q.options.map((o) => `    • ${o.label}${o.description ? ` — ${o.description}` : ""}`).join("\n")}`,
-		)
+		.map((q) => {
+			// A text question has no options: the user types a single-line answer.
+			const bullets = q.text
+				? "    • <type your answer>"
+				: q.options
+						.map(
+							(o) =>
+								`    • ${o.label}${o.description ? ` — ${o.description}` : ""}`,
+						)
+						.join("\n");
+			return `  ? ${q.question}\n${bullets}`;
+		})
 		.join("\n")}\n`;
 }
 
@@ -874,6 +908,13 @@ const workOutcomeRule: ClassifyRule = (o, stage) => {
 	if (oc === null) return null;
 	if (oc.status === "ready") return workReadyNext(o, stage, o.git);
 	if (oc.status === "answered") return workAnsweredNext(o, stage, o.git);
+	// Only a merge turn closes as superseded: a work turn re-reports ready and the
+	// normal merge turn decides (the rejection rides the resumed turn's prompt).
+	if (oc.status === "superseded")
+		return needsAt(
+			stage,
+			"Work turns do not close as superseded; report ready.",
+		);
 	return null;
 };
 
@@ -883,6 +924,17 @@ const mergeOutcomeRule: ClassifyRule = (o, stage) => {
 	if (oc === null) return null;
 	if (oc.status === "ready" || oc.status === "answered")
 		return needsAt(stage, `Unexpected outcome "${oc.status}" in a merge turn.`);
+	// OTTR-1182: a merge turn whose branch main already superseded closes done, but
+	// only with the follow-up card id it filed for the gap. The settle verifies the
+	// link and the target's push state before the cleanup runs (verifySupersededClose);
+	// an unproven report parks with the worktree intact.
+	if (oc.status === "superseded")
+		return oc.followUp !== undefined && oc.followUp.trim() !== ""
+			? { stage: "done", state: "idle", needsReason: null }
+			: needsAt(
+					stage,
+					"Reported superseded, but the report carries no follow-up card id. File the gap card with create_task, then reply and pass its id in followUp.",
+				);
 	return null;
 };
 
@@ -945,7 +997,8 @@ function isOutcome(v: unknown): v is Outcome {
 		(o.dependsOn === undefined ||
 			(Array.isArray(o.dependsOn) &&
 				o.dependsOn.every((d: unknown) => typeof d === "string"))) &&
-		(o.prBody === undefined || typeof o.prBody === "string")
+		(o.prBody === undefined || typeof o.prBody === "string") &&
+		(o.followUp === undefined || typeof o.followUp === "string")
 	);
 }
 
@@ -974,7 +1027,11 @@ export interface EventState {
 			gain: string;
 			risk: string;
 			check: string;
+			decision?: string;
 		} | null;
+		/** The question the user must answer first; null when none. Kept apart from the
+		 *  summary, so a decision holds the card even when a summary field is missing. */
+		decision?: string | null;
 		/** The board project the card files on; null files on the retro's own project. */
 		project: string | null;
 	} | null;
@@ -1041,12 +1098,7 @@ function applyAsk(state: EventState, e: AnyRec): void {
 function proposedSummary(
 	args: AnyRec,
 ): NonNullable<EventState["proposed"]>["summary"] {
-	const part = (key: string): string | null => {
-		if (typeof args[key] !== "string") return null;
-		const value = (args[key] as string).trim();
-		if (value === "") return null;
-		return value.length > 400 ? `${value.slice(0, 399)}…` : value;
-	};
+	const part = (key: string): string | null => capped(args[key]);
 	const whatChanges = part("whatChanges");
 	const why = part("why");
 	const gain = part("gain");
@@ -1055,7 +1107,23 @@ function proposedSummary(
 		return null;
 	// Summary policy: whatChanges/why/gain/check are required, risk optional and defaults
 	// to "none found"; each field is capped at 400 characters (slice to 399 + "…").
-	return { whatChanges, why, gain, risk: part("risk") ?? "none found", check };
+	const decision = part("decision");
+	const summary = {
+		whatChanges,
+		why,
+		gain,
+		risk: part("risk") ?? "none found",
+		check,
+	};
+	return decision === null ? summary : { ...summary, decision };
+}
+
+/** A trimmed, non-empty tool string capped at 400 characters (399 + "…"); null otherwise. */
+function capped(v: unknown): string | null {
+	if (typeof v !== "string") return null;
+	const value = v.trim();
+	if (value === "") return null;
+	return value.length > 400 ? `${value.slice(0, 399)}…` : value;
 }
 
 /** A propose_task call's args wait on the shared remembered map until the end event
@@ -1092,16 +1160,19 @@ function recordProposal(state: EventState, args: AnyRec): void {
 	state.recorded.push(call);
 	// Retro semantics: the first succeeded call is the proposal (the extension
 	// refuses a second, and a refused call never records).
-	if (state.proposed === null)
+	if (state.proposed === null) {
+		const decision = capped(args.decision);
 		state.proposed = {
 			prompt: call.prompt,
 			model: call.model,
 			summary: proposedSummary(args),
+			...(decision === null ? {} : { decision }),
 			project:
 				typeof args.project === "string" && args.project.trim() !== ""
 					? args.project.trim()
 					: null,
 		};
+	}
 }
 
 /** The end of one propose_task call: record only a succeeded one. The extension's
@@ -1550,13 +1621,21 @@ export function createRunSink(o: {
 /** D6: no agent run holds Ottr's ssh command, the env-scoped credential helper or the
  * per-host tokens; the server alone runs that git. GH_TOKEN is not in this set: a local run
  * (a merge turn in the server container) keeps it for its push. Worker turns never get it:
- * startRun drops it from the forwarded env, and serveWorker strips it from its own env. */
-function withoutGitAuth(
+ * startRun drops it from the forwarded env, and serveWorker strips it from its own env.
+ * Exported for the repo-relocating-env strip test (OTTR-1162). */
+export function withoutGitAuth(
 	env: Record<string, string | undefined>,
 ): Record<string, string | undefined> {
 	const out = { ...env };
 	for (const k of Object.keys(out))
 		if (GIT_AUTH_ENV_NAME.test(k)) delete out[k];
+	// OTTR-1162: a session env carrying GIT_DIR (for example a process launched from a git
+	// hook) redirects a turn's test run into the foreign gitdir — the drill on this card made
+	// fixture writes land in the enclosing repository this way, and the stray board-repo
+	// writes of 2026-11-20 matched that shape. A turn's git names its repos with path
+	// arguments; the ambient repo-relocating vars never help and only redirect. Guests strip
+	// the same set (vmGuest toolEnv).
+	stripRepoRelocatingEnv(out);
 	return out;
 }
 
@@ -1572,7 +1651,8 @@ const VM_DENIED_ENV = /^(ANTHROPIC_|OPENAI_|GH_|GITHUB_|HINDSIGHT_)/;
 
 /** True when the env entry must not reach a microVM guest: denied names, lent names, git
  * auth names, secret values, the guest's own PATH/home/agent dir, the board-config pointer
- * the guest mounts no file for (OTTR-693), and OTTR_ names outside the turn flags. */
+ * the guest mounts no file for (OTTR-693), and OTTR_ names outside the turn flags and the
+ * card-env note (OTTR-1099). */
 function vmEnvDenied(
 	k: string,
 	v: string | undefined,
@@ -1589,7 +1669,11 @@ function vmEnvDenied(
 	// pointer would name a missing file there; git would then skip the global scope
 	// entirely and never see an identity the VM image ships in its own home.
 	if (k === "GIT_CONFIG_GLOBAL") return true;
-	if (k.startsWith("OTTR_") && !/^OTTR_(RETRO|REVIEW|TRENDING)$/.test(k))
+	if (
+		k.startsWith("OTTR_") &&
+		!/^OTTR_(RETRO|REVIEW|TRENDING|TEST_PG_URL|REQUIRE_PG_TESTS)$/.test(k) &&
+		k !== CARD_ENV_NOTE_NAME
+	)
 		return true;
 	return false;
 }
@@ -1623,6 +1707,7 @@ export function vmEnv(o: {
 		env.OTTR_TASK_ID = o.board.taskId;
 	}
 	if (o.layerEnv !== null) Object.assign(env, o.layerEnv);
+	delete env.OTTR_DATABASE_URL;
 	return env;
 }
 
@@ -1673,6 +1758,10 @@ interface StartOptions {
 	sessionName?: string | null;
 	/** Set: the run's session can file cards via its create_task tool; injected as OTTR_BOARD_URL/OTTR_BOARD_TOKEN/OTTR_PROJECT/OTTR_TASK_ID. */
 	board?: BoardEnv | null;
+	/** The run's project name (OTTR-994): rides the worker request even when
+	 * `stripBoard` removes OTTR_PROJECT from the env, so retro and proposal
+	 * runs keep their per-project turn identity on the worker. */
+	project?: string | null;
 	logPath: string;
 	/** Anchor for the log write (src/confine.ts). */
 	dataRoot: string;
@@ -1802,30 +1891,35 @@ function resolveMemoryConfig(o: StartOptions): string | null {
 	return ensureMemoryOverlay();
 }
 
+type RunLayerPin = Pick<
+	RunStart,
+	"layerEnv" | "layerDir" | "layerId" | "unregisterLayer"
+>;
+
 /** Pin the agent layer once per call, before any spawn: the env carries the resolved layer
  * directory, so a later atomic switch of `.alate/current` never touches a live run. Worker
  * runs resolve the shared home (alate provisions it), the board's own runs the board home. */
-function resolveLayerPin(
-	layerHome: string,
-	sink: RunSink,
-): {
-	layerEnv: { HOME: string; PI_CODING_AGENT_DIR: string } | null;
-	layerDir: string | null;
-	layerId: string | null;
-	unregisterLayer: () => void;
-} {
+function resolveLayerPin(layerHome: string, sink: RunSink): RunLayerPin {
 	const pin = pinnedAgentLayer(layerHome);
 	if (!pin.ok && pin.reason !== "none")
 		sink.logMark(
 			`! agent layer pin failed (${pin.reason}); running the flat home\n`,
 		);
-	let unregistered = false;
+	// OTTR-1132: the lease belongs to this run alone; its release drops only this holder.
+	// An acquisition failure throws here, before any spawn reads an unprotected layer.
+	const release = pin.ok ? acquireLayerUse(layerHome, pin.layer.id) : null;
 	const unregisterLayer = (): void => {
-		if (!pin.ok || unregistered) return;
-		unregistered = true;
-		removeLayerUse(layerHome, pin.layer.id);
+		if (release === null) return;
+		// Settlement paths must not throw: a failed release keeps the lease (protection
+		// stays on) and is reported in the run log.
+		try {
+			release();
+		} catch (err) {
+			sink.logMark(
+				`! agent layer lease release failed (${err instanceof Error ? err.message : err})\n`,
+			);
+		}
 	};
-	if (pin.ok) addLayerUse(layerHome, pin.layer.id);
 	return {
 		layerEnv: pin.ok
 			? { HOME: pin.layer.dir, PI_CODING_AGENT_DIR: pin.agentDir }
@@ -1849,6 +1943,7 @@ async function resolveIdentityEnv(
 	layerEnv: { HOME: string; PI_CODING_AGENT_DIR: string } | null,
 ): Promise<Record<string, string>> {
 	const identBaseEnv = withoutGitAuth({ ...process.env, ...o.env });
+	delete identBaseEnv.OTTR_DATABASE_URL;
 	if (o.vm) {
 		return o.commitIdentity != null
 			? commitIdentityEnv(o.commitIdentity, { name: false, email: false })
@@ -1868,18 +1963,129 @@ async function resolveIdentityEnv(
 	return commitIdentityEnv(identity, probe);
 }
 
+/**
+ * OTTR-990: the run-cwd directories the pinned omp line (18.15.0) scans for project
+ * custom tools. omp imports every `.ts`/`.js` module it finds there at session start,
+ * before any model call, and no CLI flag or config key turns that off (`--no-extensions`,
+ * `--no-lsp` and the no-discovery overlay cover extensions, plugin code, LSP and project
+ * MCP only; validation #OTTR-1089 planted `.omp/tools/x.ts` and its top-level code ran in
+ * the server process). The plugin dirs matter because a project plugin registry
+ * (`.omp/plugins/installed_plugins.json`, the `.claude` analog) adds its plugins' own
+ * `tools/` dirs; the foreign dirs come from omp's `claude`/`codex` discovery providers.
+ * A work turn plants these dirs in its worktree and commits them, and every board-side
+ * run uses that worktree as its cwd, so a local run parks them out of omp's sight.
+ */
+const CUSTOM_TOOL_DIRS = [
+	".omp/tools",
+	".omp/plugins",
+	".claude/tools",
+	".claude/plugins",
+	".codex/tools",
+] as const;
+
+/** Park suffix. omp's discovery scans the exact dir names `tools` and `plugins` inside
+ * each config dir, so the suffixed sibling stays invisible for the run. A crash leftover
+ * keeps the content on disk under this name; the next run heals it (restores, then parks
+ * it again), so committed content never stays parked. */
+const PARK_SUFFIX = ".ottr-boardrun";
+
+/** One parked dir: its discovery path in the run cwd and where it sits until settle. */
+interface ParkedDir {
+	from: string;
+	to: string;
+}
+
+/** Park target for `abs`: the stable sibling when free, else numbered siblings when a
+ * crash left both the original and the stable park behind. Throws when 63 numbered
+ * siblings are taken too: that is fail-closed, the same as every park error below. */
+function parkTarget(abs: string): string {
+	if (!lstatQuiet(`${abs}${PARK_SUFFIX}`)) return `${abs}${PARK_SUFFIX}`;
+	for (let n = 2; n < 64; n++) {
+		const candidate = `${abs}${PARK_SUFFIX}-${n}`;
+		if (!lstatQuiet(candidate)) return candidate;
+	}
+	throw new Error(
+		`custom-tool park failed for ${basename(abs)}: no free park target`,
+	);
+}
+
+/** Whether `abs` exists as any entry (a dangling symlink counts): the park moves links
+ * like files, so the run's cwd keeps its exact shape across the park. */
+function lstatQuiet(abs: string): boolean {
+	try {
+		lstatSync(abs);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Parks every custom-tool source dir in the run cwd out of omp's sight, appending each
+ * pair to the caller-owned `parked` (so a throw still leaves every parked dir restorable)
+ * and returning it. Renames stay inside the parent dir, so the worktree keeps its content
+ * and git only sees the moves while the park holds. Absent dirs are skipped. Fail-closed:
+ * an unexpected rename error throws before the spawn, so a run never starts on a cwd
+ * whose park is incomplete. */
+function parkCustomToolDirs(cwd: string, parked: ParkedDir[]): ParkedDir[] {
+	for (const rel of CUSTOM_TOOL_DIRS) {
+		const from = join(cwd, rel);
+		if (!lstatQuiet(from)) {
+			// Nothing to park here — but heal a crash leftover parked at the stable
+			// sibling, so committed content never stays parked after a tracker crash.
+			const stable = `${from}${PARK_SUFFIX}`;
+			if (!lstatQuiet(stable)) continue;
+			try {
+				renameSync(stable, from);
+			} catch (err) {
+				throw new Error(
+					`custom-tool park heal failed for ${rel}: ${errmsg(err)}`,
+				);
+			}
+		}
+		const to = parkTarget(from);
+		try {
+			renameSync(from, to);
+		} catch (err) {
+			throw new Error(`custom-tool park failed for ${rel}: ${errmsg(err)}`);
+		}
+		parked.push({ from, to });
+	}
+	return parked;
+}
+
+/** Restores the parked custom-tool dirs. A failed rename is logged, not thrown: the run
+ * already happened, and its result must not turn into a failure by a restore error. The
+ * parked content stays on disk at `to`; the next run's heal or the card's untracked
+ * quarantine picks it up, and this line names the pair for that cleanup. */
+function restoreParkedToolDirs(parked: ParkedDir[], sink: RunSink): void {
+	for (const { from, to } of parked.reverse()) {
+		try {
+			renameSync(to, from);
+		} catch (err) {
+			sink.line(
+				`! custom-tool park restore failed for ${from}: ${errmsg(err)} — content stays at ${to}`,
+			);
+		}
+	}
+}
+
 /** The local dispatch: omp spawns on this host and streams its events into the sink. */
 function startLocalRun(s: RunStart): RunHandle {
 	const {
 		o,
 		sink,
-		args,
 		startedAt,
 		layerEnv,
 		identityEnv,
 		layerId,
 		unregisterLayer,
 	} = s;
+	// The board's own runs (checks, merge turns, retro, the board check; also work turns
+	// on a worker-less board) read worker-written content and sit next to the server's
+	// zero-auth loopback API, so the read tool must not fetch URLs (OTTR-982): an
+	// injected read of a loopback /api URL would otherwise pass the auth wall. The key
+	// names no other overlay's key, so the position after the memory overlay cannot clash.
+	const args = [...s.args, "--config", NO_FETCH_CONFIG];
 	// Every local child gets an explicit env so worker credentials never reach a turn (R3-6/D6).
 	const launch: RunLauncher = o.launcher ?? spawn;
 	// The provision guard's untracked scan compares against the rules dir as it
@@ -1896,6 +2102,18 @@ function startLocalRun(s: RunStart): RunHandle {
 	);
 	if (layerEnv !== null) Object.assign(base, layerEnv);
 	Object.assign(base, identityEnv);
+	// OTTR-990: the run cwd is a worker-writable worktree, and omp imports its project
+	// custom tools (`.omp/tools`, plugins, foreign `.claude`/`.codex` tool dirs) into
+	// this server process at session start. Park them out of discovery for the run and
+	// restore them at settle; a park error throws before the spawn (fail-closed), after
+	// unwinding the dirs that did park, so the worktree keeps its committed content.
+	const parked: ParkedDir[] = [];
+	try {
+		parkCustomToolDirs(o.cwd, parked);
+	} catch (err) {
+		restoreParkedToolDirs(parked, sink);
+		throw err;
+	}
 	const child = launch("omp", args, {
 		cwd: o.cwd,
 		stdio: ["pipe", "pipe", "pipe"],
@@ -1937,6 +2155,8 @@ function startLocalRun(s: RunStart): RunHandle {
 		settled = true;
 		void (async () => {
 			try {
+				// Restore before the drain, so a restore warning lands in the run log.
+				if (parked.length > 0) restoreParkedToolDirs(parked, sink);
 				await sink.drain();
 				// Audit only after the run's output and persistence callbacks finish.
 				const drift = o.auditProvisioned?.(startedAt, rulesAtStart) ?? [];
@@ -2055,6 +2275,11 @@ function startVmRun(
 		throw new Error(
 			`config overlays not copied into the VM: ${missingOverlays.join(", ")}`,
 		);
+	const testEnv: Record<string, string> = {};
+	for (const key of ["OTTR_TEST_PG_URL", "OTTR_REQUIRE_PG_TESTS"] as const) {
+		const value = process.env[key];
+		if (value !== undefined) testEnv[key] = value;
+	}
 	const vmHandle = runWorker(
 		{
 			id: crypto.randomUUID(),
@@ -2062,7 +2287,7 @@ function startVmRun(
 			cwd: o.cwd,
 			stdin: o.prompt,
 			env: vmEnv({
-				env: { ...o.env, ...identityEnv },
+				env: { ...testEnv, ...o.env, ...identityEnv },
 				secrets: o.secrets,
 				sessionName: o.sessionName,
 				board: o.board ?? null,
@@ -2215,6 +2440,13 @@ function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
 			cwd: o.cwd,
 			stdin: o.prompt,
 			env,
+			// OTTR-994: the identity key rides the request itself, so a stripBoard
+			// run (retro, proposal) keeps its project's turn uid and turn home.
+			project:
+				o.project ??
+				(o.board === null || o.board === undefined
+					? undefined
+					: o.board.project),
 			githubReadEnv: withoutDatabaseUrl(o.githubReadEnv),
 			...(project === undefined ? {} : { lists: workerTurnLists(project) }),
 		},
@@ -2262,23 +2494,52 @@ export async function startRun(o: StartOptions): Promise<RunHandle> {
 	const vmToken = o.vm
 		? o.vm.tokens.issue({ ...o.vm.grant, base: o.vm.base })
 		: null;
-	const sink = createRunSink({
-		logPath: o.logPath,
-		dataRoot: o.dataRoot,
-		onLog: o.onLog,
-		onSession: o.onSession,
-		onProgress: o.onProgress,
-		secrets: vmToken === null ? o.secrets : [...(o.secrets ?? []), vmToken],
-		meter: o.meter,
-		onUsage: o.onUsage,
-		onRecorded: o.onRecorded,
-	});
-	const startedAt = Date.now();
-	// Pin the agent layer once per call, before any spawn: the env carries the resolved layer
-	// directory, so a later atomic switch of `.alate/current` never touches a live run. Worker
-	// runs resolve the shared home (alate provisions it), the board's own runs the board home.
-	const layerHome = o.worker || o.vm ? homedir() : boardOmpHome();
-	const layerPin = resolveLayerPin(layerHome, sink);
+	// Until a handle exists, no settlement releases the lease or revokes the token: every
+	// pre-handle error (sink, lease acquisition, setup, dispatch prep) cleans up here.
+	let layerPin: RunLayerPin | null = null;
+	try {
+		const sink = createRunSink({
+			logPath: o.logPath,
+			dataRoot: o.dataRoot,
+			onLog: o.onLog,
+			onSession: o.onSession,
+			onProgress: o.onProgress,
+			secrets: vmToken === null ? o.secrets : [...(o.secrets ?? []), vmToken],
+			meter: o.meter,
+			onUsage: o.onUsage,
+			onRecorded: o.onRecorded,
+		});
+		const startedAt = Date.now();
+		// Pin the agent layer once per call, before any spawn: the env carries the resolved
+		// layer directory, so a later atomic switch of `.alate/current` never touches a live
+		// run. Worker runs resolve the shared home (alate provisions it), the board's own runs
+		// the board home.
+		const layerHome = o.worker || o.vm ? homedir() : boardOmpHome();
+		layerPin = resolveLayerPin(layerHome, sink);
+		return await startPinnedRun(
+			o,
+			sink,
+			startedAt,
+			layerHome,
+			layerPin,
+			vmToken,
+		);
+	} catch (err) {
+		layerPin?.unregisterLayer();
+		if (o.vm && vmToken !== null) o.vm.tokens.revoke(vmToken);
+		throw err;
+	}
+}
+
+/** Everything between the layer pin and the run handle: a throw here releases the pin. */
+async function startPinnedRun(
+	o: StartOptions,
+	sink: RunSink,
+	startedAt: number,
+	layerHome: string,
+	layerPin: RunLayerPin,
+	vmToken: string | null,
+): Promise<RunHandle> {
 	const memoryConfig = resolveMemoryConfig(o);
 	// The plugin-skills overlay reads the run's pinned home, so a layer run gets its own
 	// layer's plugins (docs/specs/turn-home-plugin-skills.md).

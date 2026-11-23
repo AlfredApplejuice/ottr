@@ -43,6 +43,11 @@ shots were already written).
     `/projects/lumen/tasks/<prId>`.
   - `done`: the contrast done card's drawer.
   - `board`: the Lumen project face.
+  - `settings-hindsight`: `/settings`, scrolled to the Hindsight card. The
+    board env strips the host's Hindsight endpoint and pins
+    `OTTR_BOARD_OMP_HOME` to `/proc/nonexistent`, so the memory probe fails
+    deterministically and the card renders its no-memory warning line; the
+    run refuses when the line is missing. No network dependency.
   `--view` may repeat; the default view is `card`.
 - Prints the planted card ids before the board boots.
 - Bounds every wait: an overall 90 s watchdog plus a deadline on each CDP
@@ -64,6 +69,7 @@ shots were already written).
 ## Non-goals
 
 - Other card fixtures than the parked PR card and the done card (add a view
-  when a card needs one).
-- Screenshots of settings or system pages.
+  when a card needs one). Settings views stay single-purpose: a view that
+  needs a warning line drives its own env and asserts the line.
+- Screenshots of system pages.
 - Visual-regression goldens or pixel-diff gates.

@@ -6,15 +6,20 @@ import { childEnv } from "./runner.ts";
 import { runMergeGates } from "./worktree.ts";
 
 const SECRET = "leak-".repeat(8);
+const MASTER_KEY = "ab".repeat(32);
 
 async function withSecret<T>(fn: () => Promise<T> | T): Promise<T> {
 	const prev = process.env.OTTR_HOSTED_SECRET;
+	const prevMaster = process.env.OTTR_SECRET_KEY;
 	process.env.OTTR_HOSTED_SECRET = SECRET;
+	process.env.OTTR_SECRET_KEY = MASTER_KEY;
 	try {
 		return await fn();
 	} finally {
 		if (prev === undefined) delete process.env.OTTR_HOSTED_SECRET;
 		else process.env.OTTR_HOSTED_SECRET = prev;
+		if (prevMaster === undefined) delete process.env.OTTR_SECRET_KEY;
+		else process.env.OTTR_SECRET_KEY = prevMaster;
 	}
 }
 
@@ -35,8 +40,8 @@ function fixture(check: string, testBody: string): string {
 	return dir;
 }
 
-describe("hosted secret never reaches a child process", () => {
-	test("childEnv (local agent and classic worker env) drops it from process.env", async () => {
+describe("server secrets never reach a child process", () => {
+	test("childEnv (local agent and classic worker env) drops them from process.env", async () => {
 		const env = await withSecret(() =>
 			childEnv({
 				board: {
@@ -48,12 +53,19 @@ describe("hosted secret never reaches a child process", () => {
 			}),
 		);
 		expect(env.OTTR_HOSTED_SECRET).toBeUndefined();
+		expect(env.OTTR_SECRET_KEY).toBeUndefined();
 		expect(env.OTTR_BOARD_TOKEN).toBe("t");
 	});
 
-	test("childEnv drops it from an explicit base env", () => {
+	test("childEnv drops them from an explicit base env", () => {
 		expect(
-			childEnv({ base: { PATH: "/bin", OTTR_HOSTED_SECRET: SECRET } }),
+			childEnv({
+				base: {
+					PATH: "/bin",
+					OTTR_HOSTED_SECRET: SECRET,
+					OTTR_SECRET_KEY: MASTER_KEY,
+				},
+			}),
 		).toEqual({ PATH: "/bin" });
 	});
 

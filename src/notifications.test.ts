@@ -32,6 +32,8 @@ const card = (
 	stage: "in_progress",
 	prDraft: null,
 	prComments: null,
+	prPosted: null,
+	prPostedHead: null,
 	asked: null,
 	answered: false,
 	needsReason: null,
@@ -516,6 +518,152 @@ describe("PR review notifications", () => {
 		expect(
 			clearedAlerts([a], [pr({ prComments: 500 })], new Set(["pr:P:500"])),
 		).toEqual([a]);
+	});
+
+	test("an auto-posted review entering done says the board posted it and opens the PR", () => {
+		const url = "https://github.com/ottr/ottr/pull/12";
+		const head = "a".repeat(40);
+		const old = pr({ state: "needs_you", prDraft: 3 });
+		const t = pr({
+			state: "idle",
+			stage: "done",
+			prDraft: 3,
+			prPosted: url,
+			prPostedHead: head,
+		});
+		const evs = diffEvents([old], [t]);
+		expect(evs).toEqual([
+			{
+				key: `pr:P:posted:${head}`,
+				class: "complete",
+				project: "ottr",
+				taskId: "P",
+				title: "ottr: PR review: #12 Fix the thing",
+				body: "Ottr posted the review on GitHub",
+				url,
+				tag: "complete",
+			},
+		]);
+		// The same frame again is silent.
+		expect(diffEvents([t], [t])).toEqual([]);
+	});
+
+	test("a brand-new card whose first frame carries the posted stamp fires", () => {
+		// savePrDraft files the card and the automatic post lands before the next
+		// publish: the card's first frame is already done, with no previous entry.
+		const url = "https://github.com/ottr/ottr/pull/12";
+		const head = "a".repeat(40);
+		const other = pr({ id: "Q" });
+		const t = pr({
+			id: "P",
+			state: "idle",
+			stage: "done",
+			prPosted: url,
+			prPostedHead: head,
+		});
+		expect(
+			diffEvents([other], [t]).map((e) => [e.key, e.class, e.url]),
+		).toEqual([[`pr:P:posted:${head}`, "complete", url]]);
+	});
+
+	test("a later head posted between two done frames fires on the head change", () => {
+		// Head A's post, then head B reviewed and auto-posted while the card sat at
+		// done in both published frames: the PR url is the same for both heads, so
+		// only the posted head witnesses the new occurrence.
+		const url = "https://github.com/ottr/ottr/pull/12";
+		const headA = "a".repeat(40);
+		const headB = "b".repeat(40);
+		const old = pr({
+			state: "idle",
+			stage: "done",
+			prPosted: url,
+			prPostedHead: headA,
+		});
+		const next = pr({
+			state: "idle",
+			stage: "done",
+			prPosted: url,
+			prPostedHead: headB,
+		});
+		expect(diffEvents([old], [next]).map((e) => e.key)).toEqual([
+			`pr:P:posted:${headB}`,
+		]);
+		// No head change: silent.
+		expect(diffEvents([next], [next])).toEqual([]);
+	});
+
+	test("a manual post keeps was done and the drawer url", () => {
+		const old = pr({ state: "needs_you", prDraft: 3 });
+		const t = pr({ state: "idle", stage: "done", prDraft: 3 });
+		expect(diffEvents([old], [t]).map((e) => [e.key, e.body, e.url])).toEqual([
+			[
+				"done:P",
+				"PR review: #12 Fix the thing was done",
+				"/projects/ottr/tasks/P",
+			],
+		]);
+	});
+
+	test("an error in the same frame outranks the auto-post complete event", () => {
+		const t = pr({
+			state: "idle",
+			stage: "done",
+			prDraft: 3,
+			prPosted: "https://github.com/ottr/ottr/pull/12",
+			prPostedHead: "a".repeat(40),
+			errorTurn: "t1",
+			errorText: "boom",
+		});
+		expect(
+			diffEvents([pr({ state: "needs_you", prDraft: 3 })], [t]).map((e) => [
+				e.class,
+				e.key,
+			]),
+		).toEqual([["error", "error:P:t1"]]);
+	});
+
+	test("the posted alert clears on a different head, a cleared stamp, or a vanished card", () => {
+		const head = "a".repeat(40);
+		const headB = "b".repeat(40);
+		const a = live(`pr:P:posted:${head}`, "request", "P");
+		const posted = pr({
+			state: "idle",
+			stage: "done",
+			prPosted: "https://github.com/ottr/ottr/pull/12",
+			prPostedHead: head,
+		});
+		// Stands while the board's post for this head is current.
+		expect(clearedAlerts([a], [posted], new Set())).toEqual([]);
+		// A different head's stamp (a later automatic post) clears it.
+		expect(
+			clearedAlerts([a], [pr({ ...posted, prPostedHead: headB })], new Set()),
+		).toEqual([a]);
+		// A manual post (or a new head, or a closed PR) nulls the stamp.
+		expect(
+			clearedAlerts([a], [pr({ state: "idle", stage: "done" })], new Set()),
+		).toEqual([a]);
+		expect(clearedAlerts([a], [], new Set())).toEqual([a]);
+		// The numeric comment rule beside it keeps its behavior.
+		const wave = live("pr:P:500", "request", "P");
+		expect(clearedAlerts([wave], [posted], new Set())).toEqual([wave]);
+		expect(clearedAlerts([wave], [pr({ prComments: 500 })], new Set())).toEqual(
+			[],
+		);
+	});
+
+	test("a rewritten draft on a stamped card is one request, never a complete", () => {
+		const old = pr({ state: "needs_you", prDraft: 3 });
+		const t = pr({
+			state: "needs_you",
+			stage: "done",
+			prDraft: 4,
+			prPosted: "https://github.com/ottr/ottr/pull/12",
+			prPostedHead: "a".repeat(40),
+		});
+		expect(diffEvents([old], [t]).map((e) => [e.class, e.key])).toEqual([
+			["request", "task:P:needs-pr4"],
+		]);
+		expect(diffEvents([t], [t])).toEqual([]);
 	});
 });
 

@@ -11,12 +11,19 @@ type Fetch = {
 	reason: string | null;
 };
 
-const SEVERITY_RANK: Record<string, number> = {
+/** Severity to rank order, critical first; unknown severities rank last. Shared by
+ * the review summary and the code scanning watch. */
+export const ALERT_SEVERITY_RANK: Record<string, number> = {
 	critical: 0,
 	high: 1,
 	medium: 2,
 	low: 3,
 };
+
+/** Alert count at or above which a code scanning fetch may be truncated: every
+ * page comes back full. The watch removes nothing from such a fetch, so an alert
+ * parked past the last page never dies wrongly. */
+export const CODE_SCAN_MAX_ALERTS = PAGE_SIZE * MAX_PAGES;
 
 /** Control chars, newlines and tabs become single spaces; runs of spaces collapse.
  * The DATA fence markers and the Unicode line separators die too: untrusted text must
@@ -45,7 +52,7 @@ function severity(a: Record<string, unknown>): string {
 
 /** Severity label used in the counts line; unknown severities fall in "others". */
 const countsLabel = (s: string): string =>
-	SEVERITY_RANK[s] === undefined ? "others" : s;
+	ALERT_SEVERITY_RANK[s] === undefined ? "others" : s;
 
 /** One alert endpoint's GitHub kind. */
 type AlertKind = "dependabot" | "code-scanning" | "secret-scanning";
@@ -136,6 +143,29 @@ async function fetchPage(
 	return { alerts: parsed, reason: null, nextAfter };
 }
 
+/** Dependabot pages by the after cursor until its Link header runs out. */
+async function fetchCursorPages(
+	gh: GhFn,
+	base: string,
+	kind: AlertKind,
+): Promise<Fetch> {
+	const all: Record<string, unknown>[] = [];
+	let after: string | null = null;
+	for (let page = 1; page <= MAX_PAGES; page++) {
+		const cursor = after === null ? "" : `&after=${after}`;
+		const r = await fetchPage(
+			gh,
+			`${base}?state=open&per_page=${PAGE_SIZE}${cursor}`,
+			kind,
+		);
+		if (r.reason !== null) return r;
+		all.push(...r.alerts);
+		if (r.nextAfter === null) break;
+		after = r.nextAfter;
+	}
+	return { alerts: all, reason: null };
+}
+
 /** All open alerts of one endpoint, capped at MAX_PAGES. Dependabot pages by the
  * after cursor until its Link header runs out; the scanning endpoints keep
  * whole offset pages until a short one. */
@@ -144,24 +174,10 @@ async function fetchEndpoint(
 	id: string,
 	kind: AlertKind,
 ): Promise<Fetch> {
+	if (kind === "dependabot")
+		return fetchCursorPages(gh, `repos/${id}/${kind}/alerts`, kind);
 	const base = `repos/${id}/${kind}/alerts`;
 	const all: Record<string, unknown>[] = [];
-	if (kind === "dependabot") {
-		let after: string | null = null;
-		for (let page = 1; page <= MAX_PAGES; page++) {
-			const cursor = after === null ? "" : `&after=${after}`;
-			const r = await fetchPage(
-				gh,
-				`${base}?state=open&per_page=${PAGE_SIZE}${cursor}`,
-				kind,
-			);
-			if (r.reason !== null) return r;
-			all.push(...r.alerts);
-			if (r.nextAfter === null) break;
-			after = r.nextAfter;
-		}
-		return { alerts: all, reason: null };
-	}
 	for (let page = 1; page <= MAX_PAGES; page++) {
 		const r = await fetchPage(
 			gh,
@@ -173,6 +189,15 @@ async function fetchEndpoint(
 		if (r.alerts.length < PAGE_SIZE) break;
 	}
 	return { alerts: all, reason: null };
+}
+
+/** All open code scanning alerts of one repo: the one fetch path, shared by the
+ * review summary and the watch. Returns the raw entries; the watch parses them. */
+export async function fetchCodeScanningAlerts(
+	gh: GhFn,
+	id: string,
+): Promise<{ alerts: Record<string, unknown>[]; reason: string | null }> {
+	return fetchEndpoint(gh, id, "code-scanning");
 }
 
 type Category = {
@@ -190,7 +215,8 @@ function top(
 	return [...alerts]
 		.sort((a, b) => {
 			const d =
-				(SEVERITY_RANK[severity(a)] ?? 4) - (SEVERITY_RANK[severity(b)] ?? 4);
+				(ALERT_SEVERITY_RANK[severity(a)] ?? 4) -
+				(ALERT_SEVERITY_RANK[severity(b)] ?? 4);
 			if (d !== 0) return d;
 			return (Number(a.number) || 0) - (Number(b.number) || 0);
 		})
@@ -223,6 +249,17 @@ const NOT_ENABLED_RE = [
 	/Secret scanning is disabled/i,
 ];
 
+/** True when a fetch reason means code scanning is not available for the repo: a
+ * disabled feature, or the 403/404/Not Found a repo without Advanced Security answers. */
+export function codeScanningUnavailable(reason: string): boolean {
+	return (
+		NOT_ENABLED_RE.some((re) => re.test(reason)) ||
+		reason.includes("HTTP 403") ||
+		reason.includes("HTTP 404") ||
+		reason.includes("Not Found")
+	);
+}
+
 /** One category's failure line: "not enabled" for a disabled feature, the redacted reason otherwise. */
 function alertTypeLine(name: string, kind: AlertKind, reason: string): string {
 	const disabled =
@@ -239,7 +276,7 @@ function itemLines(
 ): string[] {
 	return top(alerts, topN).map((a) => {
 		const sev = severity(a);
-		const tail = SEVERITY_RANK[sev] === undefined ? "" : ` (${sev})`;
+		const tail = ALERT_SEVERITY_RANK[sev] === undefined ? "" : ` (${sev})`;
 		return `  - ${cleanText(item(a))}${tail} ${cleanText(a.html_url, Infinity)}`;
 	});
 }

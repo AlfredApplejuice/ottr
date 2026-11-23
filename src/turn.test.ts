@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import {
 	afterEach,
+	beforeEach,
 	describe,
 	expect,
 	jest,
@@ -30,6 +31,7 @@ import { PassThrough } from "node:stream";
 import { deflateSync } from "node:zlib";
 
 import { createApp } from "./app.ts";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { GlobalStore } from "./globalStore.ts";
 import {
 	type GateCheck,
@@ -71,6 +73,8 @@ import {
 	isRetro,
 	isReview,
 	LEAD_APPLIES_OPTION,
+	LEAD_COMMITS_REASON,
+	LEAD_NO_REVIEW_REASON,
 	LEAD_NOT_APPLY_OPTION,
 	LEAD_QUESTIONS_PROMPT_PREFIX,
 	liveCard,
@@ -121,11 +125,12 @@ import type {
 	Task,
 	WorkCheckRun,
 } from "./types.ts";
-import { vmState } from "./vmState.ts";
+import { resetVmState, vmState } from "./vmState.ts";
 import { VmTokens } from "./vmTokens.ts";
 import type { DetachedRun, WorkerTarget } from "./workers.ts";
 import {
 	isClean as gitIsClean,
+	commitsAhead as realCommitsAhead,
 	PUSH_LANDED_BEFORE_ATTEMPT,
 	pushBranch as pushBranchReal,
 	checkoutState as realCheckoutState,
@@ -162,6 +167,7 @@ interface Recorded {
 		sessionName?: string | null;
 		env?: Record<string, string>;
 		secrets?: readonly string[];
+		githubReadEnv?: Record<string, string>;
 		stripBoard?: boolean;
 		stripGithubToken?: boolean;
 		tools?: string | null;
@@ -198,6 +204,7 @@ interface Recorded {
 		prompt: string;
 		model: string | null;
 		summary: ProposalSummary | null;
+		decision?: string | null;
 		project: string | null;
 	} | null;
 	/** The fake run resolves `done` with these findings (a review run's propose_task calls). */
@@ -416,6 +423,8 @@ function fakeOps(record: Recorded, overrides: FixtureOps = {}): TurnOps {
 			cwd: string;
 			prompt: string;
 			env?: Record<string, string>;
+			secrets?: readonly string[];
+			githubReadEnv?: Record<string, string>;
 			stripBoard?: boolean;
 			stripGithubToken?: boolean;
 			tools?: string | null;
@@ -818,6 +827,68 @@ describe("turn loop", () => {
 		expect(after.branch).toBeNull();
 	});
 
+	test("a trending scout gets no served GitHub token and no Settings env values (OTTR-1028)", async () => {
+		const { store, record, loop } = await setup({
+			holdFollowUps: true,
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			// The harness turnEnv honors the values flag like the server's wiring: a scout
+			// asks for the lent token only, a work turn gets the Settings values too.
+			turnEnv: async (
+				_project: string,
+				_model: string | null,
+				opts?: { values?: boolean },
+			): Promise<{
+				env: Record<string, string>;
+				missing: string[];
+				secrets: string[];
+			}> =>
+				opts?.values === false
+					? { env: { LENT_TOKEN: "lent-1" }, missing: [], secrets: ["lent-1"] }
+					: {
+							env: { SETTINGS_SECRET: "s3cret", LENT_TOKEN: "lent-1" },
+							missing: ["ABSENT"],
+							secrets: ["lent-1"],
+						},
+			turnReadToken: async () => ({ host: "github.com", token: "read-tok" }),
+		});
+		const task = await store.createTask(
+			"Trending scout for demo\nread the bundle",
+			null,
+			"trending",
+		);
+
+		await loop.runTurn(store.name, task.id);
+
+		const run = record.runs[0]!;
+		// The lent provider token and the mark ride; no Settings value does.
+		expect(run.env).toEqual({ OTTR_TRENDING: "1", LENT_TOKEN: "lent-1" });
+		// The served read-only token stays on the server: no delivery field, no redaction
+		// entry (it is never delivered, so the run log cannot leak it).
+		expect(run.githubReadEnv).toBeUndefined();
+		expect(run.secrets).toEqual(["lent-1"]);
+	});
+
+	test("a work turn still gets the served token as githubReadEnv and its Settings values", async () => {
+		const { store, record, loop } = await setup({
+			holdFollowUps: true,
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			turnEnv: async () => ({
+				env: { SETTINGS_SECRET: "s3cret" },
+				missing: [],
+				secrets: [],
+			}),
+			turnReadToken: async () => ({ host: "github.com", token: "read-tok" }),
+		});
+		const task = await store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+
+		const run = record.runs[0]!;
+		expect(run.env?.SETTINGS_SECRET).toBe("s3cret");
+		expect(run.githubReadEnv).toEqual({ GH_TOKEN: "read-tok" });
+		expect(run.secrets).toEqual(["read-tok"]);
+	});
+
 	test("a retro proposal names its source card once by id and title", async () => {
 		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
@@ -896,6 +967,79 @@ describe("turn loop", () => {
 		).toHaveLength(0);
 		expect(await logText(store, retro.id)).toContain(
 			"retro: proposal dropped: cap of 3 open proposals reached",
+		);
+	});
+
+	test("with retroAutoStart a proposal without a decision starts queued past the cap; one with a decision is held", async () => {
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
+		await store.setSettings({ retroAutoStart: true });
+		// Three open proposals fill the cap: a started card is no open proposal.
+		for (let i = 0; i < 3; i++) {
+			const p = await store.createTask(`proposal ${i}`);
+			await store.updateTask(p.id, {
+				state: "needs_you",
+				needsReason: `${PROPOSED_REASON_PREFIX}an older retro. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
+			});
+		}
+		const summary = {
+			whatChanges: "w",
+			why: "y",
+			gain: "g",
+			risk: "none found",
+			check: "c",
+		};
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
+		record.proposal = {
+			prompt: "start me",
+			model: null,
+			summary,
+			project: null,
+		};
+		await loop.runTurn(store.name, retro.id);
+		const started = (await store.listTasks()).find(
+			(t) => t.followUpOf === retro.id,
+		)!;
+		expect(started.stage).toBe("todo");
+		expect(started.state).toBe("queued");
+		expect(started.needsReason).toBeNull();
+		// No "." reply: the board start never claims the user wrote it.
+		expect(started.pendingPrompt).toBeNull();
+		expect(started.promptAuthor).toBe("board");
+		expect(started.proposalSummary).toEqual(summary);
+		expect(await logText(store, retro.id)).toContain(
+			`retro: proposal started without asking: ${started.id}`,
+		);
+
+		// A decision holds the card, also with the setting on, and the summary keeps it.
+		for (const t of await store.listTasks())
+			if (t.state === "needs_you")
+				await store.updateTask(t.id, { cancelledAt: Date.now() });
+		const retro2 = await store.createTask(
+			`${RETRO_MARKER}the second retro`,
+			null,
+			"retro",
+		);
+		record.proposal = {
+			prompt: "ask first",
+			model: null,
+			summary,
+			decision: "Keep the old flag or drop it?",
+			project: null,
+		};
+		await loop.runTurn(store.name, retro2.id);
+		const held = (await store.listTasks()).find(
+			(t) => t.followUpOf === retro2.id,
+		)!;
+		expect(held.state).toBe("needs_you");
+		expect(held.needsReason?.startsWith(PROPOSED_REASON_PREFIX)).toBe(true);
+		expect(held.proposalSummary?.decision).toBe(
+			"Keep the old flag or drop it?",
 		);
 	});
 
@@ -1495,6 +1639,7 @@ describe("turn loop", () => {
 										options: [{ label: "a" }],
 										multi: false,
 										recommended: null,
+										text: false,
 									},
 								],
 							}),
@@ -1519,6 +1664,7 @@ describe("turn loop", () => {
 				options: [{ label: "a" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 	});
@@ -1826,7 +1972,7 @@ test("no agent run carries git host auth, merge turns included (D6)", async () =
 // origin" button — the real resolveTarget runs against real git here.
 test("a merge turn on an origin without the target branch parks naming Push to origin", async () => {
 	const run = (cwd: string, ...args: string[]): void => {
-		execSync(`git ${args.join(" ")}`, { cwd, stdio: "ignore" });
+		execSync(`git ${args.join(" ")}`, { cwd, stdio: "ignore", env: fixtureGitEnv() });
 	};
 	const { store, loop } = await setup({ resolveTarget: realResolveTarget });
 	// The main checkout holds a commit; origin is an empty bare repo.
@@ -2252,6 +2398,7 @@ describe("turn quarantine", () => {
 									options: [],
 									multi: false,
 									recommended: null,
+									text: true,
 								},
 							],
 						}),
@@ -3111,9 +3258,9 @@ describe("turn sessions, steering and images", () => {
 		writeFileSync(join(wt, "shots", "committed.png"), png);
 		// Distinct bytes: byte-identical shots are deduped as one screenshot.
 		writeFileSync(join(wt, "shots", "fresh.png"), Uint8Array.from([...png, 1]));
-		execSync("git init -q -b main", { cwd: wt });
-		execSync("git add shots/committed.png", { cwd: wt });
-		execSync("git -c user.name=t -c user.email=t@t commit -qm c", { cwd: wt });
+		execSync("git init -q -b main", { cwd: wt, env: fixtureGitEnv() });
+		execSync("git add shots/committed.png", { cwd: wt, env: fixtureGitEnv() });
+		execSync("git -c user.name=t -c user.email=t@t commit -qm c", { cwd: wt, env: fixtureGitEnv() });
 		await loop.runTurn(store.name, task.id);
 		const after = (await store.getTask(task.id))!;
 		expect(after.shots).toEqual(["1.png"]); // the tracked shot never arrives
@@ -3165,9 +3312,9 @@ describe("turn sessions, steering and images", () => {
 			join(wt, "shots", "settings-kept-days.png"),
 			Uint8Array.from([...png, 1]),
 		);
-		execSync("git init -q -b main", { cwd: wt });
-		execSync("git add .", { cwd: wt });
-		execSync("git -c user.name=t -c user.email=t@t commit -qm c", { cwd: wt });
+		execSync("git init -q -b main", { cwd: wt, env: fixtureGitEnv() });
+		execSync("git add .", { cwd: wt, env: fixtureGitEnv() });
+		execSync("git -c user.name=t -c user.email=t@t commit -qm c", { cwd: wt, env: fixtureGitEnv() });
 		await loop.runTurn(store.name, task.id);
 
 		const after = (await store.getTask(task.id))!;
@@ -5139,6 +5286,472 @@ describe("turn merge outcomes", () => {
 		expect(after.needsReason).toBe(
 			'Unexpected outcome "answered" in a merge turn.',
 		);
+	});
+
+	/** A superseded report whose claims hold: follow-up card linked, target tips equal.
+	 * `gapId` is a getter: the gap card is created after setup, before the turn runs. */
+	function supersededRun(record: Recorded, gapId: () => string) {
+		return async (o: {
+			prompt: string;
+			onSession?: (sid: string) => void;
+		}) => {
+			record.runs.push(o as never);
+			await o.onSession?.("sess-1");
+			return {
+				pid: 4242,
+				done: Promise.resolve(
+					runResult({
+						outcome: {
+							status: "superseded",
+							summary: "superseded by main's flow; gap filed",
+							followUp: gapId(),
+						} satisfies Outcome,
+					}),
+				),
+				kill: async () => {},
+			};
+		};
+	}
+
+	/** Tips the verification reads: both target refs at one sha unless the test splits them. */
+	function syncedTips(local: string, origin: string) {
+		return async (_path: string, ref: string): Promise<string | null> =>
+			ref === "refs/heads/main"
+				? local
+				: ref === "origin/main" || ref === "refs/remotes/origin/main"
+					? origin
+					: null;
+	}
+
+	test("a superseded merge turn closes done, frees the worktree and branch, keeps the follow-up linked", async () => {
+		const record = baseRecord();
+		const pushes: unknown[] = [];
+		let gapId = "";
+		const { store, loop } = await setupWith(record, {
+			targetSha: syncedTips("sha-main", "sha-main"),
+			serverMergePush: async (...args: unknown[]) => {
+				pushes.push(args);
+				return { status: "skipped" as const };
+			},
+			startRun: supersededRun(record, () => gapId),
+		});
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		// The follow-up card the merge turn filed before reporting: linked to this task.
+		const gap = await store.createTask("cover the superseded flow's gap");
+		await store.updateTask(gap.id, { followUpOf: task.id });
+		gapId = gap.id;
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		// Nothing merged: no integration attribution and no CI-watch pin.
+		expect(after.commits).toBeNull();
+		expect(after.mergeHead).toBeNull();
+		expect(after.pushSha).toBeNull();
+		expect(after.releaseVersion).toBeNull();
+		// The cleanup ran per the normal merge rules.
+		expect(record.removeWorktree).toHaveLength(1);
+		expect(record.removeWorktree[0]).toMatchObject({ branch: "ott/m" });
+		// The guard: the superseded close ships nothing.
+		expect(pushes).toHaveLength(0);
+		// The follow-up card stays linked.
+		expect((await store.getTask(gap.id))!.followUpOf).toBe(task.id);
+		// The turn row records the superseded outcome.
+		const turns = await store.listTurns(task.id);
+		expect(turns.at(-1)?.outcome).toBe("superseded");
+		expect(await logText(store, task.id)).toContain(
+			`superseded close verified: follow-up ${gap.id} linked`,
+		);
+	});
+
+	test("a superseded merge turn without a follow-up card parks with the worktree kept", async () => {
+		const record = baseRecord();
+		const { store, loop } = await setupWith(record, {
+			targetSha: syncedTips("sha-main", "sha-main"),
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
+				record.runs.push(o as never);
+				await o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							outcome: {
+								status: "superseded",
+								summary: "superseded, no gap card",
+							} satisfies Outcome,
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Reported superseded, but the report carries no follow-up card id. File the gap card with create_task, then reply and pass its id in followUp.",
+		);
+		// The park keeps the worktree: nothing was cleaned, nothing integrated.
+		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	/** A superseded close whose follow-up id names no linked card parks, even when
+	 * every board holds a same-id card whose link names another project: task ids are
+	 * project-local, so `followUpOfProject` must name this board (blockers 2, 3, 5). */
+	test("a superseded close skips same-id cards whose followUpOfProject names another board", async () => {
+		const record = baseRecord();
+		const store = await freshStore();
+		const other = await freshStore();
+		const third = await freshStore();
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		// Local card: right parent id, foreign board — a local follow-up may name a
+		// foreign parent, so this link never points at this task.
+		const local = await store.createTask("local shadow", null, "work", "ZZ-1");
+		await store.updateTask(local.id, {
+			followUpOf: task.id,
+			followUpOfProject: other.name,
+		});
+		// Foreign cards: the same id, right parent id, every board but this one.
+		const inOther = await other.createTask("foreign shadow", null, "work", "ZZ-1");
+		await other.updateTask(inOther.id, {
+			followUpOf: task.id,
+			followUpOfProject: third.name,
+		});
+		const inThird = await third.createTask("third shadow", null, "work", "ZZ-1");
+		await third.updateTask(inThird.id, {
+			followUpOf: task.id,
+			followUpOfProject: other.name,
+		});
+		const loop = holdFollowUps(
+			new Map([
+				[store.name, fakeProject(store)],
+				[other.name, fakeProject(other)],
+				[third.name, fakeProject(third)],
+			]),
+			fakeOps(record, {
+				targetSha: syncedTips("sha-main", "sha-main"),
+				startRun: supersededRun(record, () => "ZZ-1"),
+			}),
+		);
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain(
+			"no card ZZ-1 is linked to this task (followUpOf)",
+		);
+		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	/** A valid linked follow-up in another project closes the card even when an
+	 * unrelated same-id card sits on this board and a mismatched same-id card sits
+	 * on a board scanned first: every board is scanned, none shadows the linked one
+	 * (blockers 4, 5). */
+	test("a superseded close finds the linked follow-up across boards despite same-id cards", async () => {
+		const record = baseRecord();
+		const store = await freshStore();
+		const other = await freshStore();
+		const third = await freshStore();
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		// This board: same id, points elsewhere.
+		const noise = await store.createTask("unrelated card", null, "work", "ZZ-1");
+		await store.updateTask(noise.id, { followUpOf: noise.id });
+		// Scanned before the linked one: same id, wrong board named.
+		const mismatch = await third.createTask("mismatch", null, "work", "ZZ-1");
+		await third.updateTask(mismatch.id, {
+			followUpOf: task.id,
+			followUpOfProject: other.name,
+		});
+		// The valid follow-up: another project's board, link names this one.
+		const gap = await other.createTask("cover the gap", null, "work", "ZZ-1");
+		await other.updateTask(gap.id, {
+			followUpOf: task.id,
+			followUpOfProject: store.name,
+		});
+		const loop = holdFollowUps(
+			new Map([
+				[store.name, fakeProject(store)],
+				[other.name, fakeProject(other)],
+				[third.name, fakeProject(third)],
+			]),
+			fakeOps(record, {
+				targetSha: syncedTips("sha-main", "sha-main"),
+				startRun: supersededRun(record, () => "ZZ-1"),
+			}),
+		);
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect((await other.getTask(gap.id))!.followUpOf).toBe(task.id);
+	});
+
+	/** Real git readers for the superseded regressions: the settle reads the same
+	 * production helpers (target resolution, unsaved-tree check, ref tips, worktree
+	 * removal) against a real repo, so the close proves itself on live git state. */
+	function supersededRealLoop(
+		record: Recorded,
+		store: ProjectStore,
+		startRun: NonNullable<FixtureOps["startRun"]>,
+	) {
+		const realTargetSha = async (mainPath: string, ref: string) => {
+			const r = Bun.spawnSync(
+				["git", "rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
+				{ cwd: mainPath, stdout: "pipe", stderr: "pipe", env: fixtureGitEnv() },
+			);
+			return r.exitCode === 0 ? r.stdout.toString().trim() : null;
+		};
+		const pushes: unknown[] = [];
+		const loop = holdFollowUps(
+			new Map([[store.name, fakeProject(store)]]),
+			fakeOps(record, {
+				resolveTarget: realResolveTarget,
+				targetSha: realTargetSha,
+				unsavedWork: realUnsavedWork,
+				commitsAhead: realCommitsAhead,
+				isClean: gitIsClean,
+				statusFiles: realStatusFiles,
+				targetCommits: realTargetCommits,
+				targetContains: realTargetContains,
+				removeWorktree: async (
+					o: Parameters<TurnOps["removeWorktree"]>[0],
+				) => {
+					await realRemoveWorktree(o);
+					record.removeWorktree.push(o);
+				},
+				serverMergePush: async (
+					...args: Parameters<TurnOps["serverMergePush"]>
+				) => {
+					pushes.push(args);
+					return { status: "skipped" as const };
+				},
+				startRun,
+			}),
+		);
+		return { loop, pushes };
+	}
+
+	/** A clean superseded branch whose commits never reached main: real git, real
+	 * unsaved-tree read. The kept-tree check must not count the branch's own
+	 * unmerged commits (the outcome is the discard decision), so the close frees
+	 * the worktree and the branch, and nothing pushes. */
+	test("a real superseded close frees a clean branch whose commits never reached main", async () => {
+		const run = (cwd: string, ...args: string[]): string => {
+			const r = Bun.spawnSync(["git", ...args], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: fixtureGitEnv(),
+			});
+			if (r.exitCode !== 0)
+				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+			return r.stdout.toString().trim();
+		};
+		const refAlive = (cwd: string, ref: string): boolean =>
+			Bun.spawnSync(["git", "rev-parse", "--verify", "--quiet", ref], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: fixtureGitEnv(),
+			}).exitCode === 0;
+		const store = await freshStore();
+		const dir = store.path;
+		const origin = mkdtempSync(join(tmpdir(), "turn-test-origin-"));
+		dirs.push(origin);
+		run(origin, "init", "-q", "--bare", "-b", "main");
+		run(dir, "init", "-q", "-b", "main");
+		run(dir, "config", "user.email", "t@t");
+		run(dir, "config", "user.name", "t");
+		run(dir, "commit", "-q", "--allow-empty", "-m", "seed");
+		run(dir, "remote", "add", "origin", origin);
+		run(dir, "push", "-q", "origin", "main:main");
+		const task = await store.createTask("merge please");
+		await store.setSettings({ originUrl: origin, targetBranch: "main" });
+		const wt = join(dir, "wt-card");
+		run(dir, "branch", "ott/m");
+		run(dir, "worktree", "add", "-q", wt, "ott/m");
+		// The card's work: one commit origin/main lacks; the tree stays clean.
+		run(wt, "commit", "-q", "--allow-empty", "-m", "the card's work");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: wt,
+			branch: "ott/m",
+		});
+		const gap = await store.createTask("cover the superseded flow's gap");
+		await store.updateTask(gap.id, { followUpOf: task.id });
+		// The precondition: one commit on the branch that origin/main lacks.
+		expect(run(wt, "rev-list", "--count", "origin/main..HEAD")).toBe("1");
+		const record = baseRecord();
+		const { loop, pushes } = supersededRealLoop(
+			record,
+			store,
+			supersededRun(record, () => gap.id),
+		);
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		// The branch's commit never reached main, and the close still landed.
+		expect(run(dir, "rev-parse", "refs/remotes/origin/main")).toBe(
+			run(dir, "rev-parse", "refs/heads/main"),
+		);
+		// The cleanup ran for real: worktree and branch are gone, nothing pushed.
+		expect(existsSync(wt)).toBe(false);
+		expect(refAlive(dir, "refs/heads/ott/m")).toBe(false);
+		expect(record.removeWorktree).toHaveLength(1);
+		expect(pushes).toHaveLength(0);
+		expect((await store.getTask(gap.id))!.followUpOf).toBe(task.id);
+		expect(await logText(store, task.id)).toContain(
+			`superseded close verified: follow-up ${gap.id} linked`,
+		);
+	});
+
+	/** A local branch named origin/main at the local target's tip must not shadow the
+	 * remote-tracking ref the guard compares: the bare name would read the shadow and
+	 * pass while main still holds unpushed commits. The qualified ref parks the close. */
+	test("a local origin/main branch cannot shadow the unpushed-tip guard", async () => {
+		const run = (cwd: string, ...args: string[]): string => {
+			const r = Bun.spawnSync(["git", ...args], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: fixtureGitEnv(),
+			});
+			if (r.exitCode !== 0)
+				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+			return r.stdout.toString().trim();
+		};
+		const store = await freshStore();
+		const dir = store.path;
+		const origin = mkdtempSync(join(tmpdir(), "turn-test-origin-"));
+		dirs.push(origin);
+		run(origin, "init", "-q", "--bare", "-b", "main");
+		run(dir, "init", "-q", "-b", "main");
+		run(dir, "config", "user.email", "t@t");
+		run(dir, "config", "user.name", "t");
+		run(dir, "commit", "-q", "--allow-empty", "-m", "seed");
+		run(dir, "remote", "add", "origin", origin);
+		run(dir, "push", "-q", "origin", "main:main");
+		const task = await store.createTask("merge please");
+		await store.setSettings({ originUrl: origin, targetBranch: "main" });
+		const wt = join(dir, "wt-card");
+		run(dir, "branch", "ott/m");
+		run(dir, "worktree", "add", "-q", wt, "ott/m");
+		run(wt, "commit", "-q", "--allow-empty", "-m", "the card's work");
+		// The turn left main one commit ahead of origin, and a branch named
+		// origin/main sits exactly at main's tip: the shadow the guard must ignore.
+		run(dir, "commit", "-q", "--allow-empty", "-m", "unpushed main work");
+		run(dir, "branch", "origin/main", "main");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: wt,
+			branch: "ott/m",
+		});
+		const gap = await store.createTask("cover the superseded flow's gap");
+		await store.updateTask(gap.id, { followUpOf: task.id });
+		const record = baseRecord();
+		const { loop, pushes } = supersededRealLoop(
+			record,
+			store,
+			supersededRun(record, () => gap.id),
+		);
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Reported superseded, but the local main branch does not match origin/main (or git could not read the tips), so the turn may hold an integration it did not report. File the gap card with create_task, sync the main checkout with origin/main when it differs, then reply and pass the card id in followUp.",
+		);
+		// The park keeps the worktree and the branch, and pushes nothing.
+		expect(existsSync(wt)).toBe(true);
+		expect(record.removeWorktree).toHaveLength(0);
+		expect(pushes).toHaveLength(0);
+	});
+
+	test("a superseded close whose follow-up id names no linked card parks", async () => {
+		const record = baseRecord();
+		const { store, loop } = await setupWith(record, {
+			targetSha: syncedTips("sha-main", "sha-main"),
+			startRun: supersededRun(record, () => gap.id),
+		});
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		// The named card exists but links to another card: the claim does not verify.
+		const other = await store.createTask("another card");
+		const gap = await store.createTask("cover the superseded flow's gap");
+		await store.updateTask(gap.id, { followUpOf: other.id });
+
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			`Reported superseded, but no card ${gap.id} is linked to this task (followUpOf). File the gap card with create_task, sync the main checkout with origin/main when it differs, then reply and pass the card id in followUp.`,
+		);
+		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	test("a superseded close with unpushed commits on the target parks", async () => {
+		const record = baseRecord();
+		let gapId = "";
+		const { store, loop } = await setupWith(record, {
+			targetSha: syncedTips("sha-local", "sha-origin"),
+			startRun: supersededRun(record, () => gapId),
+		});
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
+			stage: "merging",
+			worktree: "wt-m",
+			branch: "ott/m",
+		});
+		const gap = await store.createTask("cover the superseded flow's gap");
+		await store.updateTask(gap.id, { followUpOf: task.id });
+		gapId = gap.id;
+
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Reported superseded, but the local main branch does not match origin/main (or git could not read the tips), so the turn may hold an integration it did not report. File the gap card with create_task, sync the main checkout with origin/main when it differs, then reply and pass the card id in followUp.",
+		);
+		expect(record.removeWorktree).toHaveLength(0);
 	});
 });
 
@@ -7224,7 +7837,7 @@ describe("turn research cards", () => {
 					wtPath = o.worktreePath;
 					mkdirSync(o.worktreePath, { recursive: true });
 					// The real saveDoneFiles runs git ls-files/status: a repo, not a plain dir.
-					execSync(`git init -q "${o.worktreePath}"`, { stdio: "ignore" });
+					execSync(`git init -q "${o.worktreePath}"`, { stdio: "ignore", env: fixtureGitEnv() });
 					writeFileSync(
 						join(o.worktreePath, RESEARCH_REPORT),
 						"# findings\n\nthe body",
@@ -9711,6 +10324,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 				cwd,
 				stdout: "pipe",
 				stderr: "pipe",
+				env: fixtureGitEnv(),
 			});
 			if (r.exitCode !== 0)
 				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
@@ -9796,7 +10410,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 				targetSha: async (mainPath: string, ref: string) => {
 					const r = Bun.spawnSync(
 						["git", "rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
-						{ cwd: mainPath, stdout: "pipe", stderr: "pipe" },
+						{ cwd: mainPath, stdout: "pipe", stderr: "pipe", env: fixtureGitEnv() },
 					);
 					return r.exitCode === 0 ? r.stdout.toString().trim() : null;
 				},
@@ -9956,7 +10570,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 	test("cancel keeps a real dirty worktree under the Cancel prefix (R5-2)", async () => {
 		const repoDir = mkdtempSync(join(tmpdir(), "turn-cancel-repo-"));
 		dirs.push(repoDir);
-		const run = (cmd: string) => execSync(cmd, { stdio: "ignore" });
+		const run = (cmd: string) => execSync(cmd, { stdio: "ignore", env: fixtureGitEnv() });
 		run(`git init -q ${repoDir}`);
 		run(`git -C ${repoDir} config user.email t@t`);
 		run(`git -C ${repoDir} config user.name t`);
@@ -9964,6 +10578,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		run(`git -C ${repoDir} add seed.txt`);
 		run(`git -C ${repoDir} commit -qm seed`);
 		const base = execSync("git rev-parse HEAD", {
+			env: fixtureGitEnv(),
 			cwd: repoDir,
 			encoding: "utf8",
 		}).trim();
@@ -12444,6 +13059,161 @@ describe("turn fork-born merge hold", () => {
 	});
 });
 
+describe("turn cross-project merge hold", () => {
+	// Fresh stores share one id sequence, so a filler card keeps the foreign parent's
+	// id off the child's board: the ancestry walk must not mistake a local id twin
+	// for the ancestor.
+	async function foreignForkCase(overrides: FixtureOps = {}) {
+		const s = await setup({ commitsAhead: async () => 0, ...overrides });
+		const foreign = await freshStore();
+		s.projects.set(foreign.name, fakeProject(foreign));
+		await foreign.createTask("filler keeps ids apart");
+		const parent = await foreign.createTask("fork research: weekly digest");
+		await foreign.updateTask(parent.id, {
+			topic: "fork research",
+			research: true,
+			stage: "done",
+			state: "idle",
+		});
+		const task = await s.store.createTask("adopt fork idea");
+		await s.store.updateTask(task.id, {
+			followUpOf: parent.id,
+			followUpOfProject: foreign.name,
+		});
+		return { ...s, foreign, parent, task };
+	}
+
+	/** An update-card parent on another board; the child carries the copied hold ids
+	 * the create_task route stores. `foreignOn` turns on only the foreign board's
+	 * holdUpdateMerges; the own board's stays at its default (off). */
+	async function foreignUpdateCase(foreignOn: boolean) {
+		const s = await setup({ commitsAhead: async () => 0 });
+		const foreign = await freshStore();
+		s.projects.set(foreign.name, fakeProject(foreign));
+		await foreign.createTask("filler keeps ids apart");
+		const parent = await foreign.createTask("update pins");
+		await foreign.updateTask(parent.id, { updateIds: ["a@1"] });
+		const task = await s.store.createTask("split-off update work");
+		await s.store.updateTask(task.id, {
+			followUpOf: parent.id,
+			followUpOfProject: foreign.name,
+			updateIds: ["a@1"],
+		});
+		if (foreignOn) await foreign.setSettings({ holdUpdateMerges: true });
+		return { ...s, foreign, parent, task };
+	}
+
+	test("a card of a fork-research parent on another board parks for merge approval", async () => {
+		const { store, record, loop, task } = await foreignForkCase();
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.needsReason).toBe(FORK_HOLD_REASON);
+		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	test("the walk reads the foreign board, not a local card that shares the id", async () => {
+		const { store, foreign, parent, loop, task } = await foreignForkCase();
+		// Own board's second card gets the foreign parent's id, and it is plain work:
+		// a local-only walk would settle done instead of holding.
+		const decoy = await store.createTask("unrelated local card");
+		expect(decoy.id).toBe(parent.id);
+		expect(foreign.name).not.toBe(store.name);
+		await loop.runTurn(store.name, task.id);
+		expect((await store.getTask(task.id))!.needsReason).toBe(FORK_HOLD_REASON);
+	});
+
+	test("a child of an update card on another board holds when only that board holds update merges", async () => {
+		const { store, loop, task } = await foreignUpdateCase(true);
+		await loop.runTurn(store.name, task.id);
+		expect((await store.getTask(task.id))!.needsReason).toBe(
+			UPDATE_HOLD_REASON,
+		);
+	});
+
+	test("with both boards' holdUpdateMerges off the border child merges like any work card", async () => {
+		const { store, record, loop, task } = await foreignUpdateCase(false);
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.needsReason).toBeNull();
+		expect(record.removeWorktree).toHaveLength(1);
+	});
+
+	/** The validation scenario: fork-research R on the foreign board, a held child H
+	 * beside it, and H's child filed into the own project. A distinct taskIdPrefix
+	 * keeps the foreign ids off the own board's id sequence. */
+	async function foreignForkChainCase() {
+		const s = await setup({ commitsAhead: async () => 0 });
+		const foreign = await freshStore();
+		await foreign.setSettings({ taskIdPrefix: "AD" });
+		s.projects.set(foreign.name, fakeProject(foreign));
+		const research = await foreign.createTask("fork research: weekly digest");
+		await foreign.updateTask(research.id, {
+			topic: "fork research",
+			research: true,
+			stage: "done",
+			state: "idle",
+		});
+		const held = await foreign.createTask("adopt fork idea");
+		await foreign.updateTask(held.id, { followUpOf: research.id });
+		const task = await s.store.createTask("split-off fork work");
+		await s.store.updateTask(task.id, {
+			followUpOf: held.id,
+			followUpOfProject: foreign.name,
+		});
+		return { ...s, foreign, research, held, task };
+	}
+
+	test("the walk finds a fork-research ancestor two hops up on the foreign board", async () => {
+		const { store, record, loop, task } = await foreignForkChainCase();
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.needsReason).toBe(FORK_HOLD_REASON);
+		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	/** A grandchild whose own link is local: its parent crossed the border, and the
+	 * foreign board's holdUpdateMerges must reach it through the chain. */
+	async function foreignUpdateChainCase(foreignOn: boolean) {
+		const s = await setup({ commitsAhead: async () => 0 });
+		const foreign = await freshStore();
+		await foreign.setSettings({ taskIdPrefix: "AD" });
+		if (foreignOn) await foreign.setSettings({ holdUpdateMerges: true });
+		s.projects.set(foreign.name, fakeProject(foreign));
+		const parent = await foreign.createTask("update pins");
+		await foreign.updateTask(parent.id, { updateIds: ["a@1"] });
+		const child = await s.store.createTask("cross-border update child");
+		await s.store.updateTask(child.id, {
+			followUpOf: parent.id,
+			followUpOfProject: foreign.name,
+			updateIds: ["a@1"],
+		});
+		const task = await s.store.createTask("grandchild update work");
+		await s.store.updateTask(task.id, {
+			followUpOf: child.id,
+			updateIds: ["a@1"],
+		});
+		return { ...s, foreign, parent, child, task };
+	}
+
+	test("a grandchild of a foreign update card holds when only that board holds update merges", async () => {
+		const { store, loop, task } = await foreignUpdateChainCase(true);
+		await loop.runTurn(store.name, task.id);
+		expect((await store.getTask(task.id))!.needsReason).toBe(
+			UPDATE_HOLD_REASON,
+		);
+	});
+
+	test("with the whole chain's holdUpdateMerges off the grandchild merges like any work card", async () => {
+		const { store, record, loop, task } = await foreignUpdateChainCase(false);
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.needsReason).toBeNull();
+		expect(record.removeWorktree).toHaveLength(1);
+	});
+});
+
 describe("fork-born work check before the hold", () => {
 	// A fork-born card whose ready report carries commits classifies merging/queued; the
 	// fork hold would park it, and the second-model check must judge the head first
@@ -13718,9 +14488,12 @@ const checkedRun = (
 	};
 };
 
-const pass = (notes: string[] = []) =>
+const pass = (
+	notes: string[] = [],
+	fixed: { id: number; reason: string }[] = [],
+) =>
 	runResult({
-		finalText: JSON.stringify({ blockers: [], fixed: [], notes }),
+		finalText: JSON.stringify({ blockers: [], fixed, notes }),
 	});
 const block = (finding: string, quote: string, bugClass?: string) =>
 	runResult({
@@ -13754,6 +14527,199 @@ describe("work card check", () => {
 			...overrides,
 		});
 	}
+
+	test("an omitted earlier blocker retries and never enters the merge queue", async () => {
+		const head = { sha: "sha1" };
+		const { store, record, loop } = await workCheckCase(
+			head,
+			[block("tests were weakened", "const x = 1;"), pass(), pass()],
+			{ diffText: async () => "const x = 1;\n" },
+		);
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const blocked = (await store.getTask(task.id))!;
+		expect(blocked.workCheckLog[0]!.outcome).toBe("blockers");
+		expect(blocked.workCheckSendbacks).toBe(1);
+
+		head.sha = "sha2";
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(record.runs).toHaveLength(5);
+		expect(after.workCheckHead).toBe(blocked.workCheckHead);
+		expect(after.workCheckReport).toBe(blocked.workCheckReport);
+		expect(after.workCheckSendbacks).toBe(blocked.workCheckSendbacks);
+		expect(after.workCheckLog).toHaveLength(2);
+		expect(after.workCheckLog[0]).toEqual(blocked.workCheckLog[0]);
+		expect(after.workCheckLog[0]!.blockers[0]!.status).toBeUndefined();
+		expect(after.workCheckLog[1]!.outcome).toBe("error");
+		expect(after.workCheckLog[1]!.error).toBeTruthy();
+		expect(after.workCheckLog[1]!.blockers).toEqual([]);
+		expect(after.needsReason).toContain("failed twice");
+		const text = await logText(store, task.id);
+		expect(text).toContain("work check attempt 1 failed:");
+		expect(text).toContain("work check attempt 2 failed:");
+	});
+
+	test("repeated incomplete re-checks retain open blockers at the history cap", async () => {
+		const head = { sha: "sha1" };
+		const rechecks = 21;
+		const { store, record, loop } = await workCheckCase(
+			head,
+			[
+				block("tests were weakened", "const x = 1;"),
+				...Array.from({ length: rechecks * 2 }, () => pass()),
+			],
+			{ diffText: async () => "const x = 1;\n" },
+		);
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const blocked = (await store.getTask(task.id))!;
+
+		for (let attempt = 0; attempt < rechecks; attempt++) {
+			if (attempt > 0) {
+				await store.updateTask(task.id, {
+					state: "queued",
+					needsReason: null,
+					pendingPrompt: "Please retry the work check.",
+				});
+			}
+			head.sha = `sha${attempt + 2}`;
+			await loop.runTurn(store.name, task.id);
+
+			const after = (await store.getTask(task.id))!;
+			expect(after.stage).toBe("in_progress");
+			expect(after.state).toBe("needs_you");
+			expect(after.workCheckHead).toBe(blocked.workCheckHead);
+			expect(after.workCheckReport).toBe(blocked.workCheckReport);
+			expect(after.workCheckSendbacks).toBe(blocked.workCheckSendbacks);
+			expect(
+				after.workCheckLog.find((run) => run.outcome === "blockers")?.blockers,
+			).toEqual(blocked.workCheckLog[0]!.blockers);
+			expect(record.runs.at(-1)!.prompt).toContain(
+				"\n1. tests were weakened\n   quote: const x = 1;",
+			);
+		}
+		expect(record.runs).toHaveLength(2 + rechecks * 3);
+		expect(
+			(await store.getTask(task.id))!.workCheckLog.length,
+		).toBeLessThanOrEqual(20);
+	});
+
+	test("a partial omission rejects fixes and new blockers without a partial update", async () => {
+		const head = { sha: "sha1" };
+		const initial = runResult({
+			finalText: JSON.stringify({
+				blockers: [
+					{ finding: "weak tests", quote: "const x = 1;" },
+					{ finding: "missing validation", quote: "const y = 2;" },
+				],
+				fixed: [],
+				notes: [],
+			}),
+		});
+		const incomplete = runResult({
+			finalText: JSON.stringify({
+				blockers: [{ finding: "new issue", quote: "const z = 3;" }],
+				fixed: [{ id: 1, reason: "the tests now cover the branch" }],
+				notes: ["a new note"],
+			}),
+		});
+		const { store, record, loop } = await workCheckCase(
+			head,
+			[initial, incomplete, incomplete],
+			{ diffText: async () => "const x = 1;\nconst y = 2;\nconst z = 3;\n" },
+		);
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const blocked = (await store.getTask(task.id))!;
+		expect(blocked.workCheckLog[0]!.blockers).toHaveLength(2);
+
+		head.sha = "sha2";
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(record.runs).toHaveLength(5);
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.workCheckHead).toBe(blocked.workCheckHead);
+		expect(after.workCheckReport).toBe(blocked.workCheckReport);
+		expect(after.workCheckSendbacks).toBe(blocked.workCheckSendbacks);
+		expect(after.workCheckLog).toHaveLength(2);
+		expect(after.workCheckLog[0]).toEqual(blocked.workCheckLog[0]);
+		expect(after.workCheckLog[0]!.blockers.map((b) => b.status)).toEqual([
+			undefined,
+			undefined,
+		]);
+		expect(after.workCheckLog[1]!.outcome).toBe("error");
+		expect(after.workCheckLog[1]!.blockers).toEqual([]);
+		expect(after.workCheckLog[1]!.notes).toEqual([]);
+		expect(after.workCheckLog[1]!.error).toBeTruthy();
+	});
+
+	test("a complete retry after a partial omission applies only the valid verdict", async () => {
+		const head = { sha: "sha1" };
+		const { store, record, loop } = await workCheckCase(
+			head,
+			[
+				runResult({
+					finalText: JSON.stringify({
+						blockers: [
+							{ finding: "weak tests", quote: "const x = 1;" },
+							{ finding: "missing validation", quote: "const y = 2;" },
+						],
+						fixed: [],
+						notes: [],
+					}),
+				}),
+				pass(["discard this note"], [{ id: 1, reason: "incomplete answer" }]),
+				pass(
+					["both fixes verified"],
+					[
+						{ id: 1, reason: "the tests cover the branch" },
+						{ id: 2, reason: "the code validates the input" },
+					],
+				),
+			],
+			{ diffText: async () => "const x = 1;\nconst y = 2;\n" },
+		);
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const blocked = (await store.getTask(task.id))!;
+
+		head.sha = "sha2";
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(record.runs).toHaveLength(5);
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.workCheckHead).toBe("sha2");
+		expect(after.workCheckReport).toBe(blocked.workCheckReport);
+		expect(after.workCheckSendbacks).toBe(blocked.workCheckSendbacks);
+		expect(after.workCheckLog).toHaveLength(2);
+		expect(after.workCheckLog[0]!.blockers).toEqual([
+			{
+				finding: "weak tests",
+				quote: "const x = 1;",
+				status: "fixed",
+				statusReason: "the tests cover the branch",
+			},
+			{
+				finding: "missing validation",
+				quote: "const y = 2;",
+				status: "fixed",
+				statusReason: "the code validates the input",
+			},
+		]);
+		expect(after.workCheckLog[1]!.outcome).toBe("pass");
+		expect(after.workCheckLog[1]!.notes).toEqual(["both fixes verified"]);
+		const text = await logText(store, task.id);
+		expect(text).toContain("work check attempt 1 failed:");
+		expect(text).not.toContain("work check attempt 2 failed:");
+	});
 
 	test("a ready card with commits ahead runs the check once, and a pass keeps it merging/queued", async () => {
 		const head = { sha: "sha1" };
@@ -13906,7 +14872,10 @@ describe("work card check", () => {
 		const diffs: string[] = [];
 		const { store, record, loop } = await workCheckCase(
 			head,
-			[block("tests were weakened", "const x = 1;"), pass()],
+			[
+				block("tests were weakened", "const x = 1;"),
+				pass([], [{ id: 1, reason: "the new commits restore the tests" }]),
+			],
 			{
 				diffText: async (_wt: unknown, from: string) => {
 					diffs.push(from);
@@ -14005,7 +14974,19 @@ describe("work card check", () => {
 						notes: [],
 					}),
 				}),
-				block("scope creep", "also touched README", "round-2"),
+				runResult({
+					finalText: JSON.stringify({
+						blockers: [
+							{
+								finding: "scope creep",
+								quote: "also touched README",
+								bugClass: "round-2",
+							},
+						],
+						fixed: [{ id: 1, reason: "the tests now cover this branch" }],
+						notes: [],
+					}),
+				}),
 				runResult({
 					finalText: JSON.stringify({
 						blockers: [
@@ -14024,7 +15005,19 @@ describe("work card check", () => {
 						notes: [],
 					}),
 				}),
-				block("scope creep", "also touched README", "round-4"),
+				runResult({
+					finalText: JSON.stringify({
+						blockers: [
+							{
+								finding: "scope creep",
+								quote: "also touched README",
+								bugClass: "round-4",
+							},
+						],
+						fixed: [{ id: 1, reason: "the tests cover the new case" }],
+						notes: [],
+					}),
+				}),
 				runResult({
 					finalText: JSON.stringify({
 						blockers: [
@@ -14255,7 +15248,10 @@ describe("work card check", () => {
 		const head = { sha: "sha1" };
 		const { store, record, loop } = await workCheckCase(
 			head,
-			[block("the claim is wrong", "const x = 1;"), pass()],
+			[
+				block("the claim is wrong", "const x = 1;"),
+				pass([], [{ id: 1, reason: "the new report corrects the claim" }]),
+			],
 			{ diffText: async () => "const x = 1;\n" },
 			[
 				runResult({
@@ -14313,7 +15309,10 @@ describe("work card check", () => {
 		const head = { sha: "sha1" };
 		const { store, record, loop } = await workCheckCase(
 			head,
-			[block("tests were weakened", "const x = 1;"), pass()],
+			[
+				block("tests were weakened", "const x = 1;"),
+				pass([], [{ id: 1, reason: "the new approach restores the tests" }]),
+			],
 			{ diffText: async () => "const x = 1;\n" },
 		);
 		const task = await store.createTask("work please");
@@ -14351,7 +15350,10 @@ describe("work card check", () => {
 		const head = { sha: "sha1" };
 		const { store, record, loop } = await workCheckCase(
 			head,
-			[block("tests were weakened", "const x = 1;"), pass()],
+			[
+				block("tests were weakened", "const x = 1;"),
+				pass([], [{ id: 1, reason: "the code restores the tests" }]),
+			],
 			{ diffText: async () => "const x = 1;\n" },
 		);
 		const task = await store.createTask("work please");
@@ -14428,7 +15430,10 @@ describe("work card check", () => {
 					"touches auth and secrets; a human must review this first",
 					"const x = 1;",
 				),
-				pass(["the user approved the blocker"]),
+				pass(
+					["the user approved the blocker"],
+					[{ id: 1, reason: "the user completed the required review" }],
+				),
 			],
 			{ diffText: async () => "const x = 1;\n" },
 		);
@@ -14459,7 +15464,7 @@ describe("work card check", () => {
 		expect(after.workCheckHead).toBe("sha1");
 		expect(after.workCheckLog).toHaveLength(2);
 		expect(after.workCheckLog[1]!.outcome).toBe("pass");
-		// The approved blocker resolved when the re-check dropped it.
+		// The re-check explicitly resolves the blocker after the required human review.
 		expect(after.workCheckLog[0]!.blockers[0]!.status).toBe("fixed");
 	});
 
@@ -14606,7 +15611,7 @@ describe("work card check", () => {
 		expect(await ids(resetsAt + 1)).toContain(task.id);
 		// A queue reorder rewrites queuedAt; the hold must survive it.
 		const other = await store.createTask("another");
-		expect(await store.reorderQueue([task.id, other.id])).toBe(true);
+		expect(await store.moveInQueue(task.id, other.id)).toBe(true);
 		expect((await store.getTask(task.id))!.holdUntil).toBe(resetsAt);
 		expect(await ids()).not.toContain(task.id);
 		await store.updateTask(other.id, { state: "idle" });
@@ -14914,6 +15919,103 @@ describe("work card check", () => {
 		// anthropic work run), not only the selector it launched with.
 		const after = (await store.getTask(task.id))!;
 		expect(after.workCheckLog[0]!.role).toBe("critic");
+	});
+
+	test("a check-routing rule routes the work check to the rule's role", async () => {
+		const head = { sha: "sha1" };
+		const record = baseRecord();
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			commitsAhead: async () => 1,
+			targetSha: async () => head.sha,
+			modelRoles: () => ({
+				critic: "openai/gpt-6",
+				adversary: "anthropic/claude-opus-5-5",
+				reviewer: "moonshot/kimi-k2:low",
+			}),
+			checkRouting: () => ({
+				rules: [{ vendor: "zai", role: "reviewer" }],
+				fallback: "",
+			}),
+			workCheck: () => true,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				await o.onSession?.(`sess-${record.runs.length}`);
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						record.runs.length === 1
+							? runResult({
+									model: "zai/glm-5.3-flash",
+									outcome: {
+										status: "ready",
+										summary: "did it",
+									} satisfies Outcome,
+								})
+							: pass(),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs[1]!.model).toBe("moonshot/kimi-k2:low");
+		const after = (await store.getTask(task.id))!;
+		expect(after.workCheckLog[0]!.role).toBe("reviewer");
+		// A matched rule whose role has a model needs no explanation.
+		expect(await logText(store, task.id)).not.toContain("check routing:");
+	});
+
+	test("a rule to a missing role falls back to the default rule and logs the note once", async () => {
+		const head = { sha: "sha1" };
+		const record = baseRecord();
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			commitsAhead: async () => 1,
+			targetSha: async () => head.sha,
+			modelRoles: () => ({
+				critic: "openai/gpt-6",
+				adversary: "anthropic/claude-opus-5-5",
+			}),
+			checkRouting: () => ({
+				rules: [{ vendor: "zai", role: "reviewer" }],
+				fallback: "",
+			}),
+			workCheck: () => true,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				await o.onSession?.(`sess-${record.runs.length}`);
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						record.runs.length === 1
+							? runResult({
+									model: "zai/glm-5.3-flash",
+									outcome: {
+										status: "ready",
+										summary: "did it",
+									} satisfies Outcome,
+								})
+							: pass(),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		// The default rule took over: the OpenAI critic differs from the zai work model.
+		expect(record.runs[1]!.model).toBe("openai/gpt-6");
+		const after = (await store.getTask(task.id))!;
+		expect(after.workCheckLog[0]!.role).toBe("critic");
+		const text = await logText(store, task.id);
+		expect(text).toContain(
+			"check routing: rule zai -> reviewer names no configured role, using the default rule",
+		);
+		expect((text.match(/check routing: /g) ?? []).length).toBe(1);
 	});
 
 	test("a check that runs on the work model itself warns on the card", async () => {
@@ -15246,7 +16348,7 @@ describe("turn release line hold (dependabot gate park)", () => {
 		// Base commit: the unbumped lock, so origin/main:bun.lock is the scan's
 		// base. No remote: the ref alone answers rev-parse and cat-file.
 		const git = (...args: string[]): void => {
-			execSync(`git ${args.join(" ")}`, { cwd: wt, stdio: "ignore" });
+			execSync(`git ${args.join(" ")}`, { cwd: wt, stdio: "ignore", env: fixtureGitEnv() });
 		};
 		writeFileSync(join(wt, "bun.lock"), realLock);
 		writeFileSync(
@@ -20115,8 +21217,8 @@ describe("turn survivor round 5 — work card to merging", () => {
 		expect((await store.getTask(task.id))!.workCheckHead).toBe("sha1");
 	});
 
-	test("after an errored check, a new check sees the full diff and resolves only the open blockers", async () => {
-		const { store, record, loop } = await checkCase([verdict({})]);
+	test("after an errored check, an empty verdict leaves open blockers unresolved and parks the card", async () => {
+		const { store, record, loop } = await checkCase([verdict({}), verdict({})]);
 		const task = await store.createTask("work please");
 		const settled = {
 			finding: "old naming",
@@ -20147,21 +21249,23 @@ describe("turn survivor round 5 — work card to merging", () => {
 		expect(prompt).toContain("Diff of the branch");
 		expect(prompt).toContain("\n1. weak tests\n   quote: const x = 1;");
 		const after = (await store.getTask(task.id))!;
-		expect(after.stage).toBe("merging");
+		expect(checkPrompts(record)).toHaveLength(2);
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.workCheckSendbacks).toBe(1);
 		expect(after.workCheckLog).toHaveLength(3);
-		expect(after.workCheckLog[0]!.blockers).toEqual([
-			settled,
-			{
-				...open,
-				status: "fixed",
-				statusReason: "not re-cited by the re-check",
-			},
-		]);
+		expect(after.workCheckLog[0]!.blockers).toEqual([settled, open]);
 		expect(after.workCheckLog[1]!.blockers).toEqual([]);
+		expect(after.workCheckLog[2]!.outcome).toBe("error");
+		expect(after.workCheckLog[2]!.error).toBeTruthy();
 	});
 
 	test("a human message from the last check's start instant is not reply data, and the re-check runs anyway", async () => {
-		const { store, record, loop } = await checkCase([verdict({})]);
+		const { store, record, loop } = await checkCase([
+			verdict({
+				fixed: [{ id: 1, reason: "the tests now cover the missing case" }],
+			}),
+		]);
 		const task = await store.createTask("work please");
 		const said = await humanTurn(store, task.id, "looks fine to me");
 		await store.updateTask(task.id, {
@@ -20199,7 +21303,11 @@ describe("turn survivor round 5 — work card to merging", () => {
 	});
 
 	test("a reply-driven re-check at an unchanged head sees the reply and the since-head diff", async () => {
-		const { store, record, loop } = await checkCase([verdict({})]);
+		const { store, record, loop } = await checkCase([
+			verdict({
+				fixed: [{ id: 1, reason: "the reply completes the required review" }],
+			}),
+		]);
 		const task = await store.createTask("work please");
 		const said = await humanTurn(store, task.id, "I approve the auth change");
 		await store.updateTask(task.id, {
@@ -20224,15 +21332,22 @@ describe("turn survivor round 5 — work card to merging", () => {
 	});
 
 	test("a re-check at a new head reads the new-commits diff up to HEAD", async () => {
-		const { store, record, loop } = await checkCase([verdict({})], {
-			targetSha: async () => "sha2",
-			diffText: async (_wt: string, from: string, to: string) =>
-				to !== "HEAD"
-					? null
-					: from === "sha1"
-						? "const y = 2;\n"
-						: "const x = 1;\nconst y = 2;\n",
-		});
+		const { store, record, loop } = await checkCase(
+			[
+				verdict({
+					fixed: [{ id: 1, reason: "the new commits add the missing test" }],
+				}),
+			],
+			{
+				targetSha: async () => "sha2",
+				diffText: async (_wt: string, from: string, to: string) =>
+					to !== "HEAD"
+						? null
+						: from === "sha1"
+							? "const y = 2;\n"
+							: "const x = 1;\nconst y = 2;\n",
+			},
+		);
 		const task = await store.createTask("work please");
 		await store.updateTask(task.id, {
 			workCheckLog: [
@@ -20245,7 +21360,8 @@ describe("turn survivor round 5 — work card to merging", () => {
 
 		const prompt = checkPrompts(record)[0]!.prompt;
 		expect(prompt).toContain("Diff of only the new commits");
-		expect(prompt).toContain("\n\nconst y = 2;\n\n");
+		// No transcript rode: the new-commits diff is the prompt's last section.
+		expect(prompt.endsWith("\n\nconst y = 2;\n")).toBe(true);
 		expect(prompt).not.toContain("const x = 1;\nconst y = 2;");
 	});
 
@@ -20310,6 +21426,38 @@ describe("turn survivor round 5 — work card to merging", () => {
 		expect(after.workCheckSendbacks).toBe(1);
 	});
 
+	test.skipIf(process.platform !== "linux")(
+		"a planted transcript symlink is refused: its quote demotes and the prompt holds no path",
+		async () => {
+			const { store, record, loop } = await checkCase([
+				verdict({
+					blockers: [
+						{ finding: "claims tests ran", quote: "bun test: 12 pass" },
+					],
+				}),
+			]);
+			// The work turn planted the transcript path as a symlink (OTTR-989): the
+			// read refuses it, so the check oracle never holds the target's text and
+			// the checker gets no path to follow.
+			mkdirSync(store.sessionsDir, { recursive: true });
+			const outside = join(store.path, "server-only.txt");
+			writeFileSync(outside, '{"text":"bun test: 12 pass"}\n');
+			const transcript = join(store.sessionsDir, "1_sess-1.jsonl");
+			symlinkSync(outside, transcript);
+			const task = await store.createTask("work please");
+			await loop.runTurn(store.name, task.id);
+
+			const prompt = checkPrompts(record)[0]!.prompt;
+			expect(prompt).not.toContain("read it in ranges");
+			expect(prompt).not.toContain(transcript);
+			expect(await logText(store, task.id)).toContain("refusing");
+			const after = (await store.getTask(task.id))!;
+			expect(after.stage).toBe("merging");
+			expect(after.workCheckLog[0]!.outcome).toBe("pass");
+			expect(after.workCheckLog[0]!.notes[0]).toContain("claims tests ran");
+		},
+	);
+
 	test("with no diff and no transcript every quote demotes and the prompt holds neither", async () => {
 		const { store, record, loop } = await checkCase(
 			[verdict({ blockers: [{ finding: "looks wrong", quote: "here" }] })],
@@ -20319,10 +21467,11 @@ describe("turn survivor round 5 — work card to merging", () => {
 		await loop.runTurn(store.name, task.id);
 
 		const prompt = checkPrompts(record)[0]!.prompt;
-		expect(prompt).toContain(
-			"read files in the worktree for the rest):\n\n\n\n",
-		);
-		expect(prompt.endsWith("read it in ranges): ")).toBe(true);
+		expect(
+			prompt.endsWith("read files in the worktree for the rest):\n\n"),
+		).toBe(true);
+		// No transcript on disk: the prompt names no transcript path to follow.
+		expect(prompt).not.toContain("read it in ranges");
 		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.workCheckLog[0]!.outcome).toBe("pass");
@@ -21167,7 +22316,9 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 	/** The ops override whose /tmp rule holds only `runner` (the worker hostname or "local"). */
 	const tmpHolds = (...runners: string[]): Partial<TurnOps> => ({
 		tmpFullLine: (r) =>
-			runners.includes(r) ? `/tmp of ${r} is full (512 MiB)` : null,
+			runners.includes(r)
+				? `The temp disk (/tmp) of ${r} is full (512 MiB free)`
+				: null,
 	});
 
 	test("a tmp-full worker gets no dispatch while the other still does", async () => {
@@ -21195,7 +22346,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 		expect((await store.getTask(task.id))?.state).toBe("queued");
 		// OTTR-754: the queued card carries the hold reason with the runner's free space.
 		expect((await store.getTask(task.id))?.needsReason).toBe(
-			"/tmp of worker-a is full (512 MiB)",
+			"The temp disk (/tmp) of worker-a is full (512 MiB free)",
 		);
 	});
 
@@ -21221,7 +22372,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 		expect(record.runs).toHaveLength(0);
 		expect((await store.getTask(check.id))?.state).toBe("queued");
 		expect((await store.getTask(check.id))?.needsReason).toBe(
-			"/tmp of local is full (512 MiB)",
+			"The temp disk (/tmp) of local is full (512 MiB free)",
 		);
 	});
 
@@ -21233,7 +22384,9 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			tmpFullLine: (r) =>
-				full && r === "worker-a" ? "/tmp of worker-a is full (512 MiB)" : null,
+				full && r === "worker-a"
+					? "The temp disk (/tmp) of worker-a is full (512 MiB free)"
+					: null,
 			resolveTarget: async () => {
 				full = true; // the /tmp limit reaches the runner mid-prepare
 				return { target: "origin/main", sha: "sha0", warning: null };
@@ -21244,14 +22397,16 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 		expect(record.runs).toHaveLength(0);
 		const card = await store.getTask(task.id);
 		expect(card?.state).toBe("needs_you");
-		expect(card?.needsReason).toContain("/tmp of worker-a is full (512 MiB)");
+		expect(card?.needsReason).toContain(
+			"The temp disk (/tmp) of worker-a is full (512 MiB free)",
+		);
 	});
 
 	test("an apt disk-failure reason names the free /tmp of the runner it ran on", async () => {
 		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
-			tmpSpaceLine: (r) => `/tmp of ${r} has 512 MiB free`,
+			tmpSpaceLine: (r) => `The temp disk (/tmp) of ${r} has 512 MiB free`,
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => ({
 				pid: 4242,
 				// The dispatch record the settle reads the runner from; the reason text
@@ -21272,7 +22427,9 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 
 		const after = (await store.getTask(task.id))!;
 		expect(
-			after.needsReason?.endsWith("/tmp of worker-a has 512 MiB free"),
+			after.needsReason?.endsWith(
+				"The temp disk (/tmp) of worker-a has 512 MiB free",
+			),
 		).toBe(true);
 	});
 
@@ -21280,7 +22437,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
-			tmpSpaceLine: (r) => `/tmp of ${r} has 512 MiB free`,
+			tmpSpaceLine: (r) => `The temp disk (/tmp) of ${r} has 512 MiB free`,
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => ({
 				pid: 4242,
 				url: o.worker?.urls[0],
@@ -21299,7 +22456,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 	test("tmpEnrichNeedsReason appends only on an apt signature, only with a phrase", () => {
 		const space = (r: string) =>
 			r === "worker-a" || r === "local"
-				? `/tmp of ${r} has 512 MiB free`
+				? `The temp disk (/tmp) of ${r} has 512 MiB free`
 				: null;
 		expect(
 			tmpEnrichNeedsReason(
@@ -21308,7 +22465,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 				space,
 			),
 		).toBe(
-			"omp exited with code 1 before finishing: Splitting up failed; /tmp of worker-a has 512 MiB free",
+			"omp exited with code 1 before finishing: Splitting up failed; The temp disk (/tmp) of worker-a has 512 MiB free",
 		);
 		// "is not signed" is the other apt disk-failure signature; a local run passes null.
 		expect(
@@ -21318,7 +22475,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 				space,
 			),
 		).toBe(
-			"omp exited with code 1: package X is not signed; /tmp of local has 512 MiB free",
+			"omp exited with code 1: package X is not signed; The temp disk (/tmp) of local has 512 MiB free",
 		);
 		// No signature, or a null line (space unknown): the reason stays.
 		expect(
@@ -21335,7 +22492,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 
 	test("the /tmp hold's reason write publishes its own edge (OTTR-884)", async () => {
 		const { store, record, loop } = await setup({
-			tmpFullLine: () => "/tmp of local is full (0 MiB free)",
+			tmpFullLine: () => "The temp disk (/tmp) of local is full (0 MiB free)",
 		});
 		const task = await store.createTask("queued work");
 		await loop.schedule(); // entry + first cycle + the hold write's edge
@@ -21343,7 +22500,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 		const first = record.publishSoon;
 		expect(first).toBeGreaterThan(0);
 		expect((await store.getTask(task.id))!.needsReason).toContain(
-			"/tmp of local is full",
+			"The temp disk (/tmp) of local is full",
 		);
 		await loop.scheduleTick(); // the hold persists (the reason text matches): quiet
 		await flushPromises();
@@ -21356,7 +22513,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 		await flushPromises();
 		expect(record.publishSoon).toBe(base + 2);
 		expect((await store.getTask(task.id))!.needsReason).toContain(
-			"/tmp of local",
+			"The temp disk (/tmp) of local",
 		);
 	});
 });
@@ -22145,7 +23302,7 @@ describe("sync-commit hygiene (OTTR-531)", () => {
 		);
 	});
 
-	test("pushSyncCommits on: the tick pushes once on the unpushed edge and lifts the hold", async () => {
+	test("the tick never pushes an unpushed main, also under a stored legacy pushSyncCommits row", async () => {
 		const calls: unknown[][] = [];
 		const { store, projects, loop } = await targetedSetup({
 			branchUnpushed: async () => true,
@@ -22154,36 +23311,17 @@ describe("sync-commit hygiene (OTTR-531)", () => {
 				return { status: "pushed" as const, output: "" };
 			},
 		});
-		await store.setSettings({ pushSyncCommits: true });
+		// A board from before the removal stored the standing approval; it must stay inert.
+		await store.setSettings({ pushSyncCommits: true } as unknown as Parameters<
+			typeof store.setSettings
+		>[0]);
 		const e = projects.get(store.name)!;
 		await loop.schedule();
 		await flushPromises();
 
-		expect(calls).toHaveLength(1);
-		expect(calls[0]).toEqual([
-			e.path,
-			e.path,
-			"origin/main",
-			"",
-			null,
-			(await store.getSettings()).originUrl,
-		]);
-		expect(e.mainUnpushed).toBe(false);
-	});
-
-	test("pushSyncCommits off: the tick never pushes", async () => {
-		const calls: unknown[][] = [];
-		const { loop } = await setup({
-			branchUnpushed: async () => true,
-			serverMergePush: async (...args: unknown[]) => {
-				calls.push(args);
-				return { status: "pushed" as const, output: "" };
-			},
-		});
-		await loop.schedule();
-		await flushPromises();
-
 		expect(calls).toHaveLength(0);
+		// The hold stays until a click on Push to origin.
+		expect(e.mainUnpushed).toBe(true);
 	});
 });
 
@@ -22404,6 +23542,7 @@ describe("turn PR-mode merge settle", () => {
 									],
 									multi: false,
 									recommended: null,
+									text: false,
 								},
 							],
 						}),
@@ -22426,6 +23565,7 @@ describe("turn PR-mode merge settle", () => {
 				options: [{ label: "fix main first" }, { label: "push anyway" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 
@@ -23302,6 +24442,7 @@ describe("turn PR-mode merge settle", () => {
 					cwd,
 					stdout: "pipe",
 					stderr: "pipe",
+					env: fixtureGitEnv(),
 				});
 				if (r.exitCode !== 0)
 					throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
@@ -23391,7 +24532,7 @@ describe("turn PR-mode merge settle", () => {
 					targetSha: async (_m: string, ref: string) => {
 						const r = Bun.spawnSync(
 							["git", "rev-parse", "--verify", "--quiet", ref],
-							{ cwd: main },
+							{ cwd: main, env: fixtureGitEnv() },
 						);
 						return r.exitCode === 0 ? r.stdout.toString().trim() : null;
 					},
@@ -23493,6 +24634,7 @@ describe("turn PR-mode merge settle", () => {
 				cwd,
 				stdout: "pipe",
 				stderr: "pipe",
+				env: fixtureGitEnv(),
 			});
 			if (r.exitCode !== 0)
 				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
@@ -23533,7 +24675,7 @@ describe("turn PR-mode merge settle", () => {
 				targetSha: async (_m: string, ref: string) => {
 					const r = Bun.spawnSync(
 						["git", "rev-parse", "--verify", "--quiet", ref],
-						{ cwd: main },
+						{ cwd: main, env: fixtureGitEnv() },
 					);
 					return r.exitCode === 0 ? r.stdout.toString().trim() : null;
 				},
@@ -24048,6 +25190,7 @@ describe("turn PR-mode merge settle", () => {
 					cwd,
 					stdout: "pipe",
 					stderr: "pipe",
+					env: fixtureGitEnv(),
 				});
 				if (r.exitCode !== 0)
 					throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
@@ -24680,10 +25823,14 @@ describe("worker OOM kill: one automatic continue, then a park", () => {
 
 describe("microVM dispatch (OTTR-532)", () => {
 	const VM_URL = "http://vm-runner:8787";
-	const savedHealth = vmState.health;
+	beforeEach(() => {
+		resetVmState();
+	});
 	afterEach(() => {
-		vmState.health = savedHealth;
-		vmState.busy.clear();
+		// OTTR-1162: a test file that ran earlier (scripts/no-proxy.test.ts probes a
+		// runner this container can really resolve) leaves a pool max that gates every
+		// dispatch here; each test starts with the pool unknown, like a fresh boot.
+		resetVmState();
 		setSystemTime();
 	});
 
@@ -24692,6 +25839,9 @@ describe("microVM dispatch (OTTR-532)", () => {
 	/** A microVM project whose fake vm-runner answers with `answer` (mutable per test). */
 	async function vmSetup(overrides: FixtureOps = {}, microVm = true) {
 		vmState.health = { configured: true, ok: true, reason: null };
+		// OTTR-1162: the pool gate reads the shared singleton; reset it with the health
+		// so a leak from an earlier test file cannot hold this describe's dispatches.
+		vmState.pool = { busy: 0, max: 0 };
 		const calls: RunOpts[] = [];
 		const envModels: (string | null)[] = [];
 		const synced: [string, string][] = [];
@@ -25046,6 +26196,250 @@ describe("microVM dispatch (OTTR-532)", () => {
 			expect((await store.getTask(task.id))!.state).toBe("queued");
 			expect(tokens.check(raw)).toBeNull();
 		});
+	});
+});
+
+describe("microVM pool hold (OTTR-1142)", () => {
+	const VM_URL = "http://vm-runner:8787";
+	beforeEach(() => {
+		resetVmState();
+		vmState.health = { configured: true, ok: true, reason: null };
+	});
+	afterEach(() => {
+		resetVmState();
+		setSystemTime();
+	});
+
+	type RunOpts = Parameters<TurnOps["startRun"]>[0];
+
+	/** The fake vm dispatch: records the call, answers busy while `accepts.left` is 0,
+	 * and takes one run per count otherwise. A non-vm target (a local merge follow-up)
+	 * gets a plain accepted run. */
+	function vmPoolStartRun(
+		calls: RunOpts[],
+		accepts: { left: number },
+	): TurnOps["startRun"] {
+		return async (o) => {
+			calls.push(o);
+			const success = () =>
+				runResult({ outcome: { status: "answered", summary: "done" } });
+			const target = o.vm?.target ?? o.worker ?? null;
+			if (target === null) {
+				await o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(success()),
+					kill: async () => {},
+				};
+			}
+			const take = isVmRun(o) && accepts.left > 0;
+			if (take) accepts.left -= 1;
+			if (!take)
+				return {
+					pid: null,
+					url: target.urls[0],
+					accepted: Promise.resolve(false),
+					done: Promise.resolve(
+						runResult({ exitCode: null, sessionId: null, workerBusy: true }),
+					),
+					kill: async () => {},
+				};
+			await o.onSession?.("sess-1");
+			return {
+				pid: null,
+				url: target.urls[0],
+				accepted: Promise.resolve(true),
+				done: Promise.resolve(success()),
+				kill: async () => {},
+			};
+		};
+	}
+
+	/** True when the dispatch went to vm-runner (a vm grant; a classic run's vm is null). */
+	function isVmRun(o: RunOpts): boolean {
+		return o.vm?.grant !== undefined;
+	}
+
+	test("a full pool holds no scheduler slot: a classic card of another project starts (OTTR-1142)", async () => {
+		vmState.pool = { busy: 0, max: 1 };
+		const record = baseRecord();
+		const a = await freshStore();
+		const b = await freshStore();
+		const calls: RunOpts[] = [];
+		const loop = holdFollowUps(
+			new Map([
+				[a.name, fakeProject(a)],
+				[b.name, fakeProject(b)],
+			]),
+			fakeOps(record, {
+				maxTotalRuns: () => 2,
+				workerTarget: { urls: ["http://worker-a:8787"], token: "tok" },
+				vmTarget: { urls: [VM_URL], token: "tok" },
+				vmTokens: new VmTokens({ file: null }),
+				syncWorktreeTo: async () => {},
+				startRun: async (o) => {
+					calls.push(o);
+					if (!isVmRun(o)) {
+						await o.onSession?.("sess-b");
+						return {
+							pid: null,
+							url: "http://worker-a:8787",
+							done: Promise.resolve(
+								runResult({ outcome: { status: "answered", summary: "done" } }),
+							),
+							kill: async () => {},
+						};
+					}
+					// Every vm dispatch gets the busy answer: the fake pool stays full.
+					return {
+						pid: null,
+						url: VM_URL,
+						accepted: Promise.resolve(false),
+						done: Promise.resolve(
+							runResult({ exitCode: null, sessionId: null, workerBusy: true }),
+						),
+						kill: async () => {},
+					};
+				},
+				// The fake runner's truth: every vm dispatch gets the busy answer, the
+				// pool stays full, so a waiting card never re-claims.
+				vmProbe: async () => {
+					vmState.pool = { busy: 1, max: 1 };
+				},
+			}),
+		);
+		await a.setSettings({ microVm: true });
+		const v1 = await a.createTask("vm work one");
+		const v2 = await a.createTask("vm work two");
+		const v3 = await a.createTask("vm work three");
+		// Same-millisecond creates tie in queueOrder (newest-first from listTasks); pin
+		// the run order so the test observes oldest-first exactly.
+		const base = Date.now();
+		await a.updateTask(v1.id, { queuedAt: base + 1 });
+		await a.updateTask(v2.id, { queuedAt: base + 2 });
+		await a.updateTask(v3.id, { queuedAt: base + 3 });
+		const classic = await b.createTask("classic work");
+		for (let i = 0; i < 20; i++) {
+			await loop.scheduleTick();
+			await flushPromises();
+			if ((await b.getTask(classic.id))!.state !== "queued") break;
+		}
+		await flushPromises();
+		const vmCalls = calls.filter(isVmRun);
+		const firstClassic = calls.findIndex((c) => !isVmRun(c));
+		expect(firstClassic).toBeGreaterThan(-1);
+		// Exactly the oldest vm card discovered the busy answer before the classic card
+		// ran: the waiting cards took no slot, so the cap stayed free for project b.
+		expect(vmCalls).toHaveLength(1);
+		expect(calls.slice(0, firstClassic).filter(isVmRun)).toHaveLength(1);
+		expect(vmCalls[0]!.prompt?.startsWith("vm work one")).toBe(true);
+		expect((await a.getTask(v1.id))!.state).toBe("queued");
+		expect((await a.getTask(v2.id))!.state).toBe("queued");
+		expect(await a.listTurns(v2.id)).toHaveLength(0);
+		expect(await a.listTurns(v3.id)).toHaveLength(0);
+		expect(await b.listTurns(classic.id)).toHaveLength(1);
+		expect(vmState.inflight).toBe(0);
+	});
+
+	test("a freed slot starts exactly the oldest waiting card, one per slot (OTTR-1142)", async () => {
+		vmState.pool = { busy: 1, max: 1 };
+		const calls: RunOpts[] = [];
+		const accepts = { left: 0 };
+		const { store, loop } = await setup({
+			maxTotalRuns: () => 5,
+			vmTarget: { urls: [VM_URL], token: "tok" },
+			vmTokens: new VmTokens({ file: null }),
+			syncWorktreeTo: async () => {},
+			startRun: vmPoolStartRun(calls, accepts),
+			vmProbe: async () => {
+				vmState.pool = { busy: accepts.left > 0 ? 0 : 1, max: 1 };
+			},
+		});
+		await store.setSettings({ microVm: true });
+		const first = await store.createTask("vm work one");
+		const second = await store.createTask("vm work two");
+		// Same-millisecond creates tie in queueOrder (newest-first from listTasks); pin
+		// the run order so the test observes oldest-first exactly.
+		const base = Date.now();
+		await store.updateTask(first.id, { queuedAt: base + 1 });
+		await store.updateTask(second.id, { queuedAt: base + 2 });
+		await loop.scheduleTick();
+		await flushPromises();
+		// A full pool claims nothing: no dispatch, no turn row.
+		expect(calls).toHaveLength(0);
+		expect((await store.getTask(first.id))!.state).toBe("queued");
+		expect(await store.listTurns(first.id)).toHaveLength(0);
+
+		// One slot frees: exactly the oldest card claims and starts. Its settle probes
+		// the pool full again, so the second card keeps waiting without a claim.
+		accepts.left = 1;
+		vmState.pool = { busy: 0, max: 1 };
+		await loop.scheduleTick();
+		await flushPromises();
+		await eventually(async () => vmState.inflight === 0);
+		await flushPromises();
+		const vmCalls = () => calls.filter(isVmRun);
+		expect(vmCalls()).toHaveLength(1);
+		expect(vmCalls()[0]!.vm?.grant.taskId).toBe(first.id);
+		expect(vmState.pool.busy).toBe(1);
+		expect((await store.getTask(second.id))!.state).toBe("queued");
+		expect(await store.listTurns(second.id)).toHaveLength(0);
+
+		// The next freed slot starts the next oldest card.
+		accepts.left = 1;
+		vmState.pool = { busy: 0, max: 1 };
+		await loop.scheduleTick();
+		await flushPromises();
+		await eventually(async () => vmCalls().length === 2);
+		expect(vmCalls()[1]!.vm?.grant.taskId).toBe(second.id);
+	});
+
+	test("a waiting card writes no new turn header until a VM is free (OTTR-1142)", async () => {
+		vmState.pool = { busy: 0, max: 1 };
+		const calls: RunOpts[] = [];
+		const accepts = { left: 0 };
+		const { store, loop } = await setup({
+			maxTotalRuns: () => 5,
+			vmTarget: { urls: [VM_URL], token: "tok" },
+			vmTokens: new VmTokens({ file: null }),
+			syncWorktreeTo: async () => {},
+			startRun: vmPoolStartRun(calls, accepts),
+			vmProbe: async () => {
+				vmState.pool = { busy: accepts.left > 0 ? 0 : 1, max: 1 };
+			},
+		});
+		await store.setSettings({ microVm: true });
+		const task = await store.createTask("vm work one");
+		await loop.scheduleTick();
+		await flushPromises();
+		// The discovery dispatch: one turn header, one wait line, the card back queued.
+		expect(calls).toHaveLength(1);
+		expect((await store.getTask(task.id))!.state).toBe("queued");
+		const headers = async () =>
+			(await logText(store, task.id)).match(/^== work turn /gm)?.length ?? 0;
+		expect(await headers()).toBe(1);
+
+		// The old per-card back-off expires; the pool gate still holds the card:
+		// no re-claim, no new header, no second wait line.
+		setSystemTime(new Date(Date.now() + VM_BUSY_RETRY_MS + 60_000));
+		await loop.scheduleTick();
+		await flushPromises();
+		await loop.scheduleTick();
+		await flushPromises();
+		expect(await headers()).toBe(1);
+		expect(
+			(await logText(store, task.id)).match(
+				/waits in the queue for a free microVM/g,
+			),
+		).toHaveLength(1);
+
+		// A VM frees: the card starts, and only the start adds a header.
+		accepts.left = 1;
+		vmState.pool = { busy: 0, max: 1 };
+		await loop.scheduleTick();
+		await flushPromises();
+		await eventually(async () => vmState.inflight === 0);
+		expect(await headers()).toBe(2);
 	});
 });
 
@@ -25950,6 +27344,7 @@ describe("turn checkout guard (other projects)", () => {
 				cwd,
 				stdout: "pipe",
 				stderr: "pipe",
+				env: fixtureGitEnv(),
 			});
 			if (r.exitCode !== 0)
 				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
@@ -26018,7 +27413,7 @@ describe("turn checkout guard (other projects)", () => {
 						cwd: repo,
 						stdout: "pipe",
 						stderr: "pipe",
-						env: env === undefined ? process.env : { ...process.env, ...env },
+						env: env === undefined ? fixtureGitEnv() : { ...fixtureGitEnv(), ...env },
 					});
 					if (r.exitCode !== 0)
 						throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
@@ -26084,6 +27479,7 @@ describe("turn checkout guard (other projects)", () => {
 				cwd,
 				stdout: "pipe",
 				stderr: "pipe",
+				env: fixtureGitEnv(),
 			});
 			if (r.exitCode !== 0)
 				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
@@ -26784,6 +28180,43 @@ describe("stored review findings", () => {
 		expect(reviewAfter.details).toContain(`already open: #${old.id}`);
 	});
 
+	test("two bare-tag leads with different claims file two cards (OTTR-1164)", async () => {
+		const record = baseRecord();
+		const first = mkFinding(
+			"Needs validation\n## Claim\nThe limiter keys on the first entry.",
+		);
+		const second = mkFinding(
+			"Needs validation\n## Claim\nThe probe starts Bun in the venv.",
+		);
+		const { store, loop } = await storedReviewSetup(
+			record,
+			[mkFinding("Bug 1", 1), first, second],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+			}),
+			[verdicts([1, false, "not real"])],
+			{ maxTotalRuns: () => null },
+		);
+		const review = await reviewCard(store);
+
+		await loop.runTurn(store.name, review.id);
+
+		// Both leads are fingerprint-less; with the bare tag alone on line 1 they
+		// once shared one title key, so the second lead deduped the first one's
+		// card away. Their claims keep them apart. listTasks lists newest first,
+		// so the filed order sorts away.
+		const kids = await kidsOf(store, review.id);
+		expect(kids).toHaveLength(2);
+		expect(kids.map((k) => k.title).sort()).toEqual(
+			[
+				"Needs validation: The limiter keys on the first entry.",
+				"Needs validation: The probe starts Bun in the venv.",
+			].sort(),
+		);
+		const reviewAfter = (await store.getTask(review.id))!;
+		expect(reviewAfter.details).not.toContain("already open");
+	});
+
 	test("a title match on a done or cancelled lead card files the lead again", async () => {
 		const record = baseRecord();
 		const lead = mkFinding("Needs validation: flaky retry on push");
@@ -27362,6 +28795,7 @@ describe("stored review findings", () => {
 				],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 		expect(questions[0]!.needsReason).toBe(
@@ -27541,6 +28975,89 @@ describe("stored review findings", () => {
 		const card4 = (await store.getTask(manual.id))!;
 		expect(card4.followUpOf).toBe(r2.id);
 		expect(card4.prompt).toContain(`#${m1.id}`);
+	});
+
+	test("the validation sweep files a missed batch with no settle event (OTTR-1139)", async () => {
+		const record = baseRecord();
+		const { store, loop } = await validationCase(record);
+		// The missed-event shape: the review went done, its sandbox lead waits,
+		// no validation card exists, and no trigger fired (no settle call below).
+		const review = await doneReview(store, "missed event");
+		const lead = await leadCard(
+			store,
+			review.id,
+			"Needs validation: missed sweep lead\nBlocker: sandbox run: ms",
+		);
+		await loop.validationSweep();
+		const cards = (await store.listTasks()).filter(
+			(t) => t.kind === "validation",
+		);
+		expect(cards).toHaveLength(1);
+		const card = (await store.getTask(cards[0]!.id))!;
+		expect(card.followUpOf).toBe(review.id);
+		expect(card.stage).toBe("todo");
+		expect(card.state).toBe("queued");
+		expect(card.prompt).toContain(`#${lead.id}`);
+		// The sweep files only: it runs no turn, and the lead and the review
+		// stay as they were.
+		expect(record.runs).toHaveLength(0);
+		expect((await store.getTask(lead.id))!.stage).toBe("backlog");
+		expect((await store.getTask(review.id))!.stage).toBe("done");
+	});
+
+	test("the validation sweep files nothing when the rules refuse (OTTR-1139)", async () => {
+		const record = baseRecord();
+		const { store, loop } = await validationCase(record);
+
+		// A review whose leads are all deployment-fact: nothing batchable.
+		const factReview = await doneReview(store, "deployment facts");
+		await leadCard(
+			store,
+			factReview.id,
+			"Needs validation: proxy header\nBlocker: deployment fact: Which proxy?",
+		);
+
+		// A declined review: its newest validation card is cancelled.
+		const declinedReview = await doneReview(store, "declined");
+		await leadCard(
+			store,
+			declinedReview.id,
+			"Needs validation: declined lead\nBlocker: sandbox run: dl",
+		);
+		const declinedCard = await store.createTask(
+			"validation run",
+			null,
+			"validation",
+		);
+		await store.updateTask(declinedCard.id, {
+			followUpOf: declinedReview.id,
+			cancelledAt: Date.now(),
+		});
+
+		// An open validation card anywhere in the project: the one-open-run rule.
+		const openReview = await doneReview(store, "open run");
+		await leadCard(
+			store,
+			openReview.id,
+			"Needs validation: waiting lead\nBlocker: sandbox run: wl",
+		);
+		const openCard = await store.createTask(
+			"validation run",
+			null,
+			"validation",
+		);
+		await store.updateTask(openCard.id, { followUpOf: openReview.id });
+
+		await loop.validationSweep();
+		const cards = (await store.listTasks()).filter(
+			(t) => t.kind === "validation",
+		);
+		// Only the two cards the test created; the sweep filed none.
+		expect(cards).toHaveLength(2);
+		for (const t of cards)
+			expect([declinedCard.id, openCard.id]).toContain(t.id);
+		for (const id of [factReview.id, declinedReview.id, openReview.id])
+			expect((await store.getTask(id))!.stage).toBe("done");
 	});
 
 	test("a validation card holds no merge and never commits (OTTR-1047)", async () => {
@@ -27856,6 +29373,618 @@ describe("stored review findings", () => {
 		expect(card.followUpOf).toBe(b.id);
 		expect(card.prompt).toContain(`#${bLead.id}`);
 	});
+
+	// ---- OTTR-1129: validate blocked leads again ----
+
+	test("validate-again resets the stale blocked lead and refiles only it (OTTR-1129)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop, batches } = await validationCase(record);
+		const review = await doneReview(store, "again");
+		const a = mkFinding(
+			"Needs validation: lead A\nBlocker: sandbox run: ca",
+			1,
+		);
+		const b = mkFinding(
+			"Needs validation: lead B\nBlocker: sandbox run: cb",
+			2,
+		);
+		const c = mkFinding(
+			"Needs validation: lead C\nBlocker: sandbox run: cc",
+			3,
+		);
+		for (const f of [a, b, c]) await store.appendReviewFinding(review.id, f);
+		const la = await leadCard(store, review.id, a.prompt);
+		const lb = await leadCard(store, review.id, b.prompt);
+		const lc = await leadCard(store, review.id, c.prompt);
+
+		// Run 1 lands A "blocked" and C "deployment"; the chain files the
+		// remainder and run 2 lands B "blocked" later.
+		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
+		expect("id" in v1).toBe(true);
+		if (!("id" in v1)) throw new Error("no validation run filed");
+		batches.push([
+			mkFinding(`Validation: #${la.id} blocked\nthe sandbox lacks the control`),
+			mkFinding(
+				`Validation: #${lc.id} deployment\nWhich proxy terminates TLS?`,
+			),
+		]);
+		await loop.runTurn(store.name, v1.id);
+		await settled(store, v1.id);
+		// The chain queued run 2 for the still-unvalidated B. Cancel it: its
+		// scheduler start could race the batch push below, and an auto-started
+		// run with an empty batch settles needs_you and stays open.
+		const chained = (await store.listTasks()).find(
+			(t) =>
+				t.kind === "validation" &&
+				t.id !== v1.id &&
+				t.cancelledAt === null &&
+				t.stage !== "done",
+		);
+		expect(chained).toBeDefined();
+		await store.updateTask(chained!.id, { cancelledAt: Date.now() });
+		// A real 2 ms gap: the settle stamps validatedAt with the real clock and
+		// fake timers cannot drive it, and the cutoff below must sit strictly
+		// between the two settles' stamps.
+		await Bun.sleep(2);
+		batches.push([mkFinding(`Validation: #${lb.id} blocked\nstill lacks it`)]);
+		// File run 2 explicitly: the strict start overrides the cancelled card's
+		// decline and batches exactly B.
+		const v2 = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+		);
+		expect("id" in v2).toBe(true);
+		if (!("id" in v2)) throw new Error("no second validation run filed");
+		await loop.runTurn(store.name, v2.id);
+		await settled(store, v2.id);
+
+		const validatedB = (await store.getTask(lb.id))!.validatedAt!;
+		// The cutoff sits between the two runs: only A validated before it.
+		const cutoff =
+			((await store.getTask(la.id))!.validatedAt! + validatedB) / 2;
+
+		const again = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+			{ before: cutoff },
+		);
+		expect("id" in again).toBe(true);
+		if (!("id" in again)) throw new Error("no validation run filed");
+		expect(again.reset).toEqual([la.id]);
+
+		// A lost its validatedAt and its settle marker (the marker was the
+		// details' only line, so the cleared remainder stores null); B and C
+		// keep theirs.
+		const fullA = (await store.getTask(la.id))!;
+		expect(fullA.validatedAt).toBeNull();
+		expect(fullA.details).toBeNull();
+		const fullB = (await store.getTask(lb.id))!;
+		expect(fullB.validatedAt).toBe(validatedB);
+		expect(fullB.details).toContain(`Validated by validation run #${v2!.id}`);
+		const fullC = (await store.getTask(lc.id))!;
+		expect(fullC.validatedAt).not.toBeNull();
+		expect(fullC.details).toContain(`Validated by validation run #${v1.id}`);
+
+		// Exactly one new validation card, and its batch names A only. The
+		// cancelled chain card stays on the board, so the lookup skips it; the
+		// three live cards are run 1, run 2, and the again filing.
+		const cards = (await store.listTasks()).filter(
+			(t) => t.kind === "validation" && t.cancelledAt === null,
+		);
+		expect(cards).toHaveLength(3);
+		const fresh = cards.find((t) => t.id !== v1.id && t.id !== v2.id)!;
+		expect(fresh.prompt).toContain(`#${la.id}`);
+		expect(fresh.prompt).not.toContain(`#${lb.id}`);
+		expect(fresh.prompt).not.toContain(`#${lc.id}`);
+
+		// A's log names the old result and its run; B never gained a log file
+		// (only the reset writes one), and a present B log stays clean.
+		expect(await logText(store, la.id)).toContain(
+			`validation result cleared for re-validation: was "still blocked" (validation run #${v1.id})`,
+		);
+		const bLog = existsSync(await store.logPath(lb.id))
+			? await logText(store, lb.id)
+			: "";
+		expect(bLog).not.toContain("validation result cleared");
+	});
+
+	test("without the again flag nothing resets and the plain start refuses (OTTR-1129)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop, batches } = await validationCase(record);
+		const review = await doneReview(store, "plain start");
+		const a = mkFinding(
+			"Needs validation: lead A\nBlocker: sandbox run: ca",
+			1,
+		);
+		await store.appendReviewFinding(review.id, a);
+		const la = await leadCard(store, review.id, a.prompt);
+		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
+		expect("id" in v1).toBe(true);
+		if (!("id" in v1)) throw new Error("no validation run filed");
+		batches.push([mkFinding(`Validation: #${la.id} blocked\nstill fails`)]);
+		await loop.runTurn(store.name, v1.id);
+		await settled(store, v1.id);
+		const validated = (await store.getTask(la.id))!.validatedAt;
+		expect(validated).not.toBeNull();
+
+		// The same call without the again arg is today's behavior: the validated
+		// lead is not batchable, so the strict start refuses and nothing resets.
+		const plain = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+		);
+		expect(plain).toEqual({
+			error: `no batchable leads for review ${review.id}`,
+			status: 409,
+		});
+		expect((await store.getTask(la.id))!.validatedAt).toBe(validated);
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "validation"),
+		).toHaveLength(1);
+	});
+
+	test("validate-again keeps the newest recorded outcome per lead (OTTR-1129)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop, batches } = await validationCase(record);
+		const review = await doneReview(store, "newest wins");
+		const df = mkFinding(
+			"Needs validation: lead D\nBlocker: sandbox run: cd",
+			1,
+		);
+		const ef = mkFinding(
+			"Needs validation: lead E\nBlocker: sandbox run: ce",
+			2,
+		);
+		const gf = mkFinding(
+			"Needs validation: filler G\nBlocker: sandbox run: cg",
+			3,
+		);
+		for (const f of [df, ef, gf]) await store.appendReviewFinding(review.id, f);
+		const ld = await leadCard(store, review.id, df.prompt);
+		const le = await leadCard(store, review.id, ef.prompt);
+		const lg = await leadCard(store, review.id, gf.prompt);
+
+		// Run 1 lands D "blocked" and E "deployment"; the chain files the
+		// remainder and run 2 confirms G and re-records both leads: D flips to
+		// "deployment", E flips to "blocked". Both runs land before the cutoff.
+		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
+		expect("id" in v1).toBe(true);
+		if (!("id" in v1)) throw new Error("no validation run filed");
+		batches.push([
+			mkFinding(`Validation: #${ld.id} blocked\nno control in the sandbox`),
+			mkFinding(
+				`Validation: #${le.id} deployment\nWhich proxy terminates TLS?`,
+			),
+		]);
+		await loop.runTurn(store.name, v1.id);
+		await settled(store, v1.id);
+		// The chain queued run 2 with the untouched filler G in its batch.
+		// Cancel it so its scheduler start cannot race the batch push below.
+		const chained = (await store.listTasks()).find(
+			(t) =>
+				t.kind === "validation" &&
+				t.id !== v1.id &&
+				t.cancelledAt === null &&
+				t.stage !== "done",
+		);
+		expect(chained).toBeDefined();
+		await store.updateTask(chained!.id, { cancelledAt: Date.now() });
+		// A real 2 ms gap, same reason as the split test above: the settle
+		// stamps validatedAt with the real clock fake timers cannot drive.
+		await Bun.sleep(2);
+		batches.push([
+			mkFinding(`Validation: #${lg.id} confirmed\nthe job reproduces it`),
+			mkFinding(`Validation: #${ld.id} deployment\nflipped later`),
+			mkFinding(`Validation: #${le.id} blocked\nstill fails`),
+		]);
+		// File run 2 explicitly: the strict start overrides the cancelled
+		// card's decline and batches exactly the unvalidated filler G.
+		const v2 = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+		);
+		expect("id" in v2).toBe(true);
+		if (!("id" in v2)) throw new Error("no second validation run filed");
+		await loop.runTurn(store.name, v2.id);
+		await settled(store, v2.id);
+		const validatedAt = (await store.getTask(ld.id))!.validatedAt;
+		expect(validatedAt).not.toBeNull();
+		if (validatedAt === null) throw new Error("run 2 stamped nothing");
+
+		// Any cutoff above the two runs puts both leads in the reset window.
+		const again = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+			{ before: validatedAt + 1 },
+		);
+		expect("id" in again).toBe(true);
+		if (!("id" in again)) throw new Error("no validation run filed");
+		// The newest outcome wins: D's newest record is deployment, so only E resets.
+		expect(again.reset).toEqual([le.id]);
+		const fullD = (await store.getTask(ld.id))!;
+		expect(fullD.validatedAt).toBe(validatedAt);
+		const fullE = (await store.getTask(le.id))!;
+		expect(fullE.validatedAt).toBeNull();
+		// The reset removes the newest (run 2, blocked) marker only: the older
+		// run 1 deployment note stays as history.
+		expect(fullE.details).not.toContain(
+			`Validated by validation run #${v2.id}`,
+		);
+		expect(fullE.details).toContain(`Validated by validation run #${v1.id}`);
+		// The refiled batch names E only.
+		const fresh = (await store.getTask(again.id))!;
+		expect(fresh.prompt).toContain(`#${le.id}`);
+		expect(fresh.prompt).not.toContain(`#${ld.id}`);
+		expect(fresh.prompt).not.toContain(`#${lg.id}`);
+	});
+
+	// ---- OTTR-1128: a lead never runs as a work turn and never holds its review ----
+
+	test("a started lead of a held release goes to the release's batch validation, never a work turn (OTTR-1128)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await storedReviewSetup(
+			record,
+			[],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+				recorded: [],
+			}),
+			[],
+			{ publishRelease: publishingRelease(record), maxTotalRuns: () => null },
+		);
+		projects.get(store.name)!.target = "origin/main";
+		const review = await store.createTask(
+			`${ARCH_REVIEW_MARKER}release v1.0.0`,
+			null,
+			"review",
+		);
+		await store.updateTask(review.id, {
+			releaseVersion: "v1.0.0",
+			base: "shaR",
+			worktree: "wt-rel",
+			branch: "ott/rel",
+			releaseNotes: "notes body",
+			// Parked in the tick's held shape: the release waits at merging for
+			// its findings, and no live turn runs.
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+		});
+		const lead = await leadCard(
+			store,
+			review.id,
+			"Needs validation: release lead\nBlocker: sandbox run: cr",
+		);
+		// The user starts the lead (Accept or a drag): todo/queued.
+		await store.updateTask(lead.id, { stage: "todo", state: "queued" });
+		// A started lead holds no review: the release would otherwise wait on a
+		// work turn that has no sandbox_run (findingOpen ignores leads).
+		expect(
+			findingsHold(await store.listTasks(), (await store.getTask(review.id))!),
+		).toBeNull();
+
+		await loop.schedule();
+
+		// The same tick routes the lead back to the backlog and files the
+		// release's batch validation card with the lead in it.
+		const back = (await store.getTask(lead.id))!;
+		expect(back.stage).toBe("backlog");
+		expect(back.state).toBe("idle");
+		expect(back.queuedAt).toBeNull();
+		expect(back.validatedAt).toBeNull();
+		expect(back.details).toContain(
+			"a Needs validation lead runs in its review's batch validation run, never in a work turn.",
+		);
+		const cards = (await store.listTasks()).filter(
+			(t) => t.kind === "validation",
+		);
+		expect(cards).toHaveLength(1);
+		const card = cards[0]!;
+		expect(card.followUpOf).toBe(review.id);
+		expect(card.prompt).toContain(`#${lead.id}`);
+
+		// The release settle finishes while the lead and the open validation
+		// card exist: neither holds it.
+		await eventually(
+			async () => (await store.getTask(review.id))?.stage === "done",
+		);
+		expect(record.publishRelease).toHaveLength(1);
+		expect((await store.getTask(review.id))!.summary).toBe("Released v1.0.0");
+		expect(
+			findingsHold(await store.listTasks(), (await store.getTask(review.id))!),
+		).toBeNull();
+		// The only agent run is the validation card's: the lead never ran a work
+		// turn, and the done review's trigger filed no second card.
+		await settled(store, card.id);
+		expect(await store.listTurns(lead.id)).toHaveLength(0);
+		expect(await store.listTurns(card.id)).toHaveLength(1);
+		expect(record.runs).toHaveLength(1);
+		expect((await store.getTask(lead.id))!.stage).toBe("backlog");
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "validation"),
+		).toHaveLength(1);
+	});
+
+	test("a started lead whose branch holds commits parks needs_you and is never moved (OTTR-1128)", async () => {
+		const record = baseRecord();
+		const { store, loop } = await validationCase(record, {
+			// "ott/two" holds 2 commits beyond its base; any other branch is
+			// unreadable (null), which the routing treats like commits.
+			revListCount: async (_path: string, _base: string, branch: string) =>
+				branch === "ott/two" ? 2 : null,
+		});
+		const review = await doneReview(store, "with commits");
+		const two = await leadCard(
+			store,
+			review.id,
+			"Needs validation: two commits\nBlocker: sandbox run: c2",
+		);
+		await store.updateTask(two.id, {
+			stage: "todo",
+			state: "needs_you",
+			needsReason: "Reply to continue.",
+			branch: "ott/two",
+			base: "shaB",
+		});
+		const unreadable = await leadCard(
+			store,
+			review.id,
+			"Needs validation: unreadable branch\nBlocker: sandbox run: cu",
+		);
+		await store.updateTask(unreadable.id, {
+			stage: "in_progress",
+			state: "queued",
+			branch: "ott/gone",
+			base: "shaB",
+		});
+
+		await loop.schedule();
+		await flushPromises();
+
+		const afterTwo = (await store.getTask(two.id))!;
+		expect(afterTwo.stage).toBe("todo");
+		expect(afterTwo.state).toBe("needs_you");
+		expect(afterTwo.needsReason).toBe(LEAD_COMMITS_REASON);
+		const afterUnreadable = (await store.getTask(unreadable.id))!;
+		expect(afterUnreadable.stage).toBe("in_progress");
+		expect(afterUnreadable.state).toBe("needs_you");
+		expect(afterUnreadable.needsReason).toBe(LEAD_COMMITS_REASON);
+		// No card was deleted or batched, and neither lead ran.
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "validation"),
+		).toHaveLength(0);
+		expect(await store.listTurns(two.id)).toHaveLength(0);
+		expect(await store.listTurns(unreadable.id)).toHaveLength(0);
+		expect(record.runs).toHaveLength(0);
+	});
+
+	test("a started lead goes first in its review's batch, ahead of a better rank (OTTR-1128)", async () => {
+		const record = baseRecord();
+		const { store, loop } = await validationCase(record);
+		await store.setSettings({ validationBatchSize: 1 });
+		const review = await doneReview(store, "started first");
+		const best = mkFinding(
+			"Needs validation: best rank\nBlocker: sandbox run: cb",
+			1,
+		);
+		const worse = mkFinding(
+			"Needs validation: worse rank\nBlocker: sandbox run: cw",
+			2,
+		);
+		for (const f of [best, worse])
+			await store.appendReviewFinding(review.id, f);
+		const lBest = await leadCard(store, review.id, best.prompt);
+		const lWorse = await leadCard(store, review.id, worse.prompt);
+		// The user starts the worse-ranked lead only.
+		await store.updateTask(lWorse.id, { stage: "todo", state: "queued" });
+
+		await loop.schedule();
+
+		const cards = (await store.listTasks()).filter(
+			(t) => t.kind === "validation",
+		);
+		expect(cards).toHaveLength(1);
+		const card = (await store.getTask(cards[0]!.id))!;
+		expect(card.followUpOf).toBe(review.id);
+		// The cap of 1 takes the started lead, not the better rank.
+		expect(card.prompt).toBe(
+			validationRunPrompt({
+				reviewId: review.id,
+				leads: [{ id: lWorse.id, prompt: worse.prompt }],
+			}),
+		);
+		expect(card.prompt).not.toContain(`#${lBest.id}`);
+		expect((await store.getTask(lWorse.id))!.stage).toBe("backlog");
+		expect((await store.getTask(lBest.id))!.stage).toBe("backlog");
+	});
+
+	test("a validated lead stays normal work: it starts, a pending one is never picked (OTTR-1128)", async () => {
+		const record = baseRecord();
+		const { store, loop } = await validationCase(record, {
+			// A confirmed lead's work turn: a plain answered run.
+			startRun: async (o: StartOpts) => {
+				record.runs.push(o);
+				await o.onSession?.("sess");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({ outcome: { status: "answered", summary: "fixed" } }),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const review = await doneReview(store, "validated");
+		const confirmed = await leadCard(
+			store,
+			review.id,
+			"Needs validation: confirmed race\nBlocker: sandbox run: cc",
+		);
+		await store.updateTask(confirmed.id, {
+			validatedAt: Date.now(),
+			stage: "todo",
+			state: "queued",
+		});
+		const pending = await leadCard(
+			store,
+			review.id,
+			"Needs validation: pending race\nBlocker: sandbox run: cp",
+		);
+		await store.updateTask(pending.id, { stage: "todo", state: "queued" });
+
+		// The pure pick: the validated lead is runnable, the pending one never is.
+		const picked = pickRunnable(await store.listTasks(), {
+			maxParallel: 4,
+			hasRules: true,
+			mainUnpushed: false,
+		}).map((t) => t.id);
+		expect(picked).toContain(confirmed.id);
+		expect(picked).not.toContain(pending.id);
+
+		await loop.schedule();
+
+		// The tick starts the validated lead's work turn and never moves it back.
+		await eventually(
+			async () => (await store.listTurns(confirmed.id)).length > 0,
+		);
+		const afterConfirmed = (await store.getTask(confirmed.id))!;
+		expect(afterConfirmed.stage).not.toBe("backlog");
+		expect(afterConfirmed.details ?? "").not.toContain(
+			"Moved back to the backlog",
+		);
+		// The pending lead went to the batch instead of a work turn.
+		expect(await store.listTurns(pending.id)).toHaveLength(0);
+		expect((await store.getTask(pending.id))!.stage).toBe("backlog");
+	});
+
+	test("a lead validated during the routing tick's git read stays started, never moved (OTTR-1128)", async () => {
+		// Work-check blocker 1: a validation result writes only validatedAt on a started
+		// lead, so a stage/state recheck alone let the stale tick return the confirmed
+		// lead to the backlog, where no batch takes it and its start was lost.
+		const record = baseRecord();
+		let duringRead: () => Promise<void> = async () => {};
+		const { store, loop } = await validationCase(record, {
+			revListCount: async () => {
+				await duringRead();
+				return 0;
+			},
+		});
+		const review = await doneReview(store, "race");
+		const lead = await leadCard(
+			store,
+			review.id,
+			"Needs validation: confirmed mid-read\nBlocker: sandbox run: cr",
+		);
+		await store.updateTask(lead.id, {
+			stage: "todo",
+			state: "queued",
+			branch: "ott/race",
+			base: "shaB",
+		});
+		let confirmedAt = 0;
+		duringRead = async () => {
+			duringRead = async () => {};
+			confirmedAt = Date.now();
+			await store.updateTask(lead.id, { validatedAt: confirmedAt });
+		};
+
+		await loop.schedule();
+		await flushPromises();
+
+		const after = (await store.getTask(lead.id))!;
+		expect(confirmedAt).toBeGreaterThan(0);
+		expect(after.validatedAt).toBe(confirmedAt);
+		expect(after.stage).not.toBe("backlog");
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "validation"),
+		).toHaveLength(0);
+	});
+
+	test("a started lead waits while another review's run is open, then joins its declined review's batch (OTTR-1128)", async () => {
+		// Work-check blocker 2: the filing refusal used to strand the lead in the backlog,
+		// where declined() kept its review out of every later automatic filing.
+		const record = baseRecord();
+		const { store, loop } = await validationCase(record);
+		const reviewA = await doneReview(store, "declined A");
+		const declinedRun = await store.createTask(
+			"old run of A",
+			null,
+			"validation",
+		);
+		await store.updateTask(declinedRun.id, {
+			followUpOf: reviewA.id,
+			cancelledAt: Date.now(),
+		});
+		const reviewB = await doneReview(store, "running B");
+		const runB = await store.createTask("run of B", null, "validation");
+		await store.updateTask(runB.id, { followUpOf: reviewB.id, state: "idle" });
+		const lead = await leadCard(
+			store,
+			reviewA.id,
+			"Needs validation: started while B runs\nBlocker: sandbox run: cw",
+		);
+		await store.updateTask(lead.id, { stage: "todo", state: "queued" });
+
+		await loop.schedule();
+		await flushPromises();
+		const waiting = (await store.getTask(lead.id))!;
+		expect(waiting.stage).toBe("todo");
+		expect(waiting.state).toBe("queued");
+		expect(await store.listTurns(lead.id)).toHaveLength(0);
+
+		await store.updateTask(runB.id, { stage: "done", state: "idle" });
+		await loop.schedule();
+		await flushPromises();
+
+		const runs = (await store.listTasks()).filter(
+			(t) =>
+				t.kind === "validation" &&
+				t.followUpOf === reviewA.id &&
+				t.cancelledAt === null,
+		);
+		expect(runs).toHaveLength(1);
+		expect((await store.getTask(runs[0]!.id))!.prompt).toContain(`#${lead.id}`);
+		expect((await store.getTask(lead.id))!.stage).toBe("backlog");
+	});
+
+	test("a started lead with no live review parks needs_you with an actionable reason (OTTR-1128)", async () => {
+		// Work-check blockers 3 and 4: a lead of a cancelled review, and a lead with no
+		// review link, can never join a batch; neither may vanish into the backlog or sit
+		// queued with no reason.
+		const record = baseRecord();
+		const { store, loop } = await validationCase(record);
+		const review = await doneReview(store, "cancelled");
+		const ofCancelled = await leadCard(
+			store,
+			review.id,
+			"Needs validation: cancelled parent\nBlocker: sandbox run: cc",
+		);
+		await store.updateTask(ofCancelled.id, { stage: "todo", state: "queued" });
+		await store.updateTask(review.id, { cancelledAt: Date.now() });
+		const unlinked = await store.createTask(
+			"Needs validation: imported by hand\nBlocker: sandbox run: cu",
+		);
+
+		await loop.schedule();
+		await flushPromises();
+
+		for (const id of [ofCancelled.id, unlinked.id]) {
+			const after = (await store.getTask(id))!;
+			expect(after.stage).toBe("todo");
+			expect(after.state).toBe("needs_you");
+			expect(after.needsReason).toBe(LEAD_NO_REVIEW_REASON);
+			expect(after.cancelledAt).toBeNull();
+			expect(await store.listTurns(id)).toHaveLength(0);
+		}
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "validation"),
+		).toHaveLength(0);
+	});
 });
 
 describe("prompt gate", () => {
@@ -27909,6 +30038,7 @@ describe("prompt gate", () => {
 				options: [{ label: "sqlite" }, { label: "postgres" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 		expect(after.gate?.parked).toBe(true);
@@ -28355,6 +30485,7 @@ describe("prompt gate", () => {
 				options: [{ label: "fail" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 		// The failure signature counts the blocking questions only.
@@ -28767,13 +30898,27 @@ describe("prompt gate", () => {
 		expect(after.gate?.parked).toBe(false);
 	});
 
-	test("a board-authored prompt with an Open questions section still parks with no model call", async () => {
+	test("a board-authored prompt with an Open questions section parks on one options call, never the evaluation", async () => {
 		let calls = 0;
 		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
-				throw new Error("the seam must not run");
+				return {
+					...clearCheck(),
+					questions: [
+						{
+							question: "Which database?",
+							default: "postgres",
+							options: ["postgres", "sqlite"],
+						},
+						{
+							question: "Which migration tool?",
+							default: null,
+							options: ["golang-migrate", "dbmate"],
+						},
+					],
+				};
 			},
 		});
 		const task = await store.createTask("build a thing");
@@ -28792,8 +30937,8 @@ describe("prompt gate", () => {
 		await loop.runTurn(store.name, task.id);
 
 		const after = (await store.getTask(task.id))!;
-		// The deterministic park ran first: needs_you with the section's lines,
-		// and the model never ran.
+		// The deterministic park ran first: neither question names choices inline,
+		// so one options call fills both and the evaluation never runs.
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
 			"Prompt gate: the prompt still carries an Open questions section",
@@ -28801,22 +30946,174 @@ describe("prompt gate", () => {
 		expect(after.asked).toEqual([
 			{
 				question: "Which database?",
-				options: [],
+				options: [{ label: "postgres" }, { label: "sqlite" }],
 				multi: false,
-				recommended: null,
+				recommended: 0,
+				text: false,
 			},
 			{
 				question: "Which migration tool?",
-				options: [],
+				options: [{ label: "golang-migrate" }, { label: "dbmate" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 		expect(after.gate?.parked).toBe(true);
 		expect(after.gate?.sig).toBe("Which database?\nWhich migration tool?");
-		expect(calls).toBe(0);
+		expect(calls).toBe(1);
 		expect(record.runs).toHaveLength(0);
 		expect(record.createWorktree).toHaveLength(0);
+	});
+
+	test("an Open questions section with inline choices parks on parsed options with no model call", async () => {
+		let calls = 0;
+		const { store, loop } = await setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				throw new Error("the seam must not run");
+			},
+		});
+		const task = await store.createTask("build a thing");
+		await store.updateTask(task.id, {
+			promptAuthor: "board",
+			prompt: [
+				"polish the landing page",
+				"",
+				"## Open questions",
+				"",
+				"Ask the user with the ask tool before building, each with a recommended option and an HTML mockup per the repo rules:",
+				"",
+				"1. Which to ship: border beam only, shimmer only, both, or neither?",
+				"2. Border beam target: the hero screenshot frame `.stage .shot` or the install terminal `.term`?",
+			].join("\n"),
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		// Both questions carry inline choices: the park asks them as written and
+		// the model never runs; the intro line is an agent instruction, not context.
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Prompt gate: the prompt still carries an Open questions section",
+		);
+		expect(after.asked).toEqual([
+			{
+				question:
+					"Which to ship: border beam only, shimmer only, both, or neither?",
+				options: [
+					{ label: "border beam only" },
+					{ label: "shimmer only" },
+					{ label: "both" },
+					{ label: "neither" },
+				],
+				multi: false,
+				recommended: null,
+				text: false,
+			},
+			{
+				question:
+					"Border beam target: the hero screenshot frame `.stage .shot` or the install terminal `.term`?",
+				options: [
+					{ label: "the hero screenshot frame `.stage .shot`" },
+					{ label: "the install terminal `.term`" },
+				],
+				multi: false,
+				recommended: null,
+				text: false,
+			},
+		]);
+		for (const q of after.asked ?? []) {
+			expect(q.question.includes("Ask the user with the ask tool")).toBe(
+				false,
+			);
+			expect(/^(?:[-*+]|\d+[.)])\s/.test(q.question)).toBe(false);
+		}
+		expect(calls).toBe(0);
+		expect(after.gate?.parked).toBe(true);
+		expect(after.gate?.sig).toBe(
+			"Which to ship: border beam only, shimmer only, both, or neither?\nBorder beam target: the hero screenshot frame `.stage .shot` or the install terminal `.term`?",
+		);
+		expect(after.gate?.context).toBeUndefined();
+	});
+
+	test("a failed options call parks with the bare question and logs the cause", async () => {
+		const { store, loop } = await setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				throw new Error("gateway down");
+			},
+		});
+		const task = await store.createTask("build a thing");
+		await store.updateTask(task.id, {
+			promptAuthor: "board",
+			prompt: [
+				"migrate the store",
+				"",
+				"## Open questions",
+				"",
+				"Which database?",
+			].join("\n"),
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		// The options call failed open: the park still runs, with the bare question.
+		expect(after.state).toBe("needs_you");
+		expect(after.asked).toEqual([
+			{
+				question: "Which database?",
+				options: [],
+				multi: false,
+				recommended: null,
+				text: true,
+			},
+		]);
+		expect(await logText(store, task.id)).toContain(
+			"prompt gate: open-question options call failed: gateway down",
+		);
+		expect(after.gate?.parked).toBe(true);
+	});
+
+	test("an Open questions section with only context parks with no ask panel", async () => {
+		let calls = 0;
+		const { store, loop } = await setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				throw new Error("the seam must not run");
+			},
+		});
+		const task = await store.createTask("build a thing");
+		await store.updateTask(task.id, {
+			promptAuthor: "board",
+			prompt: [
+				"plan the rollout",
+				"",
+				"## Open questions",
+				"",
+				"We need a decision on the rollout timing.",
+			].join("\n"),
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		// The prose line is context, not a question: the park keeps it on the gate
+		// state and sends no ask panel; the options seam never runs.
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Prompt gate: the prompt still carries an Open questions section",
+		);
+		expect(after.asked).toBeNull();
+		expect(after.gate?.parked).toBe(true);
+		expect(after.gate?.context).toEqual([
+			"We need a decision on the rollout timing.",
+		]);
+		expect(calls).toBe(0);
 	});
 
 	test("a model-restore requeue with a mid-run steer titles the queue user", async () => {

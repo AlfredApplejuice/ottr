@@ -1,25 +1,43 @@
-// Tracker-global key/value store: one SQLite file under .tasks/ replaces the old
-// board-global JSON files (config.json, push-subs.json, seen-answers.json).
+// Tracker-global key/value store. SQLite keeps .tasks/tracker.db.
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { closeLocked, openLocked, vacuumInto } from "./dblock.ts";
-import type { SQLiteDatabase } from "./sqliteDriver.ts";
+import { databaseConfig } from "./postgresConfig.ts";
+import {
+	getPostgresDatabase,
+	PostgresDatabase,
+	type StoreDatabase,
+} from "./postgresDriver.ts";
+import { initializeGlobalSchema } from "./postgresSchema.ts";
 import { StoreQueue } from "./storeQueue.ts";
 
 export class GlobalStore {
 	private readonly queue: StoreQueue;
 
-	private constructor(private db: SQLiteDatabase) {
-		this.queue = new StoreQueue({
-			begin: () => this.db.exec("BEGIN IMMEDIATE"),
-			commit: () => this.db.exec("COMMIT"),
-			rollback: () => this.db.rollback(),
-		});
+	private constructor(private db: StoreDatabase) {
+		this.queue =
+			db instanceof PostgresDatabase
+				? db.createQueue()
+				: new StoreQueue({
+						begin: () => db.exec("BEGIN IMMEDIATE"),
+						commit: () => db.exec("COMMIT"),
+						rollback: () => db.rollback(),
+					});
 	}
 
 	static async open(root: string): Promise<GlobalStore> {
+		if (databaseConfig().backend === "postgres") {
+			const db = await getPostgresDatabase("ottr_global");
+			try {
+				await initializeGlobalSchema(db);
+				return new GlobalStore(db);
+			} catch (error) {
+				await db.close();
+				throw error;
+			}
+		}
 		const dir = resolve(root);
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		// Keep a fresh checkout's boot from leaving an untracked .tasks dir (mirrors ProjectStore.init).
@@ -42,7 +60,8 @@ export class GlobalStore {
 	}
 
 	async transaction<T>(work: () => T | Promise<T>): Promise<T> {
-		return this.queue.transaction(work);
+		// Public callbacks can have external effects. Never repeat them after connection loss.
+		return this.queue.transaction(work, { replay: false });
 	}
 
 	async get<T>(key: string): Promise<T | null> {
@@ -81,12 +100,20 @@ export class GlobalStore {
 
 	/** Snapshot copy of tracker.db for the backup (docs/specs/db-backup.md); `dest` must not exist. */
 	async backupTo(dest: string): Promise<void> {
+		const db = this.db;
+		if (db instanceof PostgresDatabase)
+			throw new Error(
+				"PostgreSQL backup is operator-owned; SQLite snapshots are unavailable",
+			);
 		return this.queue.run(async () => {
-			await vacuumInto(this.db, dest, ["kv"]);
+			await vacuumInto(db, dest, ["kv"]);
 		});
 	}
 
 	async close(): Promise<void> {
-		return this.queue.close(() => closeLocked(this.db));
+		return this.queue.close(async () => {
+			if (this.db instanceof PostgresDatabase) await this.db.close();
+			else await closeLocked(this.db);
+		});
 	}
 }

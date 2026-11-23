@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import {
 	RELEASE_SUMMARY_CHUNK_INSTRUCTIONS,
@@ -7,16 +10,23 @@ import {
 import {
 	buildSummaryInput,
 	type ReleaseSummaryCard,
+	readProductDescription,
 	sanitizeSummary,
 	summarizeRelease,
 } from "./releaseSummary.ts";
 
-const okSpawn = (reply: string): { spawn: SpawnFn; calls: string[] } => {
+const okSpawn = (
+	reply: string,
+): { spawn: SpawnFn; calls: string[]; users: string[] } => {
 	const calls: string[] = [];
+	const users: string[] = [];
 	return {
 		calls,
+		users,
 		spawn: async (_argv, o) => {
-			calls.push(JSON.parse(o.stdin).body.messages[0].content);
+			const body = JSON.parse(o.stdin).body;
+			calls.push(body.messages[0].content);
+			users.push(body.messages[1].content);
 			return {
 				code: 0,
 				stdout: [
@@ -119,6 +129,7 @@ describe("summarizeRelease", () => {
 			notes: "- fix: login",
 			cards: CARDS,
 			spawn,
+			projectName: "p",
 		});
 		expect(out).toEqual({ summary: reply, reason: null });
 		// One final call: input within the bound, so no chunk pass.
@@ -150,6 +161,7 @@ describe("summarizeRelease", () => {
 			notes: "n",
 			cards: [],
 			spawn,
+			projectName: "p",
 			roles: { smol: "@smol" },
 		});
 		expect(system).toBe(RELEASE_SUMMARY_INSTRUCTIONS);
@@ -162,14 +174,24 @@ describe("summarizeRelease", () => {
 			stdout: "",
 			stderr: "no quota",
 		});
-		const out = await summarizeRelease({ notes: "n", cards: [], spawn });
+		const out = await summarizeRelease({
+			notes: "n",
+			cards: [],
+			spawn,
+			projectName: "p",
+		});
 		expect(out.summary).toBeNull();
 		expect(out.reason).toMatch(/no quota/);
 	});
 
 	test("an empty reply answers the fallback reason", async () => {
 		const { spawn } = okSpawn("   \n");
-		const out = await summarizeRelease({ notes: "n", cards: [], spawn });
+		const out = await summarizeRelease({
+			notes: "n",
+			cards: [],
+			spawn,
+			projectName: "p",
+		});
 		expect(out).toEqual({
 			summary: null,
 			reason: "the model returned an empty reply",
@@ -178,7 +200,12 @@ describe("summarizeRelease", () => {
 
 	test("a reply of only HTML counts as an empty reply", async () => {
 		const { spawn } = okSpawn("<b></b><script>go()</script>");
-		const out = await summarizeRelease({ notes: "n", cards: [], spawn });
+		const out = await summarizeRelease({
+			notes: "n",
+			cards: [],
+			spawn,
+			projectName: "p",
+		});
 		expect(out.summary).toBeNull();
 		expect(out.reason).toBe("the model returned an empty reply");
 	});
@@ -186,7 +213,12 @@ describe("summarizeRelease", () => {
 	test("a dropped breaking bullet is appended under a breaking section", async () => {
 		const notes = "- **Breaking:** Drop node 16\n- feat: x";
 		const { spawn } = okSpawn("## New features\n\n- New api");
-		const out = await summarizeRelease({ notes, cards: [], spawn });
+		const out = await summarizeRelease({
+			notes,
+			cards: [],
+			spawn,
+			projectName: "p",
+		});
 		expect(out.summary).toContain(
 			"## Breaking changes\n\n- **Breaking:** Drop node 16",
 		);
@@ -195,7 +227,12 @@ describe("summarizeRelease", () => {
 	test("a reply that holds the breaking bullet does not duplicate it", async () => {
 		const notes = "- **Breaking:** Drop node 16";
 		const { spawn } = okSpawn("## Changes\n\n- **Breaking:** Drop node 16");
-		const out = await summarizeRelease({ notes, cards: [], spawn });
+		const out = await summarizeRelease({
+			notes,
+			cards: [],
+			spawn,
+			projectName: "p",
+		});
 		expect(out.summary).not.toContain("## Breaking changes");
 		const hits = (out.summary?.match(/Drop node 16/g) ?? []).length;
 		expect(hits).toBe(1);
@@ -241,6 +278,7 @@ describe("summarizeRelease", () => {
 			notes: "- fix: login",
 			cards: big,
 			spawn,
+			projectName: "p",
 		});
 		expect(out.reason).toBeNull();
 		// Three chunk calls, then the final call.
@@ -256,5 +294,125 @@ describe("summarizeRelease", () => {
 		// Each chunk input stays within half the input bound.
 		for (const u of users.slice(0, 3))
 			expect(u.length).toBeLessThanOrEqual(40_000);
+	});
+
+	test("the system message stays project-neutral and the user message names the project and description", async () => {
+		const { spawn, calls, users } = okSpawn(reply);
+		const out = await summarizeRelease({
+			notes: "- feat: x",
+			cards: [],
+			spawn,
+			projectName: "velvarr",
+			projectDescription: "A media library app for film collectors",
+		});
+		expect(out.reason).toBeNull();
+		expect(calls[0]).not.toContain("Ottr");
+		expect(users[0]).toContain("PROJECT: velvarr");
+		expect(users[0]).toContain(
+			"DESCRIPTION: A media library app for film collectors",
+		);
+	});
+
+	test("a project without a description names the project only", async () => {
+		const { spawn, users } = okSpawn(reply);
+		await summarizeRelease({
+			notes: "n",
+			cards: [],
+			spawn,
+			projectName: "velvarr",
+		});
+		expect(users[0]).toContain("PROJECT: velvarr");
+		expect(users[0]).not.toContain("DESCRIPTION:");
+	});
+
+	test("an ottr release still gets its name in the input", async () => {
+		const { spawn, users } = okSpawn(reply);
+		await summarizeRelease({
+			notes: "n",
+			cards: [],
+			spawn,
+			projectName: "ottr",
+		});
+		expect(users[0]).toContain("PROJECT: ottr");
+	});
+
+	test("both instruction constants name no project", () => {
+		expect(RELEASE_SUMMARY_INSTRUCTIONS).not.toContain("Ottr");
+		expect(RELEASE_SUMMARY_CHUNK_INSTRUCTIONS).not.toContain("Ottr");
+	});
+});
+
+describe("readProductDescription", () => {
+	// The helper reads real files: every test builds its own temp directory.
+	const temp = (): string => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-reldesc-"));
+		return dir;
+	};
+
+	test("the package.json description wins over the README", () => {
+		const dir = temp();
+		writeFileSync(
+			join(dir, "package.json"),
+			JSON.stringify({ name: "x", description: "A widget manager" }),
+		);
+		writeFileSync(join(dir, "README.md"), "# x\n\nIgnored paragraph");
+		try {
+			expect(readProductDescription(dir)).toBe("A widget manager");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("without a package.json description it reads the README's first non-heading paragraph", () => {
+		const dir = temp();
+		writeFileSync(
+			join(dir, "README.md"),
+			"# Velvarr\n\nA media library\nfor film collectors.\n\nInstall notes here.",
+		);
+		try {
+			expect(readProductDescription(dir)).toBe(
+				"A media library for film collectors.",
+			);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a package.json without a usable description falls through to the README", () => {
+		const dir = temp();
+		writeFileSync(join(dir, "package.json"), "{ not json at all");
+		writeFileSync(join(dir, "README.md"), "Only one paragraph.");
+		try {
+			expect(readProductDescription(dir)).toBe("Only one paragraph.");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a description longer than 500 characters is cut at a word boundary", () => {
+		const dir = temp();
+		const words: string[] = [];
+		for (let i = 0; i < 200; i++) words.push(`word${i}`);
+		writeFileSync(
+			join(dir, "package.json"),
+			JSON.stringify({ description: words.join(" ") }),
+		);
+		try {
+			const out = readProductDescription(dir)!;
+			expect(out.length).toBeLessThanOrEqual(500);
+			expect(out.endsWith("word")).toBe(false);
+			expect(words.join(" ").startsWith(out)).toBe(true);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("no package.json and no README answers null", () => {
+		const dir = temp();
+		try {
+			expect(readProductDescription(dir)).toBeNull();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });

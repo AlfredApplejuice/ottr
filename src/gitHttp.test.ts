@@ -9,6 +9,7 @@ import {
 	pushRefusal,
 	syncWorktreeTo,
 } from "./gitHttp.ts";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { VmTokens } from "./vmTokens.ts";
 import { gitExe } from "./worktree.ts";
 
@@ -47,6 +48,7 @@ async function run(
 		{
 			cwd,
 			env: {
+				...fixtureGitEnv(),
 				PATH: process.env.PATH ?? "",
 				GIT_CONFIG_GLOBAL: "/dev/null",
 				HOME: tmpdir(),
@@ -99,7 +101,12 @@ beforeAll(async () => {
 	server = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
-		fetch: (req) => handleGit(req, { tokens, log: (l) => logs.push(l) }),
+		fetch: (req) =>
+			handleGit(req, {
+				tokens,
+				log: (l) => logs.push(l),
+				originUrl: async () => null,
+			}),
 	});
 }, 60_000);
 afterAll(() => server?.stop(true));

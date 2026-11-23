@@ -4,10 +4,12 @@
 // sends the trusted list text on every worker turn request and a worker installs from that
 // request only (docs/specs/worker-list-isolation.md); the container that runs a turn installs
 // what it still lacks.
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { readdir } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { childDatabaseEnv } from "./childEnv.ts";
 import { resolveAgentLayer } from "./layers.ts";
 
 // Debian package names (policy 5.6.1): a list entry can never turn into an apt-get option.
@@ -23,6 +25,23 @@ export function workerProjects(home = homedir()): string[] {
 	return readdirSync(dir)
 		.sort()
 		.filter((p) => PROJECT.test(p));
+}
+
+/** The async twin, for request paths that must not hold the event loop on a shared
+ *  volume (OTTR-1088): the sync walk of a workers home on the mounted home is the slow
+ *  part of Settings -> Env. */
+export async function workerProjectsAsync(home = homedir()): Promise<string[]> {
+	const dir = join(home, ".ottr", "workers");
+	let names: string[];
+	try {
+		names = await readdir(dir);
+	} catch (err) {
+		// Only a dir that does not exist means "no provisioned projects yet".
+		if (err instanceof Error && "code" in err && err.code === "ENOENT")
+			return [];
+		throw err;
+	}
+	return names.sort().filter((p) => PROJECT.test(p));
 }
 
 /** Where alate provisions a project's package list, resolved for a read: under the home's
@@ -147,10 +166,24 @@ export async function install(
 	return [`apt: installed ${missing.join(" ")} (${file})`];
 }
 
-/** stdout; throws with the stderr tail on a non-zero exit when `check` is set. */
-async function exec(argv: string[], check = true): Promise<string> {
+// dpkg and apt read per-user config from $HOME: dpkg.cfg(5) lists ~/.dpkg.cfg, and its
+// pre-invoke/post-invoke hooks run via `sh` as root around every unpack and configure
+// (OTTR-981). The server and the workers share the home volume at /root, so a work turn
+// could plant hooks there for the server's root installs to run. Point the commands at a
+// container-local dir instead: /tmp is not a compose mount, so no worker can write it, and
+// dpkg finds no user cfg there.
+const aptHome = join(tmpdir(), "ottr-apt-home");
+
+/** stdout; throws with the stderr tail on a non-zero exit when `check` is set. Runs the
+ *  commands with a HOME no worker can write (aptHome). Exported for tests, which assert the env. */
+export async function exec(argv: string[], check = true): Promise<string> {
+	mkdirSync(aptHome, { recursive: true, mode: 0o700 });
 	const p = Bun.spawn(argv, {
-		env: { ...process.env, DEBIAN_FRONTEND: "noninteractive" },
+		env: {
+			...childDatabaseEnv(),
+			DEBIAN_FRONTEND: "noninteractive",
+			HOME: aptHome,
+		},
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",

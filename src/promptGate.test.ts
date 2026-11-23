@@ -17,10 +17,12 @@ import {
 	handoffSteps,
 	hasOpenQuestionsSection,
 	isStartAnywayReply,
+	matchOpenQuestionIndex,
 	missingCheckQuestion,
-	openQuestionsLines,
 	parseGateCheck,
+	parseOpenQuestions,
 	promptHandoffPaths,
+	removeOpenQuestionsSection,
 	replayGateParks,
 	START_ANYWAY,
 	skillBlock,
@@ -28,6 +30,7 @@ import {
 } from "./promptGate.ts";
 import { DEEPEN_POINTS, gatePrompt, gateSystem } from "./prompts.ts";
 import { ProjectStore } from "./store.ts";
+import fc from "./test/properties.ts";
 import type { PromptGateState } from "./types.ts";
 
 /** A minimal valid gate answer. */
@@ -171,25 +174,249 @@ describe("open questions section", () => {
 		expect(hasOpenQuestionsSection("## Other section")).toBe(false);
 	});
 
-	test("the section's non-empty lines come back, max 5; the heading is excluded", () => {
+	test("removeOpenQuestionsSection drops every section and keeps the rest", () => {
+		expect(
+			removeOpenQuestionsSection(
+				[
+					"top",
+					"",
+					"## Open questions",
+					"",
+					"Which database?",
+					"",
+					"## Context",
+					"",
+					"kept",
+				].join("\n"),
+			),
+		).toBe(["top", "", "## Context", "", "kept"].join("\n"));
+		// The bold heading form leaves too, and a section at the end runs to the text's end.
+		expect(removeOpenQuestionsSection("**Open questions**\nWhich port?")).toBe(
+			"",
+		);
+		expect(removeOpenQuestionsSection("a\n## open questions\nq\n\nb")).toBe(
+			"a",
+		);
+		// Two sections go: the loop removes one per pass; the last section's
+		// body runs to the next heading, "keep" survives under ## Notes.
+		expect(
+			removeOpenQuestionsSection(
+				"## Open questions\nq1\n## Open questions\nq2\n## Notes\nkeep",
+			),
+		).toBe("## Notes\nkeep");
+		// Text without a section comes back unchanged, trailing blanks included.
+		expect(removeOpenQuestionsSection("just prose\n\n")).toBe("just prose\n\n");
+	});
+
+	test("properties: removal leaves no section, keeps section-free text, and is idempotent", () => {
+		// Headings come from the constant pool; the free lines carry no "#" or
+		// "*", so only the pool can build a section or end one.
+		const piece = fc.oneof(
+			fc.constantFrom(
+				"## Open questions",
+				"### open questions",
+				"**Open questions**",
+				"**open questions**:",
+				"## Notes",
+				"## Context",
+			),
+			fc.stringMatching(/^[\w .,!?()/-]{0,40}$/),
+		);
+		fc.assert(
+			fc.property(
+				fc.array(piece, { maxLength: 14 }).map((lines) => lines.join("\n")),
+				(t) => {
+					const once = removeOpenQuestionsSection(t);
+					expect(hasOpenQuestionsSection(once)).toBe(false);
+					expect(removeOpenQuestionsSection(once)).toBe(once);
+					if (!hasOpenQuestionsSection(t)) expect(once).toBe(t);
+				},
+			),
+		);
+	});
+});
+
+describe("parseOpenQuestions", () => {
+	test("the acceptance fixture: two questions with inline options; the intro is an agent instruction", () => {
 		const text = [
-			"intro",
+			"## Open questions",
+			"",
+			"Ask the user with the ask tool before building, each with a recommended option and an HTML mockup per the repo rules:",
+			"",
+			"1. Which to ship: border beam only, shimmer only, both, or neither?",
+			"2. Border beam target: the hero screenshot frame `.stage .shot` or the install terminal `.term`?",
+		].join("\n");
+		expect(parseOpenQuestions(text)).toEqual({
+			questions: [
+				{
+					question:
+						"Which to ship: border beam only, shimmer only, both, or neither?",
+					options: ["border beam only", "shimmer only", "both", "neither"],
+				},
+				{
+					question:
+						"Border beam target: the hero screenshot frame `.stage .shot` or the install terminal `.term`?",
+					options: [
+						"the hero screenshot frame `.stage .shot`",
+						"the install terminal `.term`",
+					],
+				},
+			],
+			context: [],
+		});
+	});
+
+	test("plain question lines parse without markers; prose without ? goes to context; no section parses empty", () => {
+		const text = [
 			"## Open questions",
 			"Which database?",
-			"",
-			"Which port?",
-			"## Notes",
-			"later",
+			"We need a decision on the rollout timing.",
 		].join("\n");
-		expect(openQuestionsLines(text)).toEqual([
-			"Which database?",
-			"Which port?",
+		expect(parseOpenQuestions(text)).toEqual({
+			questions: [{ question: "Which database?", options: [] }],
+			context: ["We need a decision on the rollout timing."],
+		});
+		expect(
+			parseOpenQuestions("no section\nWhich database?\n## Notes\nlater"),
+		).toEqual({ questions: [], context: [] });
+	});
+
+	test("instruction lines never reach context; context caps at 3, questions at 5", () => {
+		const text = [
+			"## Open questions",
+			"Use the ask tool before building.",
+			"Please ask the user about timing.",
+			"Ship a pair of mockups first.",
+			"Follow the repo rules on naming.",
+			"We need a decision on the rollout timing.",
+			"Timing drives the schema migration.",
+			"1. Question one?",
+			"2. Question two?",
+			"3. Question three?",
+			"4. Question four?",
+			"5. Question five?",
+			"6. Question six?",
+			"note one",
+			"note two",
+			"note three",
+			"note four",
+		].join("\n");
+		const parsed = parseOpenQuestions(text);
+		expect(parsed.questions.map((q) => q.question)).toEqual([
+			"Question one?",
+			"Question two?",
+			"Question three?",
+			"Question four?",
+			"Question five?",
 		]);
-		const many = [
-			"**Open questions**",
-			...Array.from({ length: 7 }, (_, i) => `q${i}`),
-		];
-		expect(openQuestionsLines(many.join("\n"))).toHaveLength(5);
+		expect(parsed.context).toEqual([
+			"We need a decision on the rollout timing.",
+			"Timing drives the schema migration.",
+			"note one",
+		]);
+	});
+
+	test("inline options: dedupe, bounds, and the colon rule", () => {
+		const options = (line: string) =>
+			parseOpenQuestions(["## Open questions", line].join("\n")).questions[0]
+				?.options;
+		expect(options("A, B, or A?")).toEqual(["A", "B"]);
+		expect(options("Pick one: A?")).toEqual([]);
+		expect(options("A, B, C, D, E, or F?")).toEqual([]);
+		expect(options("A, B, C?")).toEqual([]);
+		expect(options("X or Y?")).toEqual(["X", "Y"]);
+		expect(options("Which port: 8080 or 9090?")).toEqual(["8080", "9090"]);
+	});
+
+	test("a prose-only section yields no questions and the filtered context", () => {
+		const text = [
+			"## Open questions",
+			"We need a decision on the rollout timing.",
+			"Use the ask tool before building.",
+			"Timing drives the schema migration.",
+		].join("\n");
+		expect(parseOpenQuestions(text)).toEqual({
+			questions: [],
+			context: [
+				"We need a decision on the rollout timing.",
+				"Timing drives the schema migration.",
+			],
+		});
+	});
+
+	test("properties: questions carry no marker or ask instruction, and the caps hold", () => {
+		// Free lines carry no list markers ("-", "*", "+"), so only the pool can
+		// start a question; the pool's instruction line stays context and drops.
+		const piece = fc.oneof(
+			fc.constantFrom(
+				"## Open questions",
+				"**Open questions**",
+				"## Notes",
+				"Ask the user with the ask tool before building, each with a recommended option and an HTML mockup per the repo rules:",
+				"We need a decision on the rollout timing.",
+				"Which database?",
+				"- Which port: 8080 or 9090?",
+				"1. Ship A, B, or both?",
+			),
+			fc.stringMatching(/^[\w .,!?()/]{0,40}$/),
+		);
+		fc.assert(
+			fc.property(
+				fc.array(piece, { maxLength: 14 }).map((lines) => lines.join("\n")),
+				(t) => {
+					const parsed = parseOpenQuestions(t);
+					for (const q of parsed.questions) {
+						expect(q.question.startsWith("- ")).toBe(false);
+						expect(q.question.startsWith("* ")).toBe(false);
+						expect(q.question.startsWith("+ ")).toBe(false);
+						expect(q.question.startsWith("1. ")).toBe(false);
+						expect(q.question).not.toContain("Ask the user with the ask tool");
+					}
+					expect(parsed.questions.length).toBeLessThanOrEqual(5);
+					expect(parsed.context.length).toBeLessThanOrEqual(3);
+				},
+			),
+		);
+	});
+});
+
+describe("matchOpenQuestionIndex", () => {
+	const modelQuestions = (questions: string[]) =>
+		questions.map((question) => ({ question, default: null, options: [] }));
+
+	test("exact, containment, and token-overlap matches; ties go early; unrelated is -1", () => {
+		const qs = modelQuestions([
+			"Which database should the service use?",
+			"Should we use Postgres or MySQL for storage?",
+		]);
+		// Equal normalized text scores 1.
+		expect(
+			matchOpenQuestionIndex("Which database should the service use?", qs),
+		).toBe(0);
+		// The model's extra words leave the section question contained: 0.9.
+		expect(matchOpenQuestionIndex("Which database?", qs)).toBe(0);
+		// Token overlap of 0.75 without containment picks the second question.
+		expect(
+			matchOpenQuestionIndex("Should storage use Postgres or MySQL?", qs),
+		).toBe(1);
+		// Exactly 0.5 still matches: 2 shared of 4 union tokens.
+		expect(
+			matchOpenQuestionIndex(
+				"Keep the cache?",
+				modelQuestions(["Keep the schema?"]),
+			),
+		).toBe(0);
+		// A tie goes to the earliest index.
+		expect(
+			matchOpenQuestionIndex(
+				"Keep the cache?",
+				modelQuestions(["Keep the cache?", "Keep the cache?"]),
+			),
+		).toBe(0);
+		// No model question reaches 0.5.
+		expect(
+			matchOpenQuestionIndex("Pick a color for the primary button?", qs),
+		).toBe(-1);
 	});
 });
 
@@ -207,6 +434,7 @@ describe("ask mapping", () => {
 				options: [{ label: "sqlite" }, { label: "postgres" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 	});
@@ -391,6 +619,7 @@ describe("gateHandoff", () => {
 		const r = gateHandoff({
 			prompt: `Read the handoff file first: @${join(handoffs, "h.md")}`,
 			handoffsDir: handoffs,
+			anchor: dir,
 		});
 		expect(r.text).toBe("the real steps");
 		expect(r.path).toBe(join(handoffs, "h.md"));
@@ -402,6 +631,7 @@ describe("gateHandoff", () => {
 		const r = gateHandoff({
 			prompt: "Read the handoff file first: @/etc/passwd",
 			handoffsDir: handoffs,
+			anchor: dir,
 			read: () => {
 				reads += 1;
 				return "root:x:0:0:root:/root:/bin/bash";
@@ -417,6 +647,7 @@ describe("gateHandoff", () => {
 		const r = gateHandoff({
 			prompt: `@${escapePath}`,
 			handoffsDir: handoffs,
+			anchor: dir,
 			read: () => "x",
 		});
 		expect(r.text).toBeNull();
@@ -425,28 +656,62 @@ describe("gateHandoff", () => {
 
 	test("a missing handoff file adds nothing and names the reason", () => {
 		const missing = join(handoffs, "absent.md");
-		const r = gateHandoff({ prompt: `@${missing}`, handoffsDir: handoffs });
+		const r = gateHandoff({
+			prompt: `@${missing}`,
+			handoffsDir: handoffs,
+			anchor: dir,
+		});
 		expect(r.text).toBeNull();
 		expect(r.reasons).toEqual([`${missing}: the handoff file is missing`]);
 	});
 
-	test("a symlink out of the folder resolves outside and is not read", () => {
-		const outside = join(dir, "outside.md");
-		writeFileSync(outside, "secret");
-		const link = join(handoffs, "link.md");
-		symlinkSync(outside, link);
-		const r = gateHandoff({ prompt: `@${link}`, handoffsDir: handoffs });
-		expect(r.text).toBeNull();
-		expect(r.reasons).toEqual([
-			`${link}: resolves outside the handoffs folder`,
-		]);
-	});
+	test.skipIf(process.platform !== "linux")(
+		"a symlink out of the folder resolves outside and is not read",
+		() => {
+			const outside = join(dir, "outside.md");
+			writeFileSync(outside, "secret");
+			const link = join(handoffs, "link.md");
+			symlinkSync(outside, link);
+			const r = gateHandoff({
+				prompt: `@${link}`,
+				handoffsDir: handoffs,
+				anchor: dir,
+			});
+			expect(r.text).toBeNull();
+			expect(r.reasons).toEqual([
+				`${link}: resolves outside the handoffs folder`,
+			]);
+		},
+	);
+
+	test.skipIf(process.platform !== "linux")(
+		"a symlinked handoffs folder is refused unread",
+		() => {
+			const target = join(dir, "handoffs-target");
+			mkdirSync(target, { recursive: true });
+			writeFileSync(join(target, "h.md"), "the chosen host file");
+			const linked = join(dir, "linked-handoffs");
+			symlinkSync(target, linked);
+			const named = join(linked, "h.md");
+			const r = gateHandoff({
+				prompt: `@${named}`,
+				handoffsDir: linked,
+				anchor: dir,
+			});
+			expect(r.text).toBeNull();
+			expect(r.reasons).toEqual([
+				`${named}: resolves outside the handoffs folder`,
+			]);
+			expect(r.path).toBeNull();
+		},
+	);
 
 	test("an unreadable handoff names the reason", () => {
 		mkdirSync(join(handoffs, "dir.md"), { recursive: true });
 		const r = gateHandoff({
 			prompt: `@${join(handoffs, "dir.md")}`,
 			handoffsDir: handoffs,
+			anchor: dir,
 		});
 		expect(r.text).toBeNull();
 		expect(r.reasons).toEqual([
@@ -459,6 +724,7 @@ describe("gateHandoff", () => {
 		const r = gateHandoff({
 			prompt: `see @/etc/passwd then read @${join(handoffs, "b.md")}`,
 			handoffsDir: handoffs,
+			anchor: dir,
 		});
 		expect(r.text).toBe("the steps");
 		expect(r.reasons).toEqual(["/etc/passwd: outside the handoffs folder"]);
@@ -596,6 +862,7 @@ describe("gateAskQuestions blocking-only", () => {
 				options: [{ label: "fail" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 	});
@@ -686,6 +953,7 @@ describe("replayGateParks", () => {
 					options: [],
 					multi: false,
 					recommended: null,
+					text: true,
 				},
 			],
 			...(o.pending === undefined ? {} : { pendingPrompt: o.pending }),
@@ -842,6 +1110,7 @@ describe("replayGateParks", () => {
 					options: [],
 					multi: false,
 					recommended: null,
+					text: true,
 				},
 			],
 		});

@@ -232,42 +232,42 @@ describe("paths", () => {
 			expect(() => toolsListPath(bad, "/h")).toThrow("unsafe project name");
 	});
 
-	test("env names union across every provisioned folder, sorted", () => {
+	test("env names union across every provisioned folder, sorted", async () => {
 		const h = mkdtempSync(join(home, "names-"));
 		provision("b-proj", null, ["B_ONE", "SHARED"], h);
 		provision("a-proj", null, ["A_ONE", "SHARED"], h);
 		mkdirSync(join(h, ".ottr", "workers", "not a list"));
-		expect(listedEnvNames(h)).toEqual([
+		expect(await listedEnvNames(h)).toEqual([
 			{ name: "A_ONE", projects: ["a-proj"], plain: false },
 			{ name: "B_ONE", projects: ["b-proj"], plain: false },
 			{ name: "SHARED", projects: ["a-proj", "b-proj"], plain: false },
 		]);
 	});
 
-	test("a name is plain only when every project lists it as plain", () => {
+	test("a name is plain only when every project lists it as plain", async () => {
 		const h = mkdtempSync(join(home, "kinds-"));
 		provision("a-proj", null, ["HOST plain", "MIXED plain"], h);
 		provision("b-proj", null, ["HOST plain", "MIXED"], h);
-		expect(listedEnvNames(h)).toEqual([
+		expect(await listedEnvNames(h)).toEqual([
 			{ name: "HOST", projects: ["a-proj", "b-proj"], plain: true },
 			{ name: "MIXED", projects: ["a-proj", "b-proj"], plain: false },
 		]);
 	});
 
-	test("a malformed env.txt skips only its own project", () => {
+	test("a malformed env.txt skips only its own project", async () => {
 		const h = mkdtempSync(join(home, "bad-env-"));
 		provision("good", null, ["GOOD_ONE"], h);
 		provision("bad", null, ["OK_NAME", "my-key"], h);
-		expect(listedEnvNames(h)).toEqual([
+		expect(await listedEnvNames(h)).toEqual([
 			{ name: "GOOD_ONE", projects: ["good"], plain: false },
 		]);
 	});
 
-	test("a missing env.txt lists nothing", () => {
-		expect(listedEnvNames(mkdtempSync(join(home, "empty-")))).toEqual([]);
+	test("a missing env.txt lists nothing", async () => {
+		expect(await listedEnvNames(mkdtempSync(join(home, "empty-")))).toEqual([]);
 	});
 
-	test("list reads follow the home's current agent layer", () => {
+	test("list reads follow the home's current agent layer", async () => {
 		// Alate installs the .ottr/workers lists into every layer and may prune the flat
 		// ones, so a read resolves <home>/.alate/current first
 		// (docs/specs/agent-layer-switch.md, "Layer-following reads").
@@ -284,7 +284,7 @@ describe("paths", () => {
 		expect(envListPath("p", h)).toBe(
 			join(layer, ".ottr", "workers", "p", "env.txt"),
 		);
-		expect(listedEnvNames(h)).toEqual([
+		expect(await listedEnvNames(h)).toEqual([
 			{ name: "LAYER_ONLY", projects: ["p"], plain: false },
 		]);
 		expect(turnEnvValues("p", { LAYER_ONLY: "v", FLAT_ONLY: "x" }, h)).toEqual({
@@ -293,13 +293,13 @@ describe("paths", () => {
 		});
 	});
 
-	test("a missing or dangling current link reads the flat home", () => {
+	test("a missing or dangling current link reads the flat home", async () => {
 		const h = mkdtempSync(join(home, "dangling-"));
 		mkdirSync(join(h, ".alate", "layers", "gone"), { recursive: true });
 		symlinkSync(join("layers", "gone"), join(h, ".alate", "current"));
 		rmSync(join(h, ".alate", "layers", "gone"), { recursive: true });
 		provision("p", [], ["FLAT_ONLY"], h);
-		expect(listedEnvNames(h)).toEqual([
+		expect(await listedEnvNames(h)).toEqual([
 			{ name: "FLAT_ONLY", projects: ["p"], plain: false },
 		]);
 		expect(toolsListPath("p", h)).toBe(
@@ -800,7 +800,7 @@ describe("turnEnvValues", () => {
 		});
 	});
 
-	test("a list in the shared home grants nothing; only the board home's lists count (R5-1)", () => {
+	test("a list in the shared home grants nothing; only the board home's lists count (R5-1)", async () => {
 		// The shared home a turn can write lists a secret for every project and for B.
 		const shared = mkdtempSync(join(home, "envshared-"));
 		provision("_all", null, ["A_SECRET"], shared);
@@ -813,7 +813,7 @@ describe("turnEnvValues", () => {
 			const values = { A_SECRET: "s" };
 			expect(turnEnvValues("b", values)).toEqual({ env: {}, missing: [] });
 			expect(turnEnvValues("a", values).env).toEqual({ A_SECRET: "s" });
-			expect(listedEnvNames()).toEqual([
+			expect(await listedEnvNames()).toEqual([
 				{ name: "A_SECRET", projects: ["a"], plain: false },
 			]);
 		} finally {

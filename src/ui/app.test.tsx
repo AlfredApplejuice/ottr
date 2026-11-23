@@ -6,6 +6,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { DeepenCheck } from "../deepen.ts";
 import { DEEPEN_POINTS } from "../prompts.ts";
 import { parseUsage } from "../quota.ts";
+import fc from "../test/properties.ts";
 import type {
 	PerfMetrics,
 	PerfStat,
@@ -14,6 +15,8 @@ import type {
 	PrReviewView,
 	PrRunState,
 	ReleasePlan,
+	ServiceQuotaMetric,
+	ServiceQuotaSourceState,
 	StateResponse,
 	Task,
 	TaskCard,
@@ -28,10 +31,21 @@ import {
 	PR_REVIEW_WAITING,
 	UPDATE_HOLD_REASON,
 } from "../types.ts";
+import type { Act } from "./kit.tsx";
 // Static: models.ts touches no browser global at load, so hoisting is safe.
 import { resetCatalogCache } from "./models.ts";
 // Static: notify.ts reads localStorage only when called, never at load.
 import { loadAskDrafts, saveAskDraft } from "./notify.ts";
+import { ServiceQuotas } from "./serviceQuotas.tsx";
+// Static: status.ts touches no browser global at load.
+import { bellAlarms } from "./status.ts";
+import {
+	installBrowserGlobals,
+	mount,
+	onChangeOf,
+	onClickOf,
+	stubFetch,
+} from "./testDom.tsx";
 
 // app.tsx reads sessionStorage at module load; bun test has no browser storage.
 globalThis.sessionStorage = {
@@ -42,8 +56,147 @@ globalThis.sessionStorage = {
 	clear: () => {},
 	key: () => null,
 } as Storage;
+
+/** The ProjectBoard tests' shared project fixture; doneTotal is the only
+ * field the board tests vary. */
+const boardProject = (doneTotal: number): ProjectView =>
+	({
+		name: "proj",
+		hasRules: true,
+		github: null,
+		gitless: false,
+		dirty: false,
+		archReview: null,
+		latestRelease: null,
+		latestImage: null,
+		doneTotal,
+		settings: { setupChecklist: false },
+		sessionsDir: "/tmp/s",
+	}) as unknown as ProjectView;
+
+/** Mounts a ProjectBoard with the props every board test passes unchanged. */
+const mountProjectBoard = async (project: ProjectView, tasks: TaskCard[]) =>
+	await mount(
+		<ProjectBoard
+			project={project}
+			tasks={tasks}
+			deltas={new Map()}
+			open={() => {}}
+			seenAnswers={new Set()}
+			seenDoneSince={0}
+			compose={() => {}}
+			composeDraft={() => {}}
+			act={async (fn: () => Promise<void>) => {
+				await fn();
+				return true;
+			}}
+			onNotice={() => {}}
+			draining={false}
+		/>,
+	);
+
+/** Builds the native-value setter used to type into happy-dom inputs; each
+ * describe binds it to its own window. */
+const typeIntoFor =
+	(window: Window) =>
+	(el: HTMLInputElement, value: string): void => {
+		const setter = Object.getOwnPropertyDescriptor(
+			window.HTMLInputElement.prototype,
+			"value",
+		)?.set;
+		if (setter === undefined) throw new Error("value setter missing");
+		setter.call(el, value);
+	};
+
+// LaneCol props every lane describe passes unchanged.
+const laneColBase = {
+	projectTasks: [] as TaskCard[],
+	hasRules: true,
+	github: null,
+	deltas: new Map<string, number>(),
+	open: () => {},
+	unread: () => false,
+	onReorder: async () => true,
+	filtering: false,
+	draining: false,
+} as const;
+
+/** The happy-dom globals the client-side drawer describes mount under. */
+const installDrawerClientGlobals = () =>
+	installBrowserGlobals([
+		"Event",
+		"HTMLElement",
+		"HTMLTextAreaElement",
+		"Node",
+		"getComputedStyle",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
+
+/** Parse static markup in a fresh happy-dom document for DOM queries. */
+const parseMarkup = (html: string) => {
+	const document = new Window({ url: "http://localhost/" }).document;
+	document.body.innerHTML = html;
+	return document;
+};
+
+type DrawerRunArgs = {
+	posts: { url: string; body: unknown }[];
+	container: HTMLDivElement;
+	root: ReturnType<typeof createRoot>;
+};
+
+/** Mounts the drawer for `card` under a fetch stub that records the POSTs to
+ * `route` and answers them with `respond`, serves the detail row for the card
+ * back loaded (OTTR-965: the prompt rides only on the task route), and 404s
+ * everything else. One more act lets the detail fetch land before `run`. */
+const withDrawerRoute = async (
+	base: Parameters<typeof Drawer>[0],
+	card: TaskCard,
+	route: string,
+	respond: { status: number; body: unknown },
+	run: (args: DrawerRunArgs) => Promise<void>,
+	projectView?: ProjectView,
+): Promise<void> => {
+	const posts: { url: string; body: unknown }[] = [];
+	const { restore } = stubFetch(async (url, init) => {
+		const u = String(url);
+		if (u.endsWith(route)) {
+			posts.push({
+				url: u,
+				body: JSON.parse(String(init?.body)) as unknown,
+			});
+			return new Response(JSON.stringify(respond.body), {
+				status: respond.status,
+			});
+		}
+		if (u.endsWith(`/tasks/${card.id}`)) {
+			return new Response(JSON.stringify({ ...card, turns: [] }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}
+		return new Response("{}", { status: 404 });
+	});
+	const { container, root, unmount } = await mount(
+		<Drawer
+			{...base}
+			task={card}
+			{...(projectView === undefined ? {} : { project: projectView })}
+		/>,
+	);
+	try {
+		// One more act lets the detail fetch land before the run callback queries.
+		await act(async () => {});
+		await run({ posts, container, root });
+	} finally {
+		await unmount();
+		restore();
+	}
+};
 // A static import cannot work: ESM hoists it, so the modules evaluate before the stub above exists.
 const {
+	App,
 	UpdateRowLine,
 	visibleUpdateRows,
 	LaneCol,
@@ -57,6 +210,7 @@ const {
 	KpiStrip,
 	PerfTable,
 	coveredUpdateIds,
+	appNoticeKeys,
 	implementSteps,
 	recommendsSteps,
 	serverLine,
@@ -77,6 +231,7 @@ const {
 	DeepenReview,
 	ReleaseDialog,
 	AddProjectModal,
+	draftGithubSource,
 	OrphanNotice,
 	SeedFailedLine,
 	ProvisionErrorLine,
@@ -91,6 +246,9 @@ const {
 	appInboxMeta,
 	AppInboxBell,
 	AppInboxPanel,
+	HoldResumeButton,
+	CreditsChip,
+	SystemBar,
 } = await import("./app.tsx");
 const {
 	monogram,
@@ -99,6 +257,8 @@ const {
 	ProjectLogo,
 	ProjectTag,
 	windowGone,
+	windowPace,
+	modelPace,
 } = await import("./kit.tsx");
 const {
 	alateChip,
@@ -108,7 +268,52 @@ const {
 	ALATE_WATCH_DEADLINE_MS,
 	SETTINGS_TOC,
 	SettingsPage,
+	HostedContext,
 } = await import("./settings.tsx");
+
+describe("draftGithubSource", () => {
+	test("source capability requires the exact configured GitHub host", () => {
+		expect(draftGithubSource("https://github.com/o/r.git", "github.com")).toBe(
+			true,
+		);
+		expect(draftGithubSource("git@github.com:o/r.git", "github.com")).toBe(
+			true,
+		);
+		for (const source of [
+			"https://github.com.evil.test/o/r.git",
+			"https://github.com@evil.test/o/r.git",
+			"https://evil.test/github.com/r.git",
+			"git@github.com.evil.test:o/r.git",
+			"not a remote",
+		]) {
+			expect(draftGithubSource(source, "github.com")).toBe(false);
+		}
+	});
+
+	test("generated source hosts cannot gain GitHub capability through a suffix", () => {
+		const hostLabel = fc
+			.array(fc.constantFrom(..."abcdefghijklmnopqrstuvwxyz"), {
+				minLength: 1,
+				maxLength: 20,
+			})
+			.map((characters) => characters.join(""));
+		fc.assert(
+			fc.property(hostLabel, (label) => {
+				const host = `${label}.example.test`;
+				for (const source of [
+					`https://${host}/o/r.git`,
+					`git@${host}:o/r.git`,
+				]) {
+					expect(draftGithubSource(source, host)).toBe(true);
+					expect(draftGithubSource(source, `${host}.other.test`)).toBe(false);
+				}
+				expect(
+					draftGithubSource(`https://${host}.other.test/o/r.git`, host),
+				).toBe(false);
+			}),
+		);
+	});
+});
 
 describe("windowGone", () => {
 	const H = 3_600_000;
@@ -220,6 +425,126 @@ describe("windowGone", () => {
 		expect(windowGone(lim({ window: "5h", resetsAt: now + 9 * H }), now)).toBe(
 			0,
 		);
+	});
+});
+
+describe("appNoticeKeys upstream updates", () => {
+	test("skips a hands-off project's rows, keeps rows a person must file and removed rows", () => {
+		const row = (id: string, project: string | null, over = {}) => ({
+			id,
+			project,
+			target: "v2",
+			...over,
+		});
+		const state = {
+			projects: [
+				{ name: "auto", settings: { holdUpdateMerges: false } },
+				{ name: "manual", settings: { holdUpdateMerges: true } },
+			],
+			updates: {
+				checkedAt: "x",
+				rows: [
+					row("a@2", "auto"), // the board files it
+					row("m@2", "manual"),
+					row("u@2", null), // no project: a person maps or skips it
+					row("young@3", "manual", { target: null }),
+					row("gone@1", "auto", { target: null, removed: true }),
+					row("covered@2", "manual"),
+				],
+			},
+		} as unknown as StateResponse;
+		const covered = new Map([["covered@2", {} as TaskCard]]);
+		const keys = appNoticeKeys(
+			state,
+			covered,
+			null,
+			null,
+			false,
+			0,
+			null,
+			null,
+			false,
+			[],
+			null,
+			{ held: 0, stale: 0 } as StateResponse["keptWorktrees"],
+			0,
+		);
+		expect(keys.updateIds).toEqual(["m@2", "u@2", "gone@1"]);
+	});
+});
+
+describe("windowPace", () => {
+	const H = 3_600_000;
+	const now = 1_000 * H;
+	const lim = (usedPct: number, resetsAt: number | null) => ({
+		provider: "p",
+		label: "x",
+		window: "7d",
+		windowLabel: null,
+		plan: null,
+		usedPct,
+		resetsAt,
+	});
+	test("names the lead or lag of the quota against the window's clock", () => {
+		// 7d window, 84h left: half the time gone.
+		expect(windowPace(lim(75, now + 84 * H), now)).toEqual({
+			label: "1d 18h ahead",
+			pace: "ahead",
+		});
+		expect(windowPace(lim(25, now + 84 * H), now)).toEqual({
+			label: "1d 18h behind",
+			pace: "behind",
+		});
+		expect(windowPace(lim(50, null), now)).toBeNull();
+	});
+	test("holds 'on pace' inside the 30 minute deadzone, not past it", () => {
+		// 7d = 168h; 1 point = 1.68h. 0.25 points = 25.2m (inside), 0.5 points = 50.4m (outside).
+		expect(windowPace(lim(50.25, now + 84 * H), now)?.pace).toBe("on");
+		expect(windowPace(lim(49.75, now + 84 * H), now)?.pace).toBe("on");
+		expect(windowPace(lim(50.5, now + 84 * H), now)?.pace).toBe("ahead");
+		expect(windowPace(lim(49.5, now + 84 * H), now)?.pace).toBe("behind");
+	});
+});
+
+describe("modelPace", () => {
+	const H = 3_600_000;
+	const now = 1_000 * H;
+	const lim = (
+		provider: string,
+		window: string,
+		usedPct: number,
+		resetsAt: number,
+	) => ({
+		provider,
+		label: window,
+		window,
+		windowLabel: null,
+		plan: null,
+		usedPct,
+		resetsAt,
+	});
+	test("a used-up window wins and names when the provider is back", () => {
+		const limits = [
+			lim("openai-codex", "5h", 12, now + 4 * H),
+			lim("openai-codex", "7d", 100, now + 2 * H),
+		];
+		expect(modelPace(limits, "openai-codex/gpt-6-sol", now)).toEqual({
+			label: "limit · back in 2h 0m",
+			pace: "full",
+		});
+	});
+	test("otherwise the window furthest ahead of its clock, only for the model's provider", () => {
+		const limits = [
+			// 5h, 1h left: 80 % of the time gone, 42 % used → 38 points behind.
+			lim("anthropic", "5h", 42, now + H),
+			// 7d, 84h left: 50 % gone, 81 % used → 31 points ahead.
+			lim("anthropic", "7d", 81, now + 84 * H),
+			lim("openai-codex", "7d", 100, now + 2 * H),
+		];
+		expect(modelPace(limits, "anthropic/claude-sonnet-5-5", now)?.pace).toBe(
+			"ahead",
+		);
+		expect(modelPace(limits, "ollama/llama", now)).toBeNull();
 	});
 });
 
@@ -503,18 +828,98 @@ const cardFixture = (
 		// ponytail: render test reads only the fields above; the cast keeps the fixture short.
 	}) as unknown as TaskCard;
 
+// Shared Drawer render fixtures. The drawer describes below repeated these
+// verbatim; each describe now references one hoisted copy and never mutates
+// it (describes that override fields spread instead).
+const drawerProject = {
+	name: "proj",
+	github: null,
+	hasRules: true,
+	sessionsDir: "/tmp/proj/.tasks/sessions",
+	settings: {},
+} as unknown as ProjectView;
+// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
+const drawerFields = {
+	kind: "work",
+	research: false,
+	report: null,
+	details: null,
+	branch: null,
+	model: null,
+	worktree: null,
+	sessionId: null,
+	images: [],
+	pendingImages: [],
+	shots: [],
+	keptFiles: [],
+	workCheckLog: [],
+} as unknown as Partial<TaskCard>;
+// Props every Drawer fixture shares; the named bases spread it and add the
+// fields that differ.
+const drawerBaseCore = {
+	act: async () => true,
+	onClose: () => {},
+	onFollowed: () => {},
+	projects: [],
+	onMarkUnread: () => {},
+	onMarkSeen: () => {},
+	draining: false,
+	usedTotal: 0,
+	maxTotal: null,
+};
+const drawerBase = {
+	task: null as never,
+	project: drawerProject,
+	...drawerBaseCore,
+	read: true,
+	tasks: [],
+	onOpenTask: () => {},
+};
+
+// The text AskBlock question fixture, shared by the AskBlock describes.
+const textQ = {
+	question: "Name the branch",
+	options: [],
+	multi: false,
+	recommended: null,
+	text: true,
+};
+
+// Shared board-list Drawer fixtures (same story as drawerProject above).
+const listChildCard = (over: Partial<TaskCard>): TaskCard =>
+	cardFixture({
+		workCheckLog: [],
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		updateIds: [],
+		followUpOfProject: null,
+		...over,
+	});
+const listProject = {
+	name: "proj",
+	hasRules: true,
+	github: null,
+	sessionsDir: "/tmp/sessions",
+	settings: { maxParallel: 1 },
+} as unknown as ProjectView;
+const listBaseReadonly = {
+	project: listProject,
+	...drawerBaseCore,
+	read: false,
+	onOpenTask: () => {},
+};
+const listBaseRead = {
+	project: listProject,
+	...drawerBaseCore,
+	read: true,
+	tasks: [],
+	onOpenTask: () => {},
+};
+
 describe("LaneCol backlog divider", () => {
-	const base = {
-		projectTasks: [] as TaskCard[],
-		hasRules: true,
-		github: null,
-		deltas: new Map<string, number>(),
-		open: () => {},
-		unread: () => false,
-		onReorder: async () => true,
-		filtering: false,
-		draining: false,
-	} as const;
+	const base = laneColBase;
 
 	test("regular cards sit above the divider, backlog cards below the label", () => {
 		const todo = cardFixture({ id: "t1", stage: "todo", state: "queued" });
@@ -625,22 +1030,23 @@ describe("LaneCol backlog divider", () => {
 		expect(html).toContain("lane-divider");
 		expect(html).toContain("Backlog");
 		expect(html).not.toContain("Nothing waiting.");
+		expect(html).not.toContain("No drafts yet.");
 	});
 
-	test("an empty todo lane still shows the backlog row", () => {
+	test("an empty backlog shows a placeholder", () => {
 		const html = renderToStaticMarkup(
-			<LaneCol
-				{...base}
-				stage="todo"
-				tasks={[]}
-				parked={[]}
-				parkedTotal={0}
-				onAddDraft={() => {}}
-			/>,
+			<LaneCol {...base} stage="todo" tasks={[]} parked={[]} parkedTotal={0} />,
 		);
 		expect(html).toContain("Backlog");
-		expect(html).toContain("Add draft");
+		expect(html).toContain("No drafts yet.");
 		expect(html).toContain("Nothing waiting.");
+	});
+
+	test("a backlog filtered to nothing shows no empty placeholder", () => {
+		const html = renderToStaticMarkup(
+			<LaneCol {...base} stage="todo" tasks={[]} parked={[]} parkedTotal={3} />,
+		);
+		expect(html).not.toContain("No drafts yet.");
 	});
 
 	test("a non-todo lane with no cards stays stage-empty", () => {
@@ -892,17 +1298,7 @@ describe("LaneCol backlog divider", () => {
 });
 
 describe("done lane star section", () => {
-	const base = {
-		projectTasks: [] as TaskCard[],
-		hasRules: true,
-		github: null,
-		deltas: new Map<string, number>(),
-		open: () => {},
-		unread: () => false,
-		onReorder: async () => true,
-		filtering: false,
-		draining: false,
-	} as const;
+	const base = laneColBase;
 
 	test("a starred done research card renders the star in place of the check, a plain card the check", () => {
 		const research = cardFixture({
@@ -928,21 +1324,27 @@ describe("done lane star section", () => {
 		expect(bare).not.toContain("mark-star");
 	});
 
-	test("the Starred section sits below Inbox and above normal done cards", () => {
-		const freshCard = cardFixture({
+	// The Starred-section fixtures: one fresh answered card, one starred
+	// research card, one plain done card.
+	const starredTrio = () => ({
+		freshCard: cardFixture({
 			id: "u1",
 			stage: "done",
 			state: "idle",
 			answered: true,
-		});
-		const starredCard = cardFixture({
+		}),
+		starredCard: cardFixture({
 			id: "s1",
 			stage: "done",
 			state: "idle",
 			research: true,
 			starred: true,
-		});
-		const normal = cardFixture({ id: "n1", stage: "done", state: "idle" });
+		}),
+		normal: cardFixture({ id: "n1", stage: "done", state: "idle" }),
+	});
+
+	test("the Starred section sits below Inbox and above normal done cards", () => {
+		const { freshCard, starredCard, normal } = starredTrio();
 		const html = renderToStaticMarkup(
 			<LaneCol
 				{...base}
@@ -982,20 +1384,7 @@ describe("done lane star section", () => {
 	});
 
 	test("a collapsed Starred section leaves one divider, an open one two", () => {
-		const freshCard = cardFixture({
-			id: "u1",
-			stage: "done",
-			state: "idle",
-			answered: true,
-		});
-		const starredCard = cardFixture({
-			id: "s1",
-			stage: "done",
-			state: "idle",
-			research: true,
-			starred: true,
-		});
-		const normal = cardFixture({ id: "n1", stage: "done", state: "idle" });
+		const { freshCard, starredCard, normal } = starredTrio();
 		const tasks = [starredCard, normal, freshCard];
 		const open = renderToStaticMarkup(
 			<LaneCol
@@ -1369,6 +1758,7 @@ describe("AskBlock", () => {
 		options: [{ label: "A", description: "first" }, { label: "B" }],
 		multi: true,
 		recommended: 0,
+		text: false,
 	};
 
 	test("a multi question renders checkboxes and a disabled Answer button", () => {
@@ -1456,46 +1846,64 @@ describe("AskBlock", () => {
 		expect(html).toContain('value=""');
 		expect(html).toContain("(2)");
 	});
+
+	test("the Other field's placeholder stays neutral, never a suggested answer", () => {
+		const html = renderToStaticMarkup(
+			<AskBlock
+				{...base}
+				q={{
+					question: "Which database?",
+					options: [{ label: "Postgres" }],
+					multi: false,
+					recommended: null,
+					text: false,
+				}}
+			/>,
+		);
+		expect(html).toContain('placeholder="Your answer"');
+		// A fixed composer example would read as a suggested answer under a park question.
+		expect(html).not.toContain("Deploy only the API");
+	});
+
+	test("a text question renders a labeled field and no choice controls", () => {
+		const html = renderToStaticMarkup(<AskBlock {...base} q={textQ} />);
+		expect(html).toContain('type="text"');
+		expect(html).not.toContain('type="radio"');
+		expect(html).not.toContain('type="checkbox"');
+		// The field carries the question text as its label.
+		expect(html).toContain('aria-label="Name the branch"');
+		// Nothing typed: the Answer button stays disabled.
+		expect(html).toContain("Answer");
+		expect(html).toContain("disabled");
+	});
+
+	test("a saved text answer seeds the field and shows the answered state", () => {
+		const html = renderToStaticMarkup(
+			<AskBlock {...base} q={textQ} answered selected="release-branch" />,
+		);
+		expect(html).toContain('value="release-branch"');
+		expect(html).toContain("Replace answer");
+		expect(html).toContain('class="ask-q answered"');
+	});
 });
 
 describe("AskBlock multi answers", () => {
 	// React interaction needs browser globals; the same happy-dom swap as the
 	// ProjectBoard search delay tests below: installed after app.tsx's import
 	// (its browser mount guard reads document at module load), removed after.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		HTMLElement: window.HTMLElement,
-		HTMLInputElement: window.HTMLInputElement,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+	const { window } = installBrowserGlobals([
+		"HTMLElement",
+		"HTMLInputElement",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
 
 	const multiQ = {
 		question: "Pick several",
 		options: [{ label: "A", description: "first" }, { label: "B" }],
 		multi: true,
 		recommended: null,
+		text: false,
 	};
 
 	/** The form-submit DOM event; happy-dom's Event class does not match lib.dom's. */
@@ -1506,50 +1914,17 @@ describe("AskBlock multi answers", () => {
 		}) as unknown as Event;
 
 	/** A React onChange picks up programmatic edits only through the native value setter (see settings.test.tsx). */
-	const typeInto = (el: HTMLInputElement, value: string): void => {
-		const setter = Object.getOwnPropertyDescriptor(
-			window.HTMLInputElement.prototype,
-			"value",
-		)?.set;
-		if (setter === undefined) throw new Error("value setter missing");
-		setter.call(el, value);
-	};
+	const typeInto = typeIntoFor(window);
 
-	/** The production onChange React rendered onto the node; happy-dom's dispatched
-	 *  input event never reaches React's ChangeEventPlugin (see settings.test.tsx). */
-	const onChangeOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onChange?: (e: unknown) => void;
-		};
-		if (props.onChange === undefined) throw new Error("node has no onChange");
-		return props.onChange;
-	};
-
-	/** One mounted multi AskBlock; every onAnswer text lands in `answers`, every onDraft in `drafts`. */
-	async function mountAsk(): Promise<{
-		container: HTMLDivElement;
-		answers: string[];
-		drafts: (string | null)[];
-		form: HTMLFormElement;
-		text: HTMLInputElement;
-		other: HTMLInputElement;
-		button: HTMLButtonElement;
-	}> {
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+	/** The mounted AskBlock scaffolding both question kinds share: recorders,
+	 * form and submit button. `q` picks the question; the probes differ per kind. */
+	const mountAskBlock = async (q: typeof textQ | typeof multiQ) => {
 		const answers: string[] = [];
 		const drafts: (string | null)[] = [];
 		function Block() {
 			return (
 				<AskBlock
-					q={multiQ}
+					q={q}
 					name="ask-0"
 					answered={false}
 					selected={null}
@@ -1565,27 +1940,36 @@ describe("AskBlock multi answers", () => {
 				/>
 			);
 		}
-		await act(async () => {
-			root.render(<Block />);
-		});
-		const inputs = [
-			...container.querySelectorAll("input"),
-		] as unknown as HTMLInputElement[];
-		const text = inputs.find((i) => i.type === "text");
-		const checkboxes = inputs.filter((i) => i.type === "checkbox");
-		const other = checkboxes[checkboxes.length - 1];
+		const { container } = await mount(<Block />);
 		const form = container.querySelector("form") as unknown as HTMLFormElement;
 		const button = container.querySelector(
 			"button",
 		) as unknown as HTMLButtonElement;
-		if (
-			text === undefined ||
-			other === undefined ||
-			form === null ||
-			button === null
-		)
+		if (form === null || button === null)
 			throw new Error("ask block did not render its controls");
-		return { container, answers, drafts, form, text, other, button };
+		return { container, answers, drafts, form, button };
+	};
+
+	/** One mounted multi AskBlock; every onAnswer text lands in `answers`, every onDraft in `drafts`. */
+	async function mountAsk(): Promise<{
+		container: HTMLDivElement;
+		answers: string[];
+		drafts: (string | null)[];
+		form: HTMLFormElement;
+		text: HTMLInputElement;
+		other: HTMLInputElement;
+		button: HTMLButtonElement;
+	}> {
+		const base = await mountAskBlock(multiQ);
+		const inputs = [
+			...base.container.querySelectorAll("input"),
+		] as unknown as HTMLInputElement[];
+		const text = inputs.find((i) => i.type === "text");
+		const checkboxes = inputs.filter((i) => i.type === "checkbox");
+		const other = checkboxes[checkboxes.length - 1];
+		if (text === undefined || other === undefined)
+			throw new Error("ask block did not render its controls");
+		return { ...base, text, other };
 	}
 
 	test("checking a preset counts as answered at once; unchecking it reopens", async () => {
@@ -1640,6 +2024,52 @@ describe("AskBlock multi answers", () => {
 		expect(answers).toEqual(["handwritten note"]);
 		expect(text.value).toBe("handwritten note");
 		expect(other.checked).toBe(true);
+	});
+
+	/** One mounted text AskBlock; every onAnswer text lands in `answers`, every onDraft in `drafts`. */
+	async function mountTextAsk(): Promise<{
+		container: HTMLDivElement;
+		answers: string[];
+		drafts: (string | null)[];
+		form: HTMLFormElement;
+		text: HTMLInputElement;
+		button: HTMLButtonElement;
+	}> {
+		const base = await mountAskBlock(textQ);
+		const text = base.container.querySelector(
+			'input[type="text"]',
+		) as unknown as HTMLInputElement | null;
+		if (text === null)
+			throw new Error("text ask block did not render its controls");
+		return { ...base, text };
+	}
+
+	test("a text block drafts as it types and answers the trimmed text on submit", async () => {
+		const { answers, drafts, form, text, button } = await mountTextAsk();
+		// Nothing typed: the button is disabled and a submit answers nothing.
+		expect(button.disabled).toBe(true);
+		await act(async () => {
+			form.dispatchEvent(submitEvent());
+		});
+		expect(answers).toEqual([]);
+		await act(async () => {
+			typeInto(text, "  release-branch  ");
+			onChangeOf(text)({ target: text, currentTarget: text });
+		});
+		// The draft rides the trimmed text; the button enables.
+		expect(drafts).toEqual(["release-branch"]);
+		expect(button.disabled).toBe(false);
+		await act(async () => {
+			form.dispatchEvent(submitEvent());
+		});
+		expect(answers).toEqual(["release-branch"]);
+		// Emptying the field withdraws the draft and disables the button again.
+		await act(async () => {
+			typeInto(text, "");
+			onChangeOf(text)({ target: text, currentTarget: text });
+		});
+		expect(drafts).toEqual(["release-branch", null]);
+		expect(button.disabled).toBe(true);
 	});
 });
 
@@ -1851,9 +2281,7 @@ describe("card links in bell text", () => {
 				fresh={false}
 			/>,
 		);
-		const { window } = new Window({ url: "http://localhost/" });
-		const doc = window.document;
-		doc.body.innerHTML = html;
+		const doc = parseMarkup(html);
 		const details = doc.querySelector(".notif-details");
 		expect(details?.querySelector("summary")?.textContent).toBe("Details");
 		expect(details?.textContent).toContain(
@@ -1879,9 +2307,7 @@ describe("card links in bell text", () => {
 				fresh={false}
 			/>,
 		);
-		const { window } = new Window({ url: "http://localhost/" });
-		const doc = window.document;
-		doc.body.innerHTML = html;
+		const doc = parseMarkup(html);
 		// The collapsed line keeps only the first line of the recorded text.
 		expect(doc.body.textContent).toContain(
 			"Seed pull failed for the agent layer image.",
@@ -2102,9 +2528,8 @@ describe("RestartWaitLine", () => {
 });
 
 describe("UpdateCycleControl", () => {
-	const window = new Window({ url: "http://localhost/" });
+	installBrowserGlobals(["HTMLElement"]);
 	const host = globalThis as unknown as Record<string, unknown>;
-	const originals = new Map<string, unknown>();
 	const now = 1_700_000_000_000;
 	const idle = {
 		nextCycleAt: now + 120_000,
@@ -2112,24 +2537,10 @@ describe("UpdateCycleControl", () => {
 		canStart: true,
 		error: null,
 	};
-	beforeAll(() => {
-		for (const [key, value] of Object.entries({
-			window,
-			document: window.document,
-			navigator: window.navigator,
-			HTMLElement: window.HTMLElement,
-			IS_REACT_ACT_ENVIRONMENT: true,
-		})) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-		originals.set("fetch", host.fetch);
-	});
+	// fetch is swapped per test through host.fetch; its original comes back after all.
+	const realFetch = globalThis.fetch;
 	afterAll(() => {
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
+		globalThis.fetch = realFetch;
 	});
 	test("an absent or expired controller provides no countdown or action", () => {
 		expect(
@@ -2174,12 +2585,10 @@ describe("UpdateCycleControl", () => {
 		}
 	});
 	test("the live clock updates the countdown and never shows a negative duration", async () => {
-		const container = document.createElement("div");
-		const root = createRoot(container);
+		const { container, root, unmount } = await mount(
+			<UpdateCycleControl cycle={idle} nowMs={now} />,
+		);
 		try {
-			await act(async () =>
-				root.render(<UpdateCycleControl cycle={idle} nowMs={now} />),
-			);
 			expect(container.textContent).toContain("2m");
 			await act(async () =>
 				root.render(<UpdateCycleControl cycle={idle} nowMs={now + 60_000} />),
@@ -2191,7 +2600,7 @@ describe("UpdateCycleControl", () => {
 			expect(container.textContent).toContain("is due");
 			expect(container.textContent).not.toContain("-1");
 		} finally {
-			await act(async () => root.unmount());
+			await unmount();
 		}
 	});
 	test("an idle request posts an empty object once and gives immediate feedback", async () => {
@@ -2202,12 +2611,10 @@ describe("UpdateCycleControl", () => {
 			await response.promise;
 			return Response.json({});
 		};
-		const container = document.createElement("div");
-		const root = createRoot(container);
+		const { container, root, unmount } = await mount(
+			<UpdateCycleControl cycle={idle} nowMs={now} />,
+		);
 		try {
-			await act(async () =>
-				root.render(<UpdateCycleControl cycle={idle} nowMs={now} />),
-			);
 			const button = container.querySelector("button")!;
 			await act(async () => button.click());
 			expect(button.disabled).toBe(true);
@@ -2221,18 +2628,16 @@ describe("UpdateCycleControl", () => {
 			);
 			expect(container.textContent).toBe("");
 		} finally {
-			await act(async () => root.unmount());
+			await unmount();
 		}
 	});
 	test("request and host failures stay beside the action with a retry step", async () => {
 		host.fetch = async () =>
 			Response.json({ error: "Host is unavailable" }, { status: 409 });
-		const container = document.createElement("div");
-		const root = createRoot(container);
+		const { container, root, unmount } = await mount(
+			<UpdateCycleControl cycle={idle} nowMs={now} />,
+		);
 		try {
-			await act(async () =>
-				root.render(<UpdateCycleControl cycle={idle} nowMs={now} />),
-			);
 			await act(async () => container.querySelector("button")!.click());
 			expect(container.querySelector('[role="alert"]')?.textContent).toContain(
 				"Host is unavailable",
@@ -2270,7 +2675,7 @@ describe("UpdateCycleControl", () => {
 			expect(container.querySelector("button")!.textContent).toBe("Update");
 			expect(container.querySelector("button")!.disabled).toBe(false);
 		} finally {
-			await act(async () => root.unmount());
+			await unmount();
 		}
 	});
 });
@@ -2523,38 +2928,186 @@ describe("reportHtml", () => {
 
 describe("Drawer parent chip", () => {
 	// The drawer's done view reads the list fields during render.
-	const childCard = (over: Partial<TaskCard>): TaskCard =>
-		cardFixture({
-			workCheckLog: [],
-			images: [],
-			pendingImages: [],
-			shots: [],
-			keptFiles: [],
-			updateIds: [],
-			followUpOfProject: null,
-			...over,
+	const childCard = listChildCard;
+	const _project = listProject;
+	const base = listBaseReadonly;
+	installBrowserGlobals([
+		"Event",
+		"HTMLElement",
+		"HTMLTextAreaElement",
+		"Node",
+		"getComputedStyle",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
+	// The production onClick React rendered onto the node; happy-dom's dispatched
+	// events never reach React's plugin (same helper the prompt editor tests use).
+	const json = (body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status: 200,
+			headers: { "content-type": "application/json" },
 		});
-	const project = {
-		name: "proj",
-		hasRules: true,
-		github: null,
-		sessionsDir: "/tmp/sessions",
-		settings: { maxParallel: 1 },
-	} as unknown as ProjectView;
-	const base = {
-		project,
-		act: async () => true,
-		onClose: () => {},
-		onFollowed: () => {},
-		projects: [],
-		read: false,
-		onMarkUnread: () => {},
-		onMarkSeen: () => {},
-		onOpenTask: () => {},
-		draining: false,
-		usedTotal: 0,
-		maxTotal: null,
+	/** Renders the drawer with `fetch` stubbed: every URL 404s except the ones
+	 * `serve` answers. The two acts let the mount fetches land, like the prompt
+	 * editor tests; `fetches` records every URL the drawer asked for. */
+	const mountDrawer = async (
+		task: TaskCard,
+		tasks: TaskCard[],
+		serve: (url: string) => Response | Promise<Response>,
+	): Promise<{
+		container: HTMLDivElement;
+		fetches: string[];
+		close: () => Promise<void>;
+	}> => {
+		const fetches: string[] = [];
+		const { restore } = stubFetch(async (url) => {
+			fetches.push(url);
+			return serve(url);
+		});
+		const { container, unmount } = await mount(
+			<Drawer {...base} task={task} tasks={tasks} />,
+		);
+		await act(async () => {});
+		return {
+			container,
+			fetches,
+			close: async () => {
+				await unmount();
+				restore();
+			},
+		};
 	};
+
+	test("a parent outside the Done window loads: loading row first, then the card as a link", async () => {
+		const parent = cardFixture({
+			id: "P-9",
+			stage: "done",
+			state: "idle",
+			sessionTitle: "Parent work",
+		});
+		const child = childCard({
+			id: "C-1",
+			stage: "done",
+			state: "idle",
+			followUpOf: "P-9",
+		});
+		// Held release: the fetch stays pending until the test releases it, so the
+		// loading row is observable.
+		const { promise: pending, resolve: release } =
+			Promise.withResolvers<Response>();
+		const { container, fetches, close } = await mountDrawer(child, [], (url) =>
+			url.endsWith("/tasks/P-9")
+				? pending
+				: new Response("{}", { status: 404 }),
+		);
+		try {
+			// The fetch went to the parent's tasks route, the same one the drawer's
+			// detail read uses.
+			expect(fetches).toContain("/api/projects/proj/tasks/P-9");
+			// Before the fetch lands: the id on the same three-column row shape, so
+			// nothing shifts when the card arrives. Never "Not on the board".
+			expect(container.querySelector(".lineage-gone") !== null).toBe(true);
+			expect(container.textContent).toContain("P-9");
+			expect(container.textContent).toContain("Loading");
+			expect(container.textContent).not.toContain("Not on the board");
+			release(json({ ...parent, turns: [] }));
+			await act(async () => {});
+			const link = container.querySelector<HTMLAnchorElement>(
+				'.lineage-rail a.lineage-row[href="/projects/proj/tasks/P-9"]',
+			);
+			expect(link !== null).toBe(true);
+			// Real id, title and live stage; the link's text is its accessible name.
+			expect(link?.textContent).toContain("P-9");
+			expect(link?.textContent).toContain("Parent work");
+			expect(link?.textContent).toContain("done");
+			expect(container.textContent).not.toContain("Not on the board");
+			expect(container.querySelector(".lineage-gone")).toBeNull();
+		} finally {
+			await close();
+		}
+	});
+
+	test("a parent whose fetch fails offers Retry, and Retry loads the card", async () => {
+		const parent = cardFixture({
+			id: "P-5",
+			stage: "done",
+			state: "idle",
+			sessionTitle: "Late parent",
+		});
+		const child = childCard({
+			id: "C-1",
+			stage: "done",
+			state: "idle",
+			followUpOf: "P-5",
+		});
+		let fail = true;
+		const { container, close } = await mountDrawer(child, [], (url) =>
+			url.endsWith("/tasks/P-5")
+				? fail
+					? new Response("{}", { status: 500 })
+					: json({ ...parent, turns: [] })
+				: new Response("{}", { status: 404 }),
+		);
+		try {
+			// Only a 404 proves the card does not exist; a server error keeps the id
+			// visible with an inline retry.
+			expect(container.textContent).toContain("Could not load card");
+			expect(container.textContent).not.toContain("Card not found");
+			const retry = container.querySelector<HTMLButtonElement>(
+				".lineage-gone button",
+			);
+			expect(retry?.textContent).toBe("Retry");
+			fail = false;
+			await act(async () => {
+				onClickOf(retry as unknown as Element)({});
+			});
+			await act(async () => {});
+			const link = container.querySelector<HTMLAnchorElement>(
+				'.lineage-rail a.lineage-row[href="/projects/proj/tasks/P-5"]',
+			);
+			expect(link !== null).toBe(true);
+			expect(link?.textContent).toContain("Late parent");
+			expect(container.querySelector(".lineage-gone")).toBeNull();
+		} finally {
+			await close();
+		}
+	});
+
+	test("a cross-project parent outside the window fetches from its own project", async () => {
+		const parent = cardFixture({
+			id: "P-2",
+			project: "other",
+			stage: "done",
+			state: "idle",
+			sessionTitle: "Far parent",
+		});
+		const child = childCard({
+			id: "C-1",
+			stage: "done",
+			state: "idle",
+			followUpOf: "P-2",
+			followUpOfProject: "other",
+		});
+		const { container, fetches, close } = await mountDrawer(child, [], (url) =>
+			url.endsWith("/projects/other/tasks/P-2")
+				? json({ ...parent, turns: [] })
+				: new Response("{}", { status: 404 }),
+		);
+		try {
+			// The route uses the linked card's project, and the link href follows it.
+			expect(fetches).toContain("/api/projects/other/tasks/P-2");
+			const link = container.querySelector<HTMLAnchorElement>(
+				'.lineage-rail a.lineage-row[href="/projects/other/tasks/P-2"]',
+			);
+			expect(link !== null).toBe(true);
+			expect(link?.textContent).toContain("P-2");
+			expect(link?.textContent).toContain("Far parent");
+			expect(link?.textContent).toContain("other");
+			expect(container.textContent).not.toContain("Not on the board");
+		} finally {
+			await close();
+		}
+	});
 
 	test("a parent still on the board renders as a button naming it", () => {
 		const parent = cardFixture({
@@ -2576,22 +3129,6 @@ describe("Drawer parent chip", () => {
 		expect(html).toContain("parent");
 		expect(html).toContain("Parent work");
 		expect(html).toContain('aria-current="true"');
-	});
-
-	test("a parent the state dropped (cancelled) keeps the chip on the bare id", () => {
-		const child = childCard({
-			id: "C-1",
-			stage: "done",
-			state: "idle",
-			followUpOf: "P-9",
-		});
-		const html = renderToStaticMarkup(
-			<Drawer {...base} task={child} tasks={[]} />,
-		);
-		expect(html).toContain("lineage-gone");
-		expect(html).toContain("Not on the board");
-		expect(html).toContain("P-9");
-		expect(html).toContain('title="P-9 is not on the board"');
 	});
 
 	test("follow-ups list oldest first, whatever order the state sends", () => {
@@ -2625,6 +3162,52 @@ describe("Drawer parent chip", () => {
 		) => cardFixture({ id, followUpOf, createdAt, ...over });
 		const at = (html: string, id: string) => html.indexOf(`>${id}<`);
 		const PROPOSALS = 'aria-label="Proposals"';
+
+		test("a retro source outside the Done window loads as a link", async () => {
+			// The retro parent sits in the state; its source is older than the window,
+			// so the drawer fetches it from the source's tasks route.
+			const source = cardFixture({
+				id: "SRC-1",
+				stage: "done",
+				state: "idle",
+				sessionTitle: "Source work",
+			});
+			const retro = cardFixture({
+				id: "R-1",
+				kind: "retro",
+				stage: "done",
+				state: "idle",
+				followUpOf: "SRC-1",
+				sessionTitle: "The retro",
+			});
+			const self = childCard({
+				id: "S-1",
+				stage: "done",
+				state: "idle",
+				followUpOf: "R-1",
+			});
+			const { container, fetches, close } = await mountDrawer(
+				self,
+				[retro],
+				(url) =>
+					url.endsWith("/tasks/SRC-1")
+						? json({ ...source, turns: [] })
+						: new Response("{}", { status: 404 }),
+			);
+			try {
+				expect(fetches).toContain("/api/projects/proj/tasks/SRC-1");
+				const link = container.querySelector<HTMLAnchorElement>(
+					'.lineage-rail a.lineage-row[href="/projects/proj/tasks/SRC-1"]',
+				);
+				expect(link !== null).toBe(true);
+				expect(link?.textContent).toContain("SRC-1");
+				expect(link?.textContent).toContain("Source work");
+				expect(link?.textContent).toContain("retro source");
+				expect(container.textContent).not.toContain("Not on the board");
+			} finally {
+				await close();
+			}
+		});
 
 		test("a retro is a follow-up row and its proposals nest under it, oldest first", () => {
 			const html = renderToStaticMarkup(
@@ -2732,7 +3315,7 @@ describe("Drawer parent chip", () => {
 			expect(html).not.toContain(">V-1<");
 		});
 
-		test("a retro source off the board renders inert", () => {
+		test("a retro source the window dropped holds its id until its fetch lands", () => {
 			const proposal = childCard({ id: "P-1", followUpOf: "R-1" });
 			const html = renderToStaticMarkup(
 				<Drawer
@@ -2741,10 +3324,14 @@ describe("Drawer parent chip", () => {
 					tasks={[card("R-1", "S-9", 1000, { kind: "retro" })]}
 				/>,
 			);
-			expect(html).toContain('title="S-9 is not on the board"');
+			// Static render runs no fetch: the loading row keeps the source's id and
+			// tag on the same row shape, with no link yet and no "Not on the board".
+			expect(html).toContain("lineage-gone");
+			expect(html).toContain("Loading");
 			expect(html).not.toContain("/tasks/S-9");
 			const gone = html.slice(html.indexOf("lineage-gone"), at(html, "R-1"));
 			expect(gone).toContain(">retro source<");
+			expect(html).not.toContain("Not on the board");
 		});
 
 		test("a parent that is no retro gets no grandparent row", () => {
@@ -2822,13 +3409,7 @@ describe("Drawer meta ran-on row", () => {
 		keptFiles: [],
 		updateIds: [],
 	});
-	const project = {
-		name: "proj",
-		hasRules: true,
-		github: null,
-		sessionsDir: "/tmp/sessions",
-		settings: { maxParallel: 1 },
-	} as unknown as ProjectView;
+	const project = listProject;
 
 	test("the Meta section names where the card ran", () => {
 		const html = renderToStaticMarkup(
@@ -2857,38 +3438,18 @@ describe("Drawer meta ran-on row", () => {
 });
 
 describe("Drawer cross-project lineage", () => {
-	const childCard = (over: Partial<TaskCard>): TaskCard =>
-		cardFixture({
-			workCheckLog: [],
-			images: [],
-			pendingImages: [],
-			shots: [],
-			keptFiles: [],
-			updateIds: [],
-			followUpOfProject: null,
-			...over,
-		});
-	const project = {
-		name: "proj",
-		hasRules: true,
-		github: null,
-		sessionsDir: "/tmp/sessions",
-		settings: { maxParallel: 1 },
-	} as unknown as ProjectView;
-	const base = {
-		project,
-		act: async () => true,
-		onClose: () => {},
-		onFollowed: () => {},
-		projects: [],
-		read: false,
-		onMarkUnread: () => {},
-		onMarkSeen: () => {},
-		onOpenTask: () => {},
-		draining: false,
-		usedTotal: 0,
-		maxTotal: null,
-	};
+	const childCard = listChildCard;
+	const _project = listProject;
+	const base = listBaseReadonly;
+	installBrowserGlobals([
+		"Event",
+		"HTMLElement",
+		"HTMLTextAreaElement",
+		"Node",
+		"getComputedStyle",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
 
 	test("a foreign parent renders as a link naming its project", () => {
 		const parent = cardFixture({
@@ -2936,7 +3497,10 @@ describe("Drawer cross-project lineage", () => {
 		expect(html).toContain('class="lineage-branch"');
 	});
 
-	test("a same-id card on another board does not pose as the parent", () => {
+	test("a same-id card on another board does not pose as the parent", async () => {
+		// The id+project lookup and the fetch both use the child's project
+		// (followUpOfProject ?? project), so the impostor's project never serves the
+		// row; the route's 404 earns the not-found row, never a stale link.
 		const child = childCard({
 			id: "C-1",
 			stage: "done",
@@ -2948,12 +3512,25 @@ describe("Drawer cross-project lineage", () => {
 			project: "other",
 			sessionTitle: "Impostor work",
 		});
-		const html = renderToStaticMarkup(
+		const fetches: string[] = [];
+		const { restore } = stubFetch(async (url) => {
+			fetches.push(url);
+			return new Response("{}", { status: 404 });
+		});
+		const { container, unmount } = await mount(
 			<Drawer {...base} task={child} tasks={[impostor]} />,
 		);
-		expect(html).toContain("lineage-gone");
-		expect(html).toContain("Not on the board");
-		expect(html).not.toContain("Impostor work");
+		try {
+			await act(async () => {});
+			// The fetch went to the child's project, and its 404 reads as not-found.
+			expect(fetches).toContain("/api/projects/proj/tasks/P-1");
+			expect(container.textContent).toContain("Card not found");
+			expect(container.textContent).not.toContain("Impostor work");
+			expect(container.textContent).not.toContain("Not on the board");
+		} finally {
+			await unmount();
+			restore();
+		}
 	});
 
 	test("a foreign card sharing this card's id does not list as a kid", () => {
@@ -2998,45 +3575,8 @@ describe("Drawer cross-project lineage", () => {
 
 describe("Drawer prompt loading", () => {
 	// ponytail: render test reads only these fields; the cast keeps the fixture short.
-	const project = {
-		name: "proj",
-		github: null,
-		hasRules: true,
-		sessionsDir: "/tmp/proj/.tasks/sessions",
-		settings: {},
-	} as unknown as ProjectView;
-	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
-	const drawerFields = {
-		kind: "work",
-		research: false,
-		report: null,
-		details: null,
-		branch: null,
-		model: null,
-		worktree: null,
-		sessionId: null,
-		images: [],
-		pendingImages: [],
-		shots: [],
-		keptFiles: [],
-		workCheckLog: [],
-	} as unknown as Partial<TaskCard>;
-	const base = {
-		task: null as never,
-		project,
-		act: async () => true,
-		onClose: () => {},
-		onFollowed: () => {},
-		projects: [],
-		read: true,
-		onMarkUnread: () => {},
-		onMarkSeen: () => {},
-		tasks: [],
-		onOpenTask: () => {},
-		draining: false,
-		usedTotal: 0,
-		maxTotal: null,
-	};
+	const _project = drawerProject;
+	const base = drawerBase;
 
 	test("the read-only prompt section holds a loading line until the detail fetch lands", () => {
 		// The state row carries no prompt text (OTTR-965): the drawer fetches it from
@@ -3089,45 +3629,8 @@ describe("Drawer file-section loading placeholders", () => {
 	// loading line, gated by what the board row predicts (a worktree for worktree files; a
 	// build card for changed files). The static render never resolves the fetch, so it sees
 	// exactly the loading state.
-	const project = {
-		name: "proj",
-		github: null,
-		hasRules: true,
-		sessionsDir: "/tmp/proj/.tasks/sessions",
-		settings: {},
-	} as unknown as ProjectView;
-	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
-	const drawerFields = {
-		kind: "work",
-		research: false,
-		report: null,
-		details: null,
-		branch: null,
-		model: null,
-		worktree: null,
-		sessionId: null,
-		images: [],
-		pendingImages: [],
-		shots: [],
-		keptFiles: [],
-		workCheckLog: [],
-	} as unknown as Partial<TaskCard>;
-	const base = {
-		task: null as never,
-		project,
-		act: async () => true,
-		onClose: () => {},
-		onFollowed: () => {},
-		projects: [],
-		read: true,
-		onMarkUnread: () => {},
-		onMarkSeen: () => {},
-		tasks: [],
-		onOpenTask: () => {},
-		draining: false,
-		usedTotal: 0,
-		maxTotal: null,
-	};
+	const _project = drawerProject;
+	const base = drawerBase;
 
 	test("a build card with a worktree holds both sections while the detail loads", () => {
 		const task = cardFixture({
@@ -3184,45 +3687,8 @@ describe("Drawer file-section loading placeholders", () => {
 });
 
 describe("Drawer queued steering edit", () => {
-	const project = {
-		name: "proj",
-		github: null,
-		hasRules: true,
-		sessionsDir: "/tmp/proj/.tasks/sessions",
-		settings: {},
-	} as unknown as ProjectView;
-	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
-	const drawerFields = {
-		kind: "work",
-		research: false,
-		report: null,
-		details: null,
-		branch: null,
-		model: null,
-		worktree: null,
-		sessionId: null,
-		images: [],
-		pendingImages: [],
-		shots: [],
-		keptFiles: [],
-		workCheckLog: [],
-	} as unknown as Partial<TaskCard>;
-	const base = {
-		task: null as never,
-		project,
-		act: async () => true,
-		onClose: () => {},
-		onFollowed: () => {},
-		projects: [],
-		read: true,
-		onMarkUnread: () => {},
-		onMarkSeen: () => {},
-		tasks: [],
-		onOpenTask: () => {},
-		draining: false,
-		usedTotal: 0,
-		maxTotal: null,
-	};
+	const _project = drawerProject;
+	const base = drawerBase;
 	test("queued steering offers Edit next to Cancel", () => {
 		const task = cardFixture({
 			...drawerFields,
@@ -3250,18 +3716,7 @@ describe("Drawer queued steering edit", () => {
 	});
 });
 
-describe("Drawer queued steering edit (client)", () => {
-	// The save flows through the act prop; the stub base.act never runs the body,
-	// so save-driven tests pass an act with the production contract: run the body,
-	// swallow its error, report false.
-	const runAct = async (fn: () => Promise<void>): Promise<boolean> => {
-		try {
-			await fn();
-			return true;
-		} catch {
-			return false;
-		}
-	};
+describe("Drawer hold hint expiry", () => {
 	const project = {
 		name: "proj",
 		github: null,
@@ -3269,7 +3724,6 @@ describe("Drawer queued steering edit (client)", () => {
 		sessionsDir: "/tmp/proj/.tasks/sessions",
 		settings: {},
 	} as unknown as ProjectView;
-	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
 	const drawerFields = {
 		kind: "work",
 		research: false,
@@ -3301,61 +3755,62 @@ describe("Drawer queued steering edit (client)", () => {
 		usedTotal: 0,
 		maxTotal: null,
 	};
-	// React interaction needs browser globals; the setup mirrors settings.test.tsx:
-	// happy-dom registers them for this describe, and afterAll puts the originals
-	// back, so later test files in the same process see no DOM.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		Event: window.Event,
-		HTMLElement: window.HTMLElement,
-		HTMLTextAreaElement: window.HTMLTextAreaElement,
-		Node: window.Node,
-		getComputedStyle: window.getComputedStyle,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
+	const held = (holdUntil: number): TaskCard =>
+		cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "queued",
+			holdUntil,
+			holdProvider: "openai-codex",
+			holdWindow: "7d",
+			holdSetAt: holdUntil - 120_000,
+			needsReason: "The openai-codex usage limit is reached.",
+		});
+	const HINT =
+		"To start now, pick a model from another provider in the composer";
+	const RESUME_TITLE = "End the usage-limit hold and start the task now";
+
+	test("a live hold names the composer way out and offers Resume", () => {
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={held(Date.now() + 3_600_000)} />,
+		).replaceAll("<!-- -->", "");
+		expect(html).toContain(HINT);
+		expect(html).toContain(RESUME_TITLE);
+	});
+
+	test("an expired hold hides the hint and the Resume button", () => {
+		// pickRunnable starts holdUntil <= now on its own: the card waits for a slot,
+		// so neither the hint nor the hold-only Resume button may render.
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={held(Date.now() - 60_000)} />,
+		).replaceAll("<!-- -->", "");
+		expect(html).not.toContain(HINT);
+		expect(html).not.toContain(RESUME_TITLE);
+	});
+});
+describe("Drawer queued steering edit (client)", () => {
+	// The save flows through the act prop; the stub base.act never runs the body,
+	// so save-driven tests pass an act with the production contract: run the body,
+	// swallow its error, report false.
+	const runAct = async (fn: () => Promise<void>): Promise<boolean> => {
+		try {
+			await fn();
+			return true;
+		} catch {
+			return false;
+		}
 	};
-	const originals = new Map<string, unknown>();
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+	const _project = drawerProject;
+	const base = drawerBase;
+	const { window } = installDrawerClientGlobals();
 
 	// happy-dom's dispatched clicks never reach React's event plugin (same
 	// upstream gap as settings.test.tsx's onChangeOf): call the production
 	// onClick React rendered onto the node instead.
-	const onClickOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onClick?: (e: unknown) => void;
-		};
-		if (props.onClick === undefined) throw new Error("node has no onClick");
-		return props.onClick;
-	};
 
-	test("a replaced steer never reopens the editor with the stale draft", async () => {
-		const realFetch = globalThis.fetch;
-		// The drawer's effects fetch the task detail, session context and model
-		// catalog; every one degrades to null on a failed response, so a 404 keeps
-		// the row's own fields (pendingPrompt included) authoritative.
-		globalThis.fetch = (async () =>
-			new Response("{}", { status: 404 })) as unknown as typeof fetch;
+	// Shared harness for the queued steering tests: a mounted container plus
+	// the Edit-button and editor probes the tests assert through.
+	const steerHarness = () => {
 		const container = window.document.createElement(
 			"div",
 		) as unknown as HTMLDivElement;
@@ -3377,6 +3832,39 @@ describe("Drawer queued steering edit (client)", () => {
 		};
 		const editor = (): HTMLTextAreaElement | null =>
 			container.querySelector<HTMLTextAreaElement>("#steer-edit-text");
+		return { container, root, task, editButton, editor };
+	};
+
+	/** Mounts the queued steer editor on the harness and submits its form once. */
+	const openAndSubmit = async (parts: ReturnType<typeof steerHarness>) => {
+		const { root, task, editButton, editor } = parts;
+		await act(async () => {
+			root.render(<Drawer {...base} act={runAct} task={task("first steer")} />);
+		});
+		await act(async () => {
+			onClickOf(editButton())({});
+		});
+		expect(editor()?.value).toBe("first steer");
+		const form = editor()?.closest("form");
+		if (form == null) throw new Error("no steer edit form");
+		await act(async () => {
+			form.dispatchEvent(
+				new window.Event("submit", {
+					bubbles: true,
+					cancelable: true,
+				}) as unknown as Event,
+			);
+		});
+	};
+
+	test("a replaced steer never reopens the editor with the stale draft", async () => {
+		// The drawer's effects fetch the task detail, session context and model
+		// catalog; every one degrades to null on a failed response, so a 404 keeps
+		// the row's own fields (pendingPrompt included) authoritative.
+		const { restore } = stubFetch(
+			async () => new Response("{}", { status: 404 }),
+		);
+		const { container, root, task, editButton, editor } = steerHarness();
 		try {
 			await act(async () => {
 				root.render(<Drawer {...base} task={task("first steer")} />);
@@ -3402,17 +3890,12 @@ describe("Drawer queued steering edit (client)", () => {
 				root.unmount();
 			});
 			container.remove();
-			globalThis.fetch = realFetch;
+			restore();
 		}
 	});
 
 	test("a refused steer edit keeps the draft across the detail refresh", async () => {
-		const realFetch = globalThis.fetch;
-		// The steer edit save is refused with the board's current row; every other
-		// fetch (task detail, session context, catalog) degrades to null like the
-		// replaced-steer test above, so the row's own fields stay authoritative.
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url) => {
 			if (url.includes("/steer/edit")) {
 				return new Response(
 					JSON.stringify({
@@ -3423,50 +3906,13 @@ describe("Drawer queued steering edit (client)", () => {
 				);
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		const task = (prompt: string) =>
-			cardFixture({
-				...drawerFields,
-				stage: "todo",
-				state: "queued",
-				pendingPrompt: prompt,
-			});
-		const editButton = (): Element => {
-			const node = container.querySelector(
-				'button[aria-label="Edit the queued steering"]',
-			);
-			if (node === null) throw new Error("no Edit button");
-			return node;
-		};
-		const editor = (): HTMLTextAreaElement | null =>
-			container.querySelector<HTMLTextAreaElement>("#steer-edit-text");
+		});
+		const h = steerHarness();
+		const { container, root, task, editButton, editor } = h;
 		try {
-			await act(async () => {
-				root.render(
-					<Drawer {...base} act={runAct} task={task("first steer")} />,
-				);
-			});
-			await act(async () => {
-				onClickOf(editButton())({});
-			});
-			expect(editor()?.value).toBe("first steer");
 			// The save is refused with the board's newer steering: the conflict flow
 			// keeps the draft and re-arms the revision.
-			const form = editor()?.closest("form");
-			if (form == null) throw new Error("no steer edit form");
-			await act(async () => {
-				form.dispatchEvent(
-					new window.Event("submit", {
-						bubbles: true,
-						cancelable: true,
-					}) as unknown as Event,
-				);
-			});
+			await openAndSubmit(h);
 			expect(container.textContent).toContain("changed while you were editing");
 			expect(container.textContent).toContain("second steer");
 			expect(editor()?.value).toBe("first steer");
@@ -3496,16 +3942,13 @@ describe("Drawer queued steering edit (client)", () => {
 				root.unmount();
 			});
 			container.remove();
-			globalThis.fetch = realFetch;
+			restore();
 		}
 	});
 
 	test("a refused steer edit keeps its draft when the queue empties or resumes", async () => {
-		const realFetch = globalThis.fetch;
-		// The steer edit save is refused with the board's current row; every other
-		// fetch degrades to null like the replaced-steer test above.
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
-			if (String(input).includes("/steer/edit"))
+		const { restore } = stubFetch(async (url) => {
+			if (String(url).includes("/steer/edit"))
 				return new Response(
 					JSON.stringify({
 						error: "card changed since it was loaded",
@@ -3514,28 +3957,8 @@ describe("Drawer queued steering edit (client)", () => {
 					{ status: 409 },
 				);
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		const task = (prompt: string) =>
-			cardFixture({
-				...drawerFields,
-				stage: "todo",
-				state: "queued",
-				pendingPrompt: prompt,
-			});
-		const editButton = (): Element => {
-			const node = container.querySelector(
-				'button[aria-label="Edit the queued steering"]',
-			);
-			if (node === null) throw new Error("no Edit button");
-			return node;
-		};
-		const editor = (): HTMLTextAreaElement | null =>
-			container.querySelector<HTMLTextAreaElement>("#steer-edit-text");
+		});
+		const { container, root, task, editButton, editor } = steerHarness();
 		const submit = async (): Promise<void> => {
 			await act(async () => {
 				const form = editor()?.closest("form");
@@ -3591,16 +4014,14 @@ describe("Drawer queued steering edit (client)", () => {
 				root.unmount();
 			});
 			container.remove();
-			globalThis.fetch = realFetch;
+			restore();
 		}
 	});
 
 	test("a refused steer edit restores the draft a pre-409 refresh cleared", async () => {
-		const realFetch = globalThis.fetch;
 		const gate = Promise.withResolvers<void>();
 		let refused = false;
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url) => {
 			if (url.includes("/steer/edit")) {
 				if (!refused) {
 					refused = true;
@@ -3617,48 +4038,11 @@ describe("Drawer queued steering edit (client)", () => {
 				);
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		const task = (prompt: string) =>
-			cardFixture({
-				...drawerFields,
-				stage: "todo",
-				state: "queued",
-				pendingPrompt: prompt,
-			});
-		const editButton = (): Element => {
-			const node = container.querySelector(
-				'button[aria-label="Edit the queued steering"]',
-			);
-			if (node === null) throw new Error("no Edit button");
-			return node;
-		};
-		const editor = (): HTMLTextAreaElement | null =>
-			container.querySelector<HTMLTextAreaElement>("#steer-edit-text");
+		});
+		const h = steerHarness();
+		const { container, root, task, editor } = h;
 		try {
-			await act(async () => {
-				root.render(
-					<Drawer {...base} act={runAct} task={task("first steer")} />,
-				);
-			});
-			await act(async () => {
-				onClickOf(editButton())({});
-			});
-			expect(editor()?.value).toBe("first steer");
-			await act(async () => {
-				const form = editor()?.closest("form");
-				if (form == null) throw new Error("no steer edit form");
-				form.dispatchEvent(
-					new window.Event("submit", {
-						bubbles: true,
-						cancelable: true,
-					}) as unknown as Event,
-				);
-			});
+			await openAndSubmit(h);
 			// The refresh lands while the 409 is still in flight: with no conflict
 			// yet, the pendingPrompt change clears the editor.
 			await act(async () => {
@@ -3680,98 +4064,19 @@ describe("Drawer queued steering edit (client)", () => {
 				root.unmount();
 			});
 			container.remove();
-			globalThis.fetch = realFetch;
+			restore();
 		}
 	});
 });
 
 describe("Drawer start actions wait for the prompt edit (client)", () => {
-	const project = {
-		name: "proj",
-		github: null,
-		hasRules: true,
-		sessionsDir: "/tmp/proj/.tasks/sessions",
-		settings: {},
-	} as unknown as ProjectView;
-	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
-	const drawerFields = {
-		kind: "work",
-		research: false,
-		report: null,
-		details: null,
-		branch: null,
-		model: null,
-		worktree: null,
-		sessionId: null,
-		images: [],
-		pendingImages: [],
-		shots: [],
-		keptFiles: [],
-		workCheckLog: [],
-	} as unknown as Partial<TaskCard>;
-	const base = {
-		task: null as never,
-		project,
-		act: async () => true,
-		onClose: () => {},
-		onFollowed: () => {},
-		projects: [],
-		read: true,
-		onMarkUnread: () => {},
-		onMarkSeen: () => {},
-		tasks: [],
-		onOpenTask: () => {},
-		draining: false,
-		usedTotal: 0,
-		maxTotal: null,
-	};
-	// React interaction needs browser globals; the setup mirrors the steering
-	// describe above: happy-dom registers them for this describe, and afterAll
-	// puts the originals back, so later test files in the same process see no DOM.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		Event: window.Event,
-		HTMLElement: window.HTMLElement,
-		HTMLTextAreaElement: window.HTMLTextAreaElement,
-		Node: window.Node,
-		getComputedStyle: window.getComputedStyle,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+	const _project = drawerProject;
+	const base = drawerBase;
+	const { window } = installDrawerClientGlobals();
 
 	// happy-dom's dispatched clicks never reach React's event plugin (same
 	// upstream gap as the steering describe above): call the production
 	// onClick React rendered onto the node instead.
-	const onClickOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onClick?: (e: unknown) => void;
-		};
-		if (props.onClick === undefined) throw new Error("node has no onClick");
-		return props.onClick;
-	};
 	// Buttons are found by their exact label; queries run on the DOM-typed
 	// container, so the casts stay inside the DOM lib's type family.
 	const button = (box: ParentNode, name: string): HTMLButtonElement => {
@@ -3784,17 +4089,6 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 	// The production onChange React rendered onto the node; textareas are typed by
 	// calling it with a minimal event object, since happy-dom's dispatched input
 	// event never reaches React's ChangeEventPlugin.
-	const onChangeOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onChange?: (e: unknown) => void;
-		};
-		if (props.onChange === undefined) throw new Error("node has no onChange");
-		return props.onChange;
-	};
 	/** Renders the task, opens the prompt editor, and runs `check` against the
 	 * guarded start action with the editor open and after Cancel finishes it. */
 	const expectGuard = async (
@@ -3802,12 +4096,7 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 		label: string,
 		freeTitle: string,
 	): Promise<void> => {
-		const realFetch = globalThis.fetch;
-		// The detail fetch fills the prompt (OTTR-965): serve the row back as the
-		// loaded task, so the Edit task button renders and the fixture's fields stay
-		// authoritative for the guard checks.
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url) => {
 			if (url.endsWith(`/tasks/${task.id}`)) {
 				return new Response(JSON.stringify({ ...task, turns: [] }), {
 					status: 200,
@@ -3815,7 +4104,7 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 				});
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
+		});
 		const container = window.document.createElement(
 			"div",
 		) as unknown as HTMLDivElement;
@@ -3858,7 +4147,7 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 				root.unmount();
 			});
 			container.remove();
-			globalThis.fetch = realFetch;
+			restore();
 		}
 	};
 
@@ -3917,18 +4206,46 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 		});
 	};
 
+	// The queued task these claim/save tests render, and the loaded detail the
+	// drawer's fetch effect reads back (OTTR-965): every test stubs the edit
+	// routes uniquely and falls through to serveTaskDetail for /tasks/t1.
+	const queuedCard = cardFixture({
+		...drawerFields,
+		stage: "todo",
+		state: "queued",
+		prompt: "queued idea",
+		revision: 1,
+	});
+	const serveTaskDetail = (url: string | URL): Response | null =>
+		String(url).endsWith("/tasks/t1")
+			? new Response(JSON.stringify({ ...queuedCard, turns: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				})
+			: null;
+
+	/** Mounts the queued card, lands the detail fetch, and opens the prompt
+	 * editor: the shared head of the hold-claim and save tests. */
+	const openPromptEditor = async () => {
+		const { container, unmount } = await mount(
+			<Drawer {...base} act={runAct} task={queuedCard} />,
+		);
+		// One more act lets the detail fetch land, so the Edit task button renders.
+		await act(async () => {});
+		await act(async () => {
+			onClickOf(button(container, "Edit task"))({});
+		});
+		expect(container.querySelector("#edit-text")).not.toBeNull();
+		return { container, unmount };
+	};
+
 	test("the hold claim is guarded by the draft's revision and the save carries it", async () => {
-		const realFetch = globalThis.fetch;
 		// The claim carries the draft's snapshot revision: the server refuses a claim
 		// whose revision is stale (another tab's content edit landed), and the save
 		// carries the same snapshot revision the claim confirmed.
 		const claims: Array<{ revision?: unknown }> = [];
 		const saves: Array<{ revision?: unknown }> = [];
-		globalThis.fetch = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url, init) => {
 			if (url.endsWith("/edit/start") && init?.method === "POST") {
 				const body = JSON.parse(String(init.body)) as { revision?: unknown };
 				claims.push(body);
@@ -3957,36 +4274,10 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 				);
 			}
 			// The detail fetch fills the prompt (OTTR-965): serve the row back loaded.
-			if (url.endsWith("/tasks/t1")) {
-				return new Response(JSON.stringify({ ...card, turns: [] }), {
-					status: 200,
-					headers: { "content-type": "application/json" },
-				});
-			}
-			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		const card = cardFixture({
-			...drawerFields,
-			stage: "todo",
-			state: "queued",
-			prompt: "queued idea",
-			revision: 1,
+			return serveTaskDetail(url) ?? new Response("{}", { status: 404 });
 		});
+		const { container, unmount } = await openPromptEditor();
 		try {
-			await act(async () => {
-				root.render(<Drawer {...base} act={runAct} task={card} />);
-			});
-			// One more act lets the detail fetch land, so the Edit task button renders.
-			await act(async () => {});
-			await act(async () => {
-				onClickOf(button(container, "Edit task"))({});
-			});
-			expect(container.querySelector("#edit-text")).not.toBeNull();
 			await act(async () => {});
 			await submitPromptEdit(container);
 			expect(claims).toHaveLength(1);
@@ -3998,23 +4289,15 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 				"changed while you were editing",
 			);
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	});
 
 	test("Save waits for the hold claim before it enables", async () => {
-		const realFetch = globalThis.fetch;
 		const gate = Promise.withResolvers<void>();
 		const saves: Array<{ revision?: unknown }> = [];
-		globalThis.fetch = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url, init) => {
 			if (url.endsWith("/edit/start")) {
 				await gate.promise;
 				return new Response(JSON.stringify({ ok: true, revision: 1 }), {
@@ -4027,36 +4310,10 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 				return new Response("{}", { status: 200 });
 			}
 			// The detail fetch fills the prompt (OTTR-965): serve the row back loaded.
-			if (url.endsWith("/tasks/t1")) {
-				return new Response(JSON.stringify({ ...card, turns: [] }), {
-					status: 200,
-					headers: { "content-type": "application/json" },
-				});
-			}
-			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		const card = cardFixture({
-			...drawerFields,
-			stage: "todo",
-			state: "queued",
-			prompt: "queued idea",
-			revision: 1,
+			return serveTaskDetail(url) ?? new Response("{}", { status: 404 });
 		});
+		const { container, unmount } = await openPromptEditor();
 		try {
-			await act(async () => {
-				root.render(<Drawer {...base} act={runAct} task={card} />);
-			});
-			// One more act lets the detail fetch land, so the Edit task button renders.
-			await act(async () => {});
-			await act(async () => {
-				onClickOf(button(container, "Edit task"))({});
-			});
-			expect(container.querySelector("#edit-text")).not.toBeNull();
 			// The claim is still in flight: Save cannot fire the unconditional path.
 			expect(promptSaveButton(container).disabled).toBe(true);
 			await submitPromptEdit(container);
@@ -4070,22 +4327,14 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			expect(saves[0]?.revision).toBe(1);
 		} finally {
 			gate.resolve();
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	});
 
 	test("a failed hold claim keeps Save disabled", async () => {
-		const realFetch = globalThis.fetch;
 		const saves: Array<unknown> = [];
-		globalThis.fetch = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url, init) => {
 			if (url.endsWith("/edit/start"))
 				return new Response("{}", { status: 500 });
 			if (url.endsWith("/edit") && init?.method === "POST") {
@@ -4093,58 +4342,24 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 				return new Response("{}", { status: 200 });
 			}
 			// The detail fetch fills the prompt (OTTR-965): serve the row back loaded.
-			if (url.endsWith("/tasks/t1")) {
-				return new Response(JSON.stringify({ ...card, turns: [] }), {
-					status: 200,
-					headers: { "content-type": "application/json" },
-				});
-			}
-			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		const card = cardFixture({
-			...drawerFields,
-			stage: "todo",
-			state: "queued",
-			prompt: "queued idea",
-			revision: 1,
+			return serveTaskDetail(url) ?? new Response("{}", { status: 404 });
 		});
+		const { container, unmount } = await openPromptEditor();
 		try {
-			await act(async () => {
-				root.render(<Drawer {...base} act={runAct} task={card} />);
-			});
-			// One more act lets the detail fetch land, so the Edit task button renders.
-			await act(async () => {});
-			await act(async () => {
-				onClickOf(button(container, "Edit task"))({});
-			});
-			expect(container.querySelector("#edit-text")).not.toBeNull();
 			await act(async () => {});
 			expect(promptSaveButton(container).disabled).toBe(true);
 			await submitPromptEdit(container);
 			expect(saves).toHaveLength(0);
 			expect(container.querySelector("#edit-text")).not.toBeNull();
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	});
 
 	test("a refused hold claim shows the conflict and keeps the draft", async () => {
-		const realFetch = globalThis.fetch;
 		const saves: Array<{ prompt: string; revision?: unknown }> = [];
-		globalThis.fetch = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url, init) => {
 			if (url.endsWith("/edit/start"))
 				return new Response(
 					JSON.stringify({
@@ -4162,30 +4377,12 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 				return new Response("{}", { status: 200 });
 			}
 			// The detail fetch fills the prompt (OTTR-965): serve the row back loaded.
-			if (url.endsWith("/tasks/t1")) {
-				return new Response(JSON.stringify({ ...card, turns: [] }), {
-					status: 200,
-					headers: { "content-type": "application/json" },
-				});
-			}
-			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		const card = cardFixture({
-			...drawerFields,
-			stage: "todo",
-			state: "queued",
-			prompt: "queued idea",
-			revision: 1,
+			return serveTaskDetail(url) ?? new Response("{}", { status: 404 });
 		});
+		const { container, unmount } = await mount(
+			<Drawer {...base} act={runAct} task={queuedCard} />,
+		);
 		try {
-			await act(async () => {
-				root.render(<Drawer {...base} act={runAct} task={card} />);
-			});
 			// One more act lets the detail fetch land, so the Edit task button renders.
 			await act(async () => {});
 			await act(async () => {
@@ -4204,22 +4401,14 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			expect(saves[0]?.revision).toBe(5);
 			expect(container.querySelector("#edit-text")).toBeNull();
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	});
 
 	test("a refused notes append retries onto the board's current notes", async () => {
-		const realFetch = globalThis.fetch;
 		const calls: Array<{ notes: string; revision?: unknown }> = [];
-		globalThis.fetch = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url, init) => {
 			if (url.endsWith("/release-notes") && init?.method === "POST") {
 				const body = JSON.parse(String(init.body)) as {
 					notes: string;
@@ -4243,12 +4432,7 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 				return new Response("{}", { status: 200 });
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		});
 		const card = cardFixture({
 			...drawerFields,
 			stage: "done",
@@ -4256,10 +4440,10 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			releaseVersion: "v1.0.0",
 			releaseNotes: "original notes",
 		});
+		const { container, unmount } = await mount(
+			<Drawer {...base} act={runAct} task={card} />,
+		);
 		try {
-			await act(async () => {
-				root.render(<Drawer {...base} act={runAct} task={card} />);
-			});
 			const editNotes = container.querySelector(
 				'button[aria-label="Edit release notes"]',
 			);
@@ -4292,11 +4476,8 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 				"changed while you were editing",
 			);
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	});
 
@@ -4310,9 +4491,8 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 		open: "Plan with agent" | "Move to todo",
 		want: string,
 	): Promise<void> => {
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
-			if (String(input).endsWith("/api/models"))
+		const { restore } = stubFetch(async (url) => {
+			if (String(url).endsWith("/api/models"))
 				return new Response(
 					JSON.stringify({
 						models: [
@@ -4334,13 +4514,8 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 					{ status: 200 },
 				);
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
+		});
 		resetCatalogCache();
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
 		const parked = cardFixture({
 			...drawerFields,
 			stage: "backlog",
@@ -4348,10 +4523,10 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			prompt: "parked idea",
 			...(cardModel !== null ? { model: cardModel } : {}),
 		});
+		const { container, unmount } = await mount(
+			<Drawer {...base} task={parked} />,
+		);
 		try {
-			await act(async () => {
-				root.render(<Drawer {...base} task={parked} />);
-			});
 			// One more act lets the catalog fetch land before the dialog opens.
 			await act(async () => {});
 			await act(async () => {
@@ -4363,11 +4538,8 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 					?.getAttribute("aria-label"),
 			).toBe(want);
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 			resetCatalogCache();
 		}
 	};
@@ -4406,12 +4578,10 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 	});
 
 	test("the open editor holds the card server-side and releases it on close", async () => {
-		const realFetch = globalThis.fetch;
 		// Record the hold calls; the detail GET serves the row back loaded (OTTR-965),
 		// so the Edit task button renders; everything else degrades to null detail.
 		const holds: string[] = [];
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url) => {
 			if (url.endsWith("/edit/start") || url.endsWith("/edit/stop"))
 				holds.push(url.endsWith("start") ? "start" : "stop");
 			if (url.endsWith("/tasks/t1")) {
@@ -4421,12 +4591,7 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 				});
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		});
 		// A queued todo card: the scheduler could start it at any tick, so its open
 		// editor must claim the hold (start) and release it when the editor is gone.
 		const task = cardFixture({
@@ -4435,10 +4600,10 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			state: "queued",
 			prompt: "do the thing",
 		});
+		const { container, unmount } = await mount(
+			<Drawer {...base} task={task} />,
+		);
 		try {
-			await act(async () => {
-				root.render(<Drawer {...base} task={task} />);
-			});
 			// One more act lets the detail fetch land, so the Edit task button renders.
 			await act(async () => {});
 			expect(holds).toEqual([]);
@@ -4454,57 +4619,18 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			expect(holds).toEqual(["start", "stop"]);
 			// The drawer unmounts with the editor open (Esc, X, drawer switch): the
 			// cleanup must release the hold too.
-			await act(async () => {
-				root.unmount();
-			});
+			await unmount();
 			expect(holds).toEqual(["start", "stop", "stop"]);
 		} finally {
 			container.remove();
-			globalThis.fetch = realFetch;
+			restore();
 		}
 	});
 });
 
 describe("Drawer approve button", () => {
-	const project = {
-		name: "proj",
-		github: null,
-		hasRules: true,
-		sessionsDir: "/tmp/proj/.tasks/sessions",
-		settings: {},
-	} as unknown as ProjectView;
-	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
-	const drawerFields = {
-		kind: "work",
-		research: false,
-		report: null,
-		details: null,
-		branch: null,
-		model: null,
-		worktree: null,
-		sessionId: null,
-		images: [],
-		pendingImages: [],
-		shots: [],
-		keptFiles: [],
-		workCheckLog: [],
-	} as unknown as Partial<TaskCard>;
-	const base = {
-		task: null as never,
-		project,
-		act: async () => true,
-		onClose: () => {},
-		onFollowed: () => {},
-		projects: [],
-		read: true,
-		onMarkUnread: () => {},
-		onMarkSeen: () => {},
-		tasks: [],
-		onOpenTask: () => {},
-		draining: false,
-		usedTotal: 0,
-		maxTotal: null,
-	};
+	const _project = drawerProject;
+	const base = drawerBase;
 	// The drawer itself is a native <dialog>, and closed compose dialogs render their
 	// children into static markup. One primary per surface judges what is on screen,
 	// so the closed `class="dialog"` blocks come out before counting; the drawer stays.
@@ -4782,6 +4908,7 @@ describe("Drawer approve button", () => {
 				options: [],
 				multi: false,
 				recommended: null,
+				text: true,
 			},
 		],
 	} satisfies Partial<TaskCard>;
@@ -4832,6 +4959,7 @@ describe("Drawer approve button", () => {
 					options: [],
 					multi: false,
 					recommended: null,
+					text: true,
 				},
 			],
 			worktreeFiles: ["mockup.html"],
@@ -4895,17 +5023,7 @@ describe("Drawer approve button", () => {
 });
 
 describe("cancelled cards on the board", () => {
-	const base = {
-		projectTasks: [] as TaskCard[],
-		hasRules: true,
-		github: null,
-		deltas: new Map<string, number>(),
-		open: () => {},
-		unread: () => false,
-		onReorder: async () => true,
-		filtering: false,
-		draining: false,
-	} as const;
+	const base = laneColBase;
 
 	test("a cancelled done card wears the Cancelled chip with its cancel time", () => {
 		const dead = cardFixture({
@@ -5016,8 +5134,7 @@ describe("cancelled cards on the board", () => {
 		);
 		// The project row's stage cells in column order: the cancelled card leaves
 		// In progress empty and lands in Done, like the board lanes show it.
-		const window = new Window({ url: "http://localhost/" });
-		const container = window.document.createElement("div");
+		const container = parseMarkup(html).createElement("div");
 		container.innerHTML = html;
 		const cellText = (label: string) =>
 			container.querySelector(`td[data-label="${label}"]`)!.textContent;
@@ -5033,10 +5150,8 @@ describe("cancelled cards on the board", () => {
 
 describe("Drawer research report button", () => {
 	// The drawer fetches the full task (with the report) in an effect, which
-	// renderToStaticMarkup never runs. Mount with happy-dom, the same pattern as
-	// settings.test.tsx, and serve the fetches through a mocked global fetch.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
+	// renderToStaticMarkup never runs. Mount with happy-dom (testDom.tsx) and
+	// serve the fetches through the install's fetch stub.
 	// OTTR-449's shape: the steps heading sits mid-report and holds a word between
 	// "recommended" and "steps".
 	const report449 = [
@@ -5110,44 +5225,44 @@ describe("Drawer research report button", () => {
 		prompt: "Loaded from the task route",
 		...drawerExtras,
 	} as unknown as TaskView;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		Event: window.Event,
-		HTMLElement: window.HTMLElement,
-		HTMLInputElement: window.HTMLInputElement,
-		HTMLTextAreaElement: window.HTMLTextAreaElement,
-		Node: window.Node,
-		getComputedStyle: window.getComputedStyle,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-		fetch: (url: unknown): Promise<Response> => {
-			const u = String(url);
-			const body = u.endsWith("/tasks/R-1")
-				? detailBody
-				: u.endsWith("/tasks/R-1/context")
-					? { context: null }
-					: u.endsWith("/tasks/P-1")
-						? parkedDetail
-						: u.endsWith("/tasks/P-1/context")
-							? { context: null }
-							: u.endsWith("/tasks/PR-1")
-								? proposalDetail
-								: u.endsWith("/tasks/PR-1/context")
-									? { context: null }
-									: null;
-			return Promise.resolve(
-				body === null
-					? new Response("{}", { status: 404 })
-					: new Response(JSON.stringify(body), {
-							status: 200,
-							headers: { "content-type": "application/json" },
-						}),
-			);
+	installBrowserGlobals(
+		[
+			"Event",
+			"HTMLInputElement",
+			"HTMLTextAreaElement",
+			"Node",
+			"getComputedStyle",
+			"requestAnimationFrame",
+			"cancelAnimationFrame",
+		],
+		{
+			fetch: (url: unknown): Promise<Response> => {
+				const u = String(url);
+				const body = u.endsWith("/tasks/R-1")
+					? detailBody
+					: u.endsWith("/tasks/R-1/context")
+						? { context: null }
+						: u.endsWith("/tasks/P-1")
+							? parkedDetail
+							: u.endsWith("/tasks/P-1/context")
+								? { context: null }
+								: u.endsWith("/tasks/PR-1")
+									? proposalDetail
+									: u.endsWith("/tasks/PR-1/context")
+										? { context: null }
+										: null;
+				return Promise.resolve(
+					body === null
+						? new Response("{}", { status: 404 })
+						: new Response(JSON.stringify(body), {
+								status: 200,
+								headers: { "content-type": "application/json" },
+							}),
+				);
+			},
 		},
-	};
-	const originals = new Map<string, unknown>();
+	);
+	const host = globalThis as unknown as Record<string, unknown>;
 	// Fields the Drawer body reads before the detail fetch lands; cardFixture's
 	// short cast omits them (the cancelled-card fixture carries the same set).
 	const rowFields = {
@@ -5164,44 +5279,8 @@ describe("Drawer research report button", () => {
 		workCheckLog: [],
 	};
 
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
-
-	const project = {
-		name: "proj",
-		hasRules: true,
-		github: null,
-		sessionsDir: "/tmp/sessions",
-		settings: { maxParallel: 1 },
-	} as unknown as ProjectView;
-	const base = {
-		project,
-		act: async () => true,
-		onClose: () => {},
-		onFollowed: () => {},
-		projects: [],
-		read: true,
-		onMarkUnread: () => {},
-		onMarkSeen: () => {},
-		tasks: [],
-		onOpenTask: () => {},
-		draining: false,
-		usedTotal: 0,
-		maxTotal: null,
-	};
+	const _project = listProject;
+	const base = listBaseRead;
 
 	/** Mounts the drawer for a task row and flushes the detail fetch. */
 	const mountDrawer = async (
@@ -5210,22 +5289,51 @@ describe("Drawer research report button", () => {
 		container: HTMLElement;
 		unmount: () => Promise<void>;
 	}> => {
-		const container = document.createElement("div");
-		document.body.append(container);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(<Drawer {...base} task={task} />);
-		});
+		const { container, unmount } = await mount(
+			<Drawer {...base} task={task} />,
+		);
 		await act(async () => {});
 		return {
 			container,
 			// Inside act, so no callback survives the test into the next one.
 			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
+				await unmount();
 			},
 		};
+	};
+
+	/** One settled run row for R-1; only the id and dispatched model vary. */
+	const turnRow = (id: number, dispatchedModel: string | null) => ({
+		id,
+		taskId: "R-1",
+		kind: "work",
+		input: null,
+		inputBy: null,
+		startedAt: Date.now() - 65_000,
+		endedAt: Date.now() - 5_000,
+		pid: null,
+		exitCode: 0,
+		outcome: "ready",
+		summary: null,
+		details: null,
+		question: null,
+		error: null,
+		model: "zai/glm-5.3",
+		dispatchedModel,
+	});
+
+	/** Mounts the done research row R-1 and opens the drawer. */
+	const mountDoneRow = async () => {
+		const row = cardFixture({
+			id: "R-1",
+			kind: "work",
+			research: true,
+			stage: "done",
+			state: "idle",
+			...rowFields,
+		});
+		const { container, unmount } = await mountDrawer(row);
+		return { container, unmount };
 	};
 
 	test("the drawer renders the prompt from the task route, not the row", async () => {
@@ -5262,23 +5370,18 @@ describe("Drawer research report button", () => {
 			}
 			return realFetch(input, init);
 		}) as unknown as typeof fetch;
-		const container = document.createElement("div");
-		document.body.append(container);
-		const root = createRoot(container);
+		const { container, unmount } = await mount(
+			<Drawer
+				{...base}
+				task={cardFixture({
+					id: "R-1",
+					stage: "done",
+					state: "idle",
+					research: true,
+				})}
+			/>,
+		);
 		try {
-			await act(async () => {
-				root.render(
-					<Drawer
-						{...base}
-						task={cardFixture({
-							id: "R-1",
-							stage: "done",
-							state: "idle",
-							research: true,
-						})}
-					/>,
-				);
-			});
 			expect(
 				container.querySelector('[aria-label="Loading the prompt"]'),
 			).not.toBeNull();
@@ -5296,10 +5399,7 @@ describe("Drawer research report button", () => {
 			expect(container.textContent).not.toContain("Edit task");
 		} finally {
 			globalThis.fetch = realFetch;
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
+			await unmount();
 		}
 	});
 
@@ -5383,7 +5483,8 @@ describe("Drawer research report button", () => {
 	test("the work check rows name the role each check ran with", async () => {
 		// OTTR-916: the row names the role the model came from. A fallback check
 		// (picked role unset, model from the default role) reads "default role",
-		// and a record written before the field existed renders without a role.
+		// a record written before the field existed renders without a role, and
+		// a routed check names its own role (OTTR-1116).
 		const at = 1_700_000_000_000;
 		detailBody.workCheckLog = [
 			{
@@ -5422,21 +5523,23 @@ describe("Drawer research report button", () => {
 				notes: [],
 				durationMs: 9_000,
 			},
+			{
+				at,
+				model: "zai/glm-5.3-flash",
+				role: "reviewer",
+				outcome: "pass",
+				blockers: [],
+				notes: [],
+				durationMs: 3_000,
+			},
 		] as unknown as typeof detailBody.workCheckLog;
-		const row = cardFixture({
-			id: "R-1",
-			kind: "work",
-			research: true,
-			stage: "done",
-			state: "idle",
-			...rowFields,
-		});
-		const { container, unmount } = await mountDrawer(row);
+
+		const { container, unmount } = await mountDoneRow();
 		try {
 			const rows = container.querySelectorAll(".wc-run");
-			expect(rows.length).toBe(4);
+			expect(rows.length).toBe(5);
 			const texts = Array.from(rows, (p) => p.textContent ?? "");
-			const [adversary, fallback, fallbackDefault, legacy] = texts;
+			const [adversary, fallback, fallbackDefault, legacy, routed] = texts;
 			expect(adversary).toContain("adversary");
 			expect(adversary).toContain("gpt-6");
 			expect(fallback).toContain("default role");
@@ -5452,6 +5555,12 @@ describe("Drawer research report button", () => {
 			expect(legacy).not.toContain("critic");
 			expect(legacy).not.toContain("adversary");
 			expect(legacy).not.toContain("default role");
+			// A routing rule's own role shows by name with its model.
+			expect(routed).toContain("reviewer");
+			expect(routed).toContain("glm-5.3-flash");
+			expect(routed).not.toContain("default role");
+			expect(routed).not.toContain("critic");
+			expect(routed).not.toContain("adversary");
 		} finally {
 			await act(async () => {
 				detailBody.workCheckLog = [];
@@ -5508,34 +5617,9 @@ describe("Drawer research report button", () => {
 	test("a turn that served another model than dispatched names the swap", async () => {
 		// The provider-error fallback: the timeline row says what was dispatched and
 		// what ran, so a steered model pick that did not run is legible, not silent.
-		const swapped = {
-			id: 1,
-			taskId: "R-1",
-			kind: "work",
-			input: null,
-			inputBy: null,
-			startedAt: Date.now() - 65_000,
-			endedAt: Date.now() - 5_000,
-			pid: null,
-			exitCode: 0,
-			outcome: "ready",
-			summary: null,
-			details: null,
-			question: null,
-			error: null,
-			model: "zai/glm-5.3",
-			dispatchedModel: "anthropic/claude-opus-5-5:medium",
-		};
+		const swapped = turnRow(1, "anthropic/claude-opus-5-5:medium");
 		detailBody.turns = [swapped] as unknown as typeof detailBody.turns;
-		const row = cardFixture({
-			id: "R-1",
-			kind: "work",
-			research: true,
-			stage: "done",
-			state: "idle",
-			...rowFields,
-		});
-		const { container, unmount } = await mountDrawer(row);
+		const { container, unmount } = await mountDoneRow();
 		try {
 			const note = container.querySelector(".turn-sum")?.textContent ?? "";
 			expect(note).toContain("dispatched");
@@ -5551,34 +5635,9 @@ describe("Drawer research report button", () => {
 	});
 
 	test("a turn without a dispatched selector renders no swap note", async () => {
-		const steady = {
-			id: 2,
-			taskId: "R-1",
-			kind: "work",
-			input: null,
-			inputBy: null,
-			startedAt: Date.now() - 65_000,
-			endedAt: Date.now() - 5_000,
-			pid: null,
-			exitCode: 0,
-			outcome: "ready",
-			summary: null,
-			details: null,
-			question: null,
-			error: null,
-			model: "zai/glm-5.3",
-			dispatchedModel: null,
-		};
+		const steady = turnRow(2, null);
 		detailBody.turns = [steady] as unknown as typeof detailBody.turns;
-		const row = cardFixture({
-			id: "R-1",
-			kind: "work",
-			research: true,
-			stage: "done",
-			state: "idle",
-			...rowFields,
-		});
-		const { container, unmount } = await mountDrawer(row);
+		const { container, unmount } = await mountDoneRow();
 		try {
 			const head = container.querySelector(".turn-head")?.textContent ?? "";
 			expect(head).toContain("glm-5.3");
@@ -5592,15 +5651,7 @@ describe("Drawer research report button", () => {
 	});
 
 	test("a done research card whose report recommends steps shows Implement steps", async () => {
-		const row = cardFixture({
-			id: "R-1",
-			kind: "work",
-			research: true,
-			stage: "done",
-			state: "idle",
-			...rowFields,
-		});
-		const { container, unmount } = await mountDrawer(row);
+		const { container, unmount } = await mountDoneRow();
 		try {
 			expect(container.innerHTML).toContain("Follow up");
 			expect(container.innerHTML).toContain("Implement steps");
@@ -5647,15 +5698,7 @@ describe("Drawer research report button", () => {
 
 	test("a done research card without a step section hides Implement steps", async () => {
 		detailBody.report = "## Short answer\n\nNothing to do.";
-		const row = cardFixture({
-			id: "R-1",
-			kind: "work",
-			research: true,
-			stage: "done",
-			state: "idle",
-			...rowFields,
-		});
-		const { container, unmount } = await mountDrawer(row);
+		const { container, unmount } = await mountDoneRow();
 		try {
 			expect(container.innerHTML).toContain("Follow up");
 			expect(container.innerHTML).not.toContain("Implement steps");
@@ -5666,44 +5709,8 @@ describe("Drawer research report button", () => {
 });
 
 describe("Drawer of a cancelled card opens read-only", () => {
-	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
-	const drawerFields = {
-		kind: "work",
-		research: false,
-		report: null,
-		details: null,
-		branch: null,
-		model: null,
-		worktree: null,
-		sessionId: null,
-		images: [],
-		pendingImages: [],
-		shots: [],
-		keptFiles: [],
-		workCheckLog: [],
-	} as unknown as Partial<TaskCard>;
-	const project = {
-		name: "proj",
-		hasRules: true,
-		github: null,
-		sessionsDir: "/tmp/sessions",
-		settings: { maxParallel: 1 },
-	} as unknown as ProjectView;
-	const base = {
-		project,
-		act: async () => true,
-		onClose: () => {},
-		onFollowed: () => {},
-		projects: [],
-		read: true,
-		onMarkUnread: () => {},
-		onMarkSeen: () => {},
-		tasks: [],
-		onOpenTask: () => {},
-		draining: false,
-		usedTotal: 0,
-		maxTotal: null,
-	};
+	const _project = listProject;
+	const base = listBaseRead;
 
 	test("a cancelled done card keeps its story and loses every action", () => {
 		const dead = cardFixture({
@@ -6027,44 +6034,18 @@ describe("Drawer of a cancelled card opens read-only", () => {
 // The run status after a real ask needs the noteFor state, so these tests mount
 // PrReviewSection on happy-dom (the same swap as the drawer mount tests above).
 describe("PR review draft-run status on a mounted ask composer", () => {
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		Event: window.Event,
-		HTMLElement: window.HTMLElement,
-		HTMLInputElement: window.HTMLInputElement,
-		HTMLTextAreaElement: window.HTMLTextAreaElement,
-		Node: window.Node,
-		getComputedStyle: window.getComputedStyle,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+	installBrowserGlobals([
+		"Event",
+		"HTMLElement",
+		"HTMLInputElement",
+		"HTMLTextAreaElement",
+		"Node",
+		"getComputedStyle",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
 
-	const project = {
-		name: "proj",
-		hasRules: true,
-		github: null,
-		sessionsDir: "/tmp/sessions",
-		settings: { maxParallel: 1 },
-	} as unknown as ProjectView;
+	const project = listProject;
 	const drawerBase = {
 		project,
 		act: async () => true,
@@ -6158,36 +6139,24 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 	};
 
 	test("an ask shows Writing a new draft, then the failed run's error", async () => {
-		const realFetch = globalThis.fetch;
 		const posts: { url: string; body: string }[] = [];
-		globalThis.fetch = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url, init) => {
 			if (url.endsWith("/tasks/P-5/reply") && init?.method === "POST") {
 				posts.push({ url, body: String(init.body) });
 				return new Response(JSON.stringify({ ok: true }));
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		});
+		const { container, root, unmount } = await mount(
+			<PrReviewSection
+				task={view(card())}
+				pr={prView(null)}
+				draft={draft}
+				act={actProp}
+				onLoaded={() => {}}
+			/>,
+		);
 		try {
-			await act(async () => {
-				root.render(
-					<PrReviewSection
-						task={view(card())}
-						pr={prView(null)}
-						draft={draft}
-						act={actProp}
-						onLoaded={() => {}}
-					/>,
-				);
-			});
 			const note = container.querySelector(
 				"#pr-review-note",
 			) as unknown as HTMLTextAreaElement;
@@ -6233,35 +6202,25 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 			const alert = container.querySelector('[role="alert"]');
 			expect(alert?.textContent).toBe("gateway down");
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	});
 
 	test("a landed draft flips the status to New draft ready, typing hides it", async () => {
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async () =>
-			new Response(JSON.stringify({ ok: true }))) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		const { restore } = stubFetch(
+			async () => new Response(JSON.stringify({ ok: true })),
+		);
+		const { container, root, unmount } = await mount(
+			<PrReviewSection
+				task={view(card())}
+				pr={prView(null)}
+				draft={draft}
+				act={actProp}
+				onLoaded={() => {}}
+			/>,
+		);
 		try {
-			await act(async () => {
-				root.render(
-					<PrReviewSection
-						task={view(card())}
-						pr={prView(null)}
-						draft={draft}
-						act={actProp}
-						onLoaded={() => {}}
-					/>,
-				);
-			});
 			const note = container.querySelector(
 				"#pr-review-note",
 			) as unknown as HTMLTextAreaElement;
@@ -6325,35 +6284,25 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 			expect(container.textContent).toContain("Writing a new draft...");
 			expect(container.textContent).not.toContain("New draft ready.");
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	});
 
 	test("an edited review box keeps the user's text when a draft lands", async () => {
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async () =>
-			new Response(JSON.stringify({ ok: true }))) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		const { restore } = stubFetch(
+			async () => new Response(JSON.stringify({ ok: true })),
+		);
+		const { container, root, unmount } = await mount(
+			<PrReviewSection
+				task={view(card())}
+				pr={prView(null)}
+				draft={draft}
+				act={actProp}
+				onLoaded={() => {}}
+			/>,
+		);
 		try {
-			await act(async () => {
-				root.render(
-					<PrReviewSection
-						task={view(card())}
-						pr={prView(null)}
-						draft={draft}
-						act={actProp}
-						onLoaded={() => {}}
-					/>,
-				);
-			});
 			const box = container.querySelector(
 				"#pr-review-text",
 			) as unknown as HTMLTextAreaElement;
@@ -6387,41 +6336,31 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 			).toBe("my own edit");
 			expect(container.textContent).toContain("New draft ready.");
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	});
 
 	test("a second ask waits past the stale ended record and shows the new run", async () => {
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async () =>
-			new Response(JSON.stringify({ ok: true }))) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		const { restore } = stubFetch(
+			async () => new Response(JSON.stringify({ ok: true })),
+		);
+		const { container, root, unmount } = await mount(
+			<PrReviewSection
+				task={view(card())}
+				pr={prView({
+					startedAt: 1_000,
+					endedAt: 1_400,
+					error: null,
+					model: "@plan",
+				})}
+				draft={draft}
+				act={actProp}
+				onLoaded={() => {}}
+			/>,
+		);
 		try {
 			// The card already holds a clean ended run from an earlier ask.
-			await act(async () => {
-				root.render(
-					<PrReviewSection
-						task={view(card())}
-						pr={prView({
-							startedAt: 1_000,
-							endedAt: 1_400,
-							error: null,
-							model: "@plan",
-						})}
-						draft={draft}
-						act={actProp}
-						onLoaded={() => {}}
-					/>,
-				);
-			});
 			const note = container.querySelector(
 				"#pr-review-note",
 			) as unknown as HTMLTextAreaElement;
@@ -6493,23 +6432,18 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 			expect(container.textContent).toContain("gateway down");
 			expect(container.textContent).not.toContain("Writing a new draft...");
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	});
 
 	// A pr_review card has no turns: its Work steps section shows the card log
 	// through LogView, so the draft-run lines live-update like a turn's output.
 	test("a pr_review drawer's Work steps show the card log, not No turns yet", async () => {
-		const realFetch = globalThis.fetch;
 		const logText =
 			"== pr review draft 2026-11-16T10:00:00.000Z (model @plan)\n" +
 			"- draft saved 2026-11-16T10:00:30.000Z (took 30s)\n";
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url) => {
 			if (url.endsWith("/tasks/P-5")) {
 				return new Response(JSON.stringify(view(card())), {
 					status: 200,
@@ -6527,16 +6461,11 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 				});
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		});
+		const { container, unmount } = await mount(
+			<Drawer {...drawerBase} task={card()} />,
+		);
 		try {
-			await act(async () => {
-				root.render(<Drawer {...drawerBase} task={card()} />);
-			});
 			await act(async () => {
 				await Bun.sleep(10);
 			});
@@ -6546,11 +6475,8 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 			expect(log?.textContent).toContain("draft saved");
 			expect(container.textContent).not.toContain("No turns yet.");
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	});
 });
@@ -6771,19 +6697,16 @@ describe("Overview Context, max tile and column", () => {
 
 describe("implementSteps", () => {
 	/** Fetch stub recording each URL and request body; answers one JSON body. */
-	function stubFetch(responses: Array<{ status: number; body: unknown }>) {
+	function jsonStub(responses: Array<{ status: number; body: unknown }>) {
 		const calls: string[] = [];
 		const bodies: unknown[] = [];
 		const real = globalThis.fetch;
-		globalThis.fetch = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		) => {
-			calls.push(String(input));
+		stubFetch(async (url, init) => {
+			calls.push(String(url));
 			bodies.push(JSON.parse(String(init?.body)));
 			const next = responses.shift()!;
 			return new Response(JSON.stringify(next.body), { status: next.status });
-		}) as typeof fetch;
+		});
 		return {
 			calls,
 			bodies,
@@ -6794,7 +6717,7 @@ describe("implementSteps", () => {
 	}
 
 	test("clears the pin after the follow-up lands on the picked model, then hands off", async () => {
-		const stub = stubFetch([
+		const stub = jsonStub([
 			{ status: 200, body: { id: "NEXT-1", project: "proj" } },
 		]);
 		try {
@@ -6818,7 +6741,7 @@ describe("implementSteps", () => {
 	});
 
 	test("an unchanged pick sends no model, so the server runs the default", async () => {
-		const stub = stubFetch([
+		const stub = jsonStub([
 			{ status: 200, body: { id: "NEXT-1", project: "proj" } },
 		]);
 		try {
@@ -6835,7 +6758,7 @@ describe("implementSteps", () => {
 	});
 
 	test("a failed follow-up leaves the pin up", async () => {
-		const stub = stubFetch([{ status: 500, body: { error: "nope" } }]);
+		const stub = jsonStub([{ status: 500, body: { error: "nope" } }]);
 		try {
 			await expect(
 				implementSteps({
@@ -6855,48 +6778,31 @@ describe("implementSteps", () => {
 
 describe("FollowUpDialog project picker", () => {
 	// Same happy-dom setup as the drawer tests: globals for this describe only.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
 	const bodies: Array<{ url: string; body: unknown }> = [];
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		Event: window.Event,
-		HTMLElement: window.HTMLElement,
-		HTMLTextAreaElement: window.HTMLTextAreaElement,
-		Node: window.Node,
-		getComputedStyle: window.getComputedStyle,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-		fetch: (url: unknown, init?: RequestInit): Promise<Response> => {
-			const u = String(url);
-			if (!u.endsWith("/follow-up"))
-				return Promise.resolve(new Response("{}", { status: 404 }));
-			bodies.push({ url: u, body: JSON.parse(String(init?.body)) });
-			return Promise.resolve(
-				new Response(JSON.stringify({ id: "N-1", project: "other" }), {
-					status: 200,
-					headers: { "content-type": "application/json" },
-				}),
-			);
+	const { window } = installBrowserGlobals(
+		[
+			"Event",
+			"HTMLTextAreaElement",
+			"Node",
+			"getComputedStyle",
+			"requestAnimationFrame",
+			"cancelAnimationFrame",
+		],
+		{
+			fetch: (url: unknown, init?: RequestInit): Promise<Response> => {
+				const u = String(url);
+				if (!u.endsWith("/follow-up"))
+					return Promise.resolve(new Response("{}", { status: 404 }));
+				bodies.push({ url: u, body: JSON.parse(String(init?.body)) });
+				return Promise.resolve(
+					new Response(JSON.stringify({ id: "N-1", project: "other" }), {
+						status: 200,
+						headers: { "content-type": "application/json" },
+					}),
+				);
+			},
 		},
-	};
-	const originals = new Map<string, unknown>();
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+	);
 	test("files the follow-up into the picked project", async () => {
 		const proj = (name: string) =>
 			({ name, gitless: false, settings: {} }) as unknown as ProjectView;
@@ -6994,26 +6900,7 @@ describe("path URL card links", () => {
 		workCheckLog: [],
 		updateIds: [],
 	} as unknown as Partial<TaskCard>;
-	const drawerBase = {
-		project: {
-			name: "proj",
-			hasRules: true,
-			github: null,
-			sessionsDir: "/tmp/sessions",
-			settings: { maxParallel: 1 },
-		} as unknown as ProjectView,
-		act: async () => true,
-		onClose: () => {},
-		onFollowed: () => {},
-		projects: [],
-		read: false,
-		onMarkUnread: () => {},
-		onMarkSeen: () => {},
-		onOpenTask: () => {},
-		draining: false,
-		usedTotal: 0,
-		maxTotal: null,
-	};
+	const drawerBase = listBaseReadonly;
 
 	test("a board card opens through an anchor to the card's path", () => {
 		const html = renderToStaticMarkup(
@@ -7178,61 +7065,25 @@ test("OTTR-827: the rail dot counts exactly the cards whose face shows New", () 
 });
 
 describe("ProjectBoard search delay", () => {
-	// React interaction needs browser globals; bun test has none. The same happy-dom
-	// swap as settings.test.tsx: installed after app.tsx's import (its browser mount
-	// guard reads document at module load), removed after this file's tests.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		HTMLElement: window.HTMLElement,
-		HTMLInputElement: window.HTMLInputElement,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+	const { window } = installBrowserGlobals([
+		"HTMLElement",
+		"HTMLInputElement",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
 
 	/** A React onChange picks up programmatic edits only through the native value setter (see settings.test.tsx). */
-	const typeInto = (el: HTMLInputElement, value: string): void => {
-		const setter = Object.getOwnPropertyDescriptor(
-			window.HTMLInputElement.prototype,
-			"value",
-		)?.set;
-		if (setter === undefined) throw new Error("value setter missing");
-		setter.call(el, value);
+	/** Types and fires the native change in one act scope. */
+	const typeAndSearch = async (
+		el: HTMLInputElement,
+		value: string,
+	): Promise<void> => {
+		await act(async () => {
+			typeInto(el, value);
+			onChangeOf(el)({ target: { value } });
+		});
 	};
-
-	/** The production onChange React rendered onto the node; happy-dom's dispatched
-	 *  input event never reaches React's ChangeEventPlugin (see settings.test.tsx). */
-	const onChangeOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onChange?: (e: unknown) => void;
-		};
-		if (props.onChange === undefined) throw new Error("node has no onChange");
-		return props.onChange;
-	};
+	const typeInto = typeIntoFor(window);
 
 	/** The board with three queued cards: "docs" matches exactly one. */
 	async function mountBoard(): Promise<{
@@ -7240,11 +7091,6 @@ describe("ProjectBoard search delay", () => {
 		input: HTMLInputElement;
 		unmount: () => Promise<void>;
 	}> {
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
 		const tasks = [
 			cardFixture({ id: "t1", title: "Fix bug", sessionTitle: "Fix bug" }),
 			cardFixture({
@@ -7254,36 +7100,8 @@ describe("ProjectBoard search delay", () => {
 			}),
 			cardFixture({ id: "t3", title: "Add icon", sessionTitle: "Add icon" }),
 		];
-		const project = {
-			name: "proj",
-			hasRules: true,
-			github: null,
-			gitless: false,
-			dirty: false,
-			archReview: null,
-			latestRelease: null,
-			latestImage: null,
-			doneTotal: 0,
-			settings: { setupChecklist: false },
-			sessionsDir: "/tmp/s",
-		} as unknown as ProjectView;
-		await act(async () => {
-			root.render(
-				<ProjectBoard
-					project={project}
-					tasks={tasks}
-					deltas={new Map()}
-					open={() => {}}
-					seenAnswers={new Set()}
-					seenDoneSince={0}
-					compose={() => {}}
-					composeDraft={() => {}}
-					act={async () => true}
-					onNotice={() => {}}
-					draining={false}
-				/>,
-			);
-		});
+		const project = boardProject(0);
+		const { container, unmount } = await mountProjectBoard(project, tasks);
 		const input = container.querySelector(
 			'input[aria-label="Search tasks"]',
 		) as HTMLInputElement | null;
@@ -7292,10 +7110,7 @@ describe("ProjectBoard search delay", () => {
 			container,
 			input,
 			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
+				await unmount();
 			},
 		};
 	}
@@ -7314,31 +7129,27 @@ describe("ProjectBoard search delay", () => {
 			expect(cards().sort()).toEqual(["t1", "t2", "t3"]);
 			// Each phase is its own act: React defers an update from the apply timer to
 			// the act scope's exit, so the flush lands between phases, before the assert.
-			await act(async () => {
-				typeInto(input, "docs");
-				onChangeOf(input)({ target: { value: "docs" } });
-			});
+			await typeAndSearch(input, "docs");
 			// Inside the wait window the deadline has not passed: nothing filters.
 			await act(async () => {
 				await Bun.sleep(SEARCH_APPLY_MS - 100);
 			});
 			expect(count()).toBe("3");
 			expect(cards().sort()).toEqual(["t1", "t2", "t3"]);
-			// Past the deadline, one card matches and the count box says so.
+			// Past the deadline, one card matches. The board's fetch carries no mock
+			// here, so the done search fails: the count marks the done matches
+			// unknown instead of posing the window's count as the whole result.
 			await act(async () => {
 				await Bun.sleep(SEARCH_APPLY_MS + 60);
 			});
-			expect(count()).toBe("1/3");
+			expect(count()).toBe("—/3");
 			expect(cards()).toEqual(["t2"]);
 			// Clearing waits the same way, then brings every card back.
-			await act(async () => {
-				typeInto(input, "");
-				onChangeOf(input)({ target: { value: "" } });
-			});
+			await typeAndSearch(input, "");
 			await act(async () => {
 				await Bun.sleep(SEARCH_APPLY_MS - 100);
 			});
-			expect(count()).toBe("1/3");
+			expect(count()).toBe("—/3");
 			await act(async () => {
 				await Bun.sleep(SEARCH_APPLY_MS + 60);
 			});
@@ -7358,39 +7169,18 @@ describe("ProjectBoard search delay", () => {
 describe("ProjectBoard done lane time view", () => {
 	// React rendering needs browser globals; the same happy-dom swap as the search
 	// delay tests above.
-	const window = new Window({ url: "http://localhost/projects/proj" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		HTMLElement: window.HTMLElement,
-		HTMLInputElement: window.HTMLInputElement,
+	const { window } = installBrowserGlobals([
+		"HTMLElement",
+		"HTMLInputElement",
 		// The lane's Show more handler reads Node.DOCUMENT_POSITION_PRECEDING;
 		// happy-dom exposes it on its own Window only.
-		Node: window.Node,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+		"Node",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
 
 	test("the done lane shows the state window and Show more fetches the server pages", async () => {
+		const fetches: string[] = [];
 		// The state holds only the newest window (OTTR-965): 20 held cards here, five
 		// older ones on the server. "Show more" fetches page 2; the head count and the
 		// button label read doneTotal, the project's true done+cancelled size.
@@ -7400,11 +7190,6 @@ describe("ProjectBoard done lane time view", () => {
 		const olderPage = Array.from({ length: 5 }, (_, j) =>
 			cardFixture({ id: `o${j}`, stage: "done", state: "idle", doneAt: j - 5 }),
 		);
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
 		const project = {
 			name: "proj",
 			hasRules: true,
@@ -7418,9 +7203,7 @@ describe("ProjectBoard done lane time view", () => {
 			settings: { setupChecklist: false },
 			sessionsDir: "/tmp/s",
 		} as unknown as ProjectView;
-		const realFetch = globalThis.fetch;
-		const fetches: string[] = [];
-		globalThis.fetch = (async (url: RequestInfo | URL) => {
+		const { restore } = stubFetch(async (url) => {
 			const u = String(url);
 			if (u === "/api/projects/proj/done?page=2") {
 				fetches.push(u);
@@ -7430,25 +7213,9 @@ describe("ProjectBoard done lane time view", () => {
 				});
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
+		});
+		const { container, unmount } = await mountProjectBoard(project, held);
 		try {
-			await act(async () => {
-				root.render(
-					<ProjectBoard
-						project={project}
-						tasks={held}
-						deltas={new Map()}
-						open={() => {}}
-						seenAnswers={new Set()}
-						seenDoneSince={0}
-						compose={() => {}}
-						composeDraft={() => {}}
-						act={async () => true}
-						onNotice={() => {}}
-						draining={false}
-					/>,
-				);
-			});
 			const lane = container.querySelector('[data-stage="done"]');
 			expect(lane).not.toBeNull();
 			// The switch is gone for good: no view-toggle element anywhere, and the
@@ -7478,15 +7245,13 @@ describe("ProjectBoard done lane time view", () => {
 			// Every card the server holds is on the board now: the button is gone.
 			expect(lane!.querySelector("button.lane-more")).toBeNull();
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	});
 
 	test("Show more keeps advancing pages when a page holds pinned cards", async () => {
+		const fetches: string[] = [];
 		// The server pins starred past the window into the state (boardCards) but
 		// slices every page over all settled cards (donePage): page 2 here carries
 		// the starred card plus only 19 older ones. Counting the held cards repeats
@@ -7510,11 +7275,6 @@ describe("ProjectBoard done lane time view", () => {
 			}),
 		);
 		const settled = [...held, pinned, ...older].sort(newestLanded);
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
 		const project = {
 			name: "proj",
 			hasRules: true,
@@ -7528,9 +7288,7 @@ describe("ProjectBoard done lane time view", () => {
 			settings: { setupChecklist: false },
 			sessionsDir: "/tmp/s",
 		} as unknown as ProjectView;
-		const realFetch = globalThis.fetch;
-		const fetches: string[] = [];
-		globalThis.fetch = (async (url: RequestInfo | URL) => {
+		const { restore } = stubFetch(async (url) => {
 			const u = String(url);
 			const m = /^\/api\/projects\/proj\/done\?page=(\d+)$/.exec(u);
 			if (m) {
@@ -7544,25 +7302,12 @@ describe("ProjectBoard done lane time view", () => {
 				});
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
+		});
+		const { container, unmount } = await mountProjectBoard(project, [
+			...held,
+			pinned,
+		]);
 		try {
-			await act(async () => {
-				root.render(
-					<ProjectBoard
-						project={project}
-						tasks={[...held, pinned]}
-						deltas={new Map()}
-						open={() => {}}
-						seenAnswers={new Set()}
-						seenDoneSince={0}
-						compose={() => {}}
-						composeDraft={() => {}}
-						act={async () => true}
-						onNotice={() => {}}
-						draining={false}
-					/>,
-				);
-			});
 			const lane = container.querySelector('[data-stage="done"]');
 			const ids = (): string[] =>
 				[...lane!.querySelectorAll("[data-task-id]")].map(
@@ -7613,11 +7358,512 @@ describe("ProjectBoard done lane time view", () => {
 			expect([...ids()].sort()).toEqual(settled.map((t) => t.id).sort());
 			expect(lane!.querySelector("button.lane-more")).toBeNull();
 		} finally {
+			await unmount();
+			restore();
+		}
+	});
+
+	/** A React onChange picks up programmatic edits only through the native value setter (see settings.test.tsx). */
+	const typeInto = typeIntoFor(window);
+
+	/** Types and fires the native change in one act scope. */
+	const typeAndSearch = async (
+		el: HTMLInputElement,
+		value: string,
+	): Promise<void> => {
+		await act(async () => {
+			typeInto(el, value);
+			onChangeOf(el)({ target: { value } });
+		});
+	};
+	/** One act past the search apply window. */
+	const searchSettle = async (): Promise<void> => {
+		await act(async () => {
+			await Bun.sleep(SEARCH_APPLY_MS + 100);
+		});
+	};
+
+	test("a search query fetches the server's matching Done cards", async () => {
+		const fetches: string[] = [];
+		// The state holds only the Done window (OTTR-965): 20 held cards here, none
+		// matching, while the one card that matches "prompt" lives only on the
+		// server's page for the query. Typing must fetch it, the head and the search
+		// count must read the server's total, and clearing must restore the held
+		// window with no fetch for the empty query.
+		const held = Array.from({ length: 20 }, (_, j) =>
+			cardFixture({
+				id: `d${j}`,
+				title: "plain j",
+				stage: "done",
+				state: "idle",
+				doneAt: j + 1,
+			}),
+		);
+		const found = cardFixture({
+			id: "o0",
+			title: "fix the prompt flow",
+			sessionTitle: "fix the prompt flow",
+			stage: "done",
+			state: "idle",
+			doneAt: -50,
+		});
+		const project = boardProject(61);
+		const { restore } = stubFetch(async (url) => {
+			const u = String(url);
+			if (u === "/api/projects/proj/done?page=1&q=prompt") {
+				fetches.push(u);
+				return new Response(JSON.stringify({ tasks: [found], total: 1 }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 404 });
+		});
+		const { container, unmount } = await mountProjectBoard(project, held);
+		try {
+			const lane = container.querySelector('[data-stage="done"]');
+			expect(lane).not.toBeNull();
+			const ids = (): string[] =>
+				[...lane!.querySelectorAll("[data-task-id]")].map(
+					(el) => el.getAttribute("data-task-id") ?? "",
+				);
+			const input = container.querySelector(
+				'input[aria-label="Search tasks"]',
+			) as HTMLInputElement;
+			// Before typing: no search fetch, the held window and the plain "Show more".
+			expect(fetches).toEqual([]);
+			expect(ids()).toEqual([...held].sort(newestLanded).map((t) => t.id));
+			expect(lane!.querySelector("button.lane-more")).not.toBeNull();
+			await typeAndSearch(input, "prompt");
+			await searchSettle();
+			// The query fetched the server's page, and the only matching card renders
+			// below the held window's absence: the lane reads the server answer.
+			expect(fetches).toEqual(["/api/projects/proj/done?page=1&q=prompt"]);
+			expect(ids()).toEqual(["o0"]);
+			expect(lane!.querySelector(".count")?.textContent).toBe("1/1");
+			expect(container.querySelector(".search-count")?.textContent).toBe(
+				"1/61",
+			);
+			// Clearing the box brings the held window back, with no fetch for the
+			// empty query.
+			await typeAndSearch(input, "");
+			await searchSettle();
+			expect(fetches).toEqual(["/api/projects/proj/done?page=1&q=prompt"]);
+			expect(ids()).toEqual([...held].sort(newestLanded).map((t) => t.id));
+			expect(lane!.querySelector("button.lane-more")).not.toBeNull();
+		} finally {
+			await unmount();
+			restore();
+		}
+	});
+
+	/** Mounts the done lane board and resolves the lane id/search probes. */
+	const openDoneLane = async (project: ProjectView, held: TaskCard[]) => {
+		const { container, unmount } = await mountProjectBoard(project, held);
+		const ids = (): string[] =>
+			[
+				...container
+					.querySelector('[data-stage="done"]')!
+					.querySelectorAll("[data-task-id]"),
+			].map((el) => el.getAttribute("data-task-id") ?? "");
+		const input = container.querySelector(
+			'input[aria-label="Search tasks"]',
+		) as HTMLInputElement;
+		return { container, unmount, ids, input };
+	};
+
+	test("a late answer for an old query is dropped", async () => {
+		const fetches: string[] = [];
+		const promptPage = Promise.withResolvers<Response>();
+		// The first prompt request stays deferred; the same URL typed again answers
+		// at once with the fresh card, so the late answer must not win.
+		let promptCalls = 0;
+		// The "prompt" answer resolves only after the query moved on to "other": the
+		// newer query owns the lane, so the stale answer must not render its card.
+		const held = Array.from({ length: 20 }, (_, j) =>
+			cardFixture({
+				id: `d${j}`,
+				title: "plain j",
+				stage: "done",
+				state: "idle",
+				doneAt: j + 1,
+			}),
+		);
+		const promptCard = cardFixture({
+			id: "o0",
+			title: "fix the prompt flow",
+			sessionTitle: "fix the prompt flow",
+			stage: "done",
+			state: "idle",
+			doneAt: -50,
+		});
+		const otherCard = cardFixture({
+			id: "o1",
+			title: "other thing",
+			sessionTitle: "other thing",
+			stage: "done",
+			state: "idle",
+			doneAt: -60,
+		});
+		const freshPromptCard = cardFixture({
+			id: "o2",
+			title: "fresh prompt answer",
+			sessionTitle: "fresh prompt answer",
+			stage: "done",
+			state: "idle",
+			doneAt: -70,
+		});
+		const project = boardProject(61);
+		const { restore } = stubFetch(async (url) => {
+			const u = String(url);
+			if (u === "/api/projects/proj/done?page=1&q=prompt") {
+				fetches.push(u);
+				promptCalls += 1;
+				if (promptCalls === 1) return promptPage.promise;
+				return new Response(
+					JSON.stringify({ tasks: [freshPromptCard], total: 1 }),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}
+			if (u === "/api/projects/proj/done?page=1&q=other") {
+				fetches.push(u);
+				return new Response(JSON.stringify({ tasks: [otherCard], total: 1 }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 404 });
+		});
+		const { container, unmount, ids, input } = await openDoneLane(
+			project,
+			held,
+		);
+		const lane = container.querySelector('[data-stage="done"]');
+		try {
+			await typeAndSearch(input, "prompt");
+			await searchSettle();
+			// The prompt fetch went out and is still waiting for its answer.
+			expect(fetches).toEqual(["/api/projects/proj/done?page=1&q=prompt"]);
+			// The query moves on; "other" answers at once while prompt stays pending.
+			await typeAndSearch(input, "other");
+			await searchSettle();
+			expect(fetches).toEqual([
+				"/api/projects/proj/done?page=1&q=prompt",
+				"/api/projects/proj/done?page=1&q=other",
+			]);
+			expect(ids()).toEqual(["o1"]);
+			// The query comes back: the same text, a new generation. The fresh answer
+			// renders at once while the first prompt request still waits.
+			await typeAndSearch(input, "prompt");
+			await searchSettle();
+			expect(fetches).toEqual([
+				"/api/projects/proj/done?page=1&q=prompt",
+				"/api/projects/proj/done?page=1&q=other",
+				"/api/projects/proj/done?page=1&q=prompt",
+			]);
+			expect(ids()).toEqual(["o2"]);
+			expect(lane!.querySelector(".count")?.textContent).toBe("1/1");
+			// The first prompt answer lands last: its generation is long gone, so the
+			// same-text re-entry's result stays.
 			await act(async () => {
-				root.unmount();
+				promptPage.resolve(
+					new Response(JSON.stringify({ tasks: [promptCard], total: 1 }), {
+						status: 200,
+						headers: { "content-type": "application/json" },
+					}),
+				);
+				await Bun.sleep(50);
 			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			expect(ids()).toEqual(["o2"]);
+			expect(lane!.querySelector(".count")?.textContent).toBe("1/1");
+		} finally {
+			await unmount();
+			restore();
+		}
+	});
+
+	test("a failed search fetch shows the retry line and Retry refetches", async () => {
+		const fetches: string[] = [];
+		// A rejected fetch (server down, blocked request) fails the lane the same way
+		// a non-ok answer does: the short error shows, the held window stays, and the
+		// Retry button refetches page 1 of the query that still stands.
+		const held = Array.from({ length: 4 }, (_, j) =>
+			cardFixture({
+				id: `d${j}`,
+				title: "plain j",
+				sessionTitle: "plain j",
+				stage: "done",
+				state: "idle",
+				doneAt: j + 1,
+			}),
+		);
+		const project = boardProject(4);
+		const { restore } = stubFetch(async (url) => {
+			const u = String(url);
+			if (u === "/api/projects/proj/done?page=1&q=prompt") {
+				fetches.push(u);
+				throw new Error("blocked");
+			}
+			return new Response("{}", { status: 404 });
+		});
+		const { container, unmount } = await mountProjectBoard(project, held);
+		try {
+			const lane = container.querySelector('[data-stage="done"]');
+			expect(lane).not.toBeNull();
+			const input = container.querySelector(
+				'input[aria-label="Search tasks"]',
+			) as HTMLInputElement;
+			await typeAndSearch(input, "prompt");
+			await searchSettle();
+			// The rejection shows the short error with its retry control. The lane reads
+			// the server answer only: with the page failed and no answer, it holds no
+			// cards and never poses the empty lane as a complete result.
+			expect(fetches).toEqual(["/api/projects/proj/done?page=1&q=prompt"]);
+			expect(container.textContent).toContain("Search failed");
+			// The header count marks the done matches unknown instead of repeating
+			// the state window's count as the whole result.
+			expect(container.querySelector(".search-count")?.textContent).toBe("—/4");
+			expect(lane!.querySelector("button.lane-retry")).not.toBeNull();
+			expect(lane!.textContent).toContain("No matches.");
+			expect(lane!.querySelectorAll("[data-task-id]")).toHaveLength(0);
+			// Retry refetches the same page 1 of the standing query.
+			const retry = lane!.querySelector<HTMLButtonElement>("button.lane-retry");
+			await act(async () => {
+				retry!.click();
+			});
+			await act(async () => {});
+			expect(fetches).toEqual([
+				"/api/projects/proj/done?page=1&q=prompt",
+				"/api/projects/proj/done?page=1&q=prompt",
+			]);
+		} finally {
+			await unmount();
+			restore();
+		}
+	});
+
+	test("a Done-lane data change refetches the standing search", async () => {
+		const fetches: string[] = [];
+		let searchCalls = 0;
+		// The cached matching total describes a snapshot. When the lane's own data
+		// moves (another matching card settles), the search restarts at page 1, so
+		// the lane head and the search count keep describing the cards instead of
+		// drifting apart ("2/1" beside a cached total of 1).
+		const held = Array.from({ length: 20 }, (_, j) =>
+			cardFixture({
+				id: `d${j}`,
+				title: "plain j",
+				sessionTitle: "plain j",
+				stage: "done",
+				state: "idle",
+				doneAt: j + 1,
+			}),
+		);
+		const firstMatch = cardFixture({
+			id: "o0",
+			title: "fix the prompt flow",
+			sessionTitle: "fix the prompt flow",
+			stage: "done",
+			state: "idle",
+			doneAt: -50,
+		});
+		const landedMatch = cardFixture({
+			id: "m0",
+			title: "more prompt work",
+			sessionTitle: "more prompt work",
+			stage: "done",
+			state: "idle",
+			doneAt: 100,
+		});
+		const project = boardProject(61);
+		const { restore } = stubFetch(async (url) => {
+			const u = String(url);
+			if (u === "/api/projects/proj/done?page=1&q=prompt") {
+				fetches.push(u);
+				searchCalls += 1;
+				// The settled card rides page 1 too: it is a settled matching card of
+				// the lane, newest landed first.
+				const tasks =
+					searchCalls === 1 ? [firstMatch] : [landedMatch, firstMatch];
+				return new Response(JSON.stringify({ tasks, total: searchCalls }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 404 });
+		});
+		const { container, root, unmount } = await mount(
+			<ProjectBoard
+				project={project}
+				tasks={held}
+				deltas={new Map()}
+				open={() => {}}
+				seenAnswers={new Set()}
+				seenDoneSince={0}
+				compose={() => {}}
+				composeDraft={() => {}}
+				act={async () => true}
+				onNotice={() => {}}
+				draining={false}
+			/>,
+		);
+		try {
+			const lane = container.querySelector('[data-stage="done"]');
+			const ids = (): string[] =>
+				[...lane!.querySelectorAll("[data-task-id]")].map(
+					(el) => el.getAttribute("data-task-id") ?? "",
+				);
+			const input = container.querySelector(
+				'input[aria-label="Search tasks"]',
+			) as HTMLInputElement;
+			await typeAndSearch(input, "prompt");
+			await searchSettle();
+			expect(ids()).toEqual(["o0"]);
+			expect(lane!.querySelector(".count")?.textContent).toBe("1/1");
+			expect(container.querySelector(".search-count")?.textContent).toBe(
+				"1/61",
+			);
+			// Another matching card settles: the state window and the project's
+			// doneTotal move. The search restarts at page 1 and the answer carries
+			// the new total, so every count describes the lane again.
+			await act(async () => {
+				root.render(
+					<ProjectBoard
+						project={{ ...project, doneTotal: 62 }}
+						tasks={[...held, landedMatch]}
+						deltas={new Map()}
+						open={() => {}}
+						seenAnswers={new Set()}
+						seenDoneSince={0}
+						compose={() => {}}
+						composeDraft={() => {}}
+						act={async () => true}
+						onNotice={() => {}}
+						draining={false}
+					/>,
+				);
+			});
+			await searchSettle();
+			expect(fetches).toEqual([
+				"/api/projects/proj/done?page=1&q=prompt",
+				"/api/projects/proj/done?page=1&q=prompt",
+			]);
+			expect(ids()).toEqual(["m0", "o0"]);
+			expect(lane!.querySelector(".count")?.textContent).toBe("2/2");
+			expect(container.querySelector(".search-count")?.textContent).toBe(
+				"2/62",
+			);
+		} finally {
+			await unmount();
+			restore();
+		}
+	});
+
+	test("a fetched retro counts as rendered; the match beyond page 1 keeps Show more", async () => {
+		const fetches: string[] = [];
+		// A real donePage response slices every settled match, so page 1 can carry
+		// a retro card the state window also holds. laneColumnData keeps that
+		// fetched retro (it renders like any card), and the hidden count must
+		// subtract only retro matches missing from the rendered IDs — otherwise
+		// the match on page 2 loses its "Show more" control.
+		const held = [
+			...Array.from({ length: 19 }, (_, j) =>
+				cardFixture({
+					id: `d${j}`,
+					title: "plain j",
+					sessionTitle: "plain j",
+					stage: "done",
+					state: "idle",
+					doneAt: j + 1,
+				}),
+			),
+			// The newest settled match is the retro itself: the server's page 1
+			// contains it, and the state window holds it too.
+			cardFixture({
+				id: "r0",
+				kind: "retro",
+				title: "Retro of the heatmap work",
+				sessionTitle: "Retro of the heatmap work",
+				stage: "done",
+				state: "idle",
+				doneAt: 100,
+			}),
+		];
+		// 21 matches: page 1 = the retro plus 19 work cards, page 2 = the last
+		// matching work card (DONE_PAGE = 20).
+		const work = Array.from({ length: 20 }, (_, j) =>
+			cardFixture({
+				id: `w${j}`,
+				title: `heatmap work ${j}`,
+				sessionTitle: `heatmap work ${j}`,
+				stage: "done",
+				state: "idle",
+				doneAt: 50 - j,
+			}),
+		);
+		const page1 = [held[19]!, ...work.slice(0, 19)];
+		const page2 = [work[19]!];
+		const project = boardProject(21);
+		const { restore } = stubFetch(async (url) => {
+			const u = String(url);
+			if (u === "/api/projects/proj/done?page=1&q=heatmap") {
+				fetches.push(u);
+				return new Response(JSON.stringify({ tasks: page1, total: 21 }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			if (u === "/api/projects/proj/done?page=2&q=heatmap") {
+				fetches.push(u);
+				return new Response(JSON.stringify({ tasks: page2, total: 21 }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 404 });
+		});
+		const { container, unmount, ids, input } = await openDoneLane(
+			project,
+			held,
+		);
+		const lane = container.querySelector('[data-stage="done"]');
+		try {
+			await typeAndSearch(input, "heatmap");
+			await searchSettle();
+			// Page 1 renders all 20 of its cards — the fetched retro included — and
+			// the one match beyond page 1 keeps the button at exactly 1. Subtracting
+			// the held retro here would hide the button and strand that card.
+			expect(fetches).toEqual(["/api/projects/proj/done?page=1&q=heatmap"]);
+			expect(ids()).toEqual([
+				held[19]!.id,
+				...work.slice(0, 19).map((t) => t.id),
+			]);
+			expect(lane!.querySelector(".count")?.textContent).toBe("20/21");
+			// Every Done card matches here, including the hidden retro both sides
+			// count: the header reads 21 matching of 21 tasks, never 21 of 20.
+			expect(container.querySelector(".search-count")?.textContent).toBe(
+				"21/21",
+			);
+			const more = lane!.querySelector<HTMLButtonElement>("button.lane-more");
+			expect(more?.getAttribute("aria-label")).toBe("Show more, 1 older cards");
+			// Paging to page 2 renders the last match and retires the button.
+			await act(async () => {
+				more!.click();
+			});
+			await act(async () => {});
+			expect(fetches).toEqual([
+				"/api/projects/proj/done?page=1&q=heatmap",
+				"/api/projects/proj/done?page=2&q=heatmap",
+			]);
+			expect(ids()).toEqual([held[19]!.id, ...work.map((t) => t.id)]);
+			expect(lane!.querySelector(".count")?.textContent).toBe("21/21");
+			expect(container.querySelector(".search-count")?.textContent).toBe(
+				"21/21",
+			);
+			expect(lane!.querySelector("button.lane-more")).toBeNull();
+		} finally {
+			await unmount();
+			restore();
 		}
 	});
 
@@ -7633,42 +7879,9 @@ describe("ProjectBoard done lane time view", () => {
 			}),
 			cardFixture({ id: "d2", stage: "done", state: "idle", doneAt: 3 }),
 		];
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		const project = {
-			name: "proj",
-			hasRules: true,
-			github: null,
-			gitless: false,
-			dirty: false,
-			archReview: null,
-			latestRelease: null,
-			latestImage: null,
-			doneTotal: 3,
-			settings: { setupChecklist: false },
-			sessionsDir: "/tmp/s",
-		} as unknown as ProjectView;
+		const project = boardProject(3);
+		const { container, unmount } = await mountProjectBoard(project, doneCards);
 		try {
-			await act(async () => {
-				root.render(
-					<ProjectBoard
-						project={project}
-						tasks={doneCards}
-						deltas={new Map()}
-						open={() => {}}
-						seenAnswers={new Set()}
-						seenDoneSince={0}
-						compose={() => {}}
-						composeDraft={() => {}}
-						act={async () => true}
-						onNotice={() => {}}
-						draining={false}
-					/>,
-				);
-			});
 			const section = container.querySelector(
 				'[data-stage="done"] section.starred',
 			);
@@ -7703,111 +7916,34 @@ describe("ProjectBoard done lane time view", () => {
 					?.getAttribute("aria-expanded"),
 			).toBe("false");
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
+			await unmount();
 		}
 	});
 });
 
 describe("ProjectBoard settings shortcut", () => {
-	// React interaction needs browser globals; the same happy-dom swap as the search
-	// delay tests above, plus the history/location pair settingsNavigate() drives.
-	const window = new Window({ url: "http://localhost/projects/proj" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		HTMLElement: window.HTMLElement,
-		HTMLInputElement: window.HTMLInputElement,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-		history: window.history,
-		location: window.location,
-		PopStateEvent: window.PopStateEvent,
-	};
-	const originals = new Map<string, unknown>();
-
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
-
-	/** The production onClick React rendered onto the node; a dispatched click never
-	 *  reaches React's event plugin under happy-dom (see the search delay tests). */
-	const onClickOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onClick?: (e: unknown) => void;
-		};
-		if (props.onClick === undefined) throw new Error("node has no onClick");
-		return props.onClick;
-	};
+	const { window } = installBrowserGlobals([
+		"HTMLElement",
+		"HTMLInputElement",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+		"history",
+		"location",
+		"PopStateEvent",
+	]);
 
 	/** The board with one card; the header's actions row is what the shortcut lives in. */
 	async function mountBoard(): Promise<{
 		container: HTMLDivElement;
 		unmount: () => Promise<void>;
 	}> {
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
 		const tasks = [cardFixture({ id: "t1", title: "Fix bug" })];
-		const project = {
-			name: "proj",
-			hasRules: true,
-			github: null,
-			gitless: false,
-			dirty: false,
-			archReview: null,
-			latestRelease: null,
-			latestImage: null,
-			doneTotal: 0,
-			settings: { setupChecklist: false },
-			sessionsDir: "/tmp/s",
-		} as unknown as ProjectView;
-		await act(async () => {
-			root.render(
-				<ProjectBoard
-					project={project}
-					tasks={tasks}
-					deltas={new Map()}
-					open={() => {}}
-					seenAnswers={new Set()}
-					seenDoneSince={0}
-					compose={() => {}}
-					composeDraft={() => {}}
-					act={async () => true}
-					onNotice={() => {}}
-					draining={false}
-				/>,
-			);
-		});
+		const project = boardProject(0);
+		const { container, unmount } = await mountProjectBoard(project, tasks);
 		return {
 			container,
 			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
+				await unmount();
 			},
 		};
 	}
@@ -7895,53 +8031,16 @@ describe("skillGapNote", () => {
 });
 
 describe("ProjectBoard skill-gap markers", () => {
-	// React interaction needs browser globals; the same happy-dom swap as the
-	// settings shortcut tests above, plus the dialog pair the Diagrams modal shows.
-	const window = new Window({ url: "http://localhost/projects/proj" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		HTMLElement: window.HTMLElement,
-		HTMLInputElement: window.HTMLInputElement,
-		HTMLDialogElement: window.HTMLDialogElement,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-		history: window.history,
-		location: window.location,
-		PopStateEvent: window.PopStateEvent,
-	};
-	const originals = new Map<string, unknown>();
-
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
-
-	/** The production onClick React rendered onto the node (see the settings shortcut tests). */
-	const onClickOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onClick?: (e: unknown) => void;
-		};
-		if (props.onClick === undefined) throw new Error("node has no onClick");
-		return props.onClick;
-	};
+	installBrowserGlobals([
+		"HTMLElement",
+		"HTMLInputElement",
+		"HTMLDialogElement",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+		"history",
+		"location",
+		"PopStateEvent",
+	]);
 
 	/** An arch review with unreviewed commits: the menu's Start review button shows. */
 	const archReview = {
@@ -7952,6 +8051,7 @@ describe("ProjectBoard skill-gap markers", () => {
 		cap: 3,
 		due: false,
 		running: false,
+		runningCardId: null as string | null,
 	};
 	const project = {
 		name: "proj",
@@ -7977,41 +8077,41 @@ describe("ProjectBoard skill-gap markers", () => {
 	async function mountBoard(
 		userLayer: UserLayer,
 		due = false,
+		runningCardId: string | null = null,
+		open: (id: string) => void = () => {},
 	): Promise<{
 		container: HTMLDivElement;
 		unmount: () => Promise<void>;
 	}> {
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		const boardProject = { ...project, archReview: { ...archReview, due } };
-		await act(async () => {
-			root.render(
-				<ProjectBoard
-					project={boardProject}
-					tasks={[]}
-					deltas={new Map()}
-					open={() => {}}
-					seenAnswers={new Set()}
-					seenDoneSince={0}
-					compose={() => {}}
-					composeDraft={() => {}}
-					act={async () => true}
-					onNotice={() => {}}
-					draining={false}
-					userLayer={userLayer}
-				/>,
-			);
-		});
+		const boardProject = {
+			...project,
+			archReview: {
+				...archReview,
+				due,
+				running: runningCardId !== null,
+				runningCardId,
+			},
+		};
+		const { container, unmount } = await mount(
+			<ProjectBoard
+				project={boardProject}
+				tasks={[]}
+				deltas={new Map()}
+				open={open}
+				seenAnswers={new Set()}
+				seenDoneSince={0}
+				compose={() => {}}
+				composeDraft={() => {}}
+				act={async () => true}
+				onNotice={() => {}}
+				draining={false}
+				userLayer={userLayer}
+			/>,
+		);
 		return {
 			container,
 			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
+				await unmount();
 			},
 		};
 	}
@@ -8026,6 +8126,32 @@ describe("ProjectBoard skill-gap markers", () => {
 		if (b === undefined) throw new Error(`no "${text}" button`);
 		return b;
 	};
+
+	test("a running review's chip links to its card and opens it in place", async () => {
+		const opened: string[] = [];
+		const { container, unmount } = await mountBoard(
+			{ skills: [], plugins: [], rules: [], mcp: [] },
+			false,
+			"R-7",
+			(id) => opened.push(id),
+		);
+		try {
+			const chip = container.querySelector(".project-meta a.arch-live");
+			if (chip === null) throw new Error("no review chip link");
+			expect(chip.textContent).toBe("Review in progress");
+			expect(chip.getAttribute("href")).toBe("/projects/proj/tasks/R-7");
+			await act(async () => {
+				onClickOf(chip)({
+					button: 0,
+					preventDefault() {},
+					currentTarget: { pathname: "/projects/proj/tasks/R-7" },
+				});
+			});
+			expect(opened).toEqual(["R-7"]);
+		} finally {
+			await unmount();
+		}
+	});
 
 	test("an incomplete layer appends the note to the review and release titles and shows the marks", async () => {
 		const { container, unmount } = await mountBoard({
@@ -8109,11 +8235,12 @@ describe("ProjectBoard skill-gap markers", () => {
 
 	test("the Diagrams window names the gap on Create/update diagrams", async () => {
 		// The modal fetches the file on mount; 404 keeps the create-hint body, which is enough.
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async () =>
-			new Response("no file", {
-				status: 404,
-			})) as unknown as typeof fetch;
+		const { restore } = stubFetch(
+			async () =>
+				new Response("no file", {
+					status: 404,
+				}),
+		);
 		const { container, unmount } = await mountBoard({
 			skills: [],
 			plugins: [],
@@ -8132,7 +8259,7 @@ describe("ProjectBoard skill-gap markers", () => {
 				create.querySelector('[role="img"]')?.getAttribute("aria-label"),
 			).toBe(note);
 		} finally {
-			globalThis.fetch = realFetch;
+			restore();
 			await unmount();
 		}
 	});
@@ -8310,48 +8437,14 @@ describe("ConsolidationReview", () => {
 });
 
 describe("ReleaseDialog consolidation", () => {
-	// React interaction needs browser globals; the setup mirrors the deepen
-	// describes above: happy-dom registers them for this describe, and afterAll
-	// puts the originals back, so later test files in the same process see no DOM.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		Event: window.Event,
-		HTMLElement: window.HTMLElement,
-		HTMLTextAreaElement: window.HTMLTextAreaElement,
-		Node: window.Node,
-	};
-	const originals = new Map<string, unknown>();
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+	const { window } = installBrowserGlobals([
+		"Event",
+		"HTMLElement",
+		"HTMLTextAreaElement",
+		"Node",
+	]);
 	// happy-dom's dispatched clicks never reach React's event plugin: call the
 	// production onClick React rendered onto the node instead.
-	const onClickOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onClick?: (e: unknown) => void;
-		};
-		if (props.onClick === undefined) throw new Error("node has no onClick");
-		return props.onClick;
-	};
 	// Buttons are found by their exact label.
 	const button = (box: ParentNode, name: string): HTMLButtonElement => {
 		const node = [...box.querySelectorAll("button")].find(
@@ -8363,17 +8456,6 @@ describe("ReleaseDialog consolidation", () => {
 	// The production onChange React rendered onto the node; the textarea is typed by
 	// calling it with a minimal event object, since happy-dom's dispatched input
 	// event never reaches React's ChangeEventPlugin.
-	const onChangeOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onChange?: (e: unknown) => void;
-		};
-		if (props.onChange === undefined) throw new Error("node has no onChange");
-		return props.onChange;
-	};
 	const notesValue = (box: ParentNode): string =>
 		(box.querySelector("#release-notes-proposal") as HTMLTextAreaElement).value;
 	const notes = "- add the thing\n- fix the bug";
@@ -8418,13 +8500,9 @@ describe("ReleaseDialog consolidation", () => {
 		summary?: () => Response | Promise<Response>,
 	): Promise<Harness> => {
 		const calls: Call[] = [];
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		) => {
+		const { restore } = stubFetch(async (url, init) => {
 			const call: Call = {
-				url: String(input),
+				url: String(url),
 				method: init?.method,
 				body:
 					typeof init?.body === "string"
@@ -8440,7 +8518,7 @@ describe("ReleaseDialog consolidation", () => {
 				return json({});
 			if (call.url.endsWith("/release")) return json(plan);
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
+		});
 		const container = window.document.createElement(
 			"div",
 		) as unknown as HTMLDivElement;
@@ -8462,7 +8540,7 @@ describe("ReleaseDialog consolidation", () => {
 			// One more act lets the plan fetch land.
 			await act(async () => {});
 		} catch (e) {
-			globalThis.fetch = realFetch;
+			restore();
 			throw e;
 		}
 		return {
@@ -8474,7 +8552,7 @@ describe("ReleaseDialog consolidation", () => {
 					root.unmount();
 				});
 				container.remove();
-				globalThis.fetch = realFetch;
+				restore();
 			},
 		};
 	};
@@ -8654,23 +8732,7 @@ describe("ReleaseDialog consolidation", () => {
 	});
 });
 
-// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
-const drawerFields = {
-	kind: "work",
-	research: false,
-	report: null,
-	details: null,
-	branch: null,
-	model: null,
-	worktree: null,
-	sessionId: null,
-	images: [],
-	pendingImages: [],
-	shots: [],
-	keptFiles: [],
-	workCheckLog: [],
-} as unknown as Partial<TaskCard>;
-const drawerBase = {
+const replyDrawerBase = {
 	project: {
 		name: "proj",
 		hasRules: true,
@@ -8698,44 +8760,8 @@ const drawerBase = {
 };
 
 describe("Drawer prompt gate Start anyway", () => {
-	// React interaction needs browser globals; the setup mirrors settings.test.tsx.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		Event: window.Event,
-		HTMLElement: window.HTMLElement,
-		Node: window.Node,
-	};
-	const originals = new Map<string, unknown>();
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+	installBrowserGlobals(["Event", "HTMLElement", "Node"]);
 	// happy-dom clicks never reach React's plugin: call the rendered onClick instead.
-	const onClickOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onClick?: (e: unknown) => void;
-		};
-		if (props.onClick === undefined) throw new Error("node has no onClick");
-		return props.onClick;
-	};
 	const gateTask = (gate: Task["gate"]) =>
 		cardFixture({
 			...drawerFields,
@@ -8748,22 +8774,15 @@ describe("Drawer prompt gate Start anyway", () => {
 					options: [],
 					multi: false,
 					recommended: null,
+					text: true,
 				},
 			],
 			gate,
 		});
 
 	test("a gate park renders the reason and Start anyway; its click replies with the exact marker", async () => {
-		const realFetch = globalThis.fetch;
-		const posts: { url: string; body: unknown }[] = [];
-		// The drawer's session and catalog fetches degrade to null on a 404; the
-		// detail GET serves the fixture back loaded, so its gate stamp reaches the
-		// banner (OTTR-965); only the reply POST is captured.
-		globalThis.fetch = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		) => {
-			const url = String(input);
+		const posts: { url: string; body: string }[] = [];
+		const { restore } = stubFetch(async (url, init) => {
 			if (url.endsWith("/tasks/t1/reply")) {
 				posts.push({ url, body: String(init?.body ?? "") });
 				return new Response(JSON.stringify({ ok: true }), { status: 200 });
@@ -8787,27 +8806,20 @@ describe("Drawer prompt gate Start anyway", () => {
 				);
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		});
+		const { container, unmount } = await mount(
+			<Drawer
+				{...replyDrawerBase}
+				task={gateTask({
+					hash: null,
+					seen: null,
+					fails: 1,
+					sig: "Which environment deploys this?",
+					parked: true,
+				})}
+			/>,
+		);
 		try {
-			await act(async () => {
-				root.render(
-					<Drawer
-						{...drawerBase}
-						task={gateTask({
-							hash: null,
-							seen: null,
-							fails: 1,
-							sig: "Which environment deploys this?",
-							parked: true,
-						})}
-					/>,
-				);
-			});
 			// One more act lets the detail fetch land, so the gate banner renders.
 			await act(async () => {});
 			const reason = container.querySelectorAll(".gate-start .needs-reason");
@@ -8830,51 +8842,112 @@ describe("Drawer prompt gate Start anyway", () => {
 				JSON.stringify({ text: "Start anyway", images: [] }),
 			);
 		} finally {
-			globalThis.fetch = realFetch;
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
+			restore();
+			await unmount();
 		}
 	});
 
 	test("a needs_you card without a parked gate renders no Start anyway", () => {
 		const html = renderToStaticMarkup(
-			<Drawer {...drawerBase} task={gateTask(null)} />,
+			<Drawer {...replyDrawerBase} task={gateTask(null)} />,
 		);
 		expect(html).not.toContain("Start anyway");
 		expect(html).not.toContain("gate-start");
 	});
+
+	test("a parked gate's section context renders once above the ask panel", async () => {
+		const gate = gateTask({
+			hash: null,
+			seen: null,
+			fails: 1,
+			sig: "Which environment deploys this?",
+			parked: true,
+			context: ["We need a decision on the rollout timing.", "Pick one"],
+		});
+		// The drawer body renders only once the detail fetch lands, so the GET
+		// serves the same context-carrying fixture back.
+		const { restore } = stubFetch(async (url) => {
+			if (String(url).endsWith("/tasks/t1")) {
+				return new Response(
+					JSON.stringify({ ...gate, prompt: "gate park prompt", turns: [] }),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}
+			return new Response("{}", { status: 404 });
+		});
+		const { container, unmount } = await mount(
+			<Drawer {...replyDrawerBase} task={gate} />,
+		);
+		try {
+			// One more act lets the detail fetch land, so the ask body renders.
+			await act(async () => {});
+			const ctx = container.querySelector(".gate-context");
+			expect(ctx).not.toBeNull();
+			expect(ctx!.textContent).toContain(
+				"We need a decision on the rollout timing.",
+			);
+			expect(ctx!.textContent).toContain("Pick one");
+			// Once: the lines are context, never an ask question.
+			const hits =
+				container.innerHTML.split("We need a decision on the rollout timing.")
+					.length - 1;
+			expect(hits).toBe(1);
+			// Above the questions: the ask panel follows the context block.
+			const panel = container.querySelector(".ask-panel");
+			expect(panel).not.toBeNull();
+			expect(
+				ctx!.compareDocumentPosition(panel!) & Node.DOCUMENT_POSITION_FOLLOWING,
+			).toBeTruthy();
+		} finally {
+			restore();
+			await unmount();
+		}
+	});
+
+	test("a parked gate without section context renders no gate-context", () => {
+		const html = renderToStaticMarkup(
+			<Drawer
+				{...replyDrawerBase}
+				task={gateTask({
+					hash: null,
+					seen: null,
+					fails: 1,
+					sig: "Which environment deploys this?",
+					parked: true,
+				})}
+			/>,
+		);
+		expect(html).not.toContain("gate-context");
+	});
+
+	test("a needs_you card without a parked gate renders no stale context", () => {
+		// The context lines stay in the gate state after an un-park; only a live
+		// park may show them above the ask.
+		const html = renderToStaticMarkup(
+			<Drawer
+				{...replyDrawerBase}
+				task={gateTask({
+					hash: null,
+					seen: null,
+					fails: 0,
+					sig: null,
+					parked: false,
+					context: ["Pick one"],
+				})}
+			/>,
+		);
+		expect(html).not.toContain("gate-context");
+	});
 });
 
 describe("Drawer ask drafts on the server", () => {
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		localStorage: window.localStorage,
-		Event: window.Event,
-		HTMLElement: window.HTMLElement,
-		HTMLInputElement: window.HTMLInputElement,
-		Node: window.Node,
-	};
-	const originals = new Map<string, unknown>();
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+	const { window } = installBrowserGlobals([
+		"localStorage",
+		"Event",
+		"HTMLElement",
+		"HTMLInputElement",
+		"Node",
+	]);
 	const draftUrl = "/api/projects/proj/tasks/t1/ask-draft";
 	const fp = "Which database?\nWhich region?";
 	const askTask = cardFixture({
@@ -8887,12 +8960,14 @@ describe("Drawer ask drafts on the server", () => {
 				options: [{ label: "Postgres" }, { label: "SQLite" }],
 				multi: true,
 				recommended: null,
+				text: false,
 			},
 			{
 				question: "Which region?",
 				options: [{ label: "EU" }, { label: "US" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		],
 		gate: null,
@@ -8918,14 +8993,9 @@ describe("Drawer ask drafts on the server", () => {
 			await Bun.sleep(ms);
 		});
 	/** Mounts the drawer on a fetch mock whose GET .../ask-draft answers `server`. */
-	async function mount(server: unknown) {
-		const realFetch = globalThis.fetch;
+	async function mountAsk(server: unknown) {
 		const calls: { url: string; method: string; body: string }[] = [];
-		globalThis.fetch = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url, init) => {
 			const method = init?.method ?? "GET";
 			calls.push({ url, method, body: String(init?.body ?? "") });
 			if (url === draftUrl && method === "GET")
@@ -8933,15 +9003,10 @@ describe("Drawer ask drafts on the server", () => {
 			if (url === draftUrl || url.endsWith("/tasks/t1/reply"))
 				return new Response(JSON.stringify({ ok: true }));
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(<Drawer {...drawerBase} task={askTask} />);
 		});
+		const { container, unmount } = await mount(
+			<Drawer {...replyDrawerBase} task={askTask} />,
+		);
 		await settle();
 		const chosen = () =>
 			[...container.querySelectorAll(".ask-opt.chosen")].map(
@@ -8954,15 +9019,6 @@ describe("Drawer ask drafts on the server", () => {
 		};
 		const draftPosts = () =>
 			calls.filter((c) => c.url === draftUrl && c.method === "POST");
-		const unmount = async () => {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-		};
-		const restore = () => {
-			globalThis.fetch = realFetch;
-		};
 		return { container, calls, chosen, input, draftPosts, unmount, restore };
 	}
 
@@ -8970,7 +9026,7 @@ describe("Drawer ask drafts on the server", () => {
 		window.localStorage.clear();
 		saveAskDraft("t1", { fp, answers: { 1: "EU" }, at: 100 });
 		const server = { fp, answers: { 0: "SQLite", 1: "US" }, at: 200 };
-		const m = await mount(server);
+		const m = await mountAsk(server);
 		try {
 			expect(
 				m.calls.some((c) => c.url === draftUrl && c.method === "GET"),
@@ -8988,7 +9044,7 @@ describe("Drawer ask drafts on the server", () => {
 		window.localStorage.clear();
 		const local = { fp, answers: { 0: "Postgres" }, at: 300 };
 		saveAskDraft("t1", local);
-		const m = await mount({ fp, answers: { 0: "SQLite" }, at: 200 });
+		const m = await mountAsk({ fp, answers: { 0: "SQLite" }, at: 200 });
 		try {
 			expect(m.chosen()).toEqual(["Postgres"]);
 			expect(loadAskDrafts().t1).toEqual(local);
@@ -9002,7 +9058,7 @@ describe("Drawer ask drafts on the server", () => {
 
 	test("a pick saves locally at once and POSTs the draft after the debounce", async () => {
 		window.localStorage.clear();
-		const m = await mount(null);
+		const m = await mountAsk(null);
 		try {
 			const eu = m.input("EU");
 			const before = Date.now();
@@ -9030,7 +9086,7 @@ describe("Drawer ask drafts on the server", () => {
 
 	test("closing the panel sends a pending save at once", async () => {
 		window.localStorage.clear();
-		const m = await mount(null);
+		const m = await mountAsk(null);
 		try {
 			const eu = m.input("EU");
 			await act(async () => {
@@ -9046,7 +9102,7 @@ describe("Drawer ask drafts on the server", () => {
 
 	test("a reply cancels the pending save", async () => {
 		window.localStorage.clear();
-		const m = await mount(null);
+		const m = await mountAsk(null);
 		try {
 			const eu = m.input("EU");
 			await act(async () => {
@@ -9076,7 +9132,7 @@ describe("Drawer ask drafts on the server", () => {
 			"ottr.ask.drafts",
 			JSON.stringify({ t1: { fp, answers: { 1: "EU" } } }),
 		);
-		const m = await mount(null);
+		const m = await mountAsk(null);
 		try {
 			expect(m.chosen()).toEqual(["EU"]);
 			expect(m.draftPosts().map((c) => JSON.parse(c.body))).toEqual([
@@ -9090,7 +9146,7 @@ describe("Drawer ask drafts on the server", () => {
 
 	test("a pick after a draft at the largest safe `at` stays within the API's range", async () => {
 		window.localStorage.clear();
-		const m = await mount({
+		const m = await mountAsk({
 			fp,
 			answers: { 0: "SQLite" },
 			at: Number.MAX_SAFE_INTEGER,
@@ -9202,46 +9258,13 @@ describe("OrphanNotice", () => {
 
 describe("OrphanNotice actions", () => {
 	// React interaction needs browser globals; bun test has none. happy-dom registers
-	// them here; afterAll puts the originals back (same pattern as settings.test.tsx).
-	const win = new Window({ url: "http://localhost/" });
+	// them via the shared helper; afterAll puts the originals back.
+	const { window: win } = installBrowserGlobals([
+		"Event",
+		"HTMLElement",
+		"Node",
+	]);
 	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window: win,
-		document: win.document,
-		navigator: win.navigator,
-		Event: win.Event,
-		HTMLElement: win.HTMLElement,
-		Node: win.Node,
-	};
-	const originals = new Map<string, unknown>();
-
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
-
-	const onClickOf = (node: Element): (() => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onClick?: () => void;
-		};
-		if (props.onClick === undefined) throw new Error("node has no onClick");
-		return props.onClick;
-	};
 
 	const buttonOf = (container: HTMLDivElement, label: string): Element => {
 		const el = Array.from(container.querySelectorAll("button")).find(
@@ -9260,26 +9283,19 @@ describe("OrphanNotice actions", () => {
 		kind: "retro",
 	};
 
-	async function mount(open: (id: string) => void = () => {}): Promise<{
+	async function mountNotice(open: (id: string) => void = () => {}): Promise<{
 		container: HTMLDivElement;
 		unmount: () => void;
 	}> {
 		// happy-dom's DOM classes do not structurally match lib.dom's; convert once here.
-		const container = win.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		win.document.body.append(container as never);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(
-				<OrphanNotice
-					orphans={[row]}
-					fresh={false}
-					nowMs={210_000}
-					openTask={open}
-				/>,
-			);
-		});
+		const { container, root } = await mount(
+			<OrphanNotice
+				orphans={[row]}
+				fresh={false}
+				nowMs={210_000}
+				openTask={open}
+			/>,
+		);
 		return { container, unmount: () => root.unmount() };
 	}
 
@@ -9289,13 +9305,12 @@ describe("OrphanNotice actions", () => {
 	test("stop without confirm does not post", async () => {
 		const posts: string[] = [];
 		const realConfirm = w.confirm;
-		const realFetch = globalThis.fetch;
 		w.confirm = () => false;
-		globalThis.fetch = ((input: unknown) => {
-			posts.push(String(input));
+		const { restore } = stubFetch(async (url) => {
+			posts.push(url);
 			throw new Error("must not fetch");
-		}) as unknown as typeof fetch;
-		const { container, unmount } = await mount();
+		});
+		const { container, unmount } = await mountNotice();
 		try {
 			await act(async () => {
 				onClickOf(buttonOf(container, "Stop process"))();
@@ -9303,7 +9318,7 @@ describe("OrphanNotice actions", () => {
 			expect(posts).toEqual([]);
 		} finally {
 			w.confirm = realConfirm;
-			globalThis.fetch = realFetch;
+			restore();
 			await act(async () => {
 				unmount();
 			});
@@ -9315,17 +9330,13 @@ describe("OrphanNotice actions", () => {
 		let body: unknown = null;
 		let url = "";
 		const realConfirm = w.confirm;
-		const realFetch = globalThis.fetch;
 		w.confirm = () => true;
-		globalThis.fetch = ((
-			input: unknown,
-			init?: { method?: string; body?: string },
-		) => {
-			url = String(input);
-			body = JSON.parse(init?.body ?? "null");
+		const { restore } = stubFetch(async (u, init) => {
+			url = u;
+			body = JSON.parse(String(init?.body ?? "null"));
 			return Promise.resolve(new Response('{"ok":true}', { status: 200 }));
-		}) as unknown as typeof fetch;
-		const { container, unmount } = await mount();
+		});
+		const { container, unmount } = await mountNotice();
 		try {
 			await act(async () => {
 				onClickOf(buttonOf(container, "Stop process"))();
@@ -9338,7 +9349,7 @@ describe("OrphanNotice actions", () => {
 			});
 		} finally {
 			w.confirm = realConfirm;
-			globalThis.fetch = realFetch;
+			restore();
 			await act(async () => {
 				unmount();
 			});
@@ -9357,7 +9368,7 @@ describe("OrphanNotice actions", () => {
 				},
 			},
 		};
-		const { container, unmount } = await mount();
+		const { container, unmount } = await mountNotice();
 		try {
 			await act(async () => {
 				onClickOf(buttonOf(container, "Copy kill command"))();
@@ -9374,7 +9385,7 @@ describe("OrphanNotice actions", () => {
 
 	test("the card button opens the card through openTask", async () => {
 		const opened: string[] = [];
-		const { container, unmount } = await mount((id) => {
+		const { container, unmount } = await mountNotice((id) => {
 			opened.push(id);
 		});
 		try {
@@ -9392,45 +9403,8 @@ describe("OrphanNotice actions", () => {
 });
 
 describe("Drawer proposal decision panel", () => {
-	const project = {
-		name: "proj",
-		github: null,
-		hasRules: true,
-		sessionsDir: "/tmp/proj/.tasks/sessions",
-		settings: {},
-	} as unknown as ProjectView;
-	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
-	const drawerFields = {
-		kind: "work",
-		research: false,
-		report: null,
-		details: null,
-		branch: null,
-		model: null,
-		worktree: null,
-		sessionId: null,
-		images: [],
-		pendingImages: [],
-		shots: [],
-		keptFiles: [],
-		workCheckLog: [],
-	} as unknown as Partial<TaskCard>;
-	const base = {
-		task: null as never,
-		project,
-		act: async () => true,
-		onClose: () => {},
-		onFollowed: () => {},
-		projects: [],
-		read: true,
-		onMarkUnread: () => {},
-		onMarkSeen: () => {},
-		tasks: [],
-		onOpenTask: () => {},
-		draining: false,
-		usedTotal: 0,
-		maxTotal: null,
-	};
+	const _project = drawerProject;
+	const base = drawerBase;
 	const reason =
 		"Retro proposal from t3. Accept starts it. Edit task changes the prompt first. Cancel task declines it.";
 	const summary: ProposalSummary = {
@@ -9467,12 +9441,32 @@ describe("Drawer proposal decision panel", () => {
 		expect(html).toContain("<dt>Gain</dt>");
 		expect(html).toContain("<dt>Risk</dt>");
 		expect(html).toContain("<dt>Check</dt>");
+		// No decision: no Decision line.
+		expect(html).not.toContain("<dt>Decision</dt>");
 		expect(html).toContain("Rework the proposal reason wording");
 		expect(html).toContain("One line less on every proposal card");
 		// The known id renders as a link to its card; the unknown one stays text.
 		expect(html).toContain('href="/projects/proj/tasks/OTTR-404"');
 		expect(html).not.toContain("tasks/ZZZ-9");
 		expect(html).toContain("ZZZ-9 never existed");
+	});
+
+	test("a proposal with a decision shows its question first", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+			needsReason: reason,
+			proposalSummary: {
+				...summary,
+				decision: "Keep the old flag or drop it?",
+			},
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		const decision = html.indexOf("<dt>Decision</dt>");
+		expect(decision).toBeGreaterThan(-1);
+		expect(decision).toBeLessThan(html.indexOf("<dt>What changes</dt>"));
+		expect(html).toContain("Keep the old flag or drop it?");
 	});
 
 	test("a proposal without a summary holds a loading line, no five labels", () => {
@@ -9581,7 +9575,7 @@ describe("Drawer proposal decision panel", () => {
 		expect(html).toMatch(/<div class="decide-reason"><svg class="icon-svg"/);
 	});
 
-	test("a proposal card in needs_you renders exactly one Accept button", () => {
+	test("a proposal card in needs_you renders one Accept, the model picker, and no Reply composer", () => {
 		const task = cardFixture({
 			...drawerFields,
 			stage: "todo",
@@ -9594,8 +9588,16 @@ describe("Drawer proposal decision panel", () => {
 		const accepts = html.match(/title="Start the proposed task"/g) ?? [];
 		expect(accepts).toHaveLength(1);
 		expect(html.match(/>Accept<\/button>/g) ?? []).toHaveLength(1);
-		// The composer itself stays: Reply keeps rendering under it.
-		expect(html).toContain('id="drawer-reply"');
+		// Nothing to reply to before Accept: the composer stays hidden until the task starts.
+		expect(html).not.toContain('id="drawer-reply"');
+		// The first turn's model is picked in the Decide panel, beside Accept.
+		const decide = html.slice(
+			html.indexOf('id="drawer-decide"'),
+			html.indexOf("</section>", html.indexOf('id="drawer-decide"')),
+		);
+		expect(decide).toMatch(
+			/<div class="decide-model"><div class="model-fields">/,
+		);
 	});
 
 	test("the reply band starts folded: a reply field and a Reply head, the form not open", () => {
@@ -9645,17 +9647,7 @@ describe("Drawer proposal decision panel", () => {
 	});
 
 	test("a proposal card opens through its card link without a separate action; an ordinary needs_you card keeps the alarm", () => {
-		const laneBase = {
-			projectTasks: [] as TaskCard[],
-			hasRules: true,
-			github: null,
-			deltas: new Map<string, number>(),
-			open: () => {},
-			unread: () => false,
-			onReorder: async () => true,
-			filtering: false,
-			draining: false,
-		} as const;
+		const laneBase = laneColBase;
 		const proposal = cardFixture({
 			...drawerFields,
 			stage: "todo",
@@ -9671,8 +9663,7 @@ describe("Drawer proposal decision panel", () => {
 		const withProposal = renderToStaticMarkup(
 			<LaneCol {...laneBase} stage="todo" tasks={[proposal]} />,
 		);
-		const document = new Window().document;
-		document.body.innerHTML = withProposal;
+		const document = parseMarkup(withProposal);
 		expect(document.querySelectorAll(".card button").length).toBe(0);
 		expect(document.querySelector("a.card-open")?.getAttribute("href")).toBe(
 			"/projects/proj/tasks/t1",
@@ -9697,51 +9688,11 @@ describe("Drawer proposal decision panel", () => {
 });
 
 describe("Drawer proposal panel editing (client)", () => {
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		Event: window.Event,
-		HTMLElement: window.HTMLElement,
-		HTMLTextAreaElement: window.HTMLTextAreaElement,
-		Node: window.Node,
-		getComputedStyle: window.getComputedStyle,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+	const { window } = installDrawerClientGlobals();
 	// happy-dom's dispatched clicks never reach React's event plugin: call the
 	// production onClick React rendered onto the node instead.
-	const onClickOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onClick?: (e: unknown) => void;
-		};
-		if (props.onClick === undefined) throw new Error("node has no onClick");
-		return props.onClick;
-	};
 
 	test("the panel's Edit opens exactly one prompt editor for the proposal", async () => {
-		const realFetch = globalThis.fetch;
 		const container = window.document.createElement(
 			"div",
 		) as unknown as HTMLDivElement;
@@ -9771,15 +9722,15 @@ describe("Drawer proposal panel editing (client)", () => {
 		// The detail fetch fills the prompt (OTTR-965): the row carries none, so the
 		// loaded task carries the text the editor must prefill.
 		const detail = { ...task, prompt: "Rework the wording", turns: [] };
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
-			if (String(input).endsWith("/tasks/t1")) {
+		const { restore } = stubFetch(async (url) => {
+			if (String(url).endsWith("/tasks/t1")) {
 				return new Response(JSON.stringify(detail), {
 					status: 200,
 					headers: { "content-type": "application/json" },
 				});
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
+		});
 		const panelEdit = (): Element => {
 			const node = [...container.querySelectorAll("button")].find(
 				(b) => b.textContent?.trim() === "Edit",
@@ -9828,7 +9779,7 @@ describe("Drawer proposal panel editing (client)", () => {
 				root.unmount();
 			});
 			container.remove();
-			globalThis.fetch = realFetch;
+			restore();
 		}
 	});
 });
@@ -9952,6 +9903,7 @@ describe("ProjectBoard repo link", () => {
 			doneTotal: 0,
 			settings: { setupChecklist: false },
 			sessionsDir: "/tmp/s",
+			homepage: null,
 			...over,
 		}) as unknown as ProjectView;
 
@@ -9980,6 +9932,30 @@ describe("ProjectBoard repo link", () => {
 		expect(html).toContain('href="https://github.com/octo/repo.git"');
 		expect(html).toContain("octo/repo</a>");
 		expect(html).not.toContain('aria-label="GitHub"');
+	});
+
+	test("the header links a configured project homepage", () => {
+		const html = renderBoard(
+			projectWith({
+				github: "https://github.com/octo/repo",
+				homepage: { url: "https://example.org/project", domain: "example.org" },
+			}),
+		);
+		expect(html).toContain('href="https://example.org/project"');
+		expect(html).toContain("example.org</a>");
+		const homepageLink = html.match(
+			/<a[^>]*href="https:\/\/example\.org\/project"[^>]*>(.*?)<\/a>/s,
+		);
+		expect(homepageLink?.[1]).toContain("<svg");
+		expect(html).toContain('target="_blank"');
+		expect(html).toContain('rel="noopener noreferrer"');
+		expect(html).toContain('title="Project homepage"');
+	});
+
+	test("the header hides a missing project homepage", () => {
+		const html = renderBoard(projectWith({ homepage: null }));
+		expect(html).not.toContain('title="Project homepage"');
+		expect(html).not.toContain("example.org");
 	});
 
 	test("a remote without an owner/repo tail keeps the icon-only link", () => {
@@ -10063,55 +10039,16 @@ describe("ProjectBoard rules interview action", () => {
 });
 
 describe("ProjectBoard PR-mode suggestion action", () => {
-	// React interaction needs browser globals; the same happy-dom swap as the
-	// settings-shortcut tests above.
-	const window = new Window({ url: "http://localhost/projects/proj" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		HTMLElement: window.HTMLElement,
-		HTMLInputElement: window.HTMLInputElement,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
-
-	/** The production onClick React rendered onto the node; a dispatched click never
-	 *  reaches React's event plugin under happy-dom (see the search delay tests). */
-	const onClickOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onClick?: (e: unknown) => void;
-		};
-		if (props.onClick === undefined) throw new Error("node has no onClick");
-		return props.onClick;
-	};
+	installBrowserGlobals([
+		"HTMLElement",
+		"HTMLInputElement",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
 
 	test("the Turn on PR mode button posts prMode true to the project settings", async () => {
-		const realFetch = globalThis.fetch;
 		const posts: { url: string; body: unknown }[] = [];
-		globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+		const { restore } = stubFetch(async (url, init) => {
 			if (String(url).endsWith("/api/projects/proj/settings")) {
 				posts.push({
 					url: String(url),
@@ -10120,51 +10057,44 @@ describe("ProjectBoard PR-mode suggestion action", () => {
 				return new Response(JSON.stringify({ ok: true }), { status: 200 });
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		});
+		const { container, unmount } = await mount(
+			<ProjectBoard
+				project={
+					{
+						name: "proj",
+						hasRules: true,
+						github: null,
+						gitless: false,
+						dirty: false,
+						mainBranch: null,
+						mainUnpushed: false,
+						prModeSuggestion: true,
+						target: "origin/main",
+						archReview: null,
+						latestRelease: null,
+						latestImage: null,
+						doneTotal: 0,
+						settings: { setupChecklist: false },
+						sessionsDir: "/tmp/s",
+					} as unknown as ProjectView
+				}
+				tasks={[cardFixture({ id: "t1", title: "Fix bug" })]}
+				deltas={new Map()}
+				open={() => {}}
+				seenAnswers={new Set()}
+				seenDoneSince={0}
+				compose={() => {}}
+				composeDraft={() => {}}
+				act={async (fn) => {
+					await fn();
+					return true;
+				}}
+				onNotice={() => {}}
+				draining={false}
+			/>,
+		);
 		try {
-			await act(async () => {
-				root.render(
-					<ProjectBoard
-						project={
-							{
-								name: "proj",
-								hasRules: true,
-								github: null,
-								gitless: false,
-								dirty: false,
-								mainBranch: null,
-								mainUnpushed: false,
-								prModeSuggestion: true,
-								target: "origin/main",
-								archReview: null,
-								latestRelease: null,
-								latestImage: null,
-								doneTotal: 0,
-								settings: { setupChecklist: false },
-								sessionsDir: "/tmp/s",
-							} as unknown as ProjectView
-						}
-						tasks={[cardFixture({ id: "t1", title: "Fix bug" })]}
-						deltas={new Map()}
-						open={() => {}}
-						seenAnswers={new Set()}
-						seenDoneSince={0}
-						compose={() => {}}
-						composeDraft={() => {}}
-						act={async (fn) => {
-							await fn();
-							return true;
-						}}
-						onNotice={() => {}}
-						draining={false}
-					/>,
-				);
-			});
 			const btn = Array.from(container.querySelectorAll("button")).find(
 				(b) => b.textContent === "Turn on PR mode",
 			);
@@ -10177,46 +10107,21 @@ describe("ProjectBoard PR-mode suggestion action", () => {
 			expect(post?.url).toContain("/api/projects/proj/settings");
 			expect(post?.body).toEqual({ prMode: true });
 		} finally {
-			globalThis.fetch = realFetch;
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
+			restore();
+			await unmount();
 		}
 	});
 });
 
 describe("AddProjectModal board GitHub token reuse", () => {
-	// React interaction needs browser globals; the same happy-dom swap as the
-	// AskBlock tests above: installed after app.tsx's import, removed after.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		HTMLElement: window.HTMLElement,
-		HTMLInputElement: window.HTMLInputElement,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+	const { window } = installBrowserGlobals([
+		"localStorage",
+		"sessionStorage",
+		"HTMLElement",
+		"HTMLInputElement",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
 
 	/** The form-submit DOM event; happy-dom's Event class does not match lib.dom's. */
 	const submitEvent = (): Event =>
@@ -10225,37 +10130,20 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			cancelable: true,
 		}) as unknown as Event;
 
-	const typeInto = (el: HTMLInputElement, value: string): void => {
-		const setter = Object.getOwnPropertyDescriptor(
-			window.HTMLInputElement.prototype,
-			"value",
-		)?.set;
-		if (setter === undefined) throw new Error("value setter missing");
-		setter.call(el, value);
-	};
-
-	const onChangeOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onChange?: (e: unknown) => void;
-		};
-		if (props.onChange === undefined) throw new Error("node has no onChange");
-		return props.onChange;
-	};
-
-	const onClickOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onClick?: (e: unknown) => void;
-		};
-		if (props.onClick === undefined) throw new Error("node has no onClick");
-		return props.onClick;
+	const typeInto = typeIntoFor(window);
+	// Types and fires the native change in one act scope; the Add form's
+	// wizard steps read the value on change.
+	const typeAndChange = async (
+		el: HTMLInputElement,
+		value: string,
+	): Promise<void> => {
+		await act(async () => {
+			typeInto(el, value);
+			onChangeOf(el)({
+				target: el,
+				currentTarget: el,
+			});
+		});
 	};
 
 	const project = {
@@ -10297,17 +10185,30 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		githubTokenSet,
 	});
 
+	type AddOptions = {
+		tokenChallenge?: boolean;
+		fail?: "create" | "init" | "settings" | "interview" | "checklist";
+		waitForCreate?: Promise<void>;
+		onClose?: () => void;
+		savedSettings?: Partial<ProjectView["settings"]>;
+		hasRules?: boolean;
+		sshAccess?: boolean;
+		hosted?: boolean;
+		createdSource?: Pick<ProjectView, "github" | "gitless">;
+	};
+
 	// The fetch mountAdd serves: gh-status 404, the git-hosts view for the token state,
 	// a first project POST that fails for the missing token, then success; every POST
 	// body lands in `posts`, and the github-token POST answers with the token set.
 	async function addProjectFetch(
 		hostsView: (githubTokenSet: boolean) => Record<string, unknown>,
 		posts: { url: string; body: Record<string, unknown> }[],
-		calls: { project: number },
+		calls: { project: number; settings: number; interview: number },
 		project: ProjectView,
 		githubTokenSet: boolean,
 		input: RequestInfo | URL,
 		init?: RequestInit,
+		options: AddOptions = {},
 	): Promise<Response> {
 		const url = String(input);
 		const method = init?.method ?? "GET";
@@ -10315,9 +10216,37 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			return new Response("{}", { status: 404 });
 		}
 		if (url.endsWith("/api/git-hosts")) {
-			return new Response(JSON.stringify(hostsView(githubTokenSet)), {
-				status: 200,
-			});
+			return new Response(
+				JSON.stringify({
+					...hostsView(githubTokenSet),
+					...(options.sshAccess
+						? {
+								globalKey: {
+									publicKey: "test public key",
+									fingerprint: "SHA256:before",
+								},
+							}
+						: {}),
+				}),
+				{ status: 200 },
+			);
+		}
+		if (url === "/api/git-hosts/ssh/test" && method === "POST") {
+			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			posts.push({ url, body });
+			if (body.trust === undefined) {
+				return new Response(
+					JSON.stringify({
+						error: "Host needs trust",
+						needsTrust: true,
+						host: "github.com",
+						fingerprints: ["SHA256:before"],
+						changed: false,
+					}),
+					{ status: 409 },
+				);
+			}
+			return new Response("{}", { status: 200 });
 		}
 		if (url.endsWith("/api/projects") && method === "POST") {
 			calls.project += 1;
@@ -10325,13 +10254,35 @@ describe("AddProjectModal board GitHub token reuse", () => {
 				url,
 				body: JSON.parse(String(init?.body)) as Record<string, unknown>,
 			});
-			if (calls.project === 1) {
+			if (options.waitForCreate !== undefined) await options.waitForCreate;
+			if (calls.project === 1 && options.fail === "create") {
+				return new Response(JSON.stringify({ error: "Create failed" }), {
+					status: 500,
+				});
+			}
+			if (calls.project === 1 && options.tokenChallenge !== false) {
 				return new Response(
 					JSON.stringify({
 						error: "Authentication failed",
 						needsToken: "github.com",
 					}),
 					{ status: 400 },
+				);
+			}
+			if (
+				options.sshAccess &&
+				JSON.stringify(posts.at(-1)?.body.trust) !==
+					JSON.stringify(["SHA256:after"])
+			) {
+				return new Response(
+					JSON.stringify({
+						error: "Host key changed",
+						needsTrust: true,
+						host: "github.com",
+						fingerprints: ["SHA256:after"],
+						changed: true,
+					}),
+					{ status: 409 },
 				);
 			}
 			return new Response(JSON.stringify({ project }), {
@@ -10347,11 +10298,44 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		}
 		// The wizard's calls once it replaced the form: settings saves return the view,
 		// the interview call files a card, the fork facts answer empty.
+		if (url.endsWith("/init") && method === "POST") {
+			posts.push({ url, body: {} });
+			if (
+				options.fail === "init" &&
+				posts.filter((p) => p.url === url).length === 1
+			) {
+				return new Response(JSON.stringify({ error: "Init failed" }), {
+					status: 500,
+				});
+			}
+			project.gitless = false;
+			return new Response(JSON.stringify({ project }));
+		}
 		if (url.endsWith("/settings") && method === "POST") {
 			posts.push({
 				url,
 				body: JSON.parse(String(init?.body)) as Record<string, unknown>,
 			});
+			if (
+				options.fail === "checklist" &&
+				posts.at(-1)?.body.setupChecklist === false &&
+				posts.filter((p) => p.body.setupChecklist === false).length === 1
+			) {
+				return new Response(JSON.stringify({ error: "Checklist failed" }), {
+					status: 500,
+				});
+			}
+			calls.settings += 1;
+			if (calls.settings === 1 && options.fail === "settings") {
+				return new Response(JSON.stringify({ error: "Settings failed" }), {
+					status: 500,
+				});
+			}
+			const body = posts.at(-1)?.body ?? {};
+			Object.assign(project.settings, body);
+			if (typeof body.retro === "boolean") {
+				project.settings.retroSince = body.retro ? 1 : null;
+			}
 			return new Response(JSON.stringify(project), { status: 200 });
 		}
 		if (url.endsWith("/interview") && method === "POST") {
@@ -10359,8 +10343,18 @@ describe("AddProjectModal board GitHub token reuse", () => {
 				url,
 				body: JSON.parse(String(init?.body)) as Record<string, unknown>,
 			});
+			calls.interview += 1;
+			if (calls.interview === 1 && options.fail === "interview") {
+				return new Response(JSON.stringify({ error: "Interview failed" }), {
+					status: 500,
+				});
+			}
 			return new Response(
-				JSON.stringify({ interview: "queued", id: "WIZ-1" }),
+				JSON.stringify(
+					project.hasRules
+						? { interview: "not-needed", id: null }
+						: { interview: "queued", id: "WIZ-1" },
+				),
 				{ status: 200 },
 			);
 		}
@@ -10376,31 +10370,30 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		githubTokenSet: boolean,
 		projects: ProjectView[] = [],
 		wizardProject?: ProjectView,
+		options: AddOptions = {},
 	): Promise<{
 		container: HTMLDivElement;
 		root: ReturnType<typeof createRoot>;
+		unmount: () => Promise<void>;
 		posts: { url: string; body: Record<string, unknown> }[];
 		restore: () => void;
 	}> {
 		const posts: { url: string; body: Record<string, unknown> }[] = [];
-		const calls = { project: 0 };
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
+		const calls = { project: 0, settings: 0, interview: 0 };
+		const responseProject = structuredClone(wizardProject ?? project);
+		const { restore } = stubFetch(async (url, init) =>
 			addProjectFetch(
 				hostsView,
 				posts,
 				calls,
-				wizardProject ?? project,
+				responseProject,
 				githubTokenSet,
-				input,
+				url,
 				init,
-			)) as unknown as typeof fetch;
+				options,
+			),
+		);
 
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
 		// Minimal Act: run the work, hand a failure to the dialog's inline error.
 		const actProp = async (
 			fn: () => Promise<void>,
@@ -10414,30 +10407,234 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			}
 			return true;
 		};
-		try {
-			await act(async () => {
-				root.render(
-					<AddProjectModal
-						act={actProp}
-						projects={projects}
-						onClose={() => {}}
-						openTask={() => {}}
-					/>,
-				);
-			});
-		} catch (e) {
-			globalThis.fetch = realFetch;
-			throw e;
-		}
+		const { container, root, unmount } = await mount(
+			<HostedContext.Provider value={options.hosted === true}>
+				<AddProjectModal
+					act={actProp}
+					projects={projects}
+					onClose={options.onClose ?? (() => {})}
+					openTask={() => {}}
+				/>
+			</HostedContext.Provider>,
+		);
 		return {
 			container,
 			root,
+			unmount,
 			posts,
 			restore: () => {
-				globalThis.fetch = realFetch;
+				restore();
 			},
 		};
 	}
+
+	const buttonOf = (
+		container: HTMLDivElement,
+		label: string,
+	): HTMLButtonElement => {
+		const button = [...container.querySelectorAll("button")].find(
+			(node) => node.textContent?.trim() === label,
+		);
+		if (button === undefined) throw new Error(`no ${label} button`);
+		return button;
+	};
+
+	const clickAction = async (
+		container: HTMLDivElement,
+		label: string,
+	): Promise<void> => {
+		await act(async () => {
+			buttonOf(container, label).click();
+		});
+	};
+
+	const changeField = async (
+		field: HTMLInputElement | HTMLTextAreaElement,
+		value: string,
+	): Promise<void> => {
+		await act(async () => {
+			field.value = value;
+			onChangeOf(field)({ target: field, currentTarget: field });
+		});
+	};
+
+	const chooseSource = async (
+		container: HTMLDivElement,
+		mode: "new" | "url",
+	): Promise<void> => {
+		await clickAction(container, mode === "new" ? "New" : "Git URL");
+		const input = container.querySelector(
+			mode === "url" ? "input[data-autofocus]" : "#add-panel-new input",
+		) as HTMLInputElement;
+		await changeField(
+			input,
+			mode === "url" ? "https://github.com/o/wiz.git" : "wiz",
+		);
+	};
+
+	const sourceNext = async (container: HTMLDivElement): Promise<void> => {
+		const form = container.querySelector("form");
+		if (form === null) throw new Error("no Source form");
+		await act(async () => {
+			form.dispatchEvent(submitEvent());
+		});
+	};
+
+	const reachRules = async (container: HTMLDivElement): Promise<void> => {
+		await sourceNext(container);
+		for (let step = 2; step < 5; step += 1) {
+			await clickAction(container, "Next");
+		}
+	};
+
+	const withWizard = async (
+		mode: "new" | "url",
+		run: (args: {
+			container: HTMLDivElement;
+			posts: { url: string; body: Record<string, unknown> }[];
+			closeCount: () => number;
+		}) => Promise<void>,
+		options: AddOptions = {},
+	): Promise<void> => {
+		let closes = 0;
+		const fixture = {
+			...wizardProject,
+			gitless: mode === "new",
+			github: mode === "new" ? null : wizardProject.github,
+			settings: { ...wizardProject.settings, ...options.savedSettings },
+			hasRules: options.hasRules ?? wizardProject.hasRules,
+			...options.createdSource,
+		};
+		const { container, root, posts, restore } = await mountAdd(
+			true,
+			[],
+			fixture,
+			{
+				tokenChallenge: false,
+				...options,
+				onClose: () => {
+					closes += 1;
+				},
+			},
+		);
+		try {
+			await chooseSource(container, mode);
+			await run({ container, posts, closeCount: () => closes });
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+	};
+
+	test("Source stays local until Finish", async () => {
+		const { container, root, posts, restore } = await mountAdd(true);
+		try {
+			const input = container.querySelector(
+				"input[data-autofocus]",
+			) as HTMLInputElement;
+			await act(async () => {
+				typeInto(input, "https://github.com/o/r.git");
+				onChangeOf(input)({ target: input, currentTarget: input });
+			});
+			const form = container.querySelector("form") as HTMLFormElement;
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(0);
+			const steps = [
+				...container.querySelectorAll('[aria-label="Setup steps"] li'),
+			];
+			expect(steps).toHaveLength(5);
+			expect(steps[1]?.getAttribute("aria-current")).toBe("step");
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+	});
+
+	test("clicking a source tab puts the caret in that tab's field", async () => {
+		const { container, root, restore } = await mountAdd(true);
+		const settle = (): Promise<void> =>
+			act(async () => {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				requestAnimationFrame(() => resolve());
+				await promise;
+			});
+		try {
+			await clickAction(container, "New");
+			await settle();
+			expect(document.activeElement).toBe(
+				container.querySelector("#add-panel-new input"),
+			);
+			await clickAction(container, "Git URL");
+			await settle();
+			expect(document.activeElement).toBe(
+				container.querySelector("#add-panel-url input"),
+			);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			restore();
+		}
+	});
+
+	test("Cancel discards an unsaved token draft without browser storage", async () => {
+		const draft = "draft-value-not-a-credential";
+		const assertNoStoredDraft = (): void => {
+			for (const storage of [window.localStorage, window.sessionStorage]) {
+				for (let index = 0; index < storage.length; index += 1) {
+					const key = storage.key(index);
+					expect(key).not.toContain(draft);
+					if (key !== null) expect(storage.getItem(key)).not.toContain(draft);
+				}
+			}
+		};
+		await withWizard(
+			"url",
+			async ({ container, posts, closeCount }) => {
+				await reachRules(container);
+				await clickAction(container, "Finish");
+				const token = container.querySelector(
+					'input[type="password"]',
+				) as HTMLInputElement;
+				expect(token).not.toBeNull();
+				await changeField(token, draft);
+				expect(token.value).toBe(draft);
+				assertNoStoredDraft();
+				await clickAction(container, "Cancel");
+				expect(closeCount()).toBe(1);
+				expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(1);
+				expect(posts.some((p) => p.url.endsWith("/tokens"))).toBe(false);
+				expect(posts.some((p) => p.url.endsWith("/interview"))).toBe(false);
+			},
+			{ tokenChallenge: true },
+		);
+		assertNoStoredDraft();
+		await withWizard(
+			"url",
+			async ({ container, posts }) => {
+				await reachRules(container);
+				await clickAction(container, "Finish");
+				const token = container.querySelector(
+					'input[type="password"]',
+				) as HTMLInputElement;
+				expect(token).not.toBeNull();
+				expect(token.value).toBe("");
+				assertNoStoredDraft();
+				expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(1);
+				expect(posts.some((p) => p.url.endsWith("/tokens"))).toBe(false);
+			},
+			{ tokenChallenge: true },
+		);
+	});
 
 	test("the board token button retries Add with the prefilled x-access-token", async () => {
 		const { container, root, posts, restore } = await mountAdd(true);
@@ -10446,19 +10643,10 @@ describe("AddProjectModal board GitHub token reuse", () => {
 				"input[data-autofocus]",
 			) as unknown as HTMLInputElement;
 			expect(urlInput).not.toBeNull();
-			await act(async () => {
-				typeInto(urlInput, "https://github.com/o/r.git");
-				onChangeOf(urlInput)({
-					target: urlInput,
-					currentTarget: urlInput,
-				});
-			});
-			const form = container.querySelector(
-				"form",
-			) as unknown as HTMLFormElement;
-			await act(async () => {
-				form.dispatchEvent(submitEvent());
-			});
+			await typeAndChange(urlInput, "https://github.com/o/r.git");
+			await reachRules(container);
+			expect(posts).toHaveLength(0);
+			await clickAction(container, "Finish");
 			// The 400's needsToken opened the token step, pre-filled with the
 			// GitHub host's convention, and the board token button is offered.
 			const user = container.querySelector(
@@ -10478,9 +10666,7 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			expect(posts.filter((p) => p.url.endsWith("/api/projects")).length).toBe(
 				2,
 			);
-			// The add response carries no interview verdict: the wizard replaced the form
-			// and the interview waits for its last step (OTTR-1065).
-			expect(container.textContent).toContain("Set up proj");
+			expect(posts.filter((p) => p.url.endsWith("/interview"))).toHaveLength(1);
 		} finally {
 			await act(async () => {
 				root.unmount();
@@ -10496,19 +10682,9 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			const urlInput = container.querySelector(
 				"input[data-autofocus]",
 			) as unknown as HTMLInputElement;
-			await act(async () => {
-				typeInto(urlInput, "https://github.com/o/r.git");
-				onChangeOf(urlInput)({
-					target: urlInput,
-					currentTarget: urlInput,
-				});
-			});
-			const form = container.querySelector(
-				"form",
-			) as unknown as HTMLFormElement;
-			await act(async () => {
-				form.dispatchEvent(submitEvent());
-			});
+			await typeAndChange(urlInput, "https://github.com/o/r.git");
+			await reachRules(container);
+			await clickAction(container, "Finish");
 			expect(container.textContent).toContain("Token for github.com");
 			expect(
 				[...container.querySelectorAll("button")].some(
@@ -10530,13 +10706,7 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			const urlInput = container.querySelector(
 				"input[data-autofocus]",
 			) as unknown as HTMLInputElement;
-			await act(async () => {
-				typeInto(urlInput, "https://github.com/acme/cmis-cli.git");
-				onChangeOf(urlInput)({
-					target: urlInput,
-					currentTarget: urlInput,
-				});
-			});
+			await typeAndChange(urlInput, "https://github.com/acme/cmis-cli.git");
 			const prefixInput = container.querySelector(
 				'input[aria-label="Task ID prefix"]',
 			) as unknown as HTMLInputElement;
@@ -10556,29 +10726,14 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			const urlInput = container.querySelector(
 				"input[data-autofocus]",
 			) as unknown as HTMLInputElement;
-			await act(async () => {
-				typeInto(urlInput, "https://github.com/acme/cmis-cli.git");
-				onChangeOf(urlInput)({
-					target: urlInput,
-					currentTarget: urlInput,
-				});
-			});
+			await typeAndChange(urlInput, "https://github.com/acme/cmis-cli.git");
 			const prefixInput = container.querySelector(
 				'input[aria-label="Task ID prefix"]',
 			) as unknown as HTMLInputElement;
-			await act(async () => {
-				typeInto(prefixInput, "fix");
-				onChangeOf(prefixInput)({
-					target: prefixInput,
-					currentTarget: prefixInput,
-				});
-			});
-			const form = container.querySelector(
-				"form",
-			) as unknown as HTMLFormElement;
-			await act(async () => {
-				form.dispatchEvent(submitEvent());
-			});
+			await typeAndChange(prefixInput, "fix");
+			await reachRules(container);
+			expect(posts).toHaveLength(0);
+			await clickAction(container, "Finish");
 			// The mocked answer is the 400 needsToken step; the harness still records the body.
 			expect(posts[0]?.body.taskIdPrefix).toBe("FIX");
 		} finally {
@@ -10597,21 +10752,9 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			const prefixInput = container.querySelector(
 				'input[aria-label="Task ID prefix"]',
 			) as unknown as HTMLInputElement;
-			await act(async () => {
-				typeInto(prefixInput, "FIX");
-				onChangeOf(prefixInput)({
-					target: prefixInput,
-					currentTarget: prefixInput,
-				});
-			});
+			await typeAndChange(prefixInput, "FIX");
 			expect(container.querySelector('p[role="status"]')).not.toBeNull();
-			await act(async () => {
-				typeInto(prefixInput, "XYZ");
-				onChangeOf(prefixInput)({
-					target: prefixInput,
-					currentTarget: prefixInput,
-				});
-			});
+			await typeAndChange(prefixInput, "XYZ");
 			expect(container.querySelector('p[role="status"]')).toBeNull();
 		} finally {
 			await act(async () => {
@@ -10628,23 +10771,11 @@ describe("AddProjectModal board GitHub token reuse", () => {
 			const urlInput = container.querySelector(
 				"input[data-autofocus]",
 			) as unknown as HTMLInputElement;
-			await act(async () => {
-				typeInto(urlInput, "https://github.com/acme/cmis-cli.git");
-				onChangeOf(urlInput)({
-					target: urlInput,
-					currentTarget: urlInput,
-				});
-			});
+			await typeAndChange(urlInput, "https://github.com/acme/cmis-cli.git");
 			const prefixInput = container.querySelector(
 				'input[aria-label="Task ID prefix"]',
 			) as unknown as HTMLInputElement;
-			await act(async () => {
-				typeInto(prefixInput, "A-B");
-				onChangeOf(prefixInput)({
-					target: prefixInput,
-					currentTarget: prefixInput,
-				});
-			});
+			await typeAndChange(prefixInput, "A-B");
 			const form = container.querySelector(
 				"form",
 			) as unknown as HTMLFormElement;
@@ -10665,114 +10796,769 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		}
 	});
 
-	// OTTR-1065: one guided flow — add, board step, Project step, then the interview.
-	/** Types the wizard fixture's URL and submits; the 400's token step retries through
-	 *  the board token button, leaving the wizard in the dialog. */
-	const addThroughDialog = async (container: HTMLDivElement): Promise<void> => {
-		const urlInput = container.querySelector(
-			"input[data-autofocus]",
-		) as unknown as HTMLInputElement;
-		await act(async () => {
-			typeInto(urlInput, "https://github.com/o/wiz.git");
-			onChangeOf(urlInput)({
-				target: urlInput,
-				currentTarget: urlInput,
+	for (const mode of ["new", "url"] as const) {
+		for (let step = 1; step <= 5; step += 1) {
+			test(`${mode}: Cancel at step ${step} leaves no project or interview`, async () => {
+				await withWizard(mode, async ({ container, posts, closeCount }) => {
+					if (step > 1) await sourceNext(container);
+					for (let current = 2; current < step; current += 1) {
+						await clickAction(container, "Next");
+					}
+					const steps = [
+						...container.querySelectorAll('[aria-label="Setup steps"] li'),
+					];
+					expect(steps).toHaveLength(5);
+					expect(steps[step - 1]?.getAttribute("aria-current")).toBe("step");
+					await clickAction(container, "Cancel");
+					expect(closeCount()).toBe(1);
+					expect(posts).toHaveLength(0);
+				});
 			});
-		});
-		const form = container.querySelector("form") as unknown as HTMLFormElement;
-		await act(async () => {
-			form.dispatchEvent(submitEvent());
-		});
-		const boardButton = [...container.querySelectorAll("button")].find(
-			(b) => b.textContent === "Use the board GitHub token",
-		);
-		await act(async () => {
-			onClickOf(boardButton as unknown as Element)({});
-		});
-	};
-
-	const buttonOf = (container: HTMLDivElement, label: string): Element => {
-		const b = [...container.querySelectorAll("button")].find(
-			(x) => x.textContent === label,
-		);
-		if (b === undefined) throw new Error(`no ${label} button`);
-		return b;
-	};
-
-	test("PR mode saves before the interview starts", async () => {
-		const { container, root, posts, restore } = await mountAdd(
-			true,
-			[],
-			wizardProject,
-		);
-		try {
-			await addThroughDialog(container);
-			// The fresh project opens at the board step: retro is off.
-			expect(container.textContent).toContain("Retro");
-			// Skip the board and runner steps: their defaults stay.
-			await act(async () => {
-				onClickOf(buttonOf(container, "Skip, use defaults"))({});
-			});
-			await act(async () => {
-				onClickOf(buttonOf(container, "Skip, use defaults"))({});
-			});
-			// The Project step: PR mode is the step's only checkbox.
-			const pr = container.querySelector(
-				'input[type="checkbox"]',
-			) as unknown as HTMLInputElement;
-			expect(pr).not.toBeNull();
-			await act(async () => {
-				onChangeOf(pr)({ target: { checked: true }, currentTarget: pr });
-			});
-			// Next keeps the target branch at its default; Done starts the interview.
-			await act(async () => {
-				onClickOf(buttonOf(container, "Next"))({});
-			});
-			await act(async () => {
-				onClickOf(buttonOf(container, "Done"))({});
-			});
-			const prSave = posts.findIndex(
-				(p) => p.url.endsWith("/settings") && p.body.prMode === true,
-			);
-			const interview = posts.findIndex((p) => p.url.endsWith("/interview"));
-			expect(prSave).toBeGreaterThanOrEqual(0);
-			// The interview call exists and only follows the PR mode save.
-			expect(interview).toBeGreaterThan(prSave);
-			expect(posts[interview]?.body).toEqual({});
-			// The wizard finished: the checklist flag cleared.
-			expect(
-				posts.some(
-					(p) => p.url.endsWith("/settings") && p.body.setupChecklist === false,
-				),
-			).toBe(true);
-		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			restore();
 		}
+
+		test(`${mode}: Back preserves source and settings drafts without a write`, async () => {
+			await withWizard(mode, async ({ container, posts }) => {
+				const prefix = container.querySelector(
+					'input[aria-label="Task ID prefix"]',
+				) as HTMLInputElement;
+				await changeField(prefix, "DRAFT");
+				await sourceNext(container);
+				const retro = container.querySelector(
+					'input[type="checkbox"]',
+				) as HTMLInputElement;
+				await act(async () => {
+					onChangeOf(retro)({
+						target: { checked: true },
+						currentTarget: retro,
+					});
+				});
+				await clickAction(container, "Next");
+				await changeField(
+					container.querySelector('input[type="number"]') as HTMLInputElement,
+					"3",
+				);
+				await changeField(
+					container.querySelector("textarea") as HTMLTextAreaElement,
+					"config/local.json\n.env.local",
+				);
+				await clickAction(container, "Next");
+				await changeField(
+					container.querySelector(
+						'input[aria-label="Target branch for merges"]',
+					) as HTMLInputElement,
+					"release",
+				);
+				await clickAction(container, "Next");
+				await clickAction(container, "Back");
+				expect(
+					(
+						container.querySelector(
+							'input[aria-label="Target branch for merges"]',
+						) as HTMLInputElement
+					).value,
+				).toBe("release");
+				await clickAction(container, "Back");
+				expect(
+					(container.querySelector('input[type="number"]') as HTMLInputElement)
+						.value,
+				).toBe("3");
+				expect(
+					(container.querySelector("textarea") as HTMLTextAreaElement).value,
+				).toBe("config/local.json\n.env.local");
+				await clickAction(container, "Back");
+				expect(
+					(
+						container.querySelector(
+							'input[type="checkbox"]',
+						) as HTMLInputElement
+					).checked,
+				).toBe(true);
+				await clickAction(container, "Back");
+				expect(
+					(
+						container.querySelector(
+							'input[aria-label="Task ID prefix"]',
+						) as HTMLInputElement
+					).value,
+				).toBe("DRAFT");
+				expect(
+					container
+						.querySelector(`[data-tab="${mode}"]`)
+						?.getAttribute("aria-selected"),
+				).toBe("true");
+				const source = container.querySelector(
+					mode === "url" ? "input[data-autofocus]" : "#add-panel-new input",
+				) as HTMLInputElement;
+				expect(source.value).toBe(
+					mode === "url" ? "https://github.com/o/wiz.git" : "wiz",
+				);
+				expect(posts).toHaveLength(0);
+			});
+		});
+
+		test(`${mode}: Finish creates once and saves all settings before the interview`, async () => {
+			await withWizard(mode, async ({ container, posts, closeCount }) => {
+				await sourceNext(container);
+				const retro = container.querySelector(
+					'input[type="checkbox"]',
+				) as HTMLInputElement;
+				// Retro starts on; clearing it must save off, not drop the field.
+				expect(retro.checked).toBe(true);
+				await act(async () => {
+					onChangeOf(retro)({
+						target: { checked: false },
+						currentTarget: retro,
+					});
+				});
+				await clickAction(container, "Next");
+				await changeField(
+					container.querySelector('input[type="number"]') as HTMLInputElement,
+					"3",
+				);
+				await changeField(
+					container.querySelector("textarea") as HTMLTextAreaElement,
+					"config/local.json",
+				);
+				await clickAction(container, "Next");
+				await changeField(
+					container.querySelector(
+						'input[aria-label="Target branch for merges"]',
+					) as HTMLInputElement,
+					"release",
+				);
+				if (mode === "url") {
+					const pr = container.querySelector(
+						'input[type="checkbox"]',
+					) as HTMLInputElement;
+					expect(pr.disabled).toBe(false);
+					await act(async () => {
+						onChangeOf(pr)({ target: { checked: true }, currentTarget: pr });
+					});
+				}
+				await clickAction(container, "Next");
+				expect(posts).toHaveLength(0);
+				await clickAction(container, "Finish");
+				const creates = posts.filter((p) => p.url === "/api/projects");
+				expect(creates).toHaveLength(1);
+				expect(creates[0]?.body).toMatchObject(
+					mode === "url"
+						? { name: "wiz", url: "https://github.com/o/wiz.git" }
+						: { name: "wiz", github: false },
+				);
+				const interview = posts.findIndex(
+					(p) => p.url === "/api/projects/wiz/interview",
+				);
+				expect(interview).toBeGreaterThan(0);
+				const saved = Object.assign(
+					{},
+					...posts
+						.slice(0, interview)
+						.filter((p) => p.url === "/api/projects/wiz/settings")
+						.map((p) => p.body),
+				);
+				expect(saved).toMatchObject({
+					retro: false,
+					maxParallel: 3,
+					copyExtra: ["config/local.json"],
+					targetBranch: "release",
+					...(mode === "url" ? { prMode: true } : {}),
+				});
+				const init = posts.findIndex((p) => p.url === "/api/projects/wiz/init");
+				const settings = posts.findIndex(
+					(p) => p.url === "/api/projects/wiz/settings",
+				);
+				if (mode === "new") {
+					expect(init).toBeGreaterThan(0);
+					expect(settings).toBeGreaterThan(init);
+				} else {
+					expect(init).toBe(-1);
+				}
+				expect(posts.filter((p) => p.url.endsWith("/interview"))).toHaveLength(
+					1,
+				);
+				expect(
+					posts
+						.slice(interview + 1)
+						.some(
+							(p) =>
+								p.url === "/api/projects/wiz/settings" &&
+								p.body.setupChecklist === false,
+						),
+				).toBe(true);
+				expect(closeCount()).toBe(1);
+			});
+		});
+	}
+
+	test("Start retro proposals without asking starts on, waits on Retro, and saves a clear on Finish", async () => {
+		await withWizard("new", async ({ container, posts }) => {
+			await sourceNext(container);
+			const box = (label: string): HTMLInputElement => {
+				const row = [...container.querySelectorAll("label")].find((l) =>
+					l.textContent?.startsWith(label),
+				);
+				if (row === undefined) throw new Error(`no ${label} row`);
+				return row.querySelector("input") as HTMLInputElement;
+			};
+			const set = async (input: HTMLInputElement, checked: boolean) => {
+				await act(async () => {
+					onChangeOf(input)({ target: { checked }, currentTarget: input });
+				});
+			};
+			const auto = box("Start retro proposals without asking");
+			expect(auto.checked).toBe(true);
+			expect(auto.disabled).toBe(false);
+			// Retro cleared: the sub-option locks, as the friction filter does.
+			await set(box("Retro"), false);
+			expect(box("Start retro proposals without asking").disabled).toBe(true);
+			await set(box("Retro"), true);
+			await set(box("Start retro proposals without asking"), false);
+			for (let i = 0; i < 3; i += 1) await clickAction(container, "Next");
+			await clickAction(container, "Finish");
+			const saved = Object.assign(
+				{},
+				...posts.filter((p) => p.url.endsWith("/settings")).map((p) => p.body),
+			);
+			expect(saved).toMatchObject({ retro: true, retroAutoStart: false });
+		});
 	});
 
-	test("closing the dialog after the add queues no interview", async () => {
-		const { container, root, posts, restore } = await mountAdd(
-			true,
-			[],
-			wizardProject,
-		);
-		try {
-			await addThroughDialog(container);
-			// The wizard replaced the form and no card is filed yet.
-			expect(container.textContent).toContain("Skip, use defaults");
-		} finally {
-			await act(async () => {
-				root.unmount();
+	test("the Automation step offers the watches: PR review options need PR reviews, Finish sends only changes", async () => {
+		await withWizard("url", async ({ container, posts }) => {
+			await sourceNext(container);
+			const box = (label: string): HTMLInputElement => {
+				const row = [...container.querySelectorAll("label")].find((l) =>
+					l.textContent?.startsWith(label),
+				);
+				if (row === undefined) throw new Error(`no ${label} row`);
+				return row.querySelector("input") as HTMLInputElement;
+			};
+			const set = async (input: HTMLInputElement, checked: boolean) => {
+				await act(async () => {
+					onChangeOf(input)({ target: { checked }, currentTarget: input });
+				});
+			};
+			// The stored defaults: notifications and the Dependabot warning start on.
+			expect(box("PR review notifications").checked).toBe(true);
+			expect(box("Dependabot warning").checked).toBe(true);
+			expect(box("Approve when no blocking issues remain").disabled).toBe(true);
+			await set(box("PR reviews"), true);
+			expect(box("Approve when no blocking issues remain").disabled).toBe(
+				false,
+			);
+			await set(box("Approve when no blocking issues remain"), true);
+			await set(box("Issue watch"), true);
+			await set(box("Trending scout"), true);
+			for (let i = 0; i < 3; i += 1) await clickAction(container, "Next");
+			await clickAction(container, "Finish");
+			const saved = Object.assign(
+				{},
+				...posts.filter((p) => p.url.endsWith("/settings")).map((p) => p.body),
+			);
+			expect(saved).toMatchObject({
+				prReviews: true,
+				prReviewApprove: true,
+				issueWatch: true,
+				trendingScout: true,
 			});
-			container.remove();
-			restore();
+			// Untouched rows keep the project's own values: never sent.
+			expect(saved).not.toHaveProperty("dependabotWarn");
+			expect(saved).not.toHaveProperty("ompWatch");
+		});
+	});
+
+	test("a project without GitHub gets no GitHub watch rows, but omp watch and trending scout", async () => {
+		await withWizard("new", async ({ container }) => {
+			await sourceNext(container);
+			const labels = [...container.querySelectorAll("label")].map(
+				(l) => l.textContent ?? "",
+			);
+			for (const gone of ["Issue watch", "PR reviews", "Dependabot warning"])
+				expect(labels.some((t) => t.startsWith(gone))).toBe(false);
+			for (const kept of ["omp watch", "Trending scout"])
+				expect(labels.some((t) => t.startsWith(kept))).toBe(true);
+		});
+	});
+
+	test("the Runners step offers the microVM switch, locked while no vm-runner reports ready", async () => {
+		await withWizard("new", async ({ container }) => {
+			await sourceNext(container);
+			await clickAction(container, "Next");
+			const row = [...container.querySelectorAll("label")].find((l) =>
+				l.textContent?.startsWith("Run work turns in microVMs"),
+			);
+			if (row === undefined) throw new Error("no microVM row");
+			const box = row.querySelector("input") as HTMLInputElement;
+			expect(box.checked).toBe(false);
+			// This board has no project yet, so no vm-runner state: the switch stays off.
+			expect(box.disabled).toBe(true);
+			expect(row.textContent).toContain("No vm-runner on this board");
+		});
+	});
+
+	test("a runner cap of 0 saves as no cap on Finish", async () => {
+		await withWizard("new", async ({ container, posts }) => {
+			await sourceNext(container);
+			await clickAction(container, "Next");
+			await changeField(
+				container.querySelector('input[type="number"]') as HTMLInputElement,
+				"0",
+			);
+			await clickAction(container, "Next");
+			await clickAction(container, "Next");
+			await clickAction(container, "Finish");
+			const saved = Object.assign(
+				{},
+				...posts.filter((p) => p.url.endsWith("/settings")).map((p) => p.body),
+			);
+			expect(saved).toHaveProperty("maxParallel", null);
+		});
+	});
+
+	for (const changed of [false, true]) {
+		test(`clone settings survive Finish with ${changed ? "one explicit change" : "untouched drafts"}`, async () => {
+			await withWizard(
+				"url",
+				async ({ container, posts, closeCount }) => {
+					await sourceNext(container);
+					await clickAction(container, "Next");
+					if (changed) {
+						await changeField(
+							container.querySelector(
+								'input[type="number"]',
+							) as HTMLInputElement,
+							"2",
+						);
+					}
+					await clickAction(container, "Next");
+					await clickAction(container, "Next");
+					expect(posts).toHaveLength(0);
+					await clickAction(container, "Finish");
+					const interview = posts.findIndex((p) =>
+						p.url.endsWith("/interview"),
+					);
+					expect(interview).toBeGreaterThan(0);
+					const saved = Object.assign(
+						{},
+						...posts
+							.slice(0, interview)
+							.filter((p) => p.url.endsWith("/settings"))
+							.map((p) => p.body),
+					);
+					// Retro and its auto-start are the drafts Finish always sends: both start on.
+					const always = { retro: true, retroAutoStart: true };
+					expect(saved).toEqual(
+						changed ? { ...always, maxParallel: 2 } : always,
+					);
+					expect(closeCount()).toBe(1);
+				},
+				{
+					hasRules: true,
+					savedSettings: {
+						retroSince: 1,
+						retroFilter: true,
+						forkResearch: true,
+						holdUpdateMerges: true,
+						forkMergeHold: true,
+						prMode: true,
+						targetBranch: "stable",
+						maxParallel: 6,
+						copyExtra: ["config/existing.json"],
+					},
+				},
+			);
+		});
+	}
+
+	test("property: Finish preserves ordered nonempty Extra paths after whitespace normalization", async () => {
+		const line = fc
+			.tuple(
+				fc.constantFrom("", " ", "\t", " \t"),
+				fc.string({
+					unit: fc.constantFrom("a", "b", "0", ".", "/", "-", "_", " "),
+					maxLength: 16,
+				}),
+				fc.constantFrom("", " ", "\t", "\t "),
+			)
+			.map((parts) => parts.join(""));
+		await fc.assert(
+			fc.asyncProperty(fc.array(line, { maxLength: 8 }), async (lines) => {
+				await withWizard("url", async ({ container, posts }) => {
+					await sourceNext(container);
+					await clickAction(container, "Next");
+					await changeField(
+						container.querySelector("textarea") as HTMLTextAreaElement,
+						lines.join("\n"),
+					);
+					await clickAction(container, "Next");
+					await clickAction(container, "Next");
+					expect(posts).toHaveLength(0);
+					await clickAction(container, "Finish");
+					const settings = posts.filter((p) => p.url.endsWith("/settings"));
+					expect(settings[0]?.body).toEqual({
+						retro: true,
+						retroAutoStart: true,
+						copyExtra: lines
+							.map((value) => value.trim())
+							.filter((value) => value !== ""),
+					});
+					expect(settings.at(-1)?.body).toEqual({ setupChecklist: false });
+				});
+			}),
+		);
+	}, 30_000);
+
+	for (const originalMode of ["new", "url"] as const) {
+		test(`${originalMode}: source edits after Back reach the final create request`, async () => {
+			await withWizard(originalMode, async ({ container, posts }) => {
+				await sourceNext(container);
+				await clickAction(container, "Next");
+				await changeField(
+					container.querySelector('input[type="number"]') as HTMLInputElement,
+					"3",
+				);
+				await clickAction(container, "Next");
+				await clickAction(container, "Next");
+				for (let step = 5; step > 1; step -= 1) {
+					await clickAction(container, "Back");
+				}
+				const finalMode = originalMode === "new" ? "url" : "new";
+				await chooseSource(container, finalMode);
+				await changeField(
+					container.querySelector(
+						finalMode === "url"
+							? "input[data-autofocus]"
+							: "#add-panel-new input",
+					) as HTMLInputElement,
+					finalMode === "url" ? "https://github.com/o/edited.git" : "edited",
+				);
+				await changeField(
+					container.querySelector(
+						'input[aria-label="Task ID prefix"]',
+					) as HTMLInputElement,
+					"EDITED",
+				);
+				await sourceNext(container);
+				await clickAction(container, "Next");
+				expect(
+					(container.querySelector('input[type="number"]') as HTMLInputElement)
+						.value,
+				).toBe("3");
+				await clickAction(container, "Next");
+				await clickAction(container, "Next");
+				expect(posts).toHaveLength(0);
+				await clickAction(container, "Finish");
+				const creates = posts.filter((p) => p.url === "/api/projects");
+				expect(creates).toHaveLength(1);
+				expect(creates[0]?.body).toMatchObject({
+					name: "edited",
+					taskIdPrefix: "EDITED",
+					...(finalMode === "url"
+						? { url: "https://github.com/o/edited.git" }
+						: { github: false }),
+				});
+				if (finalMode === "new") expect(creates[0]?.body.url).toBeUndefined();
+			});
+		});
+	}
+
+	for (const source of ["new", "non-GitHub URL"] as const) {
+		test(`${source}: changed source blocks selected PR mode before writes and permits correction`, async () => {
+			await withWizard(
+				"url",
+				async ({ container, posts, closeCount }) => {
+					await sourceNext(container);
+					await clickAction(container, "Next");
+					await clickAction(container, "Next");
+					const pr = container.querySelector(
+						'input[type="checkbox"]',
+					) as HTMLInputElement;
+					await act(async () => {
+						onChangeOf(pr)({ target: { checked: true }, currentTarget: pr });
+					});
+					for (let step = 4; step > 1; step -= 1) {
+						await clickAction(container, "Back");
+					}
+					if (source === "new") {
+						await chooseSource(container, "new");
+					} else {
+						await changeField(
+							container.querySelector(
+								"input[data-autofocus]",
+							) as HTMLInputElement,
+							"https://gitlab.com/o/wiz.git",
+						);
+					}
+					await sourceNext(container);
+					await clickAction(container, "Next");
+					await clickAction(container, "Next");
+					await clickAction(container, "Next");
+					if (
+						[...container.querySelectorAll("button")].some(
+							(button) => button.textContent?.trim() === "Finish",
+						)
+					) {
+						await clickAction(container, "Finish");
+					}
+					expect(
+						container.querySelector(
+							'[aria-label="Setup steps"] li[aria-current="step"]',
+						)?.textContent,
+					).toContain("Project");
+					const error = container.querySelector('[role="alert"]')?.textContent;
+					expect(error).toContain("GitHub");
+					expect(error).toContain("PR mode");
+					expect(error).toMatch(/Turn off|Source/);
+					expect(posts).toHaveLength(0);
+					expect(closeCount()).toBe(0);
+					const retained = container.querySelector(
+						'input[type="checkbox"]',
+					) as HTMLInputElement;
+					expect(retained.checked).toBe(true);
+					expect(retained.disabled).toBe(false);
+					await act(async () => {
+						onChangeOf(retained)({
+							target: { checked: false },
+							currentTarget: retained,
+						});
+					});
+					await clickAction(container, "Next");
+					await clickAction(container, "Finish");
+					const creates = posts.filter((p) => p.url === "/api/projects");
+					expect(creates).toHaveLength(1);
+					expect(creates[0]?.body).toMatchObject(
+						source === "new"
+							? { name: "wiz", github: false }
+							: { name: "wiz", url: "https://gitlab.com/o/wiz.git" },
+					);
+					expect(
+						posts.find((p) => p.url.endsWith("/settings"))?.body.prMode,
+					).toBe(false);
+					expect(
+						posts.filter((p) => p.url.endsWith("/interview")),
+					).toHaveLength(1);
+					expect(closeCount()).toBe(1);
+				},
+				{ createdSource: { github: null, gitless: source === "new" } },
+			);
+		});
+	}
+
+	test("a non-GitHub source omits a hidden fork draft and preserves untouched clone settings", async () => {
+		await withWizard(
+			"url",
+			async ({ container, posts, closeCount }) => {
+				await sourceNext(container);
+				// The row's own label starts with its name; the fork hold's text also names it.
+				const forkRow = (): HTMLLabelElement | undefined =>
+					[...container.querySelectorAll("label")].find((label) =>
+						label.textContent?.startsWith("Fork research"),
+					);
+				const forkLabel = forkRow();
+				if (forkLabel === undefined) throw new Error("no Fork research row");
+				const fork = forkLabel.querySelector("input") as HTMLInputElement;
+				await act(async () => {
+					onChangeOf(fork)({ target: { checked: true }, currentTarget: fork });
+				});
+				await clickAction(container, "Back");
+				await changeField(
+					container.querySelector("input[data-autofocus]") as HTMLInputElement,
+					"https://gitlab.com/o/wiz.git",
+				);
+				await sourceNext(container);
+				expect(forkRow()).toBeUndefined();
+				await clickAction(container, "Next");
+				await clickAction(container, "Next");
+				await clickAction(container, "Next");
+				expect(posts).toHaveLength(0);
+				await clickAction(container, "Finish");
+				expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(1);
+				const settings = posts.filter((p) => p.url.endsWith("/settings"));
+				// Only Retro and its auto-start (on by default) and the checklist close: no fork draft.
+				expect(settings.map((p) => p.body)).toEqual([
+					{ retro: true, retroAutoStart: true },
+					{ setupChecklist: false },
+				]);
+				expect(posts.filter((p) => p.url.endsWith("/interview"))).toHaveLength(
+					1,
+				);
+				expect(closeCount()).toBe(1);
+			},
+			{
+				createdSource: { github: null, gitless: false },
+				hasRules: true,
+				savedSettings: {
+					retroSince: 1,
+					retroFilter: false,
+					forkResearch: true,
+					holdUpdateMerges: true,
+					forkMergeHold: true,
+					maxParallel: 6,
+					copyExtra: ["config/existing.json"],
+					targetBranch: "stable",
+				},
+			},
+		);
+	});
+
+	test("hosted wizard keeps target branch and omits PR mode", async () => {
+		await withWizard(
+			"url",
+			async ({ container, posts }) => {
+				await sourceNext(container);
+				await clickAction(container, "Next");
+				await clickAction(container, "Next");
+				expect(container.querySelector('input[type="checkbox"]')).toBeNull();
+				const target = container.querySelector(
+					'input[aria-label="Target branch for merges"]',
+				) as HTMLInputElement;
+				expect(target).not.toBeNull();
+				await changeField(target, "release");
+				await clickAction(container, "Next");
+				expect(posts).toHaveLength(0);
+				await clickAction(container, "Finish");
+				expect(posts.some((p) => p.body.targetBranch === "release")).toBe(true);
+				expect(posts.some((p) => "prMode" in p.body)).toBe(false);
+			},
+			{ hosted: true },
+		);
+	});
+
+	for (const failure of [
+		"create",
+		"init",
+		"settings",
+		"interview",
+		"checklist",
+	] as const) {
+		test(`Finish recovers from ${failure} failure without a duplicate project`, async () => {
+			await withWizard(
+				failure === "init" ? "new" : "url",
+				async ({ container, posts, closeCount }) => {
+					await sourceNext(container);
+					await clickAction(container, "Next");
+					await changeField(
+						container.querySelector('input[type="number"]') as HTMLInputElement,
+						"3",
+					);
+					await clickAction(container, "Next");
+					await clickAction(container, "Next");
+					await clickAction(container, "Finish");
+					expect(container.querySelector('[role="alert"]')).not.toBeNull();
+					expect(closeCount()).toBe(0);
+					if (failure !== "interview" && failure !== "checklist") {
+						expect(
+							posts.filter((p) => p.url.endsWith("/interview")),
+						).toHaveLength(0);
+					}
+					if (failure === "interview") {
+						expect(posts.some((p) => p.body.setupChecklist === false)).toBe(
+							false,
+						);
+					}
+					await clickAction(container, "Finish");
+					expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(
+						failure === "create" ? 2 : 1,
+					);
+					const interviewCount = posts.filter((p) =>
+						p.url.endsWith("/interview"),
+					).length;
+					if (failure === "checklist") {
+						expect(interviewCount).toBeGreaterThanOrEqual(1);
+						expect(interviewCount).toBeLessThanOrEqual(2);
+						expect(
+							posts.filter((p) => p.body.setupChecklist === false),
+						).toHaveLength(2);
+					} else {
+						expect(interviewCount).toBe(failure === "interview" ? 2 : 1);
+					}
+					expect(closeCount()).toBe(1);
+				},
+				{ fail: failure },
+			);
+		});
+	}
+
+	test("SSH tests and changed-host approval do not create before Finish", async () => {
+		await withWizard(
+			"url",
+			async ({ container, posts, closeCount }) => {
+				await changeField(
+					container.querySelector("input[data-autofocus]") as HTMLInputElement,
+					"git@github.com:o/wiz.git",
+				);
+				await clickAction(container, "Test key");
+				expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(0);
+				await clickAction(container, "Trust and test key");
+				const tests = posts.filter((p) => p.url === "/api/git-hosts/ssh/test");
+				expect(tests).toHaveLength(2);
+				expect(tests[0]?.body).toMatchObject({
+					url: "git@github.com:o/wiz.git",
+					key: "global",
+				});
+				expect(tests[0]?.body.trust).toBeUndefined();
+				expect(tests[1]?.body.trust).toEqual(["SHA256:before"]);
+				await reachRules(container);
+				expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(0);
+				await clickAction(container, "Finish");
+				expect(closeCount()).toBe(0);
+				expect(posts.filter((p) => p.url.endsWith("/interview"))).toHaveLength(
+					0,
+				);
+				await clickAction(container, "Trust and finish");
+				const creates = posts.filter((p) => p.url === "/api/projects");
+				expect(creates.at(-1)?.body).toMatchObject({
+					url: "git@github.com:o/wiz.git",
+					sshKey: "global",
+					trust: ["SHA256:after"],
+				});
+				expect(
+					creates.filter(
+						(p) =>
+							JSON.stringify(p.body.trust) === JSON.stringify(["SHA256:after"]),
+					),
+				).toHaveLength(1);
+				expect(posts.filter((p) => p.url.endsWith("/interview"))).toHaveLength(
+					1,
+				);
+				expect(closeCount()).toBe(1);
+			},
+			{ sshAccess: true },
+		);
+	});
+
+	test("double Finish sends only one create request", async () => {
+		const { promise: waitForCreate, resolve: release } =
+			Promise.withResolvers<void>();
+		try {
+			await withWizard(
+				"url",
+				async ({ container, posts, closeCount }) => {
+					await reachRules(container);
+					const finish = buttonOf(container, "Finish");
+					await act(async () => {
+						finish.click();
+						finish.click();
+					});
+					expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(
+						1,
+					);
+					await act(async () => {
+						release();
+					});
+					expect(posts.filter((p) => p.url === "/api/projects")).toHaveLength(
+						1,
+					);
+					expect(
+						posts.filter((p) => p.url.endsWith("/interview")),
+					).toHaveLength(1);
+					expect(closeCount()).toBe(1);
+				},
+				{ waitForCreate },
+			);
+		} finally {
+			release();
 		}
-		expect(posts.some((p) => p.url.endsWith("/api/projects"))).toBe(true);
-		expect(posts.some((p) => p.url.endsWith("/interview"))).toBe(false);
 	});
 });
 
@@ -10840,39 +11626,17 @@ describe("SetupChecklist rules item", () => {
 });
 
 describe("AuthPage setup form", () => {
-	// The same happy-dom browser-mount pattern as the other client describes:
-	// React interaction needs browser globals, and afterAll puts them back.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		location: window.location,
-		localStorage: window.localStorage,
-		Event: window.Event,
-		HTMLElement: window.HTMLElement,
-		HTMLInputElement: window.HTMLInputElement,
-		Node: window.Node,
-		getComputedStyle: window.getComputedStyle,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+	const { window } = installBrowserGlobals([
+		"location",
+		"localStorage",
+		"Event",
+		"HTMLElement",
+		"HTMLInputElement",
+		"Node",
+		"getComputedStyle",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
 
 	/** The form-submit DOM event; happy-dom's Event class does not match lib.dom's. */
 	const submitEvent = (): Event =>
@@ -10881,38 +11645,7 @@ describe("AuthPage setup form", () => {
 			cancelable: true,
 		}) as unknown as Event;
 	/** A React onChange picks up programmatic edits only through the native value setter. */
-	const typeInto = (el: HTMLInputElement, value: string): void => {
-		const setter = Object.getOwnPropertyDescriptor(
-			window.HTMLInputElement.prototype,
-			"value",
-		)?.set;
-		if (setter === undefined) throw new Error("value setter missing");
-		setter.call(el, value);
-	};
-	/** Dispatched input events never reach React's ChangeEventPlugin: call the production onChange. */
-	const onChangeOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onChange?: (e: unknown) => void;
-		};
-		if (props.onChange === undefined) throw new Error("node has no onChange");
-		return props.onChange;
-	};
-	/** Buttons get the same treatment: dispatch never reaches React's onClick. */
-	const onClickOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onClick?: (e: unknown) => void;
-		};
-		if (props.onClick === undefined) throw new Error("node has no onClick");
-		return props.onClick;
-	};
+	const typeInto = typeIntoFor(window);
 
 	interface PostCall {
 		url: string;
@@ -10931,17 +11664,12 @@ describe("AuthPage setup form", () => {
 		unmount: () => Promise<void>;
 	}> {
 		const posts: PostCall[] = [];
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (
-			input: Parameters<typeof fetch>[0],
-			init?: Parameters<typeof fetch>[1],
-		) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url, init) => {
 			const body =
 				init?.body === undefined ? null : JSON.parse(String(init.body));
 			if (init?.method === "POST") posts.push({ url, body });
 			return respond(url, body);
-		}) as typeof fetch;
+		});
 		// The success path reloads the page; happy-dom's reload would navigate away.
 		const reloadCalls = { n: 0 };
 		window.location.reload = () => {
@@ -10949,14 +11677,9 @@ describe("AuthPage setup form", () => {
 		};
 		// happy-dom's DOM classes do not structurally match lib.dom's; the test
 		// speaks lib types, so the boundary converts once here.
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(<AuthPage mode="setup" version={null} />);
-		});
+		const { container, unmount } = await mount(
+			<AuthPage mode="setup" version={null} />,
+		);
 		const form = container.querySelector("form") as unknown as HTMLFormElement;
 		/** A setup field by its label text; only the token and host inputs carry aria-labels. */
 		const field = (text: string): HTMLInputElement => {
@@ -10977,11 +11700,8 @@ describe("AuthPage setup form", () => {
 			posts,
 			reloadCalls,
 			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
-				globalThis.fetch = realFetch;
+				await unmount();
+				restore();
 			},
 		};
 	}
@@ -11259,28 +11979,16 @@ describe("Drawer PR link", () => {
 });
 
 describe("Optimistic taps (client)", () => {
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		Event: window.Event,
-		HTMLElement: window.HTMLElement,
-		HTMLSelectElement: window.HTMLSelectElement,
-		HTMLTextAreaElement: window.HTMLTextAreaElement,
-		Node: window.Node,
-		getComputedStyle: window.getComputedStyle,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
+	const { window } = installBrowserGlobals([
+		"Event",
+		"HTMLSelectElement",
+		"HTMLTextAreaElement",
+		"Node",
+		"getComputedStyle",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
 	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
 		// LaneCol's FLIP effect animates committed order changes; happy-dom has no WAAPI.
 		const proto = window.HTMLElement.prototype as unknown as Record<
 			string,
@@ -11290,21 +11998,8 @@ describe("Optimistic taps (client)", () => {
 		proto.showPopover ??= () => {};
 		proto.hidePopover ??= () => {};
 	});
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
 
-	const project = {
-		name: "proj",
-		github: null,
-		hasRules: true,
-		sessionsDir: "/tmp/proj/.tasks/sessions",
-		settings: {},
-	} as unknown as ProjectView;
+	const project = drawerProject;
 	const base = {
 		project,
 		act: async (fn: () => Promise<void>) => {
@@ -11327,21 +12022,6 @@ describe("Optimistic taps (client)", () => {
 		maxTotal: null,
 		tasks: [] as TaskCard[],
 	};
-	const drawerFields = {
-		kind: "work",
-		research: false,
-		report: null,
-		details: null,
-		branch: null,
-		model: null,
-		worktree: null,
-		sessionId: null,
-		images: [],
-		pendingImages: [],
-		shots: [],
-		keptFiles: [],
-		workCheckLog: [],
-	} as unknown as Partial<TaskCard>;
 
 	// happy-dom's dispatched events never reach React's event plugin; call the
 	// production prop React rendered onto the node instead (same as above).
@@ -11368,46 +12048,34 @@ describe("Optimistic taps (client)", () => {
 		});
 	// Per-URL fetch stub: gated URLs hold until their gate resolves with a status,
 	// everything else degrades to 404 (the drawer's failed detail fetch).
-	const stubFetch = (
+	const stubGatedFetch = (
 		gates: { url: string; resolve: (status: number) => void }[],
 	): (() => void) => {
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url) => {
 			const g = gates.find((x) => url.endsWith(x.url));
 			if (g !== undefined) {
 				const status = await new Promise<number>((r) => (g.resolve = r));
 				return new Response("{}", { status });
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
+		});
 		return () => {
-			globalThis.fetch = realFetch;
+			restore();
 		};
 	};
 	/** Mounts the Drawer with `task` under act(), runs `body`, unmounts. */
 	const withDrawer = async (
 		task: TaskCard,
-		gates: Parameters<typeof stubFetch>[0],
+		gates: Parameters<typeof stubGatedFetch>[0],
 		body: () => Promise<void>,
 	): Promise<void> => {
-		const restore = stubFetch(gates);
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		const restore = stubGatedFetch(gates);
+		const { unmount } = await mount(<Drawer {...base} task={task} />);
 		try {
-			await act(async () => {
-				root.render(<Drawer {...base} task={task} />);
-			});
 			await act(async () => {});
 			await body();
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
+			await unmount();
 			restore();
 		}
 	};
@@ -11426,7 +12094,7 @@ describe("Optimistic taps (client)", () => {
 		)!;
 
 	test("star shows the flip before the server answers and rolls it back on failure", async () => {
-		const g = { url: "/star" } as Parameters<typeof stubFetch>[0][number];
+		const g = { url: "/star" } as Parameters<typeof stubGatedFetch>[0][number];
 		await withDrawer(starTask(), [g], async () => {
 			const btn = starButton();
 			expect(btn.getAttribute("aria-pressed")).toBe("false");
@@ -11446,7 +12114,7 @@ describe("Optimistic taps (client)", () => {
 	});
 
 	test("star keeps the flip after the server confirms", async () => {
-		const g = { url: "/star" } as Parameters<typeof stubFetch>[0][number];
+		const g = { url: "/star" } as Parameters<typeof stubGatedFetch>[0][number];
 		await withDrawer(starTask(), [g], async () => {
 			await act(async () => {
 				propHandler(starButton(), "onClick")({} as unknown);
@@ -11469,7 +12137,9 @@ describe("Optimistic taps (client)", () => {
 		});
 
 	test("triage rank shows the pick before the server answers and rolls it back on failure", async () => {
-		const g = { url: "/triage" } as Parameters<typeof stubFetch>[0][number];
+		const g = { url: "/triage" } as Parameters<
+			typeof stubGatedFetch
+		>[0][number];
 		await withDrawer(rankTask(), [g], async () => {
 			const seg = () =>
 				[...window.document.querySelectorAll(".rank-seg button")].find(
@@ -11493,7 +12163,9 @@ describe("Optimistic taps (client)", () => {
 	});
 
 	test("triage rank keeps the pick after the server confirms", async () => {
-		const g = { url: "/triage" } as Parameters<typeof stubFetch>[0][number];
+		const g = { url: "/triage" } as Parameters<
+			typeof stubGatedFetch
+		>[0][number];
 		await withDrawer(rankTask(), [g], async () => {
 			const seg = () =>
 				[...window.document.querySelectorAll(".rank-seg button")].find(
@@ -11518,7 +12190,7 @@ describe("Optimistic taps (client)", () => {
 		});
 	test("model pick shows before the server answers and rolls back on failure", async () => {
 		resetCatalogCache();
-		const g = { url: "/model" } as Parameters<typeof stubFetch>[0][number];
+		const g = { url: "/model" } as Parameters<typeof stubGatedFetch>[0][number];
 		const models = new Response(
 			JSON.stringify({
 				models: [
@@ -11539,9 +12211,7 @@ describe("Optimistic taps (client)", () => {
 			}),
 			{ status: 200 },
 		);
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url) => {
 			if (url.endsWith("/api/models")) return models.clone();
 			const gateHit = url.endsWith(g.url);
 			if (gateHit) {
@@ -11549,16 +12219,11 @@ describe("Optimistic taps (client)", () => {
 				return new Response("{}", { status });
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		});
+		const { container, unmount } = await mount(
+			<Drawer {...base} task={modelTask()} />,
+		);
 		try {
-			await act(async () => {
-				root.render(<Drawer {...base} task={modelTask()} />);
-			});
 			await act(async () => {});
 			const trigger = container.querySelector("button.model-trigger");
 			expect(trigger).not.toBeNull();
@@ -11585,11 +12250,8 @@ describe("Optimistic taps (client)", () => {
 				"Model: zai/glm-5.3-flash",
 			);
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 			resetCatalogCache();
 		}
 	});
@@ -11612,21 +12274,14 @@ describe("Optimistic taps (client)", () => {
 			}),
 			{ status: 200 },
 		);
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url) => {
 			if (url.endsWith("/api/models")) return pending;
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		});
+		const { container, unmount } = await mount(
+			<Drawer {...base} task={modelTask()} />,
+		);
 		try {
-			await act(async () => {
-				root.render(<Drawer {...base} task={modelTask()} />);
-			});
 			await act(async () => {});
 			// In flight: a named, list-shaped placeholder, never a silent empty list.
 			const skeleton = container.querySelector(".model-list .skeleton");
@@ -11649,11 +12304,8 @@ describe("Optimistic taps (client)", () => {
 			expect(option).toBeDefined();
 		} finally {
 			resolveModels(models);
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 			resetCatalogCache();
 		}
 	});
@@ -11673,47 +12325,54 @@ describe("Optimistic taps (client)", () => {
 		cardFixture({ id: "b", stage: "todo", state: "queued" }),
 		cardFixture({ id: "c", stage: "todo", state: "idle" }),
 	];
-	test("queue reorder applies the new order at once and rolls it back on failure", async () => {
+	/** Mounts the todo LaneCol with a deferred onReorder promise. */
+	const mountReorderLane = async () => {
 		const container = window.document.createElement(
 			"div",
 		) as unknown as HTMLDivElement;
 		window.document.body.appendChild(container as unknown as HappyNode);
 		const root = createRoot(container);
 		let resolveReorder!: (ok: boolean) => void;
-		const onReorder = ((): Promise<boolean> => {
-			return new Promise<boolean>((r) => {
-				resolveReorder = r;
-			});
-		})();
+		const onReorder = new Promise<boolean>((r) => {
+			resolveReorder = r;
+		});
 		const order = (): (string | null)[] =>
 			[...container.querySelectorAll(".card[data-task-id]")].map((el) =>
 				el.getAttribute("data-task-id"),
 			);
+		await act(async () => {
+			root.render(
+				<LaneCol
+					{...laneBase}
+					stage="todo"
+					tasks={laneTasks()}
+					onReorder={() => onReorder}
+				/>,
+			);
+		});
+		return { container, root, resolveReorder, order };
+	};
+	/** Moves card b above a through the keyboard handler (the pointer-free path). */
+	const moveBUp = async (container: HTMLDivElement): Promise<void> => {
+		const b = container.querySelector('.card[data-task-id="b"]')!;
+		await act(async () => {
+			propHandler(
+				container.querySelector(".stage-cards")!,
+				"onKeyDown",
+			)({
+				altKey: true,
+				key: "ArrowUp",
+				target: b,
+				preventDefault: () => {},
+			} as unknown);
+		});
+	};
+	test("queue reorder applies the new order at once and rolls it back on failure", async () => {
+		const { container, root, resolveReorder, order } = await mountReorderLane();
 		try {
-			await act(async () => {
-				root.render(
-					<LaneCol
-						{...laneBase}
-						stage="todo"
-						tasks={laneTasks()}
-						onReorder={() => onReorder}
-					/>,
-				);
-			});
 			expect(order()).toEqual(["a", "b", "c"]);
-			const b = container.querySelector('.card[data-task-id="b"]')!;
 			// Keyboard reorder (the pointer-free path): Alt+ArrowUp moves b above a.
-			await act(async () => {
-				propHandler(
-					container.querySelector(".stage-cards")!,
-					"onKeyDown",
-				)({
-					altKey: true,
-					key: "ArrowUp",
-					target: b,
-					preventDefault: () => {},
-				} as unknown);
-			});
+			await moveBUp(container);
 			// In flight: the overlay shows the new order at once, no spinner slot.
 			expect(order()).toEqual(["c", "b", "a"]);
 			expect(container.querySelector(".drop-slot")).toBeNull();
@@ -11730,42 +12389,9 @@ describe("Optimistic taps (client)", () => {
 	});
 
 	test("queue reorder keeps the overlay after the server confirms", async () => {
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		let resolveReorder!: (ok: boolean) => void;
-		const onReorder = new Promise<boolean>((r) => {
-			resolveReorder = r;
-		});
-		const order = (): (string | null)[] =>
-			[...container.querySelectorAll(".card[data-task-id]")].map((el) =>
-				el.getAttribute("data-task-id"),
-			);
+		const { container, root, resolveReorder, order } = await mountReorderLane();
 		try {
-			await act(async () => {
-				root.render(
-					<LaneCol
-						{...laneBase}
-						stage="todo"
-						tasks={laneTasks()}
-						onReorder={() => onReorder}
-					/>,
-				);
-			});
-			const b = container.querySelector('.card[data-task-id="b"]')!;
-			await act(async () => {
-				propHandler(
-					container.querySelector(".stage-cards")!,
-					"onKeyDown",
-				)({
-					altKey: true,
-					key: "ArrowUp",
-					target: b,
-					preventDefault: () => {},
-				} as unknown);
-			});
+			await moveBUp(container);
 			expect(order()).toEqual(["c", "b", "a"]);
 			resolveReorder(true);
 			await act(async () => {});
@@ -11780,6 +12406,45 @@ describe("Optimistic taps (client)", () => {
 		}
 	});
 
+	test("a queue reorder posts the moved card and its anchor, not the full order", async () => {
+		const bodies: unknown[] = [];
+		const { restore } = stubFetch(async (url, init) => {
+			if (url.endsWith("/queue") && (init?.method ?? "GET") === "POST") {
+				bodies.push(JSON.parse(String(init?.body)));
+				return new Response(JSON.stringify({ ok: true }), { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		});
+		const tasks = [
+			cardFixture({ id: "a", stage: "todo", state: "queued" }),
+			cardFixture({ id: "b", stage: "todo", state: "queued" }),
+			cardFixture({ id: "c", stage: "todo", state: "idle" }),
+		];
+		const project = boardProject(0);
+		const { container, unmount } = await mountProjectBoard(project, tasks);
+		try {
+			const b = container.querySelector('.card[data-task-id="b"]')!;
+			// Keyboard reorder (the pointer-free path): Alt+ArrowUp moves b above a.
+			// The lanes all render a .stage-cards; the todo lane is the one b queues in.
+			await act(async () => {
+				propHandler(
+					container.querySelector('[data-stage="todo"] .stage-cards')!,
+					"onKeyDown",
+				)({
+					altKey: true,
+					key: "ArrowUp",
+					target: b,
+					preventDefault: () => {},
+				} as unknown);
+			});
+			// The request names the moved card and the card below it only.
+			expect(bodies).toEqual([{ id: "b", before: "a" }]);
+		} finally {
+			await unmount();
+			restore();
+		}
+	});
+
 	const steerTask = () =>
 		cardFixture({
 			...drawerFields,
@@ -11789,7 +12454,7 @@ describe("Optimistic taps (client)", () => {
 		});
 
 	test("the queued steer bubble renders from the local send at once and rolls back on failure", async () => {
-		const g = { url: "/steer" } as Parameters<typeof stubFetch>[0][number];
+		const g = { url: "/steer" } as Parameters<typeof stubGatedFetch>[0][number];
 		await withDrawer(steerTask(), [g], async () => {
 			expect(window.document.querySelector(".you-bubble")).toBeNull();
 			const form = window.document.querySelector("form.steer-form")!;
@@ -11824,145 +12489,36 @@ describe("Optimistic taps (client)", () => {
 describe("Drawer re-run failed jobs action", () => {
 	const project = {
 		name: "proj",
-		github: null,
+		github: "https://github.com/ottr-ai/ottr",
 		hasRules: true,
 		sessionsDir: "/tmp/proj/.tasks/sessions",
 		settings: {},
 	} as unknown as ProjectView;
-	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
-	const drawerFields = {
-		kind: "work",
-		research: false,
-		report: null,
-		details: null,
-		branch: null,
-		model: null,
-		worktree: null,
-		sessionId: null,
-		images: [],
-		pendingImages: [],
-		shots: [],
-		keptFiles: [],
-		workCheckLog: [],
-	} as unknown as Partial<TaskCard>;
-	const base = {
-		task: null as never,
-		project,
-		act: async () => true,
-		onClose: () => {},
-		onFollowed: () => {},
-		projects: [],
-		read: true,
-		onMarkUnread: () => {},
-		onMarkSeen: () => {},
-		tasks: [],
-		onOpenTask: () => {},
-		draining: false,
-		usedTotal: 0,
-		maxTotal: null,
-	};
-	// React interaction needs browser globals; the setup mirrors the steering
-	// describes above: happy-dom registers them for this describe, and afterAll
-	// puts the originals back, so later test files in the same process see no DOM.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		Event: window.Event,
-		HTMLElement: window.HTMLElement,
-		HTMLTextAreaElement: window.HTMLTextAreaElement,
-		Node: window.Node,
-		getComputedStyle: window.getComputedStyle,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+	const base = { ...drawerBase, project };
+	installBrowserGlobals([
+		"Event",
+		"HTMLElement",
+		"HTMLTextAreaElement",
+		"Node",
+		"getComputedStyle",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
 
 	// happy-dom's dispatched clicks never reach React's event plugin (same
 	// upstream gap as settings.test.tsx's onChangeOf): call the production
 	// onClick React rendered onto the node instead.
-	const onClickOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onClick?: (e: unknown) => void;
-		};
-		if (props.onClick === undefined) throw new Error("node has no onClick");
-		return props.onClick;
-	};
 
 	/** Renders a drawer for `card` under a fetch stub; the stub records the
-	 * rerun POSTs and answers them with `rerun`, everything else with 404. */
-	const withRoot = async (
+	 * rerun POSTs and answers them with `rerun`, everything else with 404.
+	 * `projectView` overrides the suite's project fixture (OTTR-1005 binding cases). */
+	const withRoot = (
 		card: TaskCard,
 		rerun: { status: number; body: unknown },
-		run: (args: {
-			posts: { url: string; body: unknown }[];
-			container: HTMLDivElement;
-			root: ReturnType<typeof createRoot>;
-		}) => Promise<void>,
-	): Promise<void> => {
-		const posts: { url: string; body: unknown }[] = [];
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
-			const u = String(url);
-			if (u.endsWith("/rerun-failed-jobs")) {
-				posts.push({
-					url: u,
-					body: JSON.parse(String(init?.body)) as unknown,
-				});
-				return new Response(JSON.stringify(rerun.body), {
-					status: rerun.status,
-				});
-			}
-			// The detail fetch fills the prompt (OTTR-965): serve the row back loaded,
-			// so the CI-link scan sees the fixture's prompt text.
-			if (u.endsWith(`/tasks/${card.id}`)) {
-				return new Response(JSON.stringify({ ...card, turns: [] }), {
-					status: 200,
-					headers: { "content-type": "application/json" },
-				});
-			}
-			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		try {
-			await act(async () => {
-				root.render(<Drawer {...base} task={card} />);
-			});
-			// One more act lets the detail fetch land before the run callback queries.
-			await act(async () => {});
-			await run({ posts, container, root });
-		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
-		}
-	};
+		run: (args: DrawerRunArgs) => Promise<void>,
+		projectView: ProjectView = project,
+	): Promise<void> =>
+		withDrawerRoute(base, card, "/rerun-failed-jobs", rerun, run, projectView);
 
 	const rerunButton = (container: HTMLDivElement): Element => {
 		for (const node of container.querySelectorAll(".drawer-actions button"))
@@ -12057,47 +12613,62 @@ describe("Drawer re-run failed jobs action", () => {
 			},
 		);
 	});
+
+	test("a card linking another repository's run renders no button", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			prompt:
+				"See https://github.com/octocat/other/actions/runs/777 — same failure shape",
+		}) as TaskCard;
+		await withRoot(
+			card,
+			{ status: 200, body: { ok: true, url: "" } },
+			async ({ container }) => {
+				expect(container.textContent).not.toContain("Re-run failed jobs");
+			},
+		);
+	});
+
+	test("a project with no GitHub repository renders no button even on a project-repo link", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			prompt:
+				"Fix the CI failure in https://github.com/ottr-ai/ottr/actions/runs/42313545100",
+		}) as TaskCard;
+		await withRoot(
+			card,
+			{ status: 200, body: { ok: true, url: "" } },
+			async ({ container }) => {
+				expect(container.textContent).not.toContain("Re-run failed jobs");
+			},
+			{ ...project, github: null } as unknown as ProjectView,
+		);
+	});
 });
 
-describe("AddProjectModal Git URL field error", () => {
-	// React interaction needs browser globals; the same happy-dom swap as the
-	// board-GitHub-token describe above: installed after app.tsx's import,
-	// removed after this describe's tests.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		HTMLElement: window.HTMLElement,
-		HTMLInputElement: window.HTMLInputElement,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
+describe("Drawer validate blocked leads again action", () => {
+	// OTTR-1129: a done review card's drawer offers "Validate blocked leads again"
+	// — a required datetime and a busy button that POSTs to the validate route.
+	const _project = drawerProject;
+	const base = drawerBase;
+	const { window } = installBrowserGlobals([
+		"Event",
+		"HTMLElement",
+		"HTMLInputElement",
+		"HTMLTextAreaElement",
+		"Node",
+		"getComputedStyle",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
 
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
+	// happy-dom's dispatched clicks never reach React's event plugin (same
+	// upstream gap as settings.test.tsx's onChangeOf): call the production
+	// onClick React rendered onto the node instead.
 
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
-
-	const submitEvent = (): Event =>
-		new window.Event("submit", {
-			bubbles: true,
-			cancelable: true,
-		}) as unknown as Event;
-
+	// A React onChange picks up programmatic edits only through the native value
+	// setter, and happy-dom's dispatched input event never reaches React's
+	// ChangeEventPlugin: set the value natively, then call the production onChange.
 	const typeInto = (el: HTMLInputElement, value: string): void => {
 		const setter = Object.getOwnPropertyDescriptor(
 			window.HTMLInputElement.prototype,
@@ -12105,19 +12676,296 @@ describe("AddProjectModal Git URL field error", () => {
 		)?.set;
 		if (setter === undefined) throw new Error("value setter missing");
 		setter.call(el, value);
+		onChangeOf(el)({ target: el, currentTarget: el });
 	};
 
-	const onChangeOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
+	// Same happy-dom gap as onClickOf above, for onChange handlers.
+
+	const doneReviewCard = (): TaskCard =>
+		cardFixture({
+			...drawerFields,
+			kind: "review",
+			stage: "done",
+			state: "idle",
+			prompt: "Review the quota changes",
+		}) as TaskCard;
+
+	// OTTR-1166: a done release card is kind "work" with a non-null
+	// releaseVersion; isReview includes it, so the drawer offers the same
+	// control. releaseNotes stays null so the notes section renders its empty
+	// line instead of Markdown over a missing field.
+	const doneReleaseCard = (): TaskCard =>
+		cardFixture({
+			...drawerFields,
+			kind: "work",
+			releaseVersion: "v0.44.0",
+			releaseNotes: null,
+			stage: "done",
+			state: "idle",
+			prompt: "Release v0.44.0",
+		}) as TaskCard;
+
+	/** Renders a drawer for `card` under a fetch stub; the stub records the
+	 * validate POSTs and answers them with `respond`, everything else with 404. */
+	const withRoot = (
+		card: TaskCard,
+		respond: { status: number; body: unknown },
+		run: (args: DrawerRunArgs) => Promise<void>,
+	): Promise<void> => withDrawerRoute(base, card, "/validate", respond, run);
+
+	const validateInput = (container: HTMLDivElement): HTMLInputElement => {
+		const node = container.querySelector(
+			'input[type="datetime-local"]#validate-again-before',
 		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onChange?: (e: unknown) => void;
-		};
-		if (props.onChange === undefined) throw new Error("node has no onChange");
-		return props.onChange;
+		if (node === null) throw new Error("no validate-again datetime input");
+		return node as unknown as HTMLInputElement;
 	};
+
+	const validateButton = (container: HTMLDivElement): Element => {
+		for (const node of container.querySelectorAll("button"))
+			if (node.textContent?.includes("Validate blocked leads again"))
+				return node;
+		throw new Error("no Validate blocked leads again button");
+	};
+
+	test("a done review card renders the datetime and the button, disabled while the input is empty", async () => {
+		await withRoot(
+			doneReviewCard(),
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ container }) => {
+				const input = validateInput(container);
+				const button = validateButton(container);
+				const label = container.querySelector(
+					'label[for="validate-again-before"]',
+				);
+				expect(label?.textContent).toContain("Validate blocked leads again");
+				expect(input.getAttribute("required")).not.toBeNull();
+				expect((button as HTMLButtonElement).disabled).toBe(true);
+			},
+		);
+	});
+
+	test("a non-done or cancelled review card renders no validate control", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			kind: "review",
+			stage: "in_progress",
+			state: "running",
+			prompt: "Review the quota changes",
+		}) as TaskCard;
+		await withRoot(
+			card,
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ container }) => {
+				expect(container.textContent).not.toContain(
+					"Validate blocked leads again",
+				);
+			},
+		);
+	});
+
+	test("setting a datetime enables the button; clicking POSTs again:blocked with the chosen instant", async () => {
+		await withRoot(
+			doneReviewCard(),
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ posts, container }) => {
+				const input = validateInput(container);
+				const button = validateButton(container);
+				expect((button as HTMLButtonElement).disabled).toBe(true);
+				await act(async () => {
+					typeInto(input, "2026-11-05T09:30");
+				});
+				expect((validateButton(container) as HTMLButtonElement).disabled).toBe(
+					false,
+				);
+				await act(async () => {
+					onClickOf(validateButton(container))({});
+				});
+				await act(async () => {});
+				const post = posts.at(-1);
+				expect(post?.url.endsWith("/tasks/t1/validate")).toBe(true);
+				expect(post?.body).toEqual({
+					again: "blocked",
+					before: new Date("2026-11-05T09:30").toISOString(),
+				});
+			},
+		);
+	});
+
+	/** Fills the validate datetime, POSTs, and expects the inline in-flight alert. */
+	const expectValidateInFlightAlert = async (card: TaskCard) => {
+		await withRoot(
+			card,
+			{
+				status: 409,
+				body: { error: "a validation run is already in flight" },
+			},
+			async ({ posts, container }) => {
+				await act(async () => {
+					typeInto(validateInput(container), "2026-11-05T09:30");
+				});
+				await act(async () => {
+					onClickOf(validateButton(container))({});
+				});
+				await act(async () => {});
+				expect(posts).toHaveLength(1);
+				const alerts = [...container.querySelectorAll('p[role="alert"]')];
+				expect(
+					alerts.some((a) =>
+						a.textContent?.includes("a validation run is already in flight"),
+					),
+				).toBe(true);
+				expect(container.textContent).not.toContain("Validation run filed.");
+			},
+		);
+	};
+
+	test("a failed validate POST surfaces the message as an inline alert", async () => {
+		await expectValidateInFlightAlert(doneReviewCard());
+	});
+
+	test("an ok response surfaces the Validation run filed status line", async () => {
+		await withRoot(
+			doneReviewCard(),
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ container }) => {
+				await act(async () => {
+					typeInto(validateInput(container), "2026-11-05T09:30");
+				});
+				await act(async () => {
+					onClickOf(validateButton(container))({});
+				});
+				await act(async () => {});
+				const statuses = [...container.querySelectorAll('p[role="status"]')];
+				expect(
+					statuses.some((s) =>
+						s.textContent?.includes("Validation run filed."),
+					),
+				).toBe(true);
+				expect(container.textContent).not.toContain(
+					"a validation run is already in flight",
+				);
+			},
+		);
+	});
+
+	test("a done release card renders the datetime and the button too (OTTR-1166)", async () => {
+		await withRoot(
+			doneReleaseCard(),
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ container }) => {
+				const input = validateInput(container);
+				const button = validateButton(container);
+				const label = container.querySelector(
+					'label[for="validate-again-before"]',
+				);
+				expect(label?.textContent).toContain("Validate blocked leads again");
+				expect(input.getAttribute("required")).not.toBeNull();
+				expect((button as HTMLButtonElement).disabled).toBe(true);
+			},
+		);
+	});
+
+	test("a done release card's retry POSTs the validate route with the again body (OTTR-1166)", async () => {
+		await withRoot(
+			doneReleaseCard(),
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ posts, container }) => {
+				await act(async () => {
+					typeInto(validateInput(container), "2026-11-05T09:30");
+				});
+				await act(async () => {
+					onClickOf(validateButton(container))({});
+				});
+				await act(async () => {});
+				const post = posts.at(-1);
+				expect(post?.url.endsWith("/tasks/t1/validate")).toBe(true);
+				expect(post?.body).toEqual({
+					again: "blocked",
+					before: new Date("2026-11-05T09:30").toISOString(),
+				});
+				const statuses = [...container.querySelectorAll('p[role="status"]')];
+				expect(
+					statuses.some((s) =>
+						s.textContent?.includes("Validation run filed."),
+					),
+				).toBe(true);
+			},
+		);
+	});
+
+	test("a failed validate POST on a release card surfaces the inline alert (OTTR-1166)", async () => {
+		await expectValidateInFlightAlert(doneReleaseCard());
+	});
+
+	test("an ordinary done work card renders no validate control (OTTR-1166)", async () => {
+		const card = cardFixture({
+			...drawerFields,
+			kind: "work",
+			stage: "done",
+			state: "idle",
+			prompt: "Fix the widget",
+		}) as TaskCard;
+		await withRoot(
+			card,
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ container }) => {
+				expect(container.textContent).not.toContain(
+					"Validate blocked leads again",
+				);
+			},
+		);
+	});
+
+	test("an unfinished or cancelled release card renders no validate control (OTTR-1166)", async () => {
+		const unfinished = cardFixture({
+			...drawerFields,
+			kind: "work",
+			releaseVersion: "v0.44.0",
+			releaseNotes: null,
+			stage: "merging",
+			state: "running",
+			prompt: "Release v0.44.0",
+		}) as TaskCard;
+		const cancelledDone = cardFixture({
+			...drawerFields,
+			kind: "work",
+			releaseVersion: "v0.44.0",
+			releaseNotes: null,
+			stage: "done",
+			state: "idle",
+			cancelledAt: 1,
+			prompt: "Release v0.44.0",
+		}) as TaskCard;
+		for (const card of [unfinished, cancelledDone]) {
+			await withRoot(
+				card,
+				{ status: 200, body: { id: "v1", reset: [] } },
+				async ({ container }) => {
+					expect(container.textContent).not.toContain(
+						"Validate blocked leads again",
+					);
+				},
+			);
+		}
+	});
+});
+
+describe("AddProjectModal Git URL field error", () => {
+	const { window } = installBrowserGlobals([
+		"HTMLElement",
+		"HTMLInputElement",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
+
+	const submitEvent = (): Event =>
+		new window.Event("submit", {
+			bubbles: true,
+			cancelable: true,
+		}) as unknown as Event;
+
+	const typeInto = typeIntoFor(window);
 
 	const project = {
 		name: "proj",
@@ -12137,12 +12985,7 @@ describe("AddProjectModal Git URL field error", () => {
 		}) => Promise<void>,
 	): Promise<void> {
 		const posts: { url: string }[] = [];
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url, init) => {
 			const method = init?.method ?? "GET";
 			if (url.endsWith("/api/projects") && method === "POST") {
 				posts.push({ url });
@@ -12151,33 +12994,23 @@ describe("AddProjectModal Git URL field error", () => {
 				});
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		});
+		const { container, root, unmount } = await mount(
+			<AddProjectModal
+				act={async (fn) => {
+					await fn();
+					return true;
+				}}
+				onClose={() => {}}
+				openTask={() => {}}
+				projects={[]}
+			/>,
+		);
 		try {
-			await act(async () => {
-				root.render(
-					<AddProjectModal
-						act={async (fn) => {
-							await fn();
-							return true;
-						}}
-						onClose={() => {}}
-						openTask={() => {}}
-						projects={[]}
-					/>,
-				);
-			});
 			await run({ container, root, posts });
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	}
 
@@ -12237,91 +13070,23 @@ describe("AddProjectModal Git URL field error", () => {
 });
 
 describe("Drawer triage rank segmented control", () => {
-	const project = {
-		name: "proj",
-		github: null,
-		hasRules: true,
-		sessionsDir: "/tmp/proj/.tasks/sessions",
-		settings: {},
-	} as unknown as ProjectView;
-	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
-	const drawerFields = {
-		kind: "work",
-		research: false,
-		report: null,
-		details: null,
-		branch: null,
-		model: null,
-		worktree: null,
-		sessionId: null,
-		images: [],
-		pendingImages: [],
-		shots: [],
-		keptFiles: [],
-		workCheckLog: [],
-	} as unknown as Partial<TaskCard>;
+	const _project = drawerProject;
 	const base = {
-		task: null as never,
-		project,
+		...drawerBase,
 		act: async (fn: () => Promise<void>) => {
 			await fn();
 			return true;
 		},
-		onClose: () => {},
-		onFollowed: () => {},
-		projects: [],
-		read: true,
-		onMarkUnread: () => {},
-		onMarkSeen: () => {},
-		tasks: [],
-		onOpenTask: () => {},
-		draining: false,
-		usedTotal: 0,
-		maxTotal: null,
 	};
-	// React interaction needs browser globals; the same happy-dom swap as the
-	// steering describes above.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		Event: window.Event,
-		HTMLElement: window.HTMLElement,
-		HTMLTextAreaElement: window.HTMLTextAreaElement,
-		Node: window.Node,
-		getComputedStyle: window.getComputedStyle,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
-
-	const onClickOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onClick?: (e: unknown) => void;
-		};
-		if (props.onClick === undefined) throw new Error("node has no onClick");
-		return props.onClick;
-	};
+	installBrowserGlobals([
+		"Event",
+		"HTMLElement",
+		"HTMLTextAreaElement",
+		"Node",
+		"getComputedStyle",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
 
 	/** Renders a drawer for `card` under a fetch stub; the stub records the
 	 * triage POSTs and answers 200, everything else 404. */
@@ -12332,36 +13097,37 @@ describe("Drawer triage rank segmented control", () => {
 			root: ReturnType<typeof createRoot>;
 			posts: { url: string; body: unknown }[];
 		}) => Promise<void>,
+		// Without cancelBody the stub routes the triage POST; with it, the
+		// cancel/stop POSTs, answering the given body on /cancel.
+		cancelBody?: Record<string, unknown>,
 	): Promise<void> => {
 		const posts: { url: string; body: unknown }[] = [];
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+		const { restore } = stubFetch(async (url, init) => {
 			const u = String(url);
-			if (u.endsWith("/triage")) {
-				posts.push({
-					url: u,
-					body: JSON.parse(String(init?.body)) as unknown,
-				});
-				return new Response("{}", { status: 200 });
-			}
-			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		try {
-			await act(async () => {
-				root.render(<Drawer {...base} task={card} />);
+			const routed =
+				cancelBody === undefined
+					? u.endsWith("/triage")
+					: (u.endsWith("/cancel") || u.endsWith("/stop")) &&
+						(init?.method ?? "GET") === "POST";
+			if (!routed) return new Response("{}", { status: 404 });
+			posts.push({
+				url: u,
+				body: JSON.parse(String(init?.body)) as unknown,
 			});
+			if (cancelBody === undefined) return new Response("{}", { status: 200 });
+			return new Response(
+				JSON.stringify(u.endsWith("/cancel") ? cancelBody : {}),
+				{ status: 200 },
+			);
+		});
+		const { container, root, unmount } = await mount(
+			<Drawer {...base} task={card} />,
+		);
+		try {
 			await run({ container, root, posts });
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	};
 
@@ -12426,91 +13192,15 @@ describe("Drawer triage rank segmented control", () => {
 });
 
 describe("Confirm dialogs name their target", () => {
-	const project = {
-		name: "proj",
-		github: null,
-		hasRules: true,
-		sessionsDir: "/tmp/proj/.tasks/sessions",
-		settings: {},
-	} as unknown as ProjectView;
-	const drawerFields = {
-		kind: "work",
-		research: false,
-		report: null,
-		details: null,
-		branch: null,
-		model: null,
-		worktree: null,
-		sessionId: null,
-		images: [],
-		pendingImages: [],
-		shots: [],
-		keptFiles: [],
-		workCheckLog: [],
-	} as unknown as Partial<TaskCard>;
+	const _project = drawerProject;
 	const base = {
-		task: null as never,
-		project,
+		...drawerBase,
 		act: async (fn: () => Promise<void>) => {
 			await fn();
 			return true;
 		},
-		onClose: () => {},
-		onFollowed: () => {},
-		projects: [],
-		read: true,
-		onMarkUnread: () => {},
-		onMarkSeen: () => {},
-		tasks: [],
-		onOpenTask: () => {},
-		draining: false,
-		usedTotal: 0,
-		maxTotal: null,
 	};
-	// React interaction needs browser globals; the same happy-dom swap as the
-	// describes above. confirmDialog mounts into document.body, so the dialogs
-	// live outside the rendered container and this describe reads them there.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		Event: window.Event,
-		HTMLElement: window.HTMLElement,
-		HTMLTextAreaElement: window.HTMLTextAreaElement,
-		Node: window.Node,
-		getComputedStyle: window.getComputedStyle,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
-
-	const onClickOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onClick?: (e: unknown) => void;
-		};
-		if (props.onClick === undefined) throw new Error("node has no onClick");
-		return props.onClick;
-	};
+	const { window } = installDrawerClientGlobals();
 
 	/** A dialog button's handler reads `e.currentTarget` to close its dialog, so
 	 * the stubbed event carries the node (React's SyntheticEvent would too). */
@@ -12559,6 +13249,12 @@ describe("Confirm dialogs name their target", () => {
 	/** Renders a drawer for `card` under a fetch stub; the stub records cancel,
 	 * stop and triage POSTs, answers `cancelBody` on the cancel route (a kept
 	 * worktree re-asks), and 404s everything else. */
+	const actionButton = (container: HTMLDivElement, label: string): Element => {
+		for (const node of container.querySelectorAll(".drawer-actions button"))
+			if (node.textContent?.includes(label)) return node;
+		throw new Error(`no ${label} button in the drawer`);
+	};
+
 	const withDrawer = async (
 		card: TaskCard,
 		run: (args: {
@@ -12569,8 +13265,7 @@ describe("Confirm dialogs name their target", () => {
 		cancelBody: Record<string, unknown> = {},
 	): Promise<void> => {
 		const posts: { url: string; body: unknown }[] = [];
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+		const { restore } = stubFetch(async (url, init) => {
 			const u = String(url);
 			if (
 				(u.endsWith("/cancel") || u.endsWith("/stop")) &&
@@ -12586,30 +13281,16 @@ describe("Confirm dialogs name their target", () => {
 				);
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		});
+		const { container, root, unmount } = await mount(
+			<Drawer {...base} task={card} />,
+		);
 		try {
-			await act(async () => {
-				root.render(<Drawer {...base} task={card} />);
-			});
 			await run({ container, root, posts });
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
-	};
-
-	const actionButton = (container: HTMLDivElement, label: string): Element => {
-		for (const node of container.querySelectorAll(".drawer-actions button"))
-			if (node.textContent?.includes(label)) return node;
-		throw new Error(`no ${label} button in the drawer`);
 	};
 
 	test("the delete confirm names the done task", async () => {
@@ -12618,15 +13299,19 @@ describe("Confirm dialogs name their target", () => {
 			stage: "done",
 			state: "idle",
 		}) as TaskCard;
-		await withDrawer(card, async ({ container }) => {
-			await act(async () => {
-				onClickOf(actionButton(container, "Delete task"))({});
-			});
-			expect(question()).toBe(
-				'Delete the done task t1 "Task one" from the board?',
-			);
-			await dismiss();
-		});
+		await withDrawer(
+			card,
+			async ({ container }) => {
+				await act(async () => {
+					onClickOf(actionButton(container, "Delete task"))({});
+				});
+				expect(question()).toBe(
+					'Delete the done task t1 "Task one" from the board?',
+				);
+				await dismiss();
+			},
+			{},
+		);
 	});
 
 	test("the cancel confirm names the task", async () => {
@@ -12635,13 +13320,17 @@ describe("Confirm dialogs name their target", () => {
 			stage: "todo",
 			state: "running",
 		}) as TaskCard;
-		await withDrawer(card, async ({ container }) => {
-			await act(async () => {
-				onClickOf(actionButton(container, "Cancel task"))({});
-			});
-			expect(question()).toBe('Cancel t1 "Task one"?');
-			await dismiss();
-		});
+		await withDrawer(
+			card,
+			async ({ container }) => {
+				await act(async () => {
+					onClickOf(actionButton(container, "Cancel task"))({});
+				});
+				expect(question()).toBe('Cancel t1 "Task one"?');
+				await dismiss();
+			},
+			{},
+		);
 	});
 
 	test("the kept-worktree cancel confirm names the task too", async () => {
@@ -12690,17 +13379,21 @@ describe("Confirm dialogs name their target", () => {
 			stage: "todo",
 			state: "needs_you",
 		}) as TaskCard;
-		await withDrawer(card, async ({ container }) => {
-			const newSession = [...container.querySelectorAll("button")].find((b) =>
-				b.textContent?.includes("New session"),
-			);
-			if (newSession === undefined) throw new Error("no New session button");
-			await act(async () => {
-				onClickOf(newSession)({});
-			});
-			expect(question()).toBe('Start a fresh omp session for t1 "Task one"?');
-			await dismiss();
-		});
+		await withDrawer(
+			card,
+			async ({ container }) => {
+				const newSession = [...container.querySelectorAll("button")].find((b) =>
+					b.textContent?.includes("New session"),
+				);
+				if (newSession === undefined) throw new Error("no New session button");
+				await act(async () => {
+					onClickOf(newSession)({});
+				});
+				expect(question()).toBe('Start a fresh omp session for t1 "Task one"?');
+				await dismiss();
+			},
+			{},
+		);
 	});
 
 	test("the stop-turn confirm names the task", async () => {
@@ -12709,17 +13402,21 @@ describe("Confirm dialogs name their target", () => {
 			stage: "todo",
 			state: "running",
 		}) as TaskCard;
-		await withDrawer(card, async ({ container }) => {
-			const stop = [...container.querySelectorAll("button")].find((b) =>
-				b.textContent?.includes("Stop turn"),
-			);
-			if (stop === undefined) throw new Error("no Stop turn button");
-			await act(async () => {
-				onClickOf(stop)({});
-			});
-			expect(question()).toBe('Stop the running turn of t1 "Task one"?');
-			await dismiss();
-		});
+		await withDrawer(
+			card,
+			async ({ container }) => {
+				const stop = [...container.querySelectorAll("button")].find((b) =>
+					b.textContent?.includes("Stop turn"),
+				);
+				if (stop === undefined) throw new Error("no Stop turn button");
+				await act(async () => {
+					onClickOf(stop)({});
+				});
+				expect(question()).toBe('Stop the running turn of t1 "Task one"?');
+				await dismiss();
+			},
+			{},
+		);
 	});
 
 	test("the double-check stop confirm names the task too", async () => {
@@ -12728,70 +13425,42 @@ describe("Confirm dialogs name their target", () => {
 			stage: "todo",
 			state: "running",
 		}) as TaskCard;
-		await withDrawer(card, async ({ container, posts }) => {
-			const stop = [...container.querySelectorAll("button")].find((b) =>
-				b.textContent?.includes("Stop turn"),
-			);
-			if (stop === undefined) throw new Error("no Stop turn button");
-			await act(async () => {
-				onClickOf(stop)({});
-			});
-			await act(async () => {
-				press(dialogButton("Stop turn"));
-			});
-			await settle();
-			expect(question()).toBe('Really stop the running turn of t1 "Task one"?');
-			// The second yes (Stop turn) sends the stop.
-			await act(async () => {
-				press(dialogButton("Stop turn"));
-			});
-			await settle();
-			expect(posts.some((p) => p.url.endsWith("/stop"))).toBe(true);
-		});
+		await withDrawer(
+			card,
+			async ({ container, posts }) => {
+				const stop = [...container.querySelectorAll("button")].find((b) =>
+					b.textContent?.includes("Stop turn"),
+				);
+				if (stop === undefined) throw new Error("no Stop turn button");
+				await act(async () => {
+					onClickOf(stop)({});
+				});
+				await act(async () => {
+					press(dialogButton("Stop turn"));
+				});
+				await settle();
+				expect(question()).toBe(
+					'Really stop the running turn of t1 "Task one"?',
+				);
+				// The second yes (Stop turn) sends the stop.
+				await act(async () => {
+					press(dialogButton("Stop turn"));
+				});
+				await settle();
+				expect(posts.some((p) => p.url.endsWith("/stop"))).toBe(true);
+			},
+			{},
+		);
 	});
 });
 
 describe("Release card re-release confirm names its target", () => {
-	// React interaction needs browser globals; the same happy-dom swap as the
-	// ProjectBoard search-delay describe above.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		HTMLElement: window.HTMLElement,
-		HTMLInputElement: window.HTMLInputElement,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
-
-	const onClickOf = (node: Element): ((e: unknown) => void) => {
-		const key = Object.getOwnPropertyNames(node).find((k) =>
-			k.startsWith("__reactProps$"),
-		);
-		if (key === undefined) throw new Error("react props missing on node");
-		const props = (node as unknown as Record<string, unknown>)[key] as {
-			onClick?: (e: unknown) => void;
-		};
-		if (props.onClick === undefined) throw new Error("node has no onClick");
-		return props.onClick;
-	};
+	const { window } = installBrowserGlobals([
+		"HTMLElement",
+		"HTMLInputElement",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
 
 	const question = (): string => {
 		const h2 = window.document.querySelector(
@@ -12834,8 +13503,7 @@ describe("Release card re-release confirm names its target", () => {
 
 	test("the kept-worktree confirm of Release again names the release card", async () => {
 		const posts: { url: string; body: unknown }[] = [];
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+		const { restore } = stubFetch(async (url, init) => {
 			const u = String(url);
 			if (u.endsWith("/cancel") && (init?.method ?? "GET") === "POST") {
 				posts.push({
@@ -12848,58 +13516,51 @@ describe("Release card re-release confirm names its target", () => {
 				});
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		});
+		const release = cardFixture({
+			id: "r-1",
+			title: "Release the docs",
+			sessionTitle: "Release the docs",
+			releaseVersion: "v2",
+			heldMerges: ["m-1"],
+			stage: "todo",
+			state: "needs_you",
+		}) as TaskCard;
+		const boardProject = {
+			name: "proj",
+			hasRules: true,
+			github: null,
+			gitless: false,
+			dirty: false,
+			archReview: null,
+			latestRelease: null,
+			latestImage: null,
+			doneTotal: 0,
+			settings: { setupChecklist: false },
+			sessionsDir: "/tmp/s",
+		} as unknown as ProjectView;
+		const { container, unmount } = await mount(
+			<ProjectBoard
+				project={boardProject}
+				tasks={[release]}
+				deltas={new Map()}
+				open={() => {}}
+				seenAnswers={new Set()}
+				seenDoneSince={0}
+				compose={() => {}}
+				composeDraft={() => {}}
+				act={async (fn) => {
+					await fn();
+					return true;
+				}}
+				onNotice={() => {}}
+				draining={false}
+			/>,
+		);
 		try {
 			// A stalled release card: parked for the user, merges still held, every
 			// finding landed — reReleaseOf's re-release view, so the card carries
 			// the Release again chip.
-			const release = cardFixture({
-				id: "r-1",
-				title: "Release the docs",
-				sessionTitle: "Release the docs",
-				releaseVersion: "v2",
-				heldMerges: ["m-1"],
-				stage: "todo",
-				state: "needs_you",
-			}) as TaskCard;
-			const boardProject = {
-				name: "proj",
-				hasRules: true,
-				github: null,
-				gitless: false,
-				dirty: false,
-				archReview: null,
-				latestRelease: null,
-				latestImage: null,
-				doneTotal: 0,
-				settings: { setupChecklist: false },
-				sessionsDir: "/tmp/s",
-			} as unknown as ProjectView;
-			await act(async () => {
-				root.render(
-					<ProjectBoard
-						project={boardProject}
-						tasks={[release]}
-						deltas={new Map()}
-						open={() => {}}
-						seenAnswers={new Set()}
-						seenDoneSince={0}
-						compose={() => {}}
-						composeDraft={() => {}}
-						act={async (fn) => {
-							await fn();
-							return true;
-						}}
-						onNotice={() => {}}
-						draining={false}
-					/>,
-				);
-			});
 			const again = [...container.querySelectorAll("button")].find((b) =>
 				b.textContent?.includes("Release again"),
 			);
@@ -12924,45 +13585,20 @@ describe("Release card re-release confirm names its target", () => {
 			expect(posts).toHaveLength(1);
 			expect(posts[0]?.url).toBe("/api/projects/proj/tasks/r-1/cancel");
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	});
 });
 describe("LogView fetch start offset (client)", () => {
 	// The same happy-dom swap as the ProjectBoard block above: installed after
 	// app.tsx's import (its browser mount guard reads document at module load).
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		HTMLElement: window.HTMLElement,
-		HTMLInputElement: window.HTMLInputElement,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of Object.entries(originals)) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+	installBrowserGlobals([
+		"HTMLElement",
+		"HTMLInputElement",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
 
 	const project = { name: "proj", settings: {} } as unknown as ProjectView;
 
@@ -12972,9 +13608,7 @@ describe("LogView fetch start offset (client)", () => {
 		logOffset?: number | null;
 	}): Promise<{ urls: string[]; unmount: () => Promise<void> }> {
 		const urls: string[] = [];
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url) => {
 			if (url.includes("/log?")) {
 				urls.push(url);
 				const res = new Response("chunk", {
@@ -12983,23 +13617,15 @@ describe("LogView fetch start offset (client)", () => {
 				return res;
 			}
 			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(<LogView project={project} taskId="t1" {...props} />);
 		});
+		const { unmount } = await mount(
+			<LogView project={project} taskId="t1" {...props} />,
+		);
 		return {
 			urls,
 			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
-				globalThis.fetch = realFetch;
+				await unmount();
+				restore();
 			},
 		};
 	}
@@ -13114,37 +13740,14 @@ describe("boardFlipSig", () => {
 });
 
 describe("memoized Card renders", () => {
-	// React interaction needs browser globals; the setup mirrors the drawer
-	// describes: happy-dom registers them for this describe, and afterAll puts
-	// the originals back, so later test files in the same process see no DOM.
-	const window = new Window({ url: "http://localhost/" });
-	const host = globalThis as unknown as Record<string, unknown>;
-	const browserGlobals: Record<string, unknown> = {
-		window,
-		document: window.document,
-		navigator: window.navigator,
-		Event: window.Event,
-		HTMLElement: window.HTMLElement,
-		Node: window.Node,
-		getComputedStyle: window.getComputedStyle,
-		requestAnimationFrame: window.requestAnimationFrame,
-		cancelAnimationFrame: window.cancelAnimationFrame,
-	};
-	const originals = new Map<string, unknown>();
-	beforeAll(() => {
-		host.IS_REACT_ACT_ENVIRONMENT = true;
-		for (const [key, value] of Object.entries(browserGlobals)) {
-			originals.set(key, host[key]);
-			host[key] = value;
-		}
-	});
-	afterAll(() => {
-		delete host.IS_REACT_ACT_ENVIRONMENT;
-		for (const [key, value] of originals) {
-			if (value === undefined) delete host[key];
-			else host[key] = value;
-		}
-	});
+	installBrowserGlobals([
+		"Event",
+		"HTMLElement",
+		"Node",
+		"getComputedStyle",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
 
 	// The callbacks the production board also keeps stable (App's openTask is a
 	// useCallback): fresh closures per render would break the memo in the test itself.
@@ -13168,18 +13771,18 @@ describe("memoized Card renders", () => {
 	});
 
 	test("a state push that changes one card does not re-render the unchanged card", async () => {
-		const realFetch = globalThis.fetch;
+		// A sibling test file can leave the shared catalog cache filled (one bun
+		// process runs several files); the two-paint premise needs it empty.
+		resetCatalogCache();
 		// Card's model catalog fetch degrades to no catalog on a failed response.
-		globalThis.fetch = (async () =>
-			new Response("{}", { status: 404 })) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		const { restore } = stubFetch(
+			async () => new Response("{}", { status: 404 }),
+		);
 		const frame = (tasks: TaskCard[]): StateResponse =>
 			({ tasks }) as unknown as StateResponse;
 		let renders = 0;
+		const board = await mount(<LaneCol {...laneProps([], [])} tick={0} />);
+		const { container, root, unmount } = board;
 		try {
 			const a = cardFixture({
 				id: "a1",
@@ -13227,11 +13830,8 @@ describe("memoized Card renders", () => {
 			expect(container.textContent).toContain("Beta 2");
 		} finally {
 			cardRenderProbe.fn = null;
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	});
 });
@@ -13239,6 +13839,13 @@ describe("memoized Card renders", () => {
 describe("AppInboxBell badge", () => {
 	// 5 needs-you + 18 asked + 6 notices = 29 entries, as the panel lists them. The
 	// last `ackedCount` entries count as acknowledged, so the rest stay fresh.
+	const inboxMeta = (
+		acked: Set<string>,
+		need: TaskCard[],
+		ask: TaskCard[],
+		info: string[],
+	): ReturnType<typeof appInboxMeta> =>
+		appInboxMeta(null, acked, null, null, need, ask, [], [], info, [], 0, "");
 	const metaWithAcks = (ackedCount: number) => {
 		const need = Array.from({ length: 5 }, (_, n) =>
 			cardFixture({ id: `need${n}` }),
@@ -13247,36 +13854,24 @@ describe("AppInboxBell badge", () => {
 			cardFixture({ id: `ask${n}` }),
 		);
 		const info = Array.from({ length: 6 }, (_, n) => `notice:n${n}`);
-		const probe = appInboxMeta(
-			null,
-			new Set<string>(),
-			null,
-			null,
-			need,
-			ask,
-			[],
-			info,
-			[],
-			0,
-			"",
-		);
+		const probe = inboxMeta(new Set<string>(), need, ask, info);
 		const ackLocal = new Set(
 			probe.entries.slice(probe.entries.length - ackedCount).map((e) => e.key),
 		);
-		return appInboxMeta(
-			null,
-			ackLocal,
-			null,
-			null,
-			need,
-			ask,
-			[],
-			info,
-			[],
-			0,
-			"",
-		);
+		return inboxMeta(ackLocal, need, ask, info);
 	};
+	/** The meta for entry lists where every entry is acknowledged: a probe pass
+	 * collects the keys, then the real pass takes the ack set. */
+	const ackedAllMeta = (
+		need: TaskCard[],
+		ask: TaskCard[],
+		info: string[],
+	): ReturnType<typeof appInboxMeta> => {
+		const probe = inboxMeta(new Set<string>(), need, ask, info);
+		const ackLocal = new Set(probe.entries.map((e) => e.key));
+		return inboxMeta(ackLocal, need, ask, info);
+	};
+
 	const bell = (meta: ReturnType<typeof appInboxMeta>) =>
 		renderToStaticMarkup(
 			<AppInboxBell
@@ -13306,33 +13901,7 @@ describe("AppInboxBell badge", () => {
 		const ask = Array.from({ length: 18 }, (_, n) =>
 			cardFixture({ id: `ask${n}` }),
 		);
-		const probe = appInboxMeta(
-			null,
-			new Set<string>(),
-			null,
-			null,
-			[],
-			ask,
-			[],
-			[],
-			[],
-			0,
-			"",
-		);
-		const ackLocal = new Set(probe.entries.map((e) => e.key));
-		const meta = appInboxMeta(
-			null,
-			ackLocal,
-			null,
-			null,
-			[],
-			ask,
-			[],
-			[],
-			[],
-			0,
-			"",
-		);
+		const meta = ackedAllMeta([], ask, []);
 		expect(meta.inbox.total).toBe(18);
 		expect(meta.inbox.fresh.length).toBe(0);
 		expect(meta.inbox.lit).toBe(true);
@@ -13345,33 +13914,7 @@ describe("AppInboxBell badge", () => {
 
 	test("only read notices leave the bell grey; the badge keeps the count", () => {
 		const info = Array.from({ length: 6 }, (_, n) => `notice:n${n}`);
-		const probe = appInboxMeta(
-			null,
-			new Set<string>(),
-			null,
-			null,
-			[],
-			[],
-			[],
-			info,
-			[],
-			0,
-			"",
-		);
-		const ackLocal = new Set(probe.entries.map((e) => e.key));
-		const meta = appInboxMeta(
-			null,
-			ackLocal,
-			null,
-			null,
-			[],
-			[],
-			[],
-			info,
-			[],
-			0,
-			"",
-		);
+		const meta = ackedAllMeta([], [], info);
 		expect(meta.inbox.lit).toBe(false);
 		const html = bell(meta);
 		// The dim count on a grey bell keys on data-level="info" (app.css).
@@ -13382,51 +13925,53 @@ describe("AppInboxBell badge", () => {
 	});
 });
 
+// The panel renders every section from null keys and empty lists, so tests override
+// only the props they look at.
+const panelBase = {
+	error: null,
+	critKey: null,
+	needTasks: [],
+	askCards: [],
+	prActivity: [],
+	prPosted: [],
+	alarmCount: 0,
+	updatesKey: null,
+	updateCount: 0,
+	isNew: () => false,
+	notice: null,
+	noticeKey: null,
+	orphansError: null,
+	drainNotice: false,
+	drainKey: null,
+	drainCommits: [],
+	behind: 0,
+	behindKey: null,
+	behindCommits: [],
+	restartWait: null,
+	restartWaitKey: null,
+	seedFailed: null,
+	seedFailKey: null,
+	provisionError: null,
+	provisionErrKey: null,
+	state: null,
+	warnings: [],
+	orphanList: [],
+	orphansErrorKey: null,
+	orphansKey: null,
+	keptCount: { held: 0, stale: 0 },
+	keptKey: null,
+	alatePendingKey: null,
+	signinAdvisories: [],
+	projects: [],
+	nowMs: 0,
+	openTask: () => {},
+	ackInbox: () => {},
+	setShowUpdates: () => {},
+	setError: () => {},
+	setNotice: () => {},
+};
+
 describe("Inbox panel ack footer", () => {
-	// The panel renders every section from null keys and empty lists, so the
-	// footer button is the only stateful markup under test.
-	const panelBase = {
-		error: null,
-		critKey: null,
-		needTasks: [],
-		askCards: [],
-		prActivity: [],
-		alarmCount: 0,
-		updatesKey: null,
-		updateCount: 0,
-		isNew: () => false,
-		notice: null,
-		noticeKey: null,
-		orphansError: null,
-		drainNotice: false,
-		drainKey: null,
-		drainCommits: [],
-		behind: 0,
-		behindKey: null,
-		behindCommits: [],
-		restartWait: null,
-		restartWaitKey: null,
-		seedFailed: null,
-		seedFailKey: null,
-		provisionError: null,
-		provisionErrKey: null,
-		state: null,
-		warnings: [],
-		orphanList: [],
-		orphansErrorKey: null,
-		orphansKey: null,
-		keptCount: { held: 0, stale: 0 },
-		keptKey: null,
-		alatePendingKey: null,
-		signinAdvisories: [],
-		projects: [],
-		nowMs: 0,
-		openTask: () => {},
-		ackInbox: () => {},
-		setShowUpdates: () => {},
-		setError: () => {},
-		setNotice: () => {},
-	};
 	const askedMeta = (ackedCount: number) => {
 		const ask = Array.from({ length: 18 }, (_, n) =>
 			cardFixture({ id: `ask${n}` }),
@@ -13441,13 +13986,27 @@ describe("Inbox panel ack footer", () => {
 			[],
 			[],
 			[],
+			[],
 			0,
 			"",
 		);
 		const ackLocal = new Set(
 			probe.entries.slice(probe.entries.length - ackedCount).map((e) => e.key),
 		);
-		return appInboxMeta(null, ackLocal, null, null, [], ask, [], [], [], 0, "");
+		return appInboxMeta(
+			null,
+			ackLocal,
+			null,
+			null,
+			[],
+			ask,
+			[],
+			[],
+			[],
+			[],
+			0,
+			"",
+		);
 	};
 	const footerButton = (meta: ReturnType<typeof appInboxMeta>) => {
 		const html = renderToStaticMarkup(
@@ -13457,9 +14016,8 @@ describe("Inbox panel ack footer", () => {
 				inbox={meta.inbox}
 			/>,
 		);
-		const { window } = new Window({ url: "http://localhost/" });
-		window.document.body.innerHTML = html;
-		const btn = window.document.querySelector("#inbox .inbox-foot button");
+		const document = parseMarkup(html);
+		const btn = document.querySelector("#inbox .inbox-foot button");
 		if (btn === null) throw new Error("the ack footer button did not render");
 		// React renders disabled="" for true and drops the attribute for false.
 		return btn.getAttribute("disabled") !== null;
@@ -13476,5 +14034,1042 @@ describe("Inbox panel ack footer", () => {
 		const meta = askedMeta(17);
 		expect(meta.inbox.fresh.length).toBe(1);
 		expect(footerButton(meta)).toBe(false);
+	});
+});
+
+describe("PR review activity posted rows", () => {
+	const POSTED_HEAD = "a".repeat(40);
+	const postedCard = cardFixture({
+		id: "pr1",
+		kind: "pr_review",
+		stage: "done",
+		state: "idle",
+		prOccurrence: {
+			draft: 3,
+			comments: null,
+			posted: {
+				head: POSTED_HEAD,
+				url: "https://github.com/acme/widget/pull/7",
+				number: 7,
+			},
+		},
+	});
+	const panel = (prActivity: TaskCard[], prPosted: TaskCard[]) => {
+		const meta = appInboxMeta(
+			null,
+			new Set<string>(),
+			null,
+			null,
+			[],
+			[],
+			prActivity,
+			prPosted,
+			[],
+			[],
+			1,
+			"1 PR review has activity",
+		);
+		const html = renderToStaticMarkup(
+			<AppInboxPanel
+				{...panelBase}
+				prActivity={prActivity}
+				prPosted={prPosted}
+				alarmCount={1}
+				entries={meta.entries}
+				inbox={meta.inbox}
+			/>,
+		);
+		const document = parseMarkup(html);
+		return { meta, document };
+	};
+
+	test("a posted-stamped review renders an external PR row and the count", () => {
+		const { meta, document } = panel([], [postedCard]);
+		// The posted key joins the inbox entries: the badge counts it and the seen
+		// prune keeps it only while the stamp is current.
+		expect(meta.entries.map((e) => e.key)).toEqual([
+			`pr:pr1:posted:${POSTED_HEAD}`,
+		]);
+		const link = document.querySelector(
+			`#inbox [data-inbox-key="pr:pr1:posted:${POSTED_HEAD}"] a.alarm-link`,
+		) as HTMLAnchorElement | null;
+		expect(link).not.toBeNull();
+		// An external link to the PR, not a drawer link.
+		expect(link!.getAttribute("href")).toBe(
+			"https://github.com/acme/widget/pull/7",
+		);
+		expect(link!.getAttribute("target")).toBe("_blank");
+		expect(link!.getAttribute("rel")).toBe("noreferrer");
+		expect(link!.textContent).toContain("proj");
+		expect(link!.textContent).toContain("PR #7");
+		expect(link!.textContent).toContain("Ottr posted the review on GitHub");
+		expect(document.querySelector("#inbox h2")?.textContent).toBe(
+			"PR review activity · 1",
+		);
+	});
+
+	test("a manually posted review renders no posted row", () => {
+		const manual = cardFixture({
+			id: "pr2",
+			kind: "pr_review",
+			stage: "done",
+			state: "idle",
+			prOccurrence: { draft: 2, comments: 5 },
+		});
+		const { meta, document } = panel([manual], []);
+		expect(meta.entries.map((e) => e.key)).toEqual(["pr:pr2:5"]);
+		expect(document.querySelector('[data-inbox-key*=":posted:"]')).toBeNull();
+		expect(document.body.innerHTML).not.toContain(
+			"Ottr posted the review on GitHub",
+		);
+		// The unseen-comment row still renders as today.
+		expect(
+			document.querySelector('[data-inbox-key="pr:pr2:5"]'),
+		).not.toBeNull();
+	});
+});
+
+describe("bell PR rows in quiet projects", () => {
+	const project = (prReviewNotify: boolean): ProjectView =>
+		({ name: "proj", settings: { prReviewNotify } }) as unknown as ProjectView;
+	const card = (id: string, over: Partial<TaskCard>): TaskCard =>
+		cardFixture({
+			id,
+			kind: "pr_review",
+			stage: "done",
+			state: "idle",
+			...over,
+		});
+
+	test("a quiet project drops the posted, comment and needs rows", () => {
+		const posted = card("pr1", {
+			prOccurrence: {
+				draft: 1,
+				comments: null,
+				posted: {
+					head: "a".repeat(40),
+					url: "https://github.com/acme/widget/pull/7",
+					number: 7,
+				},
+			},
+		});
+		const commented = card("pr2", { prOccurrence: { draft: 1, comments: 4 } });
+		const waiting = card("pr3", { state: "needs_you" });
+		const plain = cardFixture({ id: "t9", state: "needs_you" });
+		const split = bellAlarms(
+			[posted, commented, waiting, plain],
+			[waiting, plain],
+			[project(false)],
+		);
+		expect(split.posted).toEqual([]);
+		expect(split.activity).toEqual([]);
+		expect(split.needsShown.map((t) => t.id)).toEqual(["t9"]);
+	});
+
+	test("a notifying project keeps the posted and comment rows", () => {
+		const posted = card("pr1", {
+			prOccurrence: {
+				draft: 3,
+				comments: null,
+				posted: {
+					head: "a".repeat(40),
+					url: "https://github.com/acme/widget/pull/7",
+					number: 7,
+				},
+			},
+		});
+		const commented = card("pr2", { prOccurrence: { draft: 3, comments: 4 } });
+		const split = bellAlarms([posted, commented], [], [project(true)]);
+		expect(split.posted.map((t) => t.id)).toEqual(["pr1"]);
+		expect(split.activity.map((t) => t.id)).toEqual(["pr2"]);
+	});
+});
+
+describe("service quotas in the overview", () => {
+	const observedAt = 1_700_000_000_000;
+	const balance: ServiceQuotaMetric = {
+		id: "balance",
+		label: "Credits",
+		kind: "balance",
+		unit: { kind: "currency", code: "EUR" },
+		remaining: -0.125,
+		reportedTotal: null,
+		resetsAt: null,
+		providerStatus: null,
+		plan: null,
+	};
+	const windowMetric: ServiceQuotaMetric = {
+		id: "window",
+		label: "Requests",
+		kind: "window",
+		unit: { kind: "count", name: "requests" },
+		used: 25,
+		limit: 100,
+		startsAt: null,
+		resetsAt: null,
+	};
+	const source = (
+		id = "account-a",
+		metrics: readonly ServiceQuotaMetric[] = [balance],
+	): ServiceQuotaSourceState => ({
+		id,
+		adapterId: "service-v2",
+		label: "anthropic",
+		status: "ok",
+		lastAttemptAt: observedAt,
+		nextAttemptAt: observedAt + 60_000,
+		sample: { observedAt, metrics },
+		error: null,
+	});
+	const documentOf = (html: string) => {
+		const document = parseMarkup(html);
+		return document;
+	};
+	const services = (
+		sources: readonly ServiceQuotaSourceState[] | undefined,
+		now = observedAt,
+	) =>
+		documentOf(
+			renderToStaticMarkup(<ServiceQuotas sources={sources} now={now} />),
+		);
+	const quota: StateResponse["quota"] = {
+		at: observedAt,
+		error: null,
+		limits: [
+			{
+				provider: "anthropic",
+				label: "Model window",
+				window: null,
+				windowLabel: null,
+				plan: null,
+				usedPct: 42,
+				resetsAt: null,
+			},
+		],
+	};
+	const overview = (
+		modelQuota: StateResponse["quota"],
+		sources: StateResponse["serviceQuotas"],
+		hosted = false,
+	) =>
+		documentOf(
+			renderToStaticMarkup(
+				<SystemBar
+					tasks={[]}
+					maxTotal={3}
+					quota={modelQuota}
+					serviceQuotas={sources}
+					hosted={hosted}
+					navigate={() => {}}
+				/>,
+			),
+		);
+	// OTTR-1143: minimal cards for the slot meter; its slot path reads only stage,
+	// state and cancelledAt.
+	const slotCard = (
+		id: string,
+		stage: "todo" | "in_progress" | "merging",
+		state: "running" | "preparing",
+	): TaskCard =>
+		({
+			id,
+			stage,
+			state,
+			cancelledAt: null,
+			queuedAt: null,
+			createdAt: 1,
+		}) as unknown as TaskCard;
+	// One in_progress/running and one todo/preparing card: the frame's own sum is 2.
+	const slotCards = [
+		slotCard("slot-a", "in_progress", "running"),
+		slotCard("slot-b", "todo", "preparing"),
+	];
+	const slotOverview = (slotsUsed?: number) =>
+		documentOf(
+			renderToStaticMarkup(
+				<SystemBar
+					tasks={slotCards}
+					maxTotal={1}
+					slotsUsed={slotsUsed}
+					quota={null}
+					hosted={false}
+					navigate={() => {}}
+				/>,
+			),
+		);
+
+	test("model quotas coexist with ordered service identities and equal labels", () => {
+		const document = overview(quota, [
+			source("account-b"),
+			source("account-a"),
+		]);
+		expect(document.querySelector("#system-detail")?.textContent).toContain(
+			"Provider quota",
+		);
+		expect(document.querySelector(".qt")?.textContent).toContain(
+			"Model window",
+		);
+		expect(document.querySelector(".qt")?.textContent).toContain("42 %");
+		expect(
+			[...document.querySelectorAll(".service-source h3")].map(
+				(node) => node.textContent,
+			),
+		).toEqual(["anthropic", "anthropic"]);
+		const identities = [
+			...document.querySelectorAll(".service-source > .caption:first-of-type"),
+		].map((node) => node.textContent);
+		expect(identities).toEqual([
+			"Source: account-b · Adapter: service-v2",
+			"Source: account-a · Adapter: service-v2",
+		]);
+		expect(document.querySelector(".meters")?.outerHTML).toBe(
+			overview(quota, undefined).querySelector(".meters")?.outerHTML,
+		);
+		expect(
+			document.querySelector("#system-detail")?.getAttribute("popover"),
+		).toBe("auto");
+		expect(
+			document.querySelector(".meters")?.getAttribute("popovertarget"),
+		).toBe("system-detail");
+	});
+
+	test("services remain visible without model quota and never supply the bar metric", () => {
+		const document = overview(null, [source()]);
+		expect(document.querySelector("#system-detail")?.textContent).toContain(
+			"Checking omp usage",
+		);
+		expect(document.querySelector(".service-quotas")?.textContent).toContain(
+			"EUR -0.125 remaining",
+		);
+		expect(document.querySelector(".meters")?.outerHTML).toBe(
+			overview(null, undefined).querySelector(".meters")?.outerHTML,
+		);
+	});
+
+	test("the slot meter shows the server's count over the frame's own cards", () => {
+		const document = slotOverview(1);
+		expect(document.querySelector(".sb-big")?.textContent).toBe("1");
+		expect(
+			document.querySelector("#system-detail .meter-value")?.textContent,
+		).toContain("1/1");
+		expect(document.querySelector(".ag-nums div dd")?.textContent).toBe("1");
+	});
+
+	test("without the server field the meter keeps the frame's own count", () => {
+		const document = slotOverview();
+		expect(document.querySelector(".sb-big")?.textContent).toBe("2");
+		expect(
+			document.querySelector("#system-detail .meter-value")?.textContent,
+		).toContain("2/1");
+	});
+
+	test("absent and empty services stay hidden and hosted mode hides supplied service data", () => {
+		expect(services(undefined).body.textContent).toBe("");
+		expect(services([]).body.textContent).toBe("");
+		const document = overview(quota, [source()], true);
+		expect(document.querySelector(".service-quotas")).toBeNull();
+		expect(document.querySelector("#system-detail")?.textContent).not.toContain(
+			"Provider quota",
+		);
+	});
+
+	test("balances preserve signed fractions and count units without percentages or invented resets", () => {
+		const document = services([
+			source("account-a", [
+				balance,
+				{
+					...balance,
+					id: "generations",
+					label: "Generations",
+					unit: { kind: "count", name: "generations" },
+					remaining: 12.75,
+					reportedTotal: 2_000,
+					providerStatus: "active",
+					plan: "Monthly",
+				},
+			]),
+		]);
+		expect(document.body.textContent).toContain("EUR -0.125 remaining");
+		expect(document.body.textContent).toContain("12.75 generations remaining");
+		expect(document.body.textContent).toContain(
+			"Provider total: 2,000 generations",
+		);
+		expect(document.body.textContent).toContain("Provider status: active");
+		expect(document.body.textContent).toContain("Plan: Monthly");
+		expect(document.body.textContent).not.toContain("%");
+		expect(document.body.textContent).not.toContain("Resets");
+		expect(document.body.textContent).not.toContain("Starts");
+		expect(document.querySelector(".mark")).toBeNull();
+	});
+
+	test("zero windows show raw values and positive windows retain over-limit percentages", () => {
+		for (const [used, limit, expected] of [
+			[3, 0, null],
+			[25, 100, "25 % used"],
+			[125, 100, "125 % used"],
+		] as const) {
+			const document = services([
+				source("account-a", [{ ...windowMetric, used, limit }]),
+			]);
+			expect(
+				document.querySelector(".service-metric dd > div:first-child")
+					?.textContent,
+			).toBe(`Used: ${used} requests`);
+			expect(
+				document.querySelector(".service-metric dd > div:nth-child(2)")
+					?.textContent,
+			).toBe(`Limit: ${limit} requests`);
+			if (expected === null)
+				expect(document.body.textContent).not.toContain("%");
+			else expect(document.body.textContent).toContain(expected);
+			expect(document.querySelector(".mark")).toBeNull();
+		}
+	});
+
+	test("equal metric labels retain their order and only reported dates appear", () => {
+		const document = services([
+			source("account-a", [
+				{ ...balance, label: "Allowance", reportedTotal: 0 },
+				{
+					...windowMetric,
+					label: "Allowance",
+					startsAt: observedAt,
+					resetsAt: observedAt + 60_000,
+				},
+			]),
+		]);
+		expect(
+			[...document.querySelectorAll("dt")].map((node) => node.textContent),
+		).toEqual(["Allowance", "Allowance"]);
+		const rows = document.querySelectorAll(".service-metric");
+		expect(rows[0]?.textContent).toContain("Provider total: EUR 0");
+		expect(rows[0]?.textContent).not.toContain("Resets");
+		expect(rows[1]?.textContent).toContain("Starts");
+		expect(rows[1]?.textContent).toContain("Resets");
+	});
+
+	test("service-only state updates survive card reuse without changing model quota", () => {
+		const task = cardFixture({ id: "service-state" });
+		const prev = {
+			tasks: [task],
+			quota,
+			serviceQuotas: [],
+		} as unknown as StateResponse;
+		const next = { ...prev, tasks: [{ ...task }], serviceQuotas: [source()] };
+		const merged = reuseCards(prev, next);
+		expect(merged.serviceQuotas).toBe(next.serviceQuotas);
+		expect(merged.quota).toBe(quota);
+		expect(merged.tasks).toBe(prev.tasks);
+	});
+
+	test("old frames become stale at the five-minute boundary and retain observed age", () => {
+		const frame = [source()];
+		expect(services(frame, observedAt + 299_999).body.textContent).toContain(
+			"Current · Observed 4m ago",
+		);
+		for (const elapsed of [300_000, 300_001, 360_000]) {
+			const text = services(frame, observedAt + elapsed).body.textContent;
+			expect(text).toContain(
+				`Stale · Observed ${Math.floor(elapsed / 60_000)}m ago`,
+			);
+			expect(text).toContain("EUR -0.125 remaining");
+		}
+	});
+
+	test("unconfigured pending and first-read errors stay explicit without fake balances", () => {
+		const identity = {
+			id: "account-a",
+			adapterId: "service-v2",
+			label: "anthropic",
+		};
+		const states: ServiceQuotaSourceState[] = [
+			{
+				...identity,
+				status: "unconfigured",
+				sample: null,
+				lastAttemptAt: null,
+				nextAttemptAt: null,
+				error: { code: "configuration" },
+			},
+			{
+				...identity,
+				id: "pending",
+				status: "pending",
+				sample: null,
+				lastAttemptAt: null,
+				nextAttemptAt: observedAt,
+				error: null,
+			},
+			{
+				...identity,
+				id: "error",
+				status: "error",
+				sample: null,
+				lastAttemptAt: observedAt,
+				nextAttemptAt: null,
+				error: { code: "authentication", httpStatus: 401, retryAfterAt: null },
+			},
+		];
+		const document = services(states);
+		expect(document.body.textContent).toContain("Unconfigured");
+		expect(document.body.textContent).toContain(
+			"Server configuration is missing or invalid",
+		);
+		expect(document.body.textContent).toContain("Pending");
+		expect(document.body.textContent).toContain(
+			"The first provider read has not completed",
+		);
+		expect(document.body.textContent).toContain("Error");
+		expect(document.body.textContent).toContain(
+			"The provider refused the server credentials. HTTP 401.",
+		);
+		expect(document.body.textContent).toContain("Automatic reads are paused");
+		expect(document.querySelectorAll(".service-metric")).toHaveLength(0);
+		const statusRows = document.querySelectorAll(".service-status");
+		expect(statusRows[0]?.getAttribute("data-level")).toBe("needs");
+		expect(statusRows[0]?.querySelector(".mark-needs")).not.toBeNull();
+		expect(statusRows[1]?.querySelector(".mark")).toBeNull();
+		expect(statusRows[2]?.getAttribute("data-level")).toBe("crit");
+		expect(statusRows[2]?.querySelector(".mark-crit")).not.toBeNull();
+	});
+
+	test("refresh errors retain stale samples and their original observed age", () => {
+		const stale: ServiceQuotaSourceState = {
+			...source(),
+			status: "stale",
+			staleReason: "refresh_error",
+			sample: { observedAt, metrics: [balance] },
+			lastAttemptAt: observedAt + 60_000,
+			nextAttemptAt: observedAt + 120_000,
+			error: { code: "network", httpStatus: null, retryAfterAt: null },
+		};
+		for (const elapsed of [60_000, 360_000]) {
+			const document = services([stale], observedAt + elapsed);
+			expect(document.body.textContent).toContain(
+				`Stale · Observed ${elapsed / 60_000}m ago`,
+			);
+			expect(document.body.textContent).toContain("EUR -0.125 remaining");
+			expect(document.body.textContent).toContain(
+				"The server could not reach the provider.",
+			);
+			expect(document.body.textContent).toContain(
+				"The server will retry automatically.",
+			);
+			expect(document.querySelector(".mark")).toBeNull();
+		}
+	});
+
+	test("provider labels status and plan remain plain text", () => {
+		const unsafe = '<img src=x onerror="alert(1)"><script>alert(2)</script>';
+		const document = services([
+			{
+				...source("account-a", [
+					{ ...balance, label: unsafe, plan: unsafe, providerStatus: unsafe },
+				]),
+				label: unsafe,
+			},
+		]);
+		expect(document.querySelectorAll("img, script")).toHaveLength(0);
+		expect(document.querySelector(".service-source h3")?.textContent).toBe(
+			unsafe,
+		);
+		expect(document.querySelector("dt")?.textContent).toBe(unsafe);
+		expect(document.body.textContent).toContain(`Provider status: ${unsafe}`);
+		expect(document.body.textContent).toContain(`Plan: ${unsafe}`);
+	});
+
+	test("generated balances preserve numeric values without a percentage denominator", () => {
+		fc.assert(
+			fc.property(fc.integer({ min: -1_000_000, max: 1_000_000 }), (n) => {
+				const remaining = n / 8;
+				const document = services([
+					source("account-a", [{ ...balance, remaining, reportedTotal: 1 }]),
+				]);
+				const value =
+					document.querySelector(".service-metric dd > div")?.textContent ?? "";
+				expect(
+					Number(
+						value
+							.replace("EUR ", "")
+							.replace(" remaining", "")
+							.replaceAll(",", ""),
+					),
+				).toBe(remaining);
+				expect(document.body.textContent).not.toContain("%");
+			}),
+		);
+	});
+});
+
+describe("HoldResumeButton refusal surface (client)", () => {
+	// React interaction needs browser globals; the same happy-dom swap as the
+	// AskBlock tests above: installed after app.tsx's import, removed after.
+	const { window } = installBrowserGlobals(
+		[
+			"HTMLElement",
+			"HTMLInputElement",
+			"HTMLButtonElement",
+			"requestAnimationFrame",
+			"cancelAnimationFrame",
+		],
+		{
+			// The accepted-resume case runs the button's real `post` body: happy-dom
+			// cannot fetch a relative URL, so the network boundary answers 200 here.
+			fetch: async () =>
+				({
+					ok: true,
+					status: 200,
+					json: async () => ({}),
+				}) as unknown as Response,
+		},
+	);
+
+	const MESSAGE =
+		"anthropic is still out of quota; the limit resets at 2026-11-21 19:00 UTC. Pick another model.";
+	const task = { project: "proj", id: "t1", holdProvider: "openai-codex" };
+
+	/** act with the production contract for a refused resume: the server answered
+	 *  409, the message went to the inline surface, act reports false. */
+	const refusedAct = (): Act => async (_fn, onError) => {
+		onError?.(MESSAGE);
+		return false;
+	};
+
+	/** act with the production contract for an accepted resume: the body ran, the
+	 *  switch landed, act reports true. */
+	const acceptedAct = (): Act => async (fn) => {
+		await fn();
+		return true;
+	};
+
+	/** An act whose refusal parks until the test releases it: reproduces a slow
+	 *  server's 409 landing after the view changed. */
+	const parkedRefusal = (): {
+		act: Act;
+		release: (message: string) => void;
+	} => {
+		const { promise, resolve } = Promise.withResolvers<boolean>();
+		let deliver: ((message: string) => void) | null = null;
+		return {
+			act: (_fn, onError) => {
+				deliver = (message: string) => {
+					onError?.(message);
+					resolve(false);
+				};
+				return promise;
+			},
+			release: (message) => deliver?.(message),
+		};
+	};
+
+	const click = (): Event =>
+		new window.Event("click", { bubbles: true }) as unknown as Event;
+
+	async function mountHold(
+		actStub: Act,
+		model = "anthropic/claude-sonnet-5-5",
+	): Promise<{
+		container: HTMLDivElement;
+		root: ReturnType<typeof createRoot>;
+		unmount: () => Promise<void>;
+	}> {
+		const { container, root, unmount } = await mount(
+			<HoldResumeButton
+				task={task}
+				catalog={null}
+				model={model}
+				act={actStub}
+			/>,
+		);
+		return { container, root, unmount };
+	}
+
+	const resumeButton = (container: HTMLDivElement): HTMLButtonElement =>
+		container.querySelector(
+			"button:not(.icon)",
+		) as unknown as HTMLButtonElement;
+
+	const problemLine = (container: HTMLDivElement): Element | null =>
+		container.querySelector(".resume-problem");
+
+	test("a refused resume shows the server's message beside the button", async () => {
+		const { container, root } = await mountHold(refusedAct());
+		// Closed until the click: no line, no alert role.
+		expect(problemLine(container)).toBeNull();
+		await act(async () => {
+			resumeButton(container).dispatchEvent(click());
+			await Promise.resolve();
+		});
+		const line = problemLine(container);
+		expect(line?.getAttribute("role")).toBe("alert");
+		expect(line?.textContent).toContain(MESSAGE);
+		await act(async () => {
+			root.unmount();
+		});
+		container.remove();
+	});
+
+	test("a successful retry clears the shown refusal", async () => {
+		const { container, root } = await mountHold(refusedAct());
+		await act(async () => {
+			resumeButton(container).dispatchEvent(click());
+			await Promise.resolve();
+		});
+		expect(problemLine(container)?.textContent).toContain(MESSAGE);
+		// The same button retries with an accepting act: the line drops.
+		await act(async () => {
+			root.render(
+				<HoldResumeButton
+					task={task}
+					catalog={null}
+					model="anthropic/claude-sonnet-5-5"
+					act={acceptedAct()}
+				/>,
+			);
+		});
+		await act(async () => {
+			resumeButton(container).dispatchEvent(click());
+			await Promise.resolve();
+		});
+		expect(problemLine(container)).toBeNull();
+		await act(async () => {
+			root.unmount();
+		});
+		container.remove();
+	});
+
+	test("a different model pick hides a stale refusal", async () => {
+		const { container, root } = await mountHold(refusedAct());
+		await act(async () => {
+			resumeButton(container).dispatchEvent(click());
+			await Promise.resolve();
+		});
+		expect(problemLine(container)?.textContent).toContain(MESSAGE);
+		// The reset time named anthropic; the zai pick must not keep that text up.
+		await act(async () => {
+			root.render(
+				<HoldResumeButton
+					task={task}
+					catalog={null}
+					model="zai/glm-5.3-flash"
+					act={refusedAct()}
+				/>,
+			);
+		});
+		expect(problemLine(container)).toBeNull();
+		await act(async () => {
+			root.unmount();
+		});
+		container.remove();
+	});
+
+	test("a 409 that lands after a different pick never names the old model", async () => {
+		// The response stays in flight until the test releases it, so the pick
+		// races it the way a slow server does.
+		const late = parkedRefusal();
+		const { container, root } = await mountHold(late.act);
+		await act(async () => {
+			resumeButton(container).dispatchEvent(click());
+			// Only the click starts; the response is parked.
+			await Promise.resolve();
+		});
+		// The user picks another model while the anthropic request is in flight.
+		await act(async () => {
+			root.render(
+				<HoldResumeButton
+					task={task}
+					catalog={null}
+					model="zai/glm-5.3-flash"
+					act={refusedAct()}
+				/>,
+			);
+		});
+		// The parked anthropic 409 lands now: it names the old pick, so the line
+		// must not show it under the zai selection.
+		await act(async () => {
+			late.release(MESSAGE);
+			await Promise.resolve();
+		});
+		expect(problemLine(container)).toBeNull();
+		// Picking the old model back stays clean too: the parked refusal was dropped
+		// by the pick away, not parked for a later resurrection.
+		await act(async () => {
+			root.render(
+				<HoldResumeButton
+					task={task}
+					catalog={null}
+					model="anthropic/claude-sonnet-5-5"
+					act={refusedAct()}
+				/>,
+			);
+		});
+		expect(problemLine(container)).toBeNull();
+		await act(async () => {
+			root.unmount();
+		});
+		container.remove();
+	});
+
+	test("a delayed 409 for the still-selected model shows", async () => {
+		// The guard must only drop responses for a superseded pick: a slow server's
+		// refusal for the pick that stayed shows like any other.
+		const late = parkedRefusal();
+		const { container, root } = await mountHold(late.act);
+		await act(async () => {
+			resumeButton(container).dispatchEvent(click());
+			await Promise.resolve();
+		});
+		expect(problemLine(container)).toBeNull();
+		await act(async () => {
+			late.release(MESSAGE);
+			await Promise.resolve();
+		});
+		const line = problemLine(container);
+		expect(line?.getAttribute("role")).toBe("alert");
+		expect(line?.textContent).toContain(MESSAGE);
+		await act(async () => {
+			root.unmount();
+		});
+		container.remove();
+	});
+});
+describe("CreditsChip", () => {
+	const account = "https://cp.example/account";
+
+	test("a positive balance shows the balance and links to the account page", () => {
+		const html = renderToStaticMarkup(
+			<CreditsChip credits={{ balance: 12.5, accountUrl: account }} />,
+		);
+		expect(html).toContain(`href="https://cp.example/account"`);
+		expect(html).toContain(`target="_blank"`);
+		expect(html).toContain(`rel="noopener noreferrer"`);
+		expect(html).toContain(">12.5 credits</a>");
+		expect(html).not.toContain("data-empty");
+		expect(html).toContain('title="Credits balance — opens the account page"');
+	});
+
+	test("a zero balance names the hard stop with the short-label spans", () => {
+		const html = renderToStaticMarkup(
+			<CreditsChip credits={{ balance: 0, accountUrl: account }} />,
+		);
+		expect(html).toContain('data-empty=""');
+		expect(html).toContain("Out of credit — work stopped");
+		expect(html).toContain(
+			'<span class="credits-full">Out of credit — work stopped</span>',
+		);
+		expect(html).toContain('<span class="credits-short">Out of credit</span>');
+		expect(html).toContain(
+			'title="Out of credit — top up on the account page"',
+		);
+	});
+
+	test("a negative balance names the hard stop too", () => {
+		const html = renderToStaticMarkup(
+			<CreditsChip credits={{ balance: -1.5, accountUrl: account }} />,
+		);
+		expect(html).toContain('data-empty=""');
+		expect(html).toContain("Out of credit — work stopped");
+	});
+
+	test("an unknown balance renders nothing", () => {
+		expect(
+			renderToStaticMarkup(
+				<CreditsChip credits={{ balance: null, accountUrl: account }} />,
+			),
+		).toBe("");
+	});
+});
+
+describe("credits chip in the board bar", () => {
+	// The full board mount needs the same globals as settings.hosted.test.tsx's harness:
+	// a happy-dom Window swapped in beforeAll and restored in afterAll, plus a fetch stub
+	// that answers the boot conversation and fails every other load with its 503 line.
+	const { window } = installBrowserGlobals([
+		"location",
+		"history",
+		"HTMLDialogElement",
+		"HTMLTextAreaElement",
+		"Node",
+		"getComputedStyle",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+		"CSS",
+		"sessionStorage",
+		"localStorage",
+	]);
+	const host = globalThis as unknown as Record<string, unknown>;
+	// happy-dom implements no popover attribute yet; the menus call hidePopover().
+	const proto = window.HTMLElement.prototype as unknown as Record<
+		string,
+		unknown
+	>;
+	beforeAll(() => {
+		proto.showPopover ??= () => {};
+		proto.hidePopover ??= () => {};
+	});
+	// fetch is swapped per test in this describe; its original comes back after all.
+	const realFetch = globalThis.fetch;
+	afterAll(() => {
+		globalThis.fetch = realFetch;
+	});
+
+	/** The board state with the fields App reads at boot; `extra` carries the credits. */
+	const stateBody = (extra: Record<string, unknown>): unknown => ({
+		projects: [],
+		tasks: [],
+		maxTotal: null,
+		reviewCheck: false,
+		workCheck: false,
+		idleReviews: false,
+		trendingScan: true,
+		trendingStatus: { lastRunAt: null, lastError: null, running: false },
+		serverVersion: "vtest",
+		quota: null,
+		onboarding: false,
+		user: "alice",
+		seenAnswers: [],
+		seenDoneSince: 0,
+		inboxSeen: [],
+		orphans: [],
+		orphansError: null,
+		keptWorktrees: { held: 0, stale: 0 },
+		drainUntil: null,
+		drainCommits: null,
+		warnings: [],
+		updates: null,
+		alatePendingSince: null,
+		deadSignIns: [],
+		...extra,
+	});
+
+	/** The server as the board sees it: boot and state answer, every other load 503s. */
+	const serverFor = (
+		hosted: boolean,
+		state: Record<string, unknown>,
+		requested: string[],
+	): typeof fetch =>
+		(async (input: RequestInfo | URL) => {
+			const url = String(input);
+			requested.push(url);
+			let body: unknown = { error: "not in this test" };
+			let status = 503;
+			if (url === "/api/boot") {
+				body = {
+					onboarding: false,
+					version: "vtest",
+					live: false,
+					...(hosted ? { hosted: true } : {}),
+				};
+				status = 200;
+			} else if (url === "/api/state") {
+				body = stateBody(state);
+				status = 200;
+			} else if (url === "/api/update") {
+				body = { behind: 0, commits: [] };
+				status = 200;
+			} else if (url === "/api/system") {
+				body = {
+					at: 1,
+					containers: [],
+					vm: {
+						cpuPct: null,
+						cpus: 4,
+						load1: null,
+						memAvailable: null,
+						memTotal: null,
+						history: [],
+					},
+					holds: {
+						drainUntil: null,
+						drainCommits: null,
+						maxTotal: null,
+						running: 0,
+						queued: 0,
+						oldestQueuedAt: null,
+					},
+				};
+				status = 200;
+			}
+			return new Response(JSON.stringify(body), {
+				status,
+				headers: { "Content-Type": "application/json" },
+			});
+		}) as typeof fetch;
+
+	/** Flushes fetch-fed state frames and effects until `pred` holds. */
+	async function waitFor(pred: () => boolean): Promise<void> {
+		for (let i = 0; i < 200; i++) {
+			if (pred()) return;
+			await act(async () => {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setTimeout(resolve, 5);
+				await promise;
+			});
+		}
+		throw new Error(
+			`condition not reached; body: ${document.body.innerHTML.slice(0, 1200)}`,
+		);
+	}
+
+	const boardLoaded = (): boolean => {
+		const main = document.querySelector("main.main");
+		return main !== null && !(main.textContent ?? "").includes("Loading board");
+	};
+
+	/** Mounts App against the server, runs `check`, unmounts; reports every fetched URL. */
+	async function withApp(
+		hosted: boolean,
+		state: Record<string, unknown>,
+		check: () => void,
+	): Promise<string[]> {
+		const requested: string[] = [];
+		host.fetch = serverFor(hosted, state, requested);
+		window.history.replaceState(null, "", "/");
+		const { unmount } = await mount(<App />);
+		try {
+			await waitFor(boardLoaded);
+			check();
+		} finally {
+			await unmount();
+		}
+		return requested;
+	}
+
+	test("hosted: the bar links the balance to the account page", async () => {
+		await withApp(
+			true,
+			{ credits: { balance: 12.5, accountUrl: "https://cp.example/account" } },
+			() => {
+				const chip = document.querySelector("header.bar a.credits-chip");
+				expect(chip).not.toBeNull();
+				expect(chip?.getAttribute("href")).toBe("https://cp.example/account");
+				expect(chip?.getAttribute("target")).toBe("_blank");
+				expect(chip?.getAttribute("rel")).toBe("noopener noreferrer");
+				expect(chip?.hasAttribute("data-empty")).toBe(false);
+				expect(chip?.textContent).toContain("12.5 credits");
+				expect(
+					document.querySelectorAll("header.bar a.credits-chip"),
+				).toHaveLength(1);
+			},
+		);
+	});
+
+	test("hosted: a null balance hides the chip", async () => {
+		await withApp(
+			true,
+			{ credits: { balance: null, accountUrl: "https://cp.example/account" } },
+			() => {
+				expect(document.querySelector(".credits-chip")).toBeNull();
+			},
+		);
+	});
+
+	test("flag off: a payload without credits means no chip and no fetch for one", async () => {
+		const requested = await withApp(false, {}, () => {
+			expect(document.querySelector(".credits-chip")).toBeNull();
+			expect(document.body.innerHTML).not.toContain("credits-chip");
+		});
+		// The chip fetches nothing; the recorded loads are the board's own boot calls.
+		expect(requested.every((url) => !url.includes("credit"))).toBe(true);
 	});
 });

@@ -287,6 +287,7 @@ function fakeHosted(
 			},
 			gitToken: async () => null,
 		},
+		creditBalance: { balance: null },
 	};
 	return { hosted, reports, creditCalls: () => creditCalls };
 }
@@ -1139,7 +1140,12 @@ describe("hosted credit stop", () => {
 		const { hosted } = fakeHosted();
 		const { store, loop } = await setup({ hosted });
 		await store.createTask("work please");
+		// The last gate answer left a positive balance; the stop is the control plane's
+		// zero-credit fact, so the chip data flips at once (docs/specs/hosted-mode.md
+		// section 5), not when a queued card's next gate call happens.
+		hosted.creditBalance.balance = 3.5;
 		await expect(loop.creditStop()).resolves.toBe(0);
+		expect(hosted.creditBalance.balance).toBe(0);
 	});
 
 	/** Work or merge runs resolve `main` at once; each check run (check.yml) hangs until killed. */

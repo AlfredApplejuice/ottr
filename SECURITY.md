@@ -8,6 +8,8 @@ Do not report a vulnerability in a public issue, a discussion or a pull request.
 2. Click **Report a vulnerability**.
 3. Give the affected commit or release, the steps to reproduce, and the impact.
 
+Private vulnerability reporting is on for this repository. The direct form is at <https://github.com/ottr-ai/ottr/security/advisories/new>.
+
 ## Supported versions
 
 Only the newest release and the newest commit on `main` get security fixes.

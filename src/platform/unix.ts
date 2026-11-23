@@ -2,6 +2,7 @@
 import { spawnSync } from "node:child_process";
 import type { Dirent } from "node:fs";
 import { readdirSync, readFileSync, readlinkSync } from "node:fs";
+import { childDatabaseEnv } from "../childEnv.ts";
 import type { CwdProcess, Platform, ProcessInfo } from "./index.ts";
 
 // ponytail: 32 MiB caps the ps snapshots (~1 MiB today under Stryker load, full argv listing >1 MiB).
@@ -13,6 +14,7 @@ export function descendants(pid: number): number[] | null {
 	const kids = new Map<number, number[]>();
 	try {
 		const ps = spawnSync("ps", ["-A", "-o", "pid=", "-o", "ppid="], {
+			env: childDatabaseEnv(),
 			stdio: ["ignore", "pipe", "ignore"],
 			maxBuffer: PS_MAX_BUFFER,
 		});
@@ -110,6 +112,7 @@ export const unix = {
 
 	listProcesses(run: typeof spawnSync = spawnSync): ProcessInfo[] {
 		const ps = run("ps", ["-eo", "pid=,etimes=,args="], {
+			env: childDatabaseEnv(),
 			stdio: ["ignore", "pipe", "ignore"],
 			maxBuffer: PS_MAX_BUFFER,
 		});

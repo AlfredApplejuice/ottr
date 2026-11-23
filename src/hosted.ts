@@ -171,7 +171,7 @@ export interface MeteringRecord {
 	turnId: number;
 	/** The turn's kind (work, merge, ...). */
 	kind: string;
-	/** The model role the run resolved its model from (default, critic, adversary). */
+	/** The model role the run resolved its model from: the routed check role, or "default". */
 	role: string;
 	/** provider/model the run used; null when omp never named it. */
 	model: string | null;
@@ -210,13 +210,24 @@ export interface HostedHooks {
 
 type Fetch = (url: string, init: RequestInit) => Promise<Response>;
 
+/** The credit balance the control plane last reported (credits); null until one answer carried it. */
+export interface CreditBalance {
+	balance: number | null;
+}
+
 /** The HTTP client for HostedHooks (endpoints in docs/specs/hosted-mode.md). */
 export function controlPlaneHooks(
 	cfg: HostedConfig,
-	opts: { fetch?: Fetch; log?: (msg: string) => void } = {},
+	opts: {
+		fetch?: Fetch;
+		log?: (msg: string) => void;
+		/** The cell creditOk records a reported balance into; server.ts shares it with Hosted. */
+		credit?: CreditBalance;
+	} = {},
 ): HostedHooks {
 	const doFetch: Fetch = opts.fetch ?? ((url, init) => fetch(url, init));
 	const log = opts.log ?? ((msg) => console.error(msg));
+	const cell: CreditBalance = opts.credit ?? { balance: null };
 	const base = cfg.controlUrl;
 	const call = (
 		method: string,
@@ -252,9 +263,12 @@ export function controlPlaneHooks(
 		async creditOk() {
 			const res = await call("GET", "/credit");
 			if (!res.ok) throw new Error(`credit check got HTTP ${res.status}`);
-			const body = (await res.json()) as { ok?: unknown };
+			const body = (await res.json()) as { ok?: unknown; balance?: unknown };
 			if (typeof body.ok !== "boolean")
 				throw new Error("credit check answered without a boolean ok");
+			// A finite balance records for the chip; any other value keeps the last one.
+			if (typeof body.balance === "number" && Number.isFinite(body.balance))
+				cell.balance = body.balance;
 			return body.ok;
 		},
 		async gitToken(project, remote) {
@@ -282,6 +296,8 @@ export function controlPlaneHooks(
 export interface Hosted {
 	config: HostedConfig;
 	hooks: HostedHooks;
+	/** The cell controlPlaneHooks' creditOk records into; the state payload reads it per frame. */
+	creditBalance: CreditBalance;
 }
 
 /** Which watch a forwarded GitHub event kicks (docs/specs/hosted-mode.md section 8). */

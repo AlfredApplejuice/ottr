@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { splitLevel } from "../levels.ts";
 import type { ModelOption } from "../models.ts";
+import type { CheckRoutingSetting } from "../types.ts";
+import { modelVendor } from "../vendor.ts";
 import { httpNextStep, httpStatusWords } from "./kit.tsx";
 
 export type ModelCatalog = {
@@ -43,12 +45,45 @@ export function roleWarnings(
 		: [`No active sign-in for ${provider} on the board`];
 }
 
-/** The check roles missing from the edited role names: critic checks Anthropic models,
-    adversary checks the rest. A missing role runs its checks on the default model, which is
-    often the model they check — the editor flags the gap so the fallback is a decision. */
-export function missingCheckRoles(roles: readonly string[]): string[] {
-	const have = new Set(roles);
-	return ["critic", "adversary"].filter((role) => !have.has(role));
+/** The vendors the configured models use, first-appearance order, each once: every
+ *  role selector's vendor (the default role's model runs work turns too), and a
+ *  selector whose vendor no token names counts as "unknown". */
+export function roleVendors(roles: Record<string, string>): string[] {
+	const vendors: string[] = [];
+	for (const selector of Object.values(roles)) {
+		const vendor = modelVendor(selector) ?? "unknown";
+		if (!vendors.includes(vendor)) vendors.push(vendor);
+	}
+	return vendors;
+}
+
+/** The vendors in use that no configured role of another vendor covers: their checks fall
+ *  back to the default model, which is often the model they check. The default role
+ *  names no check role, so it never covers a vendor here. The editor flags the
+ *  gap so the fallback is a decision, and the Check routing table can pin a rule. */
+export function missingCheckRoles(roles: Record<string, string>): string[] {
+	return roleVendors(roles).filter(
+		(vendor) =>
+			!Object.entries(roles).some(
+				([role, selector]) =>
+					role !== "default" && (modelVendor(selector) ?? "unknown") !== vendor,
+			),
+	);
+}
+
+/** True when the edited routing differs from the saved setting: `rules` maps vendor to
+ *  role ("" or absent = automatic, so a reverted vendor drops out), `fallback` is the
+ *  fallback role or "". An empty draft against a null setting is clean. */
+export function checkRoutingDirty(
+	saved: CheckRoutingSetting | null,
+	rules: Record<string, string>,
+	fallback: string,
+): boolean {
+	if (fallback !== (saved?.fallback ?? "")) return true;
+	const savedRules = saved?.rules ?? [];
+	const active = Object.entries(rules).filter(([, role]) => role !== "");
+	if (active.length !== savedRules.length) return true;
+	return savedRules.some((r) => ownField(rules, r.vendor) !== r.role);
 }
 
 /** Board seed state after a save: "copy" when the board reads the provisioned copy (no seed),

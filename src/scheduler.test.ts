@@ -12,8 +12,10 @@ import { ARCH_REVIEW_MARKER, RULES_INTERVIEW_MARKER } from "./prompts.ts";
 import {
 	applyCheckVerdicts,
 	archReviewView,
+	blockingReview,
 	checkModelWarning,
 	checkRoleFor,
+	checkRoutingNote,
 	type DepIndex,
 	type DepProject,
 	demoteUnquoted,
@@ -35,7 +37,6 @@ import {
 	liveCardOf,
 	mergeAnywayPatch,
 	mergeHold,
-	modelVendor,
 	openWorkBlockers,
 	overrideWorkBlockers,
 	PUSH_HOLD,
@@ -53,14 +54,18 @@ import {
 	SILENT_LOG_MS,
 	selectFindings,
 	silentSince,
+	validatableReview,
 	waitingOn,
+	workCheckAccountingError,
 	workCheckBlockerCounts,
 	workCheckCountsDiverged,
 	workCheckDivergeAsk,
 	workCheckDiverged,
 	workCheckDivergeReason,
 } from "./scheduler.ts";
+import fc from "./test/properties.ts";
 import type { Task, WorkCheckRun } from "./types.ts";
+import { modelVendor } from "./vendor.ts";
 
 describe("silentSince", () => {
 	test("flags a preparing or running log silent past SILENT_LOG_MS, floored; else null", () => {
@@ -144,11 +149,26 @@ describe("mergeAnywayPatch", () => {
 				at: 1,
 				model: null,
 				outcome: "blockers",
-				blockers: [{ finding: "f", quote: "q" }],
+				blockers: [
+					{ finding: "f", quote: "q" },
+					{
+						finding: "fixed",
+						quote: "q2",
+						status: "fixed",
+						statusReason: "the code now rejects it",
+					},
+					{
+						finding: "overridden",
+						quote: "q3",
+						status: "overridden",
+						statusReason: "the user accepted this risk",
+					},
+				],
 				notes: [],
 				durationMs: 0,
 			},
 		];
+		const completed = structuredClone(log[0]!.blockers.slice(1));
 		const before = Date.now();
 		const patch = mergeAnywayPatch({ workCheckLog: log }, "why");
 		const after = Date.now();
@@ -166,6 +186,8 @@ describe("mergeAnywayPatch", () => {
 			asked: null,
 		});
 		expect(patch.workCheckLog[0]?.blockers[0]?.statusReason).toBe("why");
+		expect(patch.workCheckLog[0]?.blockers.slice(1)).toEqual(completed);
+		expect(log[0]?.blockers[0]?.status).toBeUndefined();
 	});
 });
 
@@ -235,6 +257,7 @@ function task(p: Partial<Task> = {}): Task {
 		sourcePrCrossRepo: false,
 		sourcePrDependabot: false,
 		sourcePrSuperseded: false,
+		sourceIssue: null,
 		followUpPrNumber: null,
 		followUpPrUrl: null,
 		pushSha: null,
@@ -1337,16 +1360,16 @@ describe("findingsHold", () => {
 });
 
 describe("the doneAt cutoff is inclusive at the same millisecond (CI 43875479904)", () => {
-	test("a follow-up filed in the review's done millisecond holds a queued merge", () => {
+	test("a validation run filed in the review's done millisecond never holds; a work follow-up does", () => {
 		// OTTR-1047's one CI failure, deterministic: the board files a validation
 		// run as a followUpOf child of the done review. When the filing lands in
 		// the SAME millisecond as the review's done stamp (a fast runner),
-		// `createdAt <= doneAt` counts it as a finding. It is stage todo — an
-		// open finding whose leadAtDone is false, because it did not exist when
-		// the review landed done (the stamp records the stage AT doneAt,
-		// OTTR-963) — so a queued merge waits. Fail-closed by design; the flaky
-		// fixture that tripped this (turn.test.ts's doneReview) now sleeps
-		// across the millisecond boundary instead of assuming the clock advanced.
+		// `createdAt <= doneAt` counts it as a finding. OTTR-1128 changed the rule:
+		// a validation run (kind "validation") never holds a merge in any stage, so
+		// it cannot hold the queued merge any more. The inclusive cutoff still
+		// holds for an untagged work follow-up filed in the same millisecond: it is
+		// stage todo, an open finding whose leadAtDone is false (it did not exist
+		// when the review landed done, OTTR-963), so a queued merge waits.
 		const review = task({
 			kind: "review",
 			stage: "done",
@@ -1360,7 +1383,9 @@ describe("the doneAt cutoff is inclusive at the same millisecond (CI 43875479904
 			createdAt: 5_000,
 		});
 		const merge = task({ stage: "merging", state: "queued" });
-		expect(mergeHold([review, validation, merge], merge)).toBe(FINDINGS_HOLD);
+		expect(mergeHold([review, validation, merge], merge)).toBeNull();
+		const work = task({ followUpOf: review.id, createdAt: 5_000 });
+		expect(mergeHold([review, work, merge], merge)).toBe(FINDINGS_HOLD);
 	});
 
 	test("a lead filed in the same millisecond never holds: backlog is not open", () => {
@@ -1397,6 +1422,171 @@ describe("the doneAt cutoff is inclusive at the same millisecond (CI 43875479904
 		});
 		const merge = task({ stage: "merging", state: "queued" });
 		expect(mergeHold([review, validation, merge], merge)).toBeNull();
+	});
+});
+
+describe("OTTR-1128: a lead never runs as a work turn and never holds its review", () => {
+	/** The board card form of `t`: no prompt, plus the `lead` mark for a lead. */
+	const boardCard = (t: Task, lead: boolean) => {
+		const { prompt: _prompt, ...rest } = t;
+		return lead ? { ...rest, lead: true as const } : rest;
+	};
+	const leadsOf = (review: Task) => [
+		task({
+			prompt: "Needs validation: a todo lead",
+			followUpOf: review.id,
+			createdAt: 150,
+		}),
+		task({
+			prompt: "Needs validation: an in_progress lead",
+			followUpOf: review.id,
+			createdAt: 160,
+			stage: "in_progress",
+			state: "needs_you",
+		}),
+	];
+
+	test("a release at merging whose only open findings are leads is free to finish", () => {
+		const release = task({
+			releaseVersion: "v9.9.9",
+			stage: "merging",
+			state: "idle",
+			createdAt: 100,
+		});
+		const leads = leadsOf(release);
+		const merge = task({ stage: "merging", state: "queued" });
+		const tasks = [release, ...leads, merge];
+		expect(findingsHold(tasks, release)).toBeNull();
+		// The unrelated merge still waits for the release to ship, never for the leads.
+		expect(mergeHold(tasks, merge)).toBe("waiting for release v9.9.9");
+		// The board card form: no prompt, the `lead` mark instead.
+		const board = [
+			boardCard(release, false),
+			...leads.map((l) => boardCard(l, true)),
+		];
+		expect(findingsHold(board, release)).toBeNull();
+		expect(mergeHold([...board, merge], merge)).toBe(
+			"waiting for release v9.9.9",
+		);
+	});
+
+	test("the Review button's review at merging is free once only leads are open", () => {
+		const review = task({
+			kind: "review",
+			stage: "merging",
+			state: "idle",
+			createdAt: 100,
+		});
+		const leads = leadsOf(review);
+		expect(findingsHold([review, ...leads], review)).toBeNull();
+		const board = [
+			boardCard(review, false),
+			...leads.map((l) => boardCard(l, true)),
+		];
+		expect(findingsHold(board, review)).toBeNull();
+	});
+
+	test("a done review's promoted leads and its validation run never hold a merge", () => {
+		// leadAtDone false: the leads were not parked backlog leads at doneAt, so only
+		// the OTTR-1128 lead rule frees the merge.
+		const review = task({
+			kind: "review",
+			stage: "done",
+			state: "idle",
+			createdAt: 100,
+			doneAt: 5_000,
+		});
+		const leads = leadsOf(review);
+		const validation = task({
+			kind: "validation",
+			followUpOf: review.id,
+			createdAt: 170,
+			stage: "in_progress",
+		});
+		const merge = task({ stage: "merging", state: "queued" });
+		expect(mergeHold([review, ...leads, validation, merge], merge)).toBeNull();
+		const board = [
+			boardCard(review, false),
+			...leads.map((l) => boardCard(l, true)),
+			boardCard(validation, false),
+		];
+		expect(mergeHold([...board, merge], merge)).toBeNull();
+	});
+
+	test("a non-lead finding in todo still holds (control)", () => {
+		const release = task({
+			releaseVersion: "v9.9.8",
+			stage: "merging",
+			state: "idle",
+			createdAt: 100,
+		});
+		const finding = task({
+			prompt: "Fix the rate limiter",
+			followUpOf: release.id,
+			createdAt: 150,
+		});
+		const tasks = [release, ...leadsOf(release), finding];
+		expect(findingsHold(tasks, release)).toBe(FINDINGS_HOLD);
+		// The board form of the same finding (no lead mark) holds too.
+		expect(
+			findingsHold(
+				tasks.map((t) => boardCard(t, t !== finding && t !== release)),
+				release,
+			),
+		).toBe(FINDINGS_HOLD);
+		// The review's question card is no lead: its hyphenated prefix holds.
+		const question = task({
+			prompt: `${LEAD_QUESTIONS_PROMPT_PREFIX} x`,
+			followUpOf: release.id,
+			createdAt: 150,
+		});
+		expect(findingsHold([release, question], release)).toBe(FINDINGS_HOLD);
+	});
+
+	test("pickRunnable never starts a lead that waits for a sandbox", () => {
+		const many = { ...opts, maxParallel: 10 };
+		const todoLead = task({ prompt: "Needs validation: rate limiter" });
+		const startedLead = task({
+			prompt: "Needs validation: retry\nBlocker: sandbox run: no network deny",
+			stage: "in_progress",
+		});
+		expect(pickRunnable([todoLead, startedLead], many)).toEqual([]);
+		const validated = task({
+			prompt: "Needs validation: proven",
+			validatedAt: 5,
+		});
+		const deployment = task({
+			prompt:
+				"Needs validation: proxy\nBlocker: deployment fact: Does a trusted proxy set X-Forwarded-For?",
+		});
+		const normal = task();
+		expect(
+			pickRunnable(
+				[todoLead, startedLead, validated, deployment, normal],
+				many,
+			),
+		).toEqual([validated, deployment, normal]);
+	});
+
+	test("validatableReview: a done review, or one idle at merging", () => {
+		const review = (p: Partial<Task>) =>
+			validatableReview(task({ kind: "review", ...p }));
+		expect(review({ stage: "done", state: "idle" })).toBe(true);
+		expect(review({ stage: "merging", state: "idle" })).toBe(true);
+		expect(
+			validatableReview(
+				task({ releaseVersion: "v1.0.0", stage: "merging", state: "idle" }),
+			),
+		).toBe(true);
+		expect(review({ stage: "merging", state: "queued" })).toBe(false);
+		expect(review({ stage: "merging", state: "running" })).toBe(false);
+		expect(review({ stage: "in_progress", state: "idle" })).toBe(false);
+		expect(review({ stage: "done", state: "idle", cancelledAt: 9 })).toBe(
+			false,
+		);
+		expect(validatableReview(task({ stage: "done", state: "idle" }))).toBe(
+			false,
+		);
 	});
 });
 
@@ -1438,6 +1628,8 @@ describe("reviewBlocked", () => {
 		expect(reviewBlocked([review, finding])).toBe(
 			"The last review's findings are not done yet.",
 		);
+		// The chip links to the review card, not the finding, while findings keep it open.
+		expect(blockingReview([review, finding])?.id).toBe(review.id);
 		const fixed = {
 			...finding,
 			stage: "done" as const,
@@ -1565,7 +1757,7 @@ describe("archReviewView", () => {
 			anchor,
 		});
 		expect(
-			archReviewView(lastFullReview([review]), delta("aaa"), 30, false),
+			archReviewView(lastFullReview([review]), delta("aaa"), 30, null),
 		).toEqual({
 			delta: 12,
 			reviewed: true,
@@ -1574,6 +1766,7 @@ describe("archReviewView", () => {
 			cap: 30,
 			due: false,
 			running: false,
+			runningCardId: null,
 		});
 		// The release ran after the full review, so it froze a newer base — but only a full
 		// review resets the counter: base and card id still name the full review.
@@ -1589,7 +1782,7 @@ describe("archReviewView", () => {
 			lastFullReview([review, release]),
 			delta("aaa"),
 			30,
-			false,
+			null,
 		);
 		expect(view.base).toBe("aaa");
 		expect(view.reviewCardId).toBe(review.id);
@@ -1609,7 +1802,7 @@ describe("archReviewView", () => {
 				lastFullReview([review]),
 				{ delta: 1, reviewed: true, anchor: "zzz" },
 				30,
-				false,
+				null,
 			),
 		).toEqual({
 			delta: 1,
@@ -1619,6 +1812,7 @@ describe("archReviewView", () => {
 			cap: 30,
 			due: false,
 			running: false,
+			runningCardId: null,
 		});
 	});
 
@@ -1628,7 +1822,7 @@ describe("archReviewView", () => {
 				lastFullReview([]),
 				{ delta: 9, reviewed: false, anchor: "" },
 				30,
-				false,
+				null,
 			),
 		).toEqual({
 			delta: 9,
@@ -1639,6 +1833,7 @@ describe("archReviewView", () => {
 			// An un-reviewed project is always due, whatever its history size.
 			due: true,
 			running: false,
+			runningCardId: null,
 		});
 	});
 });
@@ -1817,20 +2012,132 @@ describe("review check policy", () => {
 		});
 	});
 
-	test("checkRoleFor picks the role by model vendor, not provider prefix", () => {
+	test("checkRoleFor keeps today's roles for Claude and GPT runs on today's board", () => {
+		// Today's setup: critic = an OpenAI model, adversary = an Anthropic model.
+		const roles = {
+			critic: "openai/gpt-6",
+			adversary: "anthropic/claude-opus-5-5",
+		};
 		// Claude through another provider is still Anthropic: the critic role checks it.
-		expect(checkRoleFor("anthropic/claude-opus-5-5")).toBe("critic");
-		expect(checkRoleFor("github-copilot/claude-sonnet-4-5")).toBe("critic");
-		expect(checkRoleFor("openrouter/anthropic/claude-opus-4-1")).toBe("critic");
-		expect(checkRoleFor("bedrock/us.anthropic.claude-sonnet-4-5")).toBe(
+		expect(checkRoleFor(null, roles, "anthropic/claude-opus-5-5")).toBe(
 			"critic",
 		);
-		// Other vendors and unknown ids keep the adversary role.
-		expect(checkRoleFor("openai/gpt-6.1")).toBe("adversary");
-		expect(checkRoleFor("openai-codex/gpt-5.6-luna")).toBe("adversary");
-		expect(checkRoleFor("zai/glm-5.3-flash")).toBe("adversary");
-		expect(checkRoleFor("fake/default-model")).toBe("adversary");
-		expect(checkRoleFor(null)).toBe("adversary");
+		expect(checkRoleFor(null, roles, "github-copilot/claude-sonnet-4-5")).toBe(
+			"critic",
+		);
+		expect(
+			checkRoleFor(null, roles, "openrouter/anthropic/claude-opus-4-1"),
+		).toBe("critic");
+		expect(
+			checkRoleFor(null, roles, "bedrock/us.anthropic.claude-sonnet-4-5"),
+		).toBe("critic");
+		// A GPT run gets the Anthropic adversary.
+		expect(checkRoleFor(null, roles, "openai/gpt-6.1")).toBe("adversary");
+		expect(checkRoleFor(null, roles, "openai-codex/gpt-5.6-luna")).toBe(
+			"adversary",
+		);
+		// A third vendor gets the OpenAI critic: a real second vendor's opinion, the
+		// routing this change introduces (the old rule sent it to the adversary too).
+		expect(checkRoleFor(null, roles, "zai/glm-5.3-flash")).toBe("critic");
+		// An unknown or unset work model: the OpenAI critic differs from its unknown vendor.
+		expect(checkRoleFor(null, roles, "fake/default-model")).toBe("critic");
+		expect(checkRoleFor(null, roles, null)).toBe("critic");
+	});
+
+	test("checkRoleFor routes an only-Chinese board across vendors with no setting", () => {
+		const roles = {
+			adversary: "zai/glm-5.3-flash",
+			critic: "qwen/qwen-max",
+		};
+		expect(checkRoleFor(null, roles, "zai/glm-5.3-flash")).toBe("critic");
+		expect(checkRoleFor(null, roles, "qwen/qwen-max")).toBe("adversary");
+	});
+
+	test("a user rule routes the vendor to its role, else the fallback applies", () => {
+		const roles = {
+			critic: "openai/gpt-6",
+			adversary: "anthropic/claude-opus-5-5",
+			reviewer: "moonshot/kimi-k2",
+		};
+		const settings = {
+			rules: [{ vendor: "zai", role: "reviewer" }],
+			fallback: "",
+		};
+		expect(checkRoleFor(settings, roles, "zai/glm-5.3-flash")).toBe("reviewer");
+		expect(checkRoutingNote(settings, roles, "zai/glm-5.3-flash")).toBeNull();
+		// The first matching rule wins; later duplicates never run.
+		const dup = {
+			rules: [
+				{ vendor: "zai", role: "reviewer" },
+				{ vendor: "zai", role: "critic" },
+			],
+			fallback: "",
+		};
+		expect(checkRoleFor(dup, roles, "zai/glm-5.3-flash")).toBe("reviewer");
+		// A model no rule names takes a configured fallback role.
+		const fb = {
+			rules: [{ vendor: "zai", role: "reviewer" }],
+			fallback: "reviewer",
+		};
+		expect(checkRoleFor(fb, roles, "anthropic/claude-opus-5-5")).toBe(
+			"reviewer",
+		);
+		expect(checkRoutingNote(fb, roles, "anthropic/claude-opus-5-5")).toBeNull();
+		// An empty fallback and no match: the default rule, with no note.
+		expect(checkRoleFor(settings, roles, "anthropic/claude-opus-5-5")).toBe(
+			"critic",
+		);
+		expect(checkRoutingNote(settings, roles, "anthropic/claude-opus-5-5")).toBe(
+			null,
+		);
+	});
+
+	test("a rule or fallback to a missing role falls back to the default rule and logs one line", () => {
+		const roles = {
+			critic: "openai/gpt-6",
+			adversary: "anthropic/claude-opus-5-5",
+		};
+		const settings = {
+			rules: [{ vendor: "zai", role: "reviewer" }],
+			fallback: "",
+		};
+		expect(checkRoleFor(settings, roles, "zai/glm-5.3-flash")).toBe("critic");
+		expect(checkRoutingNote(settings, roles, "zai/glm-5.3-flash")).toBe(
+			"check routing: rule zai -> reviewer names no configured role, using the default rule",
+		);
+		// The same for a nonempty fallback whose role has no configured model.
+		const fb = { rules: [], fallback: "reviewer" };
+		expect(checkRoleFor(fb, roles, "anthropic/claude-opus-5-5")).toBe("critic");
+		expect(checkRoutingNote(fb, roles, "anthropic/claude-opus-5-5")).toBe(
+			"check routing: fallback reviewer names no configured role, using the default rule",
+		);
+		// hasOwn, not a bare member read: a rule naming an inherited member
+		// ("constructor") stays an unconfigured role — default rule + note.
+		const trap = {
+			rules: [{ vendor: "zai", role: "constructor" }],
+			fallback: "",
+		};
+		expect(checkRoleFor(trap, roles, "zai/glm-5.3-flash")).toBe("critic");
+		expect(checkRoutingNote(trap, roles, "zai/glm-5.3-flash")).toBe(
+			"check routing: rule zai -> constructor names no configured role, using the default rule",
+		);
+	});
+
+	test("the unknown vendor rule matches a model with no known vendor", () => {
+		const roles = {
+			critic: "openai/gpt-6",
+			adversary: "anthropic/claude-opus-5-5",
+		};
+		const settings = {
+			rules: [{ vendor: "unknown", role: "adversary" }],
+			fallback: "critic",
+		};
+		expect(checkRoleFor(settings, roles, "fake/default-model")).toBe(
+			"adversary",
+		);
+		expect(checkRoleFor(settings, roles, null)).toBe("adversary");
+		// A known vendor never matches the unknown rule: the fallback applies.
+		expect(checkRoleFor(settings, roles, "zai/glm-5.3-flash")).toBe("critic");
 	});
 
 	test("modelVendor reads the vendor from the model id after the provider prefix", () => {
@@ -2055,6 +2362,191 @@ describe("work check helpers", () => {
 			{ finding: "fabricated", quote: "NOT IN THE SOURCES" },
 		]);
 		expect(notes).toHaveLength(3); // two demotions plus the plain note
+	});
+
+	describe("workCheckAccountingError", () => {
+		const open = [
+			{ finding: "first", quote: "first quote" },
+			{ finding: "second", quote: "second quote" },
+		];
+		const fixed = [
+			{ id: 1, reason: "the code now rejects it" },
+			{ id: 2, reason: "the regression test covers it" },
+		];
+
+		test("accepts complete fixes, with no account needed when no blockers precede the check", () => {
+			expect(
+				workCheckAccountingError({ blockers: [], notes: [], fixed }, open, []),
+			).toBeNull();
+			expect(
+				workCheckAccountingError(
+					{ blockers: [], notes: [], fixed: [] },
+					[],
+					[],
+				),
+			).toBeNull();
+			expect(
+				workCheckAccountingError(
+					{ blockers: [], notes: [], fixed: [{ id: 1, reason: " \tfix\n" }] },
+					open.slice(0, 1),
+					[],
+				),
+			).toBeNull();
+		});
+
+		test.each([
+			["empty account", []],
+			["partial account", fixed.slice(0, 1)],
+			...[-1, 0, 3, 1.5, Number.NaN, Number.POSITIVE_INFINITY].map(
+				(id) =>
+					[`invalid ID ${id}`, [...fixed, { id, reason: "fix" }]] as const,
+			),
+			...["", " \t\n"].map(
+				(reason) => ["empty reason", [...fixed, { id: 1, reason }]] as const,
+			),
+		] as const)("rejects %s", (_name, account) => {
+			expect(
+				workCheckAccountingError(
+					{ blockers: [], notes: [], fixed: [...account] },
+					open,
+					[],
+				),
+			).not.toBeNull();
+		});
+
+		test.each([
+			null,
+			7,
+			{ id: "2", reason: "fix" },
+			{ id: 2.5, reason: "fix" },
+			{ id: 2, reason: 7 },
+			{ reason: "fix" },
+		])(
+			"a malformed parsed fix cannot account for the second blocker: %j",
+			(bad) => {
+				const parsed = parseWorkCheck(
+					JSON.stringify({ blockers: [], fixed: [fixed[0], bad], notes: [] }),
+				);
+				expect(parsed).not.toBeNull();
+				expect(workCheckAccountingError(parsed!, open, [])).not.toBeNull();
+			},
+		);
+
+		test("accepts an exact grounded recurrence with a fix for the other blocker", () => {
+			const parsed = parseWorkCheck(
+				JSON.stringify({
+					blockers: [{ finding: "a new description", quote: open[1]!.quote }],
+					fixed: [fixed[0]],
+				}),
+			)!;
+			for (const sources of [
+				["second quote", "", ""],
+				["", "second quote", ""],
+				["", "", "second quote"],
+			] as const) {
+				const { blockers } = demoteUnquoted(
+					parsed,
+					sources[0],
+					sources[1],
+					sources[2],
+				);
+				expect(workCheckAccountingError(parsed, open, blockers)).toBeNull();
+			}
+		});
+
+		test.each([
+			["second quote", undefined, ""],
+			["second quote", "nit", "second quote"],
+			["second quote", "pre-existing", "second quote"],
+			["second", undefined, "second quote"],
+			["", undefined, "second quote"],
+		] as const)(
+			"rejects an ungrounded, demoted, or changed recurrence: %s %s",
+			(quote, severity, source) => {
+				const parsed = parseWorkCheck(
+					JSON.stringify({
+						blockers: [{ finding: "still open", quote, severity }],
+						fixed: [fixed[0]],
+					}),
+				)!;
+				const { blockers } = demoteUnquoted(parsed, source, "", "");
+				expect(workCheckAccountingError(parsed, open, blockers)).not.toBeNull();
+			},
+		);
+
+		test("property: a no-blocker verdict passes only with a reason for every earlier blocker", () => {
+			fc.assert(
+				fc.property(
+					fc.array(
+						fc.record({
+							include: fc.boolean(),
+							reason: fc.oneof(
+								fc.string(),
+								fc.constant("fixed"),
+								fc.constant(" \t"),
+							),
+						}),
+						{ maxLength: 8 },
+					),
+					(accounts) => {
+						const earlier = accounts.map((_, i) => ({
+							finding: `finding ${i}`,
+							quote: `quote ${i}`,
+						}));
+						const parsed = parseWorkCheck(
+							JSON.stringify({
+								blockers: [],
+								fixed: accounts.flatMap((account, i) =>
+									account.include
+										? [{ id: i + 1, reason: account.reason }]
+										: [],
+								),
+							}),
+						)!;
+						expect(workCheckAccountingError(parsed, earlier, []) === null).toBe(
+							accounts.every(
+								(account) => account.include && account.reason.trim() !== "",
+							),
+						);
+					},
+				),
+			);
+		});
+
+		test("property: an omitted or malformed fix cannot close an earlier blocker", () => {
+			fc.assert(
+				fc.property(
+					fc.array(fc.string(), { minLength: 1, maxLength: 8 }),
+					fc.nat(),
+					fc.constantFrom("omitted", "type", "fraction", "range", "reason"),
+					(reasons, index, kind) => {
+						const missing = index % reasons.length;
+						const earlier = reasons.map((_, i) => ({
+							finding: `finding ${i}`,
+							quote: `quote ${i}`,
+						}));
+						const bad = {
+							omitted: null,
+							type: { id: String(missing + 1), reason: "fix" },
+							fraction: { id: missing + 1.5, reason: "fix" },
+							range: { id: reasons.length + 1, reason: "fix" },
+							reason: { id: missing + 1, reason: " \t\n" },
+						}[kind];
+						const parsed = parseWorkCheck(
+							JSON.stringify({
+								blockers: [],
+								fixed: reasons.map((reason, i) =>
+									i === missing ? bad : { id: i + 1, reason: `Fix: ${reason}` },
+								),
+							}),
+						)!;
+						expect(
+							workCheckAccountingError(parsed, earlier, []),
+						).not.toBeNull();
+					},
+				),
+			);
+		});
 	});
 
 	test("openWorkBlockers returns the last blockers run's unresolved entries only", () => {

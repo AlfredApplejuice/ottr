@@ -6,8 +6,9 @@
  * npm registry itself (releaseLineBlocked). The rule lives in
  * src/releaseLine.ts (docs/specs/release-line-gate.md).
  */
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { childDatabaseEnv } from "./childEnv.ts";
+import { readBoundedFile } from "./confine.ts";
 import {
 	lineCapReached,
 	type RegistryRelease,
@@ -19,6 +20,21 @@ const DAY_MS = 86_400_000;
 export const AGE_MS = 7 * DAY_MS;
 export const CAP_MS = 14 * DAY_MS;
 const TIMEOUT_MS = 20_000;
+/** Byte cap for every worktree file the hold reads (bun.lock, package.json)
+ * and for the base blob out of git, through the bounded readers (d6f0a9dd):
+ * a bigger file fails closed to null and keeps the park. */
+export const LOCK_MAX_BYTES = 4 * 1024 * 1024;
+/** Retention cap for a streamed packument: the scan keeps at most this many
+ * version entries. Measured maximum on the real registry on 2026-11-22 was
+ * 3892 versions (typescript); a packument listing more refuses the fetch, the
+ * scan fails closed, and the park stays. There is no body byte cap: real
+ * packuments legitimately reach tens of MiB (vite measured 37.2 MiB), so the
+ * body is streamed and only the selected fields are kept in memory. */
+export const MAX_PACKUMENT_VERSIONS = 20_000;
+/** The board scan stops when the changed set exceeds this count or when
+ * SCAN_MS passed since its start; both fail the scan closed (park stays). */
+export const MAX_CHANGED_PACKAGES = 500;
+export const SCAN_MS = 60_000;
 /** "name@1.2.3" or "@scope/name@1.2.3-beta.1"; the last @ separates the version. */
 const REGISTRY_ENTRY = /^(@?[^@]+)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/;
 /** Stable only: a prerelease pin never blocks and never gets checked. */
@@ -192,8 +208,381 @@ export function releasesOf(body: unknown): RegistryRelease[] {
 	return releases;
 }
 
+/** The packument fields the scan reads, selected out of the stream: every
+ * versions key with its deprecated flag, and the time map. */
+export type SelectedPackument = {
+	versions: Record<string, { deprecated?: string } | undefined>;
+	time: Record<string, string>;
+};
+
+const MAX_JSON_DEPTH = 64;
+const MAX_KEY_CHARS = 256;
+const MAX_DEPRECATED_CHARS = 2000;
+const MAX_TIME_VALUE_CHARS = 64;
+
+const SIMPLE_ESCAPES: Record<string, string> = {
+	'"': '"',
+	"\\": "\\",
+	"/": "/",
+	b: "\b",
+	f: "\f",
+	n: "\n",
+	r: "\r",
+	t: "\t",
+};
+
+function malformed(message: string): Error {
+	return new Error(`malformed packument: ${message}`);
+}
+
+function truncatedPackument(): Error {
+	return new Error("packument stream truncated");
+}
+
+function isTokenChar(ch: string | undefined): boolean {
+	if (ch === undefined) return false;
+	const code = ch.charCodeAt(0);
+	return (
+		(code >= 48 && code <= 57) || // 0-9
+		(code >= 65 && code <= 90) || // A-Z
+		(code >= 97 && code <= 122) || // a-z
+		code === 43 || // +
+		code === 45 || // -
+		code === 46 // .
+	);
+}
+
+/** Chunk-wise JSON cursor over the response stream: decodes chunks as they
+ * arrive and bulk-scans each buffer, so a multi-MiB body is never buffered
+ * whole. Refills only at token boundaries; a token that straddles the buffer
+ * end appends chunks just for itself. */
+class PackumentCursor {
+	private text = "";
+	private pos = 0;
+	private readonly decoder = new TextDecoder();
+	private eof = false;
+
+	constructor(
+		private readonly reader: ReadableStreamDefaultReader<Uint8Array>,
+	) {}
+
+	/** True when at least one char is buffered. */
+	private async ensure(): Promise<boolean> {
+		while (this.pos >= this.text.length) {
+			if (this.eof) return false;
+			const chunk = await this.reader.read();
+			if (chunk.done) {
+				this.eof = true;
+				return false;
+			}
+			this.text = this.decoder.decode(chunk.value, { stream: true });
+			this.pos = 0;
+		}
+		return true;
+	}
+
+	/** Appends the next chunk to the buffered tail, for a token that
+	 * straddles the buffer end. False at end of stream. */
+	private async append(): Promise<boolean> {
+		for (;;) {
+			if (this.eof) return false;
+			const chunk = await this.reader.read();
+			if (chunk.done) {
+				this.eof = true;
+				return false;
+			}
+			this.text =
+				this.text.slice(this.pos) +
+				this.decoder.decode(chunk.value, { stream: true });
+			this.pos = 0;
+			if (this.text.length > 0) return true;
+		}
+	}
+
+	private async peek(): Promise<string | null> {
+		if (!(await this.ensure())) return null;
+		return this.text[this.pos] ?? null;
+	}
+
+	private async skipWs(): Promise<void> {
+		for (;;) {
+			if (!(await this.ensure())) return;
+			const t = this.text;
+			let i = this.pos;
+			while (
+				i < t.length &&
+				(t[i] === " " || t[i] === "\t" || t[i] === "\n" || t[i] === "\r")
+			)
+				i++;
+			this.pos = i;
+			if (i < t.length) return;
+		}
+	}
+
+	/** Consumes a JSON string. With `capture` it returns the decoded text and
+	 * refuses a string longer than `maxChars` before it can grow; without, it
+	 * keeps nothing (a hostile huge string costs no memory). */
+	private async scanString(
+		capture: boolean,
+		maxChars: number,
+	): Promise<string> {
+		await this.skipWs();
+		if (!(await this.ensure())) throw truncatedPackument();
+		if (this.text[this.pos] !== '"') throw malformed("expected a string");
+		this.pos++;
+		let out = "";
+		for (;;) {
+			const t = this.text;
+			let i = this.pos;
+			while (i < t.length && t[i] !== '"' && t[i] !== "\\") i++;
+			if (i >= t.length) {
+				if (capture) {
+					out += t.slice(this.pos);
+					if (out.length > maxChars)
+						throw malformed(`string longer than ${maxChars} chars`);
+				}
+				this.pos = t.length;
+				if (!(await this.append())) throw truncatedPackument();
+				continue;
+			}
+			if (capture) out += t.slice(this.pos, i);
+			this.pos = i;
+			if (t[i] === '"') {
+				this.pos = i + 1;
+				if (capture && out.length > maxChars)
+					throw malformed(`string longer than ${maxChars} chars`);
+				return out;
+			}
+			if (i + 1 >= t.length) {
+				if (!(await this.append())) throw truncatedPackument();
+				continue;
+			}
+			const marker = t[i + 1];
+			if (marker === "u") {
+				if (i + 6 > t.length) {
+					if (!(await this.append())) throw truncatedPackument();
+					continue;
+				}
+				const hex = t.slice(i + 2, i + 6);
+				if (!/^[0-9a-fA-F]{4}$/.test(hex))
+					throw malformed("bad unicode escape");
+				if (capture) out += String.fromCharCode(parseInt(hex, 16));
+				this.pos = i + 6;
+			} else {
+				const raw = t[i + 1];
+				const decoded = raw === undefined ? undefined : SIMPLE_ESCAPES[raw];
+				if (decoded === undefined) throw malformed("bad escape");
+				if (capture) out += decoded;
+				this.pos = i + 2;
+			}
+		}
+	}
+
+	private async readKey(maxChars: number): Promise<string> {
+		await this.skipWs();
+		const quote = await this.peek();
+		if (quote === null) throw truncatedPackument();
+		if (quote !== '"') throw malformed("expected an object key");
+		return this.scanString(true, maxChars);
+	}
+
+	private async expectColon(): Promise<void> {
+		await this.skipWs();
+		const colon = await this.peek();
+		if (colon === null) throw truncatedPackument();
+		if (colon !== ":") throw malformed("expected a colon");
+		this.pos++;
+	}
+
+	/** Right after a `{`: true when the object is empty (`}` consumed). */
+	private async atEmptyObject(): Promise<boolean> {
+		await this.skipWs();
+		if ((await this.peek()) === "}") {
+			this.pos++;
+			return true;
+		}
+		return false;
+	}
+
+	/** Skips any JSON value without keeping it. Refuses nesting past
+	 * MAX_JSON_DEPTH, so a hostile deep body cannot exhaust the stack. */
+	private async skipValue(depth: number): Promise<void> {
+		if (depth > MAX_JSON_DEPTH) throw malformed("nesting too deep");
+		await this.skipWs();
+		const first = await this.peek();
+		if (first === null) throw truncatedPackument();
+		if (first === '"') {
+			await this.scanString(false, 0);
+			return;
+		}
+		if (first === "{" || first === "[") {
+			const close = first === "{" ? "}" : "]";
+			this.pos++;
+			for (;;) {
+				await this.skipWs();
+				const next = await this.peek();
+				if (next === null) throw truncatedPackument();
+				if (next === close) {
+					this.pos++;
+					return;
+				}
+				if (first === "{") {
+					if (next !== '"') throw malformed("expected an object key");
+					await this.scanString(false, 0);
+					await this.expectColon();
+				}
+				await this.skipValue(depth + 1);
+				await this.skipWs();
+				const sep = await this.peek();
+				if (sep === null) throw truncatedPackument();
+				if (sep === ",") {
+					this.pos++;
+					continue;
+				}
+				if (sep === close) {
+					this.pos++;
+					return;
+				}
+				throw malformed("expected a comma or the closing brace");
+			}
+		}
+		// number, true, false, null: bulk-consume the token's characters.
+		for (;;) {
+			const t = this.text;
+			let i = this.pos;
+			while (i < t.length && isTokenChar(t[i])) i++;
+			this.pos = i;
+			if (i < t.length) return;
+			if (!(await this.append())) return;
+		}
+	}
+
+	/** Walks the packument: versions keys with their deprecated flags and the
+	 * time map are kept, every other field is skipped. A list of more than
+	 * `maxVersions` versions cancels the stream and refuses. */
+	async walkPackument(maxVersions: number): Promise<SelectedPackument> {
+		const sel: SelectedPackument = { versions: {}, time: {} };
+		let versionCount = 0;
+		await this.skipWs();
+		if ((await this.peek()) !== "{")
+			throw malformed("packument is not an object");
+		this.pos++;
+		if (await this.atEmptyObject()) return sel;
+		for (;;) {
+			const key = await this.readKey(MAX_KEY_CHARS);
+			await this.expectColon();
+			if (key === "versions") {
+				await this.skipWs();
+				if ((await this.peek()) !== "{")
+					throw malformed("versions is not an object");
+				this.pos++;
+				if (!(await this.atEmptyObject()))
+					for (;;) {
+						const version = await this.readKey(MAX_KEY_CHARS);
+						await this.expectColon();
+						versionCount++;
+						if (versionCount > maxVersions) {
+							await this.reader.cancel().catch(() => {});
+							throw new Error(
+								`packument lists more than ${maxVersions} versions`,
+							);
+						}
+						sel.versions[version] = {};
+						await this.skipWs();
+						if ((await this.peek()) !== "{") {
+							// A manifest is always an object; skip anything else.
+							await this.skipValue(2);
+						} else {
+							this.pos++;
+							if (!(await this.atEmptyObject()))
+								for (;;) {
+									const field = await this.readKey(MAX_KEY_CHARS);
+									await this.expectColon();
+									await this.skipWs();
+									if (field === "deprecated" && (await this.peek()) === '"') {
+										const message = await this.scanString(
+											true,
+											MAX_DEPRECATED_CHARS,
+										);
+										sel.versions[version] = { deprecated: message };
+									} else {
+										await this.skipValue(3);
+									}
+									const close = await this.walkMemberEnd();
+									if (close) break;
+								}
+						}
+						const entryEnd = await this.walkMemberEnd();
+						if (entryEnd) break;
+					}
+			} else if (key === "time") {
+				await this.skipWs();
+				if ((await this.peek()) !== "{")
+					throw malformed("time is not an object");
+				this.pos++;
+				if (!(await this.atEmptyObject()))
+					for (;;) {
+						const when = await this.readKey(MAX_KEY_CHARS);
+						await this.expectColon();
+						await this.skipWs();
+						if ((await this.peek()) === '"') {
+							sel.time[when] = await this.scanString(
+								true,
+								MAX_TIME_VALUE_CHARS,
+							);
+						} else {
+							await this.skipValue(2);
+						}
+						const close = await this.walkMemberEnd();
+						if (close) break;
+					}
+			} else {
+				await this.skipValue(1);
+			}
+			const objectEnd = await this.walkMemberEnd();
+			if (objectEnd) break;
+		}
+		await this.skipWs();
+		if ((await this.peek()) !== null)
+			throw malformed("trailing data after the packument");
+		return sel;
+	}
+
+	/** Shared member-loop tail: consumes `,` (returns false, keep walking) or
+	 * `}` (returns true, member list done). Anything else is malformed. */
+	private async walkMemberEnd(): Promise<boolean> {
+		await this.skipWs();
+		const sep = await this.peek();
+		if (sep === null) throw truncatedPackument();
+		if (sep === ",") {
+			this.pos++;
+			return false;
+		}
+		if (sep === "}") {
+			this.pos++;
+			return true;
+		}
+		throw malformed("expected a comma or the closing brace");
+	}
+}
+
+/** Streams a packument body and keeps only what `releasesOf` reads: every
+ * versions key with its string-deprecated flag, and the time map. The body is
+ * never buffered whole, so a multi-MiB packument (typescript measures
+ * 15.2 MiB) costs only its retained entries. A malformed or truncated stream,
+ * and a list of more than `maxVersions` versions, refuse the fetch (the scan
+ * fails closed). */
+export async function streamPackument(
+	reader: ReadableStreamDefaultReader<Uint8Array>,
+	maxVersions: number,
+): Promise<SelectedPackument> {
+	return new PackumentCursor(reader).walkPackument(maxVersions);
+}
+
 /** GET {registry}/{name} with "/" encoded as %2F and "@" kept (the
- * OMP_PACKAGE_URL style). */
+ * OMP_PACKAGE_URL style). The packument body is streamed, never buffered:
+ * duration is bounded by the request timeout, memory by the retained-entries
+ * cap. */
 export async function fetchReleases(name: string): Promise<RegistryRelease[]> {
 	const registry = (
 		process.env.OTTR_NPM_REGISTRY ?? "https://registry.npmjs.org"
@@ -204,7 +593,13 @@ export async function fetchReleases(name: string): Promise<RegistryRelease[]> {
 	});
 	if (!response.ok)
 		throw new Error(`registry returned HTTP ${response.status}`);
-	return releasesOf(await response.json());
+	if (response.body === null) throw new Error("registry response has no body");
+	const reader = response.body.getReader();
+	try {
+		return releasesOf(await streamPackument(reader, MAX_PACKUMENT_VERSIONS));
+	} finally {
+		await reader.cancel().catch(() => {});
+	}
 }
 
 /** One unsettled direct or transitive package: the rule's blocker names the
@@ -222,7 +617,9 @@ export type ReleaseLineScan =
 
 /** The scan: one fetch call per changed package, ascending by name. Never
  * throws: an unparseable lock reports name "bun.lock"; a failed fetch reports
- * the package and stops the scan (the script's exit-1 semantics). */
+ * the package and stops the scan (the script's exit-1 semantics). The board
+ * bounds (`maxChangedPackages`, `deadlineMs`) stop the scan the same way:
+ * both fail closed with name "bun.lock" before or between fetches. */
 export async function scanReleaseLines(input: {
 	lockText: string;
 	baseLockText: string; // "" = empty base map
@@ -231,6 +628,10 @@ export async function scanReleaseLines(input: {
 	now: number;
 	ageMs: number;
 	capMs: number;
+	/** Stop when the changed set holds more than this many packages. */
+	maxChangedPackages?: number;
+	/** Stop before a fetch when Date.now() passed this epoch ms. */
+	deadlineMs?: number;
 }): Promise<ReleaseLineScan> {
 	const { directNames, now, ageMs, capMs } = input;
 	let current: LockEntry[];
@@ -249,9 +650,29 @@ export async function scanReleaseLines(input: {
 			},
 		};
 	}
+	const changed = changedPackages(current, base, directNames);
+	if (
+		input.maxChangedPackages !== undefined &&
+		changed.length > input.maxChangedPackages
+	)
+		return {
+			ok: false,
+			failed: {
+				name: "bun.lock",
+				message: `lock diff changes ${changed.length} packages, over the ${input.maxChangedPackages} cap`,
+			},
+		};
 	const direct: Unsettled[] = [];
 	const transitive: Unsettled[] = [];
-	for (const pkg of changedPackages(current, base, directNames)) {
+	for (const pkg of changed) {
+		if (input.deadlineMs !== undefined && Date.now() > input.deadlineMs)
+			return {
+				ok: false,
+				failed: {
+					name: "bun.lock",
+					message: "release line scan deadline passed",
+				},
+			};
 		let releases: RegistryRelease[];
 		try {
 			releases = await input.fetch(pkg.name);
@@ -298,8 +719,15 @@ export async function releaseLineBlocked(
 	let lockText: string;
 	let pkgText: string;
 	try {
-		lockText = readFileSync(join(wt, "bun.lock"), "utf8");
-		pkgText = readFileSync(join(wt, "package.json"), "utf8");
+		// The bounded readers (d6f0a9dd): a symlink, a non-regular file, or a
+		// file over LOCK_MAX_BYTES fails closed below — never an unbounded
+		// read of a worker-writable path.
+		lockText = (
+			await readBoundedFile(join(wt, "bun.lock"), LOCK_MAX_BYTES)
+		).toString("utf8");
+		pkgText = (
+			await readBoundedFile(join(wt, "package.json"), LOCK_MAX_BYTES)
+		).toString("utf8");
 	} catch {
 		return null;
 	}
@@ -312,6 +740,7 @@ export async function releaseLineBlocked(
 	// No base ref: fail closed — nothing to compare against.
 	const rev = Bun.spawnSync(["git", "rev-parse", "--verify", "origin/main"], {
 		cwd: wt,
+		env: childDatabaseEnv(),
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -324,6 +753,7 @@ export async function releaseLineBlocked(
 		["git", "ls-tree", "--name-only", "origin/main", "--", "bun.lock"],
 		{
 			cwd: wt,
+			env: childDatabaseEnv(),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -336,12 +766,16 @@ export async function releaseLineBlocked(
 			["git", "cat-file", "blob", "origin/main:bun.lock"],
 			{
 				cwd: wt,
+				env: childDatabaseEnv(),
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "pipe",
 			},
 		);
 		if (shown.exitCode !== 0) return null;
+		// The base blob sits in git's object store, but past commits wrote it:
+		// the same byte cap applies before the whole blob lands in memory.
+		if (shown.stdout.byteLength > LOCK_MAX_BYTES) return null;
 		baseLockText = shown.stdout.toString();
 	}
 	let scan: ReleaseLineScan;
@@ -354,6 +788,8 @@ export async function releaseLineBlocked(
 			now: Date.now(),
 			ageMs: AGE_MS,
 			capMs: CAP_MS,
+			maxChangedPackages: MAX_CHANGED_PACKAGES,
+			deadlineMs: Date.now() + SCAN_MS,
 		});
 	} catch {
 		return null;

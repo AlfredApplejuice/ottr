@@ -38,9 +38,10 @@ In each home `H`:
 - `H/.alate/current` is a symlink to `layers/<id>`. Alate switches it with one
   atomic rename: create a temp symlink, `rename()` it over `current`. Before
   the switch, nothing a running turn reads changes.
-- `H/.alate/in-use.json` is the board's registry of layers that live runs
-  pinned. Shape: `{"layers": [{"id": string, "since": epoch-ms}]}`. The board
-  is the only writer; alate only reads it for clean-up.
+- `H/.alate/in-use.json` lists layers with live holders.
+  Shape: `{"layers": [{"id": string, "since": epoch-ms}]}`.
+  Ottr writes this file. Alate reads each entry's `id` for retention.
+  The entry shape stays unchanged for OTTR-1132.
 
 ### State that stays shared (never in a layer)
 
@@ -104,27 +105,45 @@ pinned run: the env holds the resolved layer directory, not the link.
 
 ### Record: which layers are in use
 
-- `startRun` adds the layer id to `H/.alate/in-use.json` before the spawn and
-  removes it when the run settles (close, error, or kill). Every board-spawned
-  run records: turns, review checks, retro runs.
-- Work and merge turns also persist the layer id: the `turns` table gains a
-  `layer` column (`startTurn` takes it from the run handle). It is a record,
-  not the clean-up source.
-- On boot the board rebuilds `in-use.json` from `turns` rows that have no
-  `ended_at` (their task may still be shown as running after a crash).
-  Locally spawned children die with the server process; worker-side children
-  are handled by `sweepLostTurns`.
+OTTR-1132 corrects the lease lifetime. Two runs can read the same layer.
+A release must remove only its own holder, not every holder of that layer.
 
-### Clean-up (alate side, ALAT-63)
+- Each acquisition creates a random lease token and a durable private record.
+  The token is an ownership handle, not a credential.
+- Ottr stores ownership records separately from `in-use.json`.
+  The public registry remains an aggregate of layer `id` and `since` values.
+- A shared filesystem lock serializes acquisition, release, and reconciliation.
+  The lock works across independent processes and containers on the shared volume.
+  A process-local counter or PID check is not sufficient.
+- Each holder keeps an OS-backed lock for its lifetime.
+  Reconciliation removes a holder only after its lock proves that the holder ended.
+  An uncertain lock result preserves the record.
+- `startRun` acquires before dispatch. Its release closure owns only that lease.
+  Preparation errors release that lease before the error reaches the caller.
+- The classic worker acquires a separate lease before it spawns the child.
+  It releases after child close or spawn failure, not after stream loss or detach.
+  Thus, board settlement cannot release a worker's live lease.
+- VM dispatch retains its board lease through settlement.
+  The guest reads a copy of the layer, not the shared host layer.
+- Work and merge turns persist the layer id in the `turns` table.
+  On boot, open turn layers supply conservative recovery records.
+  Reconciliation preserves independent live holders and refreshes recovery records.
+- A repeated release has no effect on another holder.
+  Different layer ids remain independent.
+- Registry paths use the existing confined file operations.
+  Lock paths reject symlinks and non-regular files.
+  A failed acquisition stops dispatch before a process reads an unprotected layer.
+  A failed release retains protection and reports the error.
 
-Alate deletes a layer folder only when all of these hold: it is not
-`current`, it is not the layer `current` pointed to before the last switch,
-and its id is absent from `in-use.json`. The current layer and the one before
-it always stay. Residual risk, accepted: a turn that outlives two switches
-(possible for a 9 h Stryker run) can lose its layer; the turn then fails and
-classifies requeues it once, then parks it for a human. A corrupt or unwritable
-`in-use.json` never fails a run (the board logs a warning); clean-up then
-still keeps the last two layers.
+### Clean-up (Alate side, ALAT-63)
+
+Alate deletes a layer folder only when all of these conditions hold:
+it is not `current`, it is not the previous layer, and its id is absent from
+`in-use.json`. A live lease protects a layer through any number of switches.
+The current and previous layers remain additional retention rules, not a lease limit.
+An unreadable registry must not authorize deletion.
+The separate Alate cleanup-consumer task must read each registry object's `id`.
+OTTR-1132 does not change Alate or the shared entry shape.
 
 ### Provision trigger
 
@@ -169,11 +188,12 @@ layers. `agentDir()` (the credential store path) stays flat by definition.
 - **Broken link** (`current` exists, `realpath` fails): the spawn falls back
   to the flat home and logs a warning. Alate's next provision repairs the
   switch.
-- **Layer deleted under a turn**: prevented by the clean-up rule above
-  (`in-use.json` plus keep-last-two). The residual risk is stated above.
+- **Layer deleted under a turn**: the lease and retention rules prevent this.
+  The home guard remains active and reports any violation.
 - **Prepare failure** (a shared-state link cannot be written): the spawn falls
-  back to the flat home and logs a warning; the run never fails because of
-  pinning.
+  back to the flat home and logs a warning.
+- **Lease acquisition failure**: dispatch fails before the spawn.
+  Release or reconciliation failure preserves existing protection and reports the error.
 - **Old alate** (no `layers: true` in health): the tick keeps the idle gate
   for that attempt and the manual route stays available.
 
@@ -216,4 +236,13 @@ layers. `agentDir()` (the credential store path) stays flat by definition.
   `HOME` and `PI_CODING_AGENT_DIR` point into the layer, the shared-state
   links resolve to the flat home, and the layer's config.yml ships byte for
   byte as installed (the pin never rewrites it).
-- `bun run check`, `bun test` and the delta mutation gate pass.
+- Two real runs pin the same layer. The first settlement leaves the layer leased.
+  The last settlement clears it. The tests also cover distinct layer ids and repeated release.
+- Independent processes share the real ownership store and cannot overwrite another holder.
+- Boot reconciliation preserves a live worker lease, including a detached worker.
+- An isolated retention scenario rotates through at least three newer layers.
+  The old live holder still reads its skill files and remains outside the deletion candidates.
+  No test provisions or deletes a real home.
+- `bun install --frozen-lockfile`, `bun audit --audit-level=high`,
+  `bun run check`, `bun test --timeout 20000`, and `bun run test:e2e` pass.
+  Work turns skip mutation gates.

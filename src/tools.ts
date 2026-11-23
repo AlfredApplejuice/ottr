@@ -19,9 +19,11 @@ import {
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { PROJECT, workerProjects } from "./apt.ts";
+import { PROJECT, workerProjectsAsync } from "./apt.ts";
+import { childDatabaseEnv } from "./childEnv.ts";
 import { resolveAgentLayer } from "./layers.ts";
 import { boardOmpHome, turnListHome } from "./login.ts";
 import { pluginSkillDirs } from "./pluginSkills.ts";
@@ -320,22 +322,41 @@ function readEnvNames(project: string, home = boardOmpHome()): EnvEntry[] {
 	return parseEnvTxt(readFileSync(file, "utf8"));
 }
 
+/** The async twin of readEnvNames for the request path (OTTR-1088): the reads wait on
+ *  the mounted workers home, so a turn's env lookup must not hold the event loop. */
+async function readEnvNamesAsync(
+	project: string,
+	home = boardOmpHome(),
+): Promise<EnvEntry[]> {
+	const file = envListPath(project, home);
+	let text: string;
+	try {
+		text = await readFile(file, "utf8");
+	} catch (err) {
+		// Only a file that does not exist means the project lists nothing.
+		if (err instanceof Error && "code" in err && err.code === "ENOENT")
+			return [];
+		throw err;
+	}
+	return parseEnvTxt(text);
+}
+
 /**
  * Every name provisioned for any project, with the projects that list it and its kind: plain
  * only when every listing says `plain`. A malformed env.txt is logged and skipped, so one bad
  * list does not hide every other project's names.
  */
-export function listedEnvNames(
+export async function listedEnvNames(
 	home = boardOmpHome(),
-): { name: string; projects: string[]; plain: boolean }[] {
+): Promise<{ name: string; projects: string[]; plain: boolean }[]> {
 	const byName = new Map<string, { projects: string[]; plain: boolean }>();
-	// One resolve for the folder list and the reads: workerProjects has no layer
+	// One resolve for the folder list and the reads: workerProjectsAsync has no layer
 	// resolution of its own (apt.ts), and a switch mid-read must not mix two layers.
 	home = layerHome(home);
-	for (const project of workerProjects(home)) {
+	for (const project of await workerProjectsAsync(home)) {
 		let entries: EnvEntry[];
 		try {
-			entries = readEnvNames(project, home);
+			entries = await readEnvNamesAsync(project, home);
 		} catch (err) {
 			console.warn(
 				`env: ${project}: ${err instanceof Error ? err.message : err}`,
@@ -591,6 +612,7 @@ function guardPaths(name: string, dir: string): void {
 /** stdout; throws with the stderr tail on a non-zero exit. */
 async function exec(argv: string[]): Promise<string> {
 	const p = Bun.spawn(argv, {
+		env: childDatabaseEnv(),
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",

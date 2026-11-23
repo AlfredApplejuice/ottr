@@ -67,6 +67,14 @@ export interface AlertCardInput {
 	/** The card's unseen comment stamp (`pr_review.comments_at` while the wave is unseen);
 	 * null when every comment wave is read or none arrived. A change is one new occurrence. */
 	prComments: number | null;
+	/** The PR URL when the board posted the current review by itself (`prOccurrence.posted`:
+	 * the row's last post is the board's and still current); null otherwise, so a manual Post
+	 * keeps null. */
+	prPosted: string | null;
+	/** The head prPosted's occurrence is bound to: the posted head of the board's own post.
+	 * The URL serves every head of the PR, so only the head witnesses a later automatic
+	 * post between two frames. */
+	prPostedHead: string | null;
 	asked: AskQuestion[] | null;
 	answered: boolean;
 	needsReason: string | null;
@@ -97,12 +105,14 @@ function errorBody(text: string | null): string {
 	return first === "" ? "A turn failed" : first.slice(0, ERROR_BODY_MAX);
 }
 
-/** One alert event for a card state. */
+/** One alert event for a card state. `url` overrides the card drawer (the auto-post complete
+ * event opens the pull request instead). */
 function alertEvent(
 	t: AlertCardInput,
 	cls: AlertClass,
 	key: string,
 	body: string,
+	url?: string,
 ): AlertEvent {
 	return {
 		key,
@@ -111,7 +121,9 @@ function alertEvent(
 		taskId: t.id,
 		title: `${t.project}: ${t.sessionTitle ?? t.title}`,
 		body,
-		url: `/projects/${encodeURIComponent(t.project)}/tasks/${encodeURIComponent(t.id)}`,
+		url:
+			url ??
+			`/projects/${encodeURIComponent(t.project)}/tasks/${encodeURIComponent(t.id)}`,
 		tag: cls,
 	};
 }
@@ -199,9 +211,31 @@ function completeEvent(t: AlertCardInput, old: AlertCardInput | undefined) {
 	return alertEvent(t, "complete", `done:${t.id}`, body);
 }
 
+/** The complete event of the board's own post, keyed by the posted head; null when
+ * there is none. The head is the occurrence: it fires for a brand-new card whose
+ * first frame already carries the stamp, and for a later head posted between two
+ * frames whose card sits at done in both — a stage change cannot witness either. The
+ * PR URL stays the same across heads, so only the head detects the new post. */
+function prPostedEvent(t: AlertCardInput, old: AlertCardInput | undefined) {
+	if (
+		t.prPosted === null ||
+		t.prPostedHead === null ||
+		t.prPostedHead === (old?.prPostedHead ?? null)
+	)
+		return null;
+	return alertEvent(
+		t,
+		"complete",
+		`pr:${t.id}:posted:${t.prPostedHead}`,
+		"Ottr posted the review on GitHub",
+		t.prPosted,
+	);
+}
+
 /**
  * Events for cards that changed between two frames: at most one per card, precedence
- * error > request > complete. An error that leaves the card in needs_you takes the needs_you
+ * error > request > complete, where the board's own post outranks the plain done event.
+ * An error that leaves the card in needs_you takes the needs_you
  * entry key, so the inbox entry and the push are one occurrence instead of two.
  * null prev = first frame after server start: silent. Retro cards never alert.
  */
@@ -219,6 +253,7 @@ export function diffEvents(
 			errorEvent(t, old) ??
 			requestEvent(t, old) ??
 			prCommentsEvent(t, old) ??
+			prPostedEvent(t, old) ??
 			completeEvent(t, old);
 		if (ev !== null) out.push(ev);
 	}
@@ -281,7 +316,7 @@ export function shortKey(prefix: string, body: string): string {
 		: `${prefix}:#${askHash(body)}`;
 }
 
-/** Keys of live alerts whose cause cleared (card gone or cancelled; task: key no longer the card's current needs_you entry key; done: card neither in done nor answered; error:<id>:<turn> card's errorTurn differs) or whose key is in `seen`. */
+/** Keys of live alerts whose cause cleared (card gone or cancelled; task: key no longer the card's current needs_you entry key; done: card neither in done nor answered; error:<id>:<turn> card's errorTurn differs; pr:<id>:posted the board-posted stamp no longer current) or whose key is in `seen`. */
 export function clearedAlerts(
 	live: readonly LiveAlert[],
 	next: readonly AlertCardInput[],
@@ -294,7 +329,15 @@ export function clearedAlerts(
 		if (t === undefined || t.cancelled) return true;
 		if (a.key.startsWith("task:"))
 			return t.state !== "needs_you" || taskEntryKey(t) !== a.key;
-		if (a.key.startsWith("pr:")) return a.key !== `pr:${t.id}:${t.prComments}`;
+		if (a.key.startsWith("pr:")) {
+			// The board's own post is an occurrence keyed by the posted head: it stays
+			// live while that exact head is current and clears for a different head
+			// or a cleared stamp (docs/specs/pr-review-auto-post.md).
+			const postedAt = a.key.indexOf(":posted:");
+			if (postedAt > 0)
+				return a.key.slice(postedAt + ":posted:".length) !== t.prPostedHead;
+			return a.key !== `pr:${t.id}:${t.prComments}`;
+		}
 		if (a.key.startsWith("done:")) {
 			// An answered question-only card completes without entering done.
 			return t.stage !== "done" && !t.answered;

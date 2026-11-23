@@ -2,6 +2,7 @@
 // Startup and wiring only: routes live in createApp() (src/app.ts), the turn
 // engine lives in createTurnLoop() (src/turn.ts). This file binds them.
 
+import { lstatSync, readdirSync } from "node:fs";
 import { constants, homedir } from "node:os";
 import { basename, delimiter, join, resolve } from "node:path";
 import type { Server } from "bun";
@@ -13,7 +14,12 @@ import {
 } from "./app.ts";
 import { ensureProjectPackages } from "./apt.ts";
 import { newSecret } from "./auth.ts";
-import { backupSources, backupTick, resolveBackup } from "./backup.ts";
+import {
+	backupSources,
+	backupTick,
+	POSTGRES_BACKUP_NOTICE,
+	resolveBackup,
+} from "./backup.ts";
 import { logError, trapCrashes } from "./crash.ts";
 import { pidAlive, StoreLockedError } from "./dblock.ts";
 import { errmsg } from "./errmsg.ts";
@@ -22,7 +28,13 @@ import { syncWorktreeTo } from "./gitHttp.ts";
 import { githubHost } from "./githubHost.ts";
 import type { CommitIdentity } from "./gitIdentity.ts";
 import { GlobalStore } from "./globalStore.ts";
-import { controlPlaneHooks, type Hosted, takeHostedConfig } from "./hosted.ts";
+import {
+	type CreditBalance,
+	controlPlaneHooks,
+	type Hosted,
+	scrubProcEnviron,
+	takeHostedConfig,
+} from "./hosted.ts";
 import { startLlmGateway } from "./llmGateway.ts";
 import { agentDir, boardOmpEnv, boardOmpHome, turnListHome } from "./login.ts";
 import {
@@ -31,6 +43,8 @@ import {
 } from "./ompStatsDashboard.ts";
 import { orphanPids } from "./orphans.ts";
 import { platform } from "./platform/index.ts";
+import { initializeDatabaseConfig } from "./postgresConfig.ts";
+import { closePostgresBackend, getPostgresDatabase } from "./postgresDriver.ts";
 import { replayGateParks } from "./promptGate.ts";
 import {
 	commentOnPullRequest,
@@ -48,9 +62,10 @@ import {
 	runGh,
 	runReleaseCommand,
 } from "./release.ts";
+import { cachedRepoHomepage } from "./repoHomepage.ts";
 import { publicHosts } from "./requestGuards.ts";
 import { startRun, vmRunnerFromEnv, workerFromEnv } from "./runner.ts";
-import { archReviewView, lastFullReview, reviewBlocked } from "./scheduler.ts";
+import { archReviewView, blockingReview, lastFullReview } from "./scheduler.ts";
 import { loadSecretBox, type SecretBox } from "./secretBox.ts";
 import {
 	type AdoptResult,
@@ -75,8 +90,8 @@ import {
 	parseReleaseVersion,
 	type TurnLoop,
 } from "./turn.ts";
-import type { LatestImage, OpenPrsView } from "./types.ts";
-import { VM_UNCONFIGURED, vmState } from "./vmState.ts";
+import type { CheckRoutingSetting, LatestImage, OpenPrsView } from "./types.ts";
+import { probeVmRunner } from "./vmHealth.ts";
 import { VmTokens } from "./vmTokens.ts";
 import {
 	detachedRuns as detachedRunsRequest,
@@ -104,6 +119,7 @@ import {
 	githubUrl,
 	hasRules,
 	ignoreInMain,
+	integrationSha,
 	isClean,
 	isGitRepoWithCommit,
 	isIntegrated,
@@ -135,6 +151,8 @@ import {
 	worktreeLinked,
 } from "./worktree.ts";
 
+const DATABASE = initializeDatabaseConfig();
+
 const PORT = Number(process.env.PORT ?? 4747);
 /** Bind address; set OMP_TRACKER_HOST (e.g. 0.0.0.0) to serve beyond loopback. */
 const HOST = process.env.OMP_TRACKER_HOST ?? "127.0.0.1";
@@ -145,10 +163,16 @@ const PUBLIC_HOSTS = publicHosts();
  * exists. A half-set hosted env throws here and stops the boot.
  */
 const HOSTED = takeHostedConfig();
+/** The credits cell the credit gate records into, and the state payload reads per frame. */
+const creditBalance: CreditBalance = { balance: null };
 const hosted: Hosted | undefined =
 	HOSTED === null
 		? undefined
-		: { config: HOSTED, hooks: controlPlaneHooks(HOSTED) };
+		: {
+				config: HOSTED,
+				hooks: controlPlaneHooks(HOSTED, { credit: creditBalance }),
+				creditBalance,
+			};
 /** Production mode: the board is static (no WebSocket); UI bundles/minifies via Bun. */
 const PROD = process.env.NODE_ENV === "production";
 // Refuse an invalid OTTR_GITHUB_HOST at boot: every GitHub feature would otherwise aim at
@@ -163,7 +187,89 @@ const ROOTS = process.env.OMP_TRACKER_ROOTS
 // Scratch tests and dev boards set OTTR_STATE_DIR so the global kv store never
 // opens (and locks) the checkout's own tracker.db.
 const STATE_DIR = process.env.OTTR_STATE_DIR ?? resolve(import.meta.dir, "..");
-const gstore = await GlobalStore.open(STATE_DIR);
+if (DATABASE.backend === "postgres") {
+	console.log(
+		`database: postgres host=${JSON.stringify(DATABASE.host)} database=${JSON.stringify(DATABASE.database)}`,
+	);
+} else {
+	console.log("database: sqlite");
+}
+
+/** Inspect paths only. Never open or converge the SQLite files during PostgreSQL startup. */
+function hasLiveSqliteState(): boolean {
+	const present = (path: string): boolean =>
+		lstatSync(path, { throwIfNoEntry: false }) !== undefined;
+	const children = (path: string): string[] => {
+		try {
+			return readdirSync(path, { withFileTypes: true })
+				.filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+				.map((entry) => join(path, entry.name));
+		} catch (error) {
+			if (
+				(error as NodeJS.ErrnoException).code === "ENOENT" ||
+				(error as NodeJS.ErrnoException).code === "ENOTDIR"
+			)
+				return [];
+			throw error;
+		}
+	};
+	try {
+		if (present(join(resolve(STATE_DIR), ".tasks", "tracker.db"))) return true;
+		for (const root of ROOTS) {
+			for (const project of [resolve(root), ...children(root)]) {
+				if (present(join(project, ".tasks", "tasks.db"))) return true;
+			}
+		}
+		for (const root of [
+			process.env.OTTR_DATA_DIR,
+			process.env.OTTR_SERVER_DATA_DIR,
+		]) {
+			if (!root) continue;
+			for (const project of children(resolve(root))) {
+				if (present(join(project, "tasks.db"))) return true;
+			}
+		}
+		return false;
+	} catch {
+		throw new Error(
+			"Cannot inspect existing SQLite state before PostgreSQL startup.",
+		);
+	}
+}
+
+async function openGlobalStore(): Promise<GlobalStore> {
+	if (DATABASE.backend === "sqlite") return GlobalStore.open(STATE_DIR);
+	try {
+		// Keep this reference through initialization so ownership has no gap after inspection.
+		const guard = await getPostgresDatabase("ottr_global");
+		try {
+			const global = await guard.serialize(() =>
+				guard
+					.query<{ present: number }, [string]>(
+						"SELECT 1 AS present FROM pg_catalog.pg_namespace WHERE nspname = ?",
+					)
+					.get("ottr_global"),
+			);
+			if (
+				global === null &&
+				process.env.OTTR_PG_ALLOW_EMPTY !== "1" &&
+				hasLiveSqliteState()
+			) {
+				throw new Error(
+					"PostgreSQL has no ottr_global schema, but live SQLite state exists. Run bun src/import-sqlite-to-postgres.ts first, or set OTTR_PG_ALLOW_EMPTY=1 to accept an empty backend.",
+				);
+			}
+			return await GlobalStore.open(STATE_DIR);
+		} finally {
+			await guard.close();
+		}
+	} catch (error) {
+		await closePostgresBackend();
+		throw error;
+	}
+}
+
+const gstore = await openGlobalStore();
 /** Jira token sealing (docs/specs/jira-import.md section 1): the key file sits next to tracker.db.
  * A malformed key never stops the boot: the Jira routes answer 503 until it is fixed. */
 let secretBox: SecretBox | undefined;
@@ -171,6 +277,11 @@ try {
 	secretBox = loadSecretBox({ dir: join(resolve(STATE_DIR), ".tasks") });
 } catch (err) {
 	console.error(`jira: secret key: ${errmsg(err)}; Jira routes are off`);
+} finally {
+	// The master key must not outlive this read: like the database URL, it leaves
+	// env and /proc/<pid>/environ, so no spawned child or same-user process sees it.
+	delete process.env.OTTR_SECRET_KEY;
+	scrubProcEnviron("OTTR_SECRET_KEY");
 }
 
 // Mutable settings shared with createApp: /api/settings writes them, the scheduler and
@@ -188,6 +299,8 @@ const shared: {
 	trendingScan: boolean;
 	/** OTTR-693: the commit identity Settings names for board and turn commits; null keeps the built-in Ottr default. */
 	commitIdentity: CommitIdentity | null;
+	/** OTTR-1116: the user-set vendor routing for the check run's role; null = automatic. */
+	checkRouting: CheckRoutingSetting | null;
 	removedPaths: string[]; // projects removed from the board; discovery must not re-find them
 	projectPaths: string[]; // explicitly added projects; discovery finds these even outside the roots
 	/** Project names in board order, persisted via /api/projects/order. */
@@ -207,6 +320,7 @@ const shared: {
 	idleReviews: true,
 	trendingScan: true,
 	commitIdentity: null,
+	checkRouting: null,
 	envValues: {},
 	envPlain: {},
 	...(await storedProjectPaths(gstore)),
@@ -242,7 +356,7 @@ function every(work: () => void | Promise<unknown>, ms: number): void {
 let loopRef: TurnLoop | undefined;
 let appRef: App | undefined;
 /** Stop new work, settle active callbacks, and release all locks before exit. */
-async function shutdown(exitCode: number): Promise<void> {
+export async function shutdown(exitCode: number): Promise<void> {
 	if (shuttingDown) return;
 	shuttingDown = true;
 	for (const timer of timers) clearInterval(timer);
@@ -286,6 +400,12 @@ async function shutdown(exitCode: number): Promise<void> {
 	} catch (err) {
 		failed = true;
 		logError("shutdown: could not close the global store", err);
+	}
+	try {
+		await closePostgresBackend();
+	} catch (err) {
+		failed = true;
+		logError("shutdown: could not close the PostgreSQL backend", err);
 	}
 	process.exit(exitCode === 0 && failed ? 1 : exitCode);
 }
@@ -367,20 +487,51 @@ async function refreshArchReview(e: Entry): Promise<void> {
 		e.target,
 		last === null ? null : last.base,
 	).catch(() => null);
-	const { cap, running } = await e.store.transaction(async () => ({
+	const { cap, runningCardId } = await e.store.transaction(async () => ({
 		cap: (await getSettingsLogged(e)).archReviewCap,
 		// Running: a review is queued or running, or its findings are still landing.
-		running: reviewBlocked(await e.store.listTasks()) !== null,
+		runningCardId: blockingReview(await e.store.listTasks())?.id ?? null,
 	}));
-	e.archReview = a === null ? null : archReviewView(last, a, cap, running);
+	e.archReview =
+		a === null ? null : archReviewView(last, a, cap, runningCardId);
 }
 
 /** Open-PR header chips re-probe gh at most this often; a PR opened between probes waits out the TTL. */
 const PR_TTL = 10 * 60_000;
 const prChips = new Map<string, { at: number; value: OpenPrsView | null }>();
 
+/** Homepage links piggyback on the project metadata poll, with repo-scoped cached probes. */
+function refreshHomepage(e: Entry, publish?: () => void): void {
+	const repo = e.github === null ? null : ownerRepo(e.github);
+	if (repo === null) {
+		const previous = e.homepage;
+		e.homepage = null;
+		e.homepageRepo = null;
+		if (previous != null) publish?.();
+		return;
+	}
+	if (e.homepageRepo !== repo) {
+		const previous = e.homepage;
+		e.homepageRepo = repo;
+		e.homepage = null;
+		if (previous != null) publish?.();
+	}
+	void cachedRepoHomepage(repo).then((value) => {
+		if (
+			e.homepageRepo !== repo ||
+			e.github === null ||
+			ownerRepo(e.github) !== repo
+		)
+			return;
+		const previous = e.homepage;
+		e.homepage = value;
+		if (JSON.stringify(previous) !== JSON.stringify(value)) publish?.();
+	});
+}
+
 /** Open-PR chips piggybacking on the release refresh: writes e.openPrs, one gh probe per TTL per repo. */
 function refreshOpenPrs(e: Entry, publish?: () => void): void {
+	refreshHomepage(e, publish);
 	const repo = e.github === null ? null : ownerRepo(e.github);
 	if (repo === null) {
 		e.openPrs = null;
@@ -428,7 +579,11 @@ const SELF_ROOT = resolve(import.meta.dir, "..");
  * The image's OTTR_VERSION stamp, else the release tag HEAD carries, else short sha on dev, else boot time. */
 const serverVersion = await describeVersion(SELF_ROOT);
 
-if (process.env.OTTR_DATA_DIR && process.env.OTTR_SERVER_DATA_DIR) {
+if (
+	DATABASE.backend === "sqlite" &&
+	process.env.OTTR_DATA_DIR &&
+	process.env.OTTR_SERVER_DATA_DIR
+) {
 	let adopted: AdoptResult[] = [];
 	try {
 		adopted = await adoptSharedProjectData(
@@ -451,7 +606,7 @@ if (process.env.OTTR_DATA_DIR && process.env.OTTR_SERVER_DATA_DIR) {
 				`could not move project database ${r.name} to the server data dir (${r.error}); move it by hand, see docs/WORKERS.md`,
 			);
 	}
-} else if (process.env.OTTR_DATA_DIR) {
+} else if (DATABASE.backend === "sqlite" && process.env.OTTR_DATA_DIR) {
 	console.warn(
 		"OTTR_SERVER_DATA_DIR is not set: project databases stay on the worker-shared data dir (OTTR_DATA_DIR)",
 	);
@@ -469,6 +624,29 @@ const workerRoots = process.env.OTTR_DATA_DIR
 	: [];
 if (process.env.OTTR_DATA_DIR) setWorkerRoots(workerRoots);
 
+let registeredProjects: string[] | undefined;
+if (DATABASE.backend === "postgres") {
+	try {
+		const registry = await getPostgresDatabase("ottr_global");
+		try {
+			registeredProjects = await registry.serialize(async () =>
+				(
+					await registry
+						.query<{ project_name: string }, []>(
+							'SELECT project_name FROM "ottr_global"."project_registry"',
+						)
+						.all()
+				).map((row) => row.project_name),
+			);
+		} finally {
+			await registry.close();
+		}
+	} catch (err) {
+		logError("refusing to read the PostgreSQL project registry", err);
+		await shutdown(1);
+	}
+}
+
 /** Projects whose tasks.db did not open at boot: the backup records each as a failed database,
  * so retention keeps the last good copy (docs/specs/db-backup.md). */
 const unopenedProjects: { name: string; error: string }[] = [];
@@ -476,12 +654,13 @@ for (const p of discoverProjects(
 	ROOTS,
 	shared.projectPaths,
 	shared.removedPaths,
+	registeredProjects,
 )) {
 	let store: ProjectStore;
 	try {
 		store = await ProjectStore.open(p);
 	} catch (err) {
-		if (err instanceof StoreLockedError) {
+		if (err instanceof StoreLockedError || DATABASE.backend === "postgres") {
 			// A second server must refuse startup and release all stores it opened.
 			logError("refusing to start", err);
 			await shutdown(1);
@@ -639,57 +818,19 @@ if (vmTarget !== null)
 			logError("the microVM provider gateway did not start", err),
 		);
 
-/** One GET /healthz of the microVM runner into vmState.health; unconfigured stays unconfigured. */
-async function probeVmRunner(): Promise<void> {
-	if (vmTarget === null) {
-		vmState.health = { configured: false, ok: false, reason: VM_UNCONFIGURED };
-		return;
-	}
-	const url = vmTarget.urls[0];
-	if (url === undefined) {
-		vmState.health = { configured: false, ok: false, reason: VM_UNCONFIGURED };
-		return;
-	}
-	try {
-		const res = await fetch(`${url}/healthz`, {
-			headers: vmTarget.token ? { "x-otwr-token": vmTarget.token } : {},
-			// The worker token never follows a redirect off-host.
-			redirect: "manual",
-			signal: AbortSignal.timeout(5000),
-		});
-		// vm-runner's 503 body is its own one-line reason ("vm-runner: /dev/kvm is missing");
-		// the UI already names vm-runner, so the prefix and the URL stay out of the text.
-		const body = (await res.text())
-			.trim()
-			.replace(/^vm-runner:\s*/, "")
-			.slice(0, 300);
-		vmState.health =
-			res.status === 200
-				? { configured: true, ok: true, reason: null }
-				: {
-						configured: true,
-						ok: false,
-						reason: body || `/healthz answered HTTP ${res.status}`,
-					};
-	} catch (err) {
-		vmState.health = {
-			configured: true,
-			ok: false,
-			reason: `no answer from ${url} (${err instanceof Error ? err.message : String(err)})`,
-		};
-	}
-}
 // Boot probe without blocking boot: until it answers, microVM cards wait unclaimed.
-runWork(() => probeVmRunner());
-every(() => probeVmRunner(), 30_000);
+runWork(() => probeVmRunner(vmTarget));
+every(() => probeVmRunner(vmTarget), 30_000);
 // Demo board (src/dev.ts): the seeded gate card's meter needs a fabricated progress line,
 // because no agent runs and loop.running stays empty. Real boards never set OTTR_DEMO and
 // take loop.running only. The import is dynamic: the image ships src/ only, never scripts/,
-// so a static import crashes every real board at boot.
-const demoProgress =
+// so a static import crashes every real board at boot. The demo board's slotsUsed comes
+// from demoSlotsUsed for the same reason (OTTR-1143).
+const demoData =
 	process.env.OTTR_DEMO === "1"
-		? await (await import("../scripts/demo-data.ts")).demoProgressMap(projects)
+		? await import("../scripts/demo-data.ts")
 		: null;
+const demoProgress = demoData ? await demoData.demoProgressMap(projects) : null;
 
 // The loop owns the engine; the request layer calls back into it through deps.schedule, and
 // the loop's publish/log plumbing is late-bound to createApp's handles (both exist by boot).
@@ -699,6 +840,7 @@ const loop = createTurnLoop(projects, {
 	maxTotalRuns: () => shared.maxTotalRuns,
 	reviewCheck: () => shared.reviewCheck,
 	workCheck: () => shared.workCheck,
+	checkRouting: () => shared.checkRouting ?? null,
 	quota: () => fetchQuota(boardOmpEnv()),
 	drained: () => shuttingDown || app.drained(),
 	stopping: () => shuttingDown,
@@ -739,6 +881,8 @@ const loop = createTurnLoop(projects, {
 	branchUnpushed,
 	checkedOutBranch,
 	checkoutState,
+	// OTTR-987: the head the server's fast-forward would land; the merge hold audits it.
+	integrationHead: integrationSha,
 	serverMergePush,
 	// OTTR-552 PR mode: the ship step pushes the card branch (server git credentials,
 	// force-with-lease) and adopts or opens the PR via gh; the integrated proof is a
@@ -782,6 +926,8 @@ const loop = createTurnLoop(projects, {
 	workerTarget,
 	// OTTR-532: microVM projects' eligible turns, their token store and the worktree sync.
 	vmTarget,
+	// OTTR-1142: the settle of an accepted VM run probes the pool before its wake schedule.
+	vmProbe: () => probeVmRunner(vmTarget),
 	vmTokens,
 	syncWorktreeTo,
 	startRun,
@@ -794,19 +940,21 @@ const loop = createTurnLoop(projects, {
 	// merge turn must not read a worker-plantable apt.txt from there
 	// (docs/specs/worker-list-isolation.md).
 	ensurePackages: (project) => ensureProjectPackages(project, turnListHome()),
-	turnEnv: (project, model) =>
-		turnEnv(
+	turnEnv: async (project, model, opts) =>
+		await turnEnv(
 			project,
 			model,
 			envValuesByKind(
 				shared.envValues,
 				shared.envPlain,
-				listedEnvNames(workersHome),
+				await listedEnvNames(workersHome),
 			),
 			{
 				home: workersHome,
 				// Hosted model access is API keys only: no provider OAuth token is lent to turns.
 				lend: hosted === undefined,
+				// A scout omits the Settings values (OTTR-1028); every other turn gets them.
+				values: opts?.values,
 			},
 		),
 	// R5-1: a server-local turn reads tools.json and requirements.txt and installs under the
@@ -925,6 +1073,9 @@ every(() => ompStatsDashboard.tick(), 60_000);
 // below moves it forward each regular poll. The boot poll is irregular, so the
 // grid starts one hour out.
 const prPollGrid = { nextAt: Date.now() + 3_600_000 };
+// OTTR-1087: the code-scanning poll grid for the Settings watches row; the
+// hourly wiring below moves it forward each regular poll, like the PR grid.
+const codeScanPollGrid = { nextAt: Date.now() + 3_600_000 };
 const app = await createApp({
 	gstore,
 	defaultDir: resolve(ROOTS[0] ?? resolve(import.meta.dir, "..", "..")),
@@ -938,8 +1089,8 @@ const app = await createApp({
 	projects,
 	cancel: loop.cancel,
 	// OTTR-1047: the manual start is strict — it files for the named review only.
-	validateLeads: (e, reviewId) =>
-		loop.filePendingValidationRun(e, reviewId, true),
+	validateLeads: (e, reviewId, strictReview, again) =>
+		loop.filePendingValidationRun(e, reviewId, strictReview ?? true, again),
 	stopTurn: loop.stopTurn,
 	creditStop: loop.creditStop,
 	creditRelease: loop.creditRelease,
@@ -961,9 +1112,22 @@ const app = await createApp({
 	],
 	// OTTR-548: the /signins tick probes the same urls the loop dispatches work turns to.
 	workerTarget,
+	// OTTR-1151: the /system view polls the vm-runner's /stats like a worker's and shows
+	// the VM fleet on that row.
+	vmTarget,
 	runnerTurns: () => loop.runnerTurns(),
+	// OTTR-1143: the state frame's slotsUsed is the loop's own live slot count — the exact
+	// number the claim gate caps. The demo board runs no agents (the loop sets stay empty)
+	// while its seeded pool shows running/preparing cards, so there the frame carries the
+	// seeded count, like demoProgress does for progress lines.
+	slotsUsed:
+		demoData !== null
+			? () => demoData.demoSlotsUsed(projects)
+			: () => loop.slotsUsed(),
 	// OTTR-1071: the Settings watches row shows when the next regular PR poll runs.
 	prPollNextAt: () => prPollGrid.nextAt,
+	// OTTR-1087: the same for the code-scanning watch's next regular poll.
+	codeScanPollNextAt: () => codeScanPollGrid.nextAt,
 	// OTTR-763: the checkout guard's ambiguous-change notices for the bell.
 	checkoutNotices: () => loop.checkoutNotices(),
 	// The /system view's live runs: the loop keys entries `${project}/${id}`; split at the first "/".
@@ -1001,10 +1165,22 @@ const app = await createApp({
 	vmTokens,
 	llmGateway: () => llmGateway,
 	hosted,
+	// No live secret source is approved. Keep internal bindings empty and server-only.
+	serviceQuotas:
+		hosted === undefined
+			? {
+					sources: [],
+					registry: new Map(),
+					resolveCredential: () => undefined,
+				}
+			: undefined,
 	secretBox,
 	ompStats: { info: ompStatsInfo, dashboard: ompStatsDashboard },
 });
 appRef = app;
+// OTTR-1088: warm the transcript usage scan once at boot, so the first Settings
+// visit answers from the report cache or the single-flight build, never a cold walk.
+app.ompStatsWarm();
 
 // Boot recovery is the loop's job now: a restart resurfaces running/preparing
 // turns through one code path, so a cancelled card can never be requeued twice.
@@ -1013,6 +1189,11 @@ await loop.schedule();
 every(() => loop.scheduleTick(), 5000);
 
 every(() => supervisor.tick(), 60_000);
+
+// OTTR-1139: the catch-up sweep files the batch validation a done review still
+// waits for when its settle event never fired. Same 60 s cadence as the
+// supervisor tick; the filing rules live in the loop's filePendingValidationRun.
+every(() => loop.validationSweep(), 60_000);
 
 // U9: when the alate server holds an unprovisioned import and no turn runs, run the same
 // provision path as Settings → Alate → Provision; a failed attempt waits an hour.
@@ -1048,36 +1229,43 @@ every(async () => {
 
 // Backups (docs/specs/db-backup.md): daily snapshot of tracker.db and each tasks.db, hourly
 // check; the boot call lets a board that was down catch up.
-const backup = resolveBackup(process.env, STATE_DIR, workerRoots);
-for (const text of backup.errors) console.error(`backup: ${text}`);
-if (backup.keep !== 0) {
-	const backupNow = async (): Promise<void> => {
-		if (shuttingDown) return;
-		if (backupWork !== undefined) return backupWork;
-		backupWork = backupTick({
-			dir: backup.dir,
-			keep: backup.keep,
-			now: new Date(),
-			refuseBelow: backup.refuseBelow,
-			// A project that opened later (added again from the board) is a live source, not a failure.
-			sources: () =>
-				backupSources(
-					gstore,
-					[...projects.values()].map((e) => e.store),
-					unopenedProjects.filter((u) => !projects.has(u.name)),
-				),
-			log: (line) => console.log(line),
-		});
-		try {
-			await backupWork;
-		} finally {
-			backupWork = undefined;
-		}
-	};
-	await backupNow();
-	every(backupNow, 3_600_000);
+if (DATABASE.backend === "postgres") {
+	console.log(POSTGRES_BACKUP_NOTICE);
+} else {
+	const backup = resolveBackup(process.env, STATE_DIR, workerRoots);
+	for (const text of backup.errors) console.error(`backup: ${text}`);
+	if (backup.keep !== 0) {
+		const backupNow = async (): Promise<void> => {
+			if (shuttingDown) return;
+			if (backupWork !== undefined) return backupWork;
+			backupWork = backupTick({
+				dir: backup.dir,
+				keep: backup.keep,
+				now: new Date(),
+				refuseBelow: backup.refuseBelow,
+				// A project that opened later is a live source, not a failure.
+				sources: () =>
+					backupSources(
+						gstore,
+						[...projects.values()].map((e) => e.store),
+						unopenedProjects.filter((u) => !projects.has(u.name)),
+					),
+				log: (line) => console.log(line),
+			});
+			try {
+				await backupWork;
+			} finally {
+				backupWork = undefined;
+			}
+		};
+		await backupNow();
+		every(backupNow, 3_600_000);
+	}
 }
 
+// Service due checks never wait for statistics or model quota work.
+app.checkServiceQuotas();
+every(() => app.checkServiceQuotas(), 30_000);
 // System sampler, one for all tabs (and for /api/system in polling mode): container and VM
 // readings, self-update checks and the usage quota live behind sampleStats() in the request layer.
 runWork(() => app.sampleStats());
@@ -1104,6 +1292,15 @@ every(() => {
 // Issue watch: hourly poll; files new open GitHub issues as backlog cards, capped per day.
 runWork(() => app.issueWatchTick());
 every(() => app.issueWatchTick(), 3_600_000);
+
+// Code scanning watch: hourly poll; files GitHub code scanning alerts as backlog cards.
+// OTTR-1087: the grid feeds the state payload's nextPollAt for the Settings watches row.
+runWork(() => app.codeScanWatchTick());
+every(() => {
+	codeScanPollGrid.nextAt = Date.now() + 3_600_000;
+	// Returned, not voided: runWork's chain awaits and logs the tick's rejections.
+	return app.codeScanWatchTick();
+}, 3_600_000);
 
 // omp watch: hourly npm poll; a model reviews each new omp release, files fail and bump cards.
 runWork(() => app.ompWatchTick());

@@ -1,5 +1,6 @@
 // Provider usage limits (5 h, 7 d, monthly, ...) as reported by `omp usage --json`.
-import type { QuotaLimit, QuotaState } from "./types.ts";
+import { childDatabaseEnv } from "./childEnv.ts";
+import type { QuotaLimit, QuotaResetCredits, QuotaState } from "./types.ts";
 
 type Obj = Record<string, unknown>;
 const obj = (v: unknown): Obj =>
@@ -21,6 +22,36 @@ export function parseUsage(text: string): QuotaLimit[] {
 	}
 	return out;
 }
+
+/** Each report's banked resets (`resetCredits`), skipping providers that report none. The
+ *  soonest expiry counts only credits whose status is "available". */
+export function parseResetCredits(text: string): QuotaResetCredits[] {
+	const reports = obj(JSON.parse(text)).reports;
+	if (!Array.isArray(reports)) return [];
+	const out: QuotaResetCredits[] = [];
+	for (const r of reports) {
+		const provider = obj(r).provider;
+		const rc = obj(obj(r).resetCredits);
+		const available = num(rc.availableCount);
+		if (typeof provider !== "string" || available === null) continue;
+		const expiries = (Array.isArray(rc.credits) ? rc.credits : [])
+			.filter((c) => obj(c).status === "available")
+			.map((c) => Date.parse(String(obj(c).expiresAt)))
+			.filter((t) => Number.isFinite(t));
+		out.push({
+			provider,
+			available,
+			nextExpiry: expiries.length > 0 ? Math.min(...expiries) : null,
+		});
+	}
+	return out;
+}
+
+/** A usage report's limits and banked resets. */
+const report = (text: string) => ({
+	limits: parseUsage(text),
+	resetCredits: parseResetCredits(text),
+});
 
 // ponytail: two accounts of one provider show as two same-named rows; add the account label if that ever happens.
 /** One account's limits, in omp's order, deduplicated by shared window group. */
@@ -180,12 +211,15 @@ export async function fetchQuota(
 	env: Record<string, string | undefined>,
 ): Promise<QuotaState> {
 	const at = Date.now();
+	// The dev board (src/dev.ts) has no omp sign-in: it hands an `omp usage --json` report here.
+	const demo = env.OTTR_DEMO_USAGE;
+	if (demo) return { ...report(demo), error: null, at };
 	try {
 		// omp caches each account's report for 5 min, so this rarely hits the providers.
 		const p = Bun.spawn(["omp", "usage", "--json"], {
 			stdout: "pipe",
 			stderr: "pipe",
-			env,
+			env: childDatabaseEnv(env),
 			windowsHide: true,
 			timeout: 30_000,
 		});
@@ -200,7 +234,7 @@ export async function fetchQuota(
 				error: err.trim().split("\n").at(-1) || `omp usage exited with ${code}`,
 				at,
 			};
-		return { limits: parseUsage(out), error: null, at };
+		return { ...report(out), error: null, at };
 	} catch (e) {
 		return {
 			limits: [],

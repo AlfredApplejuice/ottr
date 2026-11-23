@@ -7,6 +7,7 @@
  */
 import { lookup } from "node:dns/promises";
 import { isIPv4 } from "node:net";
+import { childDatabaseEnv } from "./childEnv.ts";
 
 export interface ExecResult {
 	code: number | null;
@@ -19,6 +20,7 @@ export type Exec = (argv: string[]) => Promise<ExecResult>;
 export const defaultExec: Exec = async (argv) => {
 	try {
 		const p = Bun.spawn(argv, {
+			env: childDatabaseEnv(),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",

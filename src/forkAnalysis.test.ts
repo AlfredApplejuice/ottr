@@ -7,6 +7,7 @@ import {
 	buildUserMessage,
 	defaultSpawn,
 	hasCredentialShape,
+	PROMPT_CHAR_BUDGET,
 	parseAnalysis,
 	proposalPrompt,
 	redactSecrets,
@@ -168,10 +169,51 @@ describe("redactSecrets", () => {
 		expect(r.hits).toBe(1);
 		expect(r.text).toBe("before [REDACTED] after");
 	});
+	test("JWT at the segment bounds still redacts", () => {
+		const jwt = `eyJ${"h".repeat(118)}.${"a".repeat(2048)}.${"S".repeat(2048)}`;
+		const r = redactSecrets(`x ${jwt} y`);
+		expect(r.hits).toBe(1);
+		expect(r.text).toBe("x [REDACTED] y");
+	});
+	test("JWT segment beyond the bound stays visible (OTTR-997)", () => {
+		const jwt = `eyJ${"h".repeat(118)}.${"a".repeat(2049)}.SflKxwRJSMeKKF2QT4`;
+		const r = redactSecrets(jwt);
+		expect(r.hits).toBe(0);
+		expect(r.text).toBe(jwt);
+	});
+	test("PEM gap beyond 8 KiB stays visible (OTTR-997)", () => {
+		const block =
+			`-----BEGIN RSA PRIVATE KEY-----\n${"a".repeat(8193)}\n` +
+			"-----END RSA PRIVATE KEY-----";
+		const r = redactSecrets(`before ${block} after`);
+		expect(r.hits).toBe(0);
+		expect(r.text).toBe(`before ${block} after`);
+	});
+	test("stays fast on attacker-shaped text that cannot match (OTTR-997)", () => {
+		// Before the fix these two ran the old unbounded patterns for 81 s and 16 s.
+		const t0 = performance.now();
+		const jwtText = redactSecrets("eyJ".repeat(333_333));
+		const jwtMs = performance.now() - t0;
+		expect(jwtText.hits).toBe(0);
+		expect(jwtMs).toBeLessThan(1000);
+		const t1 = performance.now();
+		const pemText = redactSecrets(
+			"-----BEGIN PRIVATE KEY-----\n".repeat(40000),
+		);
+		const pemMs = performance.now() - t1;
+		expect(pemText.hits).toBe(0);
+		expect(pemMs).toBeLessThan(1000);
+	});
 	test("URL with credentials", () => {
 		const r = redactSecrets("postgres://admin:supersecret12@db.example.com/x");
 		expect(r.hits).toBe(1);
 		expect(r.text).toBe("[REDACTED]db.example.com/x");
+	});
+	test("URL user part beyond the bound stays visible (OTTR-997)", () => {
+		const s = `postgres://${"u".repeat(256)}:password123@db.example.com/x`;
+		const r = redactSecrets(s);
+		expect(r.hits).toBe(0);
+		expect(r.text).toBe(s);
 	});
 	test("suspicious assignment redacts the quoted value", () => {
 		const r = redactSecrets('cfg.password = "abcdefghijklmnop"');
@@ -215,6 +257,17 @@ describe("redactSecrets", () => {
 		expect(r.hits).toBe(0);
 		expect(r.text).toBe("password = superlongunquotedvalue123");
 	});
+	test("quoted value at the 8 KiB bound redacts (OTTR-997)", () => {
+		const r = redactSecrets(`password: "${"a".repeat(8192)}"`);
+		expect(r.hits).toBe(1);
+		expect(r.text).toBe('password: "[REDACTED]"');
+	});
+	test("quoted value beyond the 8 KiB bound stays visible (OTTR-997)", () => {
+		const s = `password: "${"a".repeat(8193)}"`;
+		const r = redactSecrets(s);
+		expect(r.hits).toBe(0);
+		expect(r.text).toBe(s);
+	});
 	test("property: no quoted suspicious value survives redaction", () => {
 		const key = fc.constantFrom(
 			"password",
@@ -245,6 +298,36 @@ describe("redactSecrets", () => {
 					// The model never sees the value: every non-fixture quoted value
 					// is gone after redaction, and redaction never throws.
 					if (!fixture.test(v.trim())) expect(r.text).not.toContain(v);
+				},
+			),
+		);
+	});
+	test("property: bounded token shapes never survive redaction (OTTR-997)", () => {
+		const secret = fc.constantFrom(
+			"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4",
+			"-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----",
+			"postgres://admin:supersecret12@db.example.com/x",
+			`ghp_${"x".repeat(36)}`,
+		);
+		// Fillers carry match prefixes without the required literals; the newline
+		// keeps the \b boundary of the token prefixes intact.
+		const filler = fc.constantFrom(
+			"plain code",
+			"eyJ",
+			"-----BEGIN PRIVATE KEY-----",
+			".",
+			"a",
+			"postgres://",
+		);
+		fc.assert(
+			fc.property(
+				fc.array(filler, { maxLength: 3 }),
+				secret,
+				fc.array(filler, { maxLength: 3 }),
+				(pre, s, post) => {
+					const text = `${pre.join("")}\n${s}\n${post.join("")}`;
+					const r = redactSecrets(text);
+					expect(r.text).not.toContain(s);
 				},
 			),
 		);
@@ -308,8 +391,12 @@ describe("buildUserMessage", () => {
 		expect(msg).toContain('password = "[REDACTED]"');
 		expect(msg).not.toContain("abcdefghijklmnop");
 	});
-	test("throws RangeError when oversized patches bust the budget", () => {
-		const big = "x".repeat(600_000);
+	test("a token straddling the raw cut still redacts (OTTR-997)", () => {
+		const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4";
+		// Two commits -> cap 200_000, raw cut at 249_152. The patch goes over the
+		// cut, the token sits well inside the cleaned region before the dropped
+		// tail zone, and the marker beyond the raw cut goes with the tail.
+		const patch = `${"a".repeat(190_000)}${jwt}${"b".repeat(70_000)}ZZTAILZZ`;
 		const r = range({
 			commits: [
 				{
@@ -318,12 +405,316 @@ describe("buildUserMessage", () => {
 					files: 1,
 					plus: 1,
 					minus: 0,
-					patch: big,
+					patch,
+					branches: [],
+				},
+				{
+					sha: SHA2,
+					subject: "t",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "+x",
 					branches: [],
 				},
 			],
 			merges: [],
 		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("[REDACTED]");
+		expect(msg).toContain("[patch truncated]");
+		expect(msg).not.toContain("eyJ");
+		expect(msg).not.toContain("ZZTAILZZ");
+	});
+	test("a PEM block straddling the old precap cut redacts in budget (OTTR-997)", () => {
+		// Two commits -> per-patch cap 200_000. The block spans the position the
+		// earlier 4 KiB slack pre-cut sat at; the range stays in budget, so
+		// capPatches would never trim it and the raw body would reach the model.
+		const patch1 =
+			`${"a".repeat(204_000)}-----BEGIN RSA PRIVATE KEY-----\n` +
+			`${"X".repeat(3000)}\n-----END RSA PRIVATE KEY-----${"b".repeat(1000)}`;
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: patch1,
+					branches: [],
+				},
+				{
+					sha: SHA2,
+					subject: "t",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "+x",
+					branches: [],
+				},
+			],
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("[REDACTED]");
+		expect(msg).not.toContain("XXXXXXXXXX");
+	});
+	test("a 6 KiB PEM block straddling the cap redacts before the trim (OTTR-997)", () => {
+		// The block is longer than the earlier 4 KiB slack: even when capPatches
+		// trims, the pre-cut must sit far enough past the cap to cover it whole.
+		const patch1 =
+			`${"a".repeat(199_500)}-----BEGIN RSA PRIVATE KEY-----\n` +
+			`${"X".repeat(6000)}\n-----END RSA PRIVATE KEY-----${"b".repeat(10_000)}`;
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: patch1,
+					branches: [],
+				},
+				{
+					sha: SHA2,
+					subject: "t",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "a".repeat(199_000),
+					branches: [],
+				},
+			],
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("[REDACTED]");
+		expect(msg).not.toContain("XXXXXXXXXX");
+	});
+	test("a JWT straddling the old precap cut redacts in budget (OTTR-997)", () => {
+		// The token spans the position the earlier 4 KiB slack pre-cut sat at;
+		// a prefix of it must never reach the model unredacted.
+		const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4";
+		const patch1 = `${"a".repeat(204_060)}${jwt}${"b".repeat(2000)}`;
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: patch1,
+					branches: [],
+				},
+				{
+					sha: SHA2,
+					subject: "t",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "+x",
+					branches: [],
+				},
+			],
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("[REDACTED]");
+		expect(msg).not.toContain("eyJ");
+	});
+	test("redaction shrink ahead of the cut cannot expose a cut token (OTTR-997)", () => {
+		// Two commits -> cap 200_000, raw cut at 249_152. Three redacted blocks
+		// shrink the cleaned text by ~18 KiB, so the emitted cut at 198_228 must
+		// still sit before the last block, whose body straddles the raw cut.
+		const block = (body: number) =>
+			`-----BEGIN RSA PRIVATE KEY-----\n${"X".repeat(body)}\n-----END RSA PRIVATE KEY-----`;
+		const patch1 =
+			"a".repeat(1000) +
+			block(6000).repeat(3) +
+			"a".repeat(226_966) +
+			block(6000) +
+			"b".repeat(500);
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: patch1,
+					branches: [],
+				},
+				{
+					sha: SHA2,
+					subject: "t",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "+x",
+					branches: [],
+				},
+			],
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("[REDACTED]");
+		expect(msg).toContain("[patch truncated]");
+		expect(msg).not.toContain("XXXXXXXXXX");
+		expect(msg).not.toContain("BEGIN RSA");
+	});
+	test("invisible-char shrink ahead of the cut cannot expose a cut token (OTTR-997)", () => {
+		// 20 000 zero-width spaces shrink the cleaned text by 20 KiB; the raw cut
+		// at 249_152 lands inside the last block's body and its prefix must stay
+		// dropped.
+		const patch1 =
+			"\u200C".repeat(20_000) +
+			"a".repeat(226_000) +
+			"-----BEGIN RSA PRIVATE KEY-----\n" +
+			`${"X".repeat(6000)}\n-----END RSA PRIVATE KEY-----${"b".repeat(500)}`;
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: patch1,
+					branches: [],
+				},
+				{
+					sha: SHA2,
+					subject: "t",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "+x",
+					branches: [],
+				},
+			],
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("[patch truncated]");
+		expect(msg).not.toContain("XXXXXXXXXX");
+		expect(msg).not.toContain("BEGIN RSA");
+		expect(msg).toContain("aaaa");
+	});
+	test("cleaned text below the drop zone emits nothing, marked truncated (OTTR-997)", () => {
+		// 25 commits -> cap 16_000, raw cut at 65_152. Nine redacted blocks shrink
+		// the cleaned text to 10 684 chars, below the 32 KiB drop zone: the whole
+		// cleaned text is tail zone, so nothing is emitted and the truncation is
+		// marked instead of silently dropping the patch.
+		const block = (body: number) =>
+			`-----BEGIN RSA PRIVATE KEY-----\n${"X".repeat(body)}\n-----END RSA PRIVATE KEY-----`;
+		const patch1 = `${"a".repeat(5_000)}${block(6000).repeat(10)}${"b".repeat(500)}`;
+		const r = range({
+			commits: Array.from({ length: 25 }, (_, i) => ({
+				sha: `${"c".repeat(38)}${String(i).padStart(2, "0")}`,
+				subject: "s",
+				files: 1,
+				plus: 1,
+				minus: 0,
+				patch: i === 0 ? patch1 : "+x",
+				branches: [],
+			})),
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("COMMITS");
+		expect(msg).toContain("[patch truncated]");
+		expect(msg).not.toContain("XXXXXXXXXX");
+		expect(msg).not.toContain("BEGIN RSA");
+	});
+	test("a benign cut patch in a small-cap range keeps its cap (OTTR-997)", () => {
+		// 25 commits -> cap 16_000, raw cut at 65_152. The patch holds no secret,
+		// so the emitted text must reach the cap, carry the truncation marker,
+		// and stop before a marker placed past the cap.
+		const patch1 = `${"a".repeat(20_000)}ZZENDZZ${"a".repeat(46_000)}`;
+		const r = range({
+			commits: Array.from({ length: 25 }, (_, i) => ({
+				sha: `${"c".repeat(38)}${String(i).padStart(2, "0")}`,
+				subject: "s",
+				files: 1,
+				plus: 1,
+				minus: 0,
+				patch: i === 0 ? patch1 : "+x",
+				branches: [],
+			})),
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("a".repeat(100));
+		expect(msg).toContain("[patch truncated]");
+		expect(msg).not.toContain("ZZENDZZ");
+	});
+	test("a cut PEM on a small-cap range never emits its body (OTTR-997)", () => {
+		// 25 commits -> cap 16_000, raw cut at 65_152 lands inside the body; the
+		// emitted cap region ends long before the body starts.
+		const patch1 =
+			`${"a".repeat(60_000)}-----BEGIN RSA PRIVATE KEY-----\n` +
+			`${"X".repeat(6000)}\n-----END RSA PRIVATE KEY-----${"b".repeat(5_000)}`;
+		const r = range({
+			commits: Array.from({ length: 25 }, (_, i) => ({
+				sha: `${"c".repeat(38)}${String(i).padStart(2, "0")}`,
+				subject: "s",
+				files: 1,
+				plus: 1,
+				minus: 0,
+				patch: i === 0 ? patch1 : "+x",
+				branches: [],
+			})),
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("[patch truncated]");
+		expect(msg).not.toContain("XXXXXXXXXX");
+		expect(msg).not.toContain("BEGIN RSA");
+	});
+	test("truncates a huge patch in budget instead of stalling (OTTR-997)", () => {
+		// Before the fix this input cleaned the whole 1 MB patch for 81 s and
+		// then threw; now the pre-cut and the tail drop bound it into budget.
+		// Two commits -> cap 200_000, raw cut at 249_152, no shrinkage: the kept
+		// text reaches the cap and the marker past it is dropped.
+		const patch1 = `${"eyJ".repeat(83_333)}ZZENDZZ${"eyJ".repeat(16_666)}`;
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: patch1,
+					branches: [],
+				},
+				{
+					sha: SHA2,
+					subject: "t",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "+x",
+					branches: [],
+				},
+			],
+			merges: [],
+		});
+		const t0 = performance.now();
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(performance.now() - t0).toBeLessThan(1000);
+		expect(msg.length).toBeLessThan(PROMPT_CHAR_BUDGET);
+		expect(msg).toContain("[patch truncated]");
+		// The tail zone dropped at the raw cut removes the marker with it.
+		expect(msg).not.toContain("ZZENDZZ");
+		expect(msg).toContain("COMMITS");
+	});
+	test("throws RangeError when non-patch sections bust the budget", () => {
+		const r = range({ upstreamDocs: "y".repeat(500_000) });
 		expect(() => buildUserMessage(r, { titles: [], declines: [] })).toThrow(
 			RangeError,
 		);

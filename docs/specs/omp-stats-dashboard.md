@@ -26,8 +26,11 @@ through its own login, gives it every session transcript of the board, and stops
    `tailscale serve`.
 2. Auth wall: when the peer is not direct loopback (`walled`, with the proxy server's
    `requestIP`), the request needs a valid board session cookie or `X-API-Key`
-   (`authorized`). Cookies do not depend on the port, so the board's `ottr.session`
-   cookie for `localhost` reaches `localhost:<port>`. Without auth, the proxy answers 401
+   (`authorized`). The board's cookie name carries the board port
+   (`ottr.session.<port>`, for example `ottr.session.8080`). Browsers send a host's
+   cookies to every port on the host, so the browser also presents that cookie to
+   `localhost:<proxy port>`, where the proxy reads the board-port name. Without auth,
+   the proxy answers 401
    with a short HTML page that links to the board sign-in at
    `http://<request hostname>:<board port>/`.
 3. Every method other than GET and HEAD needs an Origin of `http://127.0.0.1:<port>` or

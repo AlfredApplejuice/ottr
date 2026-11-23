@@ -7,6 +7,7 @@ import {
 	alateUrlError,
 	CONFIG_YML,
 	commitConfigYml,
+	configBlobAt,
 	ensureAlateProjectsRoot,
 	ghApi,
 	loadConfigYml,
@@ -865,6 +866,8 @@ describe("commitConfigYml", () => {
 	}
 	const happy = {
 		"repos/o/r": ok({ default_branch: "dev" }),
+		"repos/o/r/git/ref/heads/main": ok({ object: { sha: B } }),
+		"repos/o/r/git/ref/heads/dev": ok({ object: { sha: B } }),
 		[`repos/o/r/git/commits/${B}`]: ok({ tree: { sha: "T0" } }),
 		"repos/o/r/git/trees": ok({ sha: "T1" }),
 		"repos/o/r/git/commits": ok({ sha: "C1" }),
@@ -880,6 +883,7 @@ describe("commitConfigYml", () => {
 			body: { commit: "C1" },
 		});
 		expect(calls).toEqual([
+			["api", "repos/o/r/git/ref/heads/main"],
 			["api", `repos/o/r/git/commits/${B}`],
 			[
 				"api",
@@ -927,7 +931,8 @@ describe("commitConfigYml", () => {
 			(await commitConfigYml(gh, { name: "o/r", ref: "" }, B, "c", "m")).ok,
 		).toBe(true);
 		expect(calls[0]).toEqual(["api", "repos/o/r"]);
-		expect(calls[4]?.[3]).toBe("repos/o/r/git/refs/heads/dev");
+		expect(calls[1]).toEqual(["api", "repos/o/r/git/ref/heads/dev"]);
+		expect(calls[5]?.[3]).toBe("repos/o/r/git/refs/heads/dev");
 	});
 	test("invalid branch stops before any commit call", async () => {
 		for (const ref of ["a..b", "feat/a..b", "x y", "~main", "main~"]) {
@@ -983,9 +988,10 @@ describe("commitConfigYml", () => {
 		const fail: R = { code: 1, stdout: '{"message":"nope"}', stderr: "" };
 		for (const [key, ref, count] of [
 			["repos/o/r", "", 1],
-			[`repos/o/r/git/commits/${B}`, "main", 1],
-			["repos/o/r/git/trees", "main", 2],
-			["repos/o/r/git/commits", "main", 3],
+			["repos/o/r/git/ref/heads/main", "main", 1],
+			[`repos/o/r/git/commits/${B}`, "main", 2],
+			["repos/o/r/git/trees", "main", 3],
+			["repos/o/r/git/commits", "main", 4],
 		] as const) {
 			const { gh, calls } = fake({ ...happy, [key]: fail });
 			expect(
@@ -1010,6 +1016,197 @@ describe("commitConfigYml", () => {
 			status: 409,
 			error: "GitHub: Update is not a fast forward",
 		});
+	});
+	test("a loaded commit that is not the branch head is refused before any write", async () => {
+		const other = "d".repeat(40);
+		// The head sits behind the loaded commit: the PATCH would still be a
+		// fast-forward and move the branch onto the loaded history.
+		const ahead = fake({
+			...happy,
+			"repos/o/r/git/ref/heads/main": ok({ object: { sha: other } }),
+		});
+		expect(
+			await commitConfigYml(
+				ahead.gh,
+				{ name: "o/r", ref: "main" },
+				B,
+				"c",
+				"m",
+			),
+		).toEqual({
+			ok: false,
+			status: 409,
+			error: `the data repo branch head is ${other}, but the loaded commit is ${B}`,
+			refMismatch: true,
+		});
+		// Only the head read ran; no tree, commit or ref update.
+		expect(ahead.calls).toEqual([["api", "repos/o/r/git/ref/heads/main"]]);
+		// The head sits ahead of the loaded commit (the branch moved): refused too.
+		const moved = fake({
+			...happy,
+			"repos/o/r/git/ref/heads/main": ok({ object: { sha: other } }),
+		});
+		const r = await commitConfigYml(
+			moved.gh,
+			{ name: "o/r", ref: "main" },
+			B,
+			"c",
+			"m",
+		);
+		expect(r.ok).toBe(false);
+		if (!r.ok) expect(r.refMismatch).toBe(true);
+		expect(moved.calls).toEqual([["api", "repos/o/r/git/ref/heads/main"]]);
+		// A head answer without a sha is a refusal, not a write.
+		const shapeless = fake({
+			...happy,
+			"repos/o/r/git/ref/heads/main": ok({ object: {} }),
+		});
+		const bad = await commitConfigYml(
+			shapeless.gh,
+			{ name: "o/r", ref: "main" },
+			B,
+			"c",
+			"m",
+		);
+		expect(bad.ok).toBe(false);
+		if (!bad.ok) {
+			expect(bad.refMismatch).toBe(true);
+			expect(bad.error).toContain("unknown");
+		}
+		expect(shapeless.calls).toEqual([["api", "repos/o/r/git/ref/heads/main"]]);
+	});
+	test("expectBranch match writes, mismatch stops before any call", async () => {
+		const good = fake(happy);
+		expect(
+			await commitConfigYml(
+				good.gh,
+				{ name: "o/r", ref: "main" },
+				B,
+				"c",
+				"m",
+				"main",
+			),
+		).toEqual({ ok: true, body: { commit: "C1" } });
+		expect(good.calls.length).toBe(5);
+		const stop = fake(happy);
+		expect(
+			await commitConfigYml(
+				stop.gh,
+				{ name: "o/r", ref: "main" },
+				B,
+				"c",
+				"m",
+				"live",
+			),
+		).toEqual({
+			ok: false,
+			status: 409,
+			error: "the data repo branch is main, but the pinned branch is live",
+			pinMismatch: true,
+		});
+		expect(stop.calls).toEqual([]);
+	});
+	test("expectBranch compares the resolved default branch", async () => {
+		const other = fake(happy);
+		expect(
+			await commitConfigYml(
+				other.gh,
+				{ name: "o/r", ref: "" },
+				B,
+				"c",
+				"m",
+				"main",
+			),
+		).toEqual({
+			ok: false,
+			status: 409,
+			error: "the data repo branch is dev, but the pinned branch is main",
+			pinMismatch: true,
+		});
+		expect(other.calls).toEqual([["api", "repos/o/r"]]);
+		const same = fake(happy);
+		expect(
+			(
+				await commitConfigYml(
+					same.gh,
+					{ name: "o/r", ref: "" },
+					B,
+					"c",
+					"m",
+					"dev",
+				)
+			).ok,
+		).toBe(true);
+	});
+});
+
+describe("configBlobAt", () => {
+	const B = "b".repeat(40);
+	test("argv and decoded bytes", async () => {
+		const bytes = new TextEncoder().encode("modelRoles:\n  a: b\n");
+		const calls: string[][] = [];
+		const r = await configBlobAt(
+			async (a) => {
+				calls.push(a);
+				return ok({
+					content: Buffer.from(bytes).toString("base64"),
+					encoding: "base64",
+				});
+			},
+			{ name: "o/r" },
+			B,
+		);
+		expect(r).toEqual({ ok: true, body: { bytes } });
+		expect(calls).toEqual([
+			["api", `repos/o/r/contents/${CONFIG_YML}?ref=${B}`],
+		]);
+	});
+	test("not found gives null bytes", async () => {
+		const r = await configBlobAt(
+			async () => ({ code: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)" }),
+			{ name: "o/r" },
+			B,
+		);
+		expect(r).toEqual({ ok: true, body: { bytes: null } });
+	});
+	test("other gh failures pass through", async () => {
+		const r = await configBlobAt(
+			async () => ({ code: 1, stdout: '{"message":"nope"}', stderr: "" }),
+			{ name: "o/r" },
+			B,
+		);
+		expect(r).toEqual({ ok: false, status: 502, error: "GitHub: nope" });
+	});
+	test("missing content is 502", async () => {
+		for (const body of [{}, { content: 5 }]) {
+			const r = await configBlobAt(async () => ok(body), { name: "o/r" }, B);
+			expect(r).toEqual({
+				ok: false,
+				status: 502,
+				error: "GitHub returned an invalid response",
+			});
+		}
+	});
+	test("property: any bytes round trip through the contents answer", async () => {
+		const prop = fc.asyncProperty(
+			fc.uint8Array({ minLength: 0, maxLength: 4096 }),
+			async (bytes) => {
+				const r = await configBlobAt(
+					async () =>
+						ok({
+							content: Buffer.from(bytes).toString("base64"),
+							encoding: "base64",
+						}),
+					{ name: "o/r" },
+					B,
+				);
+				if (!r.ok) return false;
+				if (r.body.bytes === null || r.body.bytes.length !== bytes.length)
+					return false;
+				return r.body.bytes.every((b, i) => b === bytes[i]);
+			},
+		);
+		await fc.assert(prop, { seed: 42, numRuns: 200 });
 	});
 });
 

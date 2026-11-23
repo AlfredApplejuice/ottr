@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { aptListPath, ensureProjectPackages, parseAptTxt } from "./apt.ts";
+import { childDatabaseEnv } from "./childEnv.ts";
 import { platform } from "./platform/index.ts";
 import {
 	ensureProjectPython,
@@ -174,7 +175,7 @@ async function exec(argv: string[], cwd?: string): Promise<ExecResult> {
 	try {
 		const p = Bun.spawn(argv, {
 			cwd,
-			env: toolEnv(),
+			env: childDatabaseEnv(toolEnv()),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -493,7 +494,7 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 				try {
 					child = spawn(opts.ompPath ?? "omp", body.argv, {
 						cwd,
-						env,
+						env: childDatabaseEnv(env),
 						stdio: ["pipe", "pipe", "pipe"],
 						windowsHide: true,
 					});
@@ -698,6 +699,7 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 				"-",
 			],
 			{
+				env: childDatabaseEnv(toolEnv()),
 				stdin: new TextEncoder().encode(`${names.join("\0")}\0`),
 				stdout: "pipe",
 				stderr: "ignore",

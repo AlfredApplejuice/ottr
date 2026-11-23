@@ -109,11 +109,23 @@ lead.
 The reply route applies the answers (`src/app.ts`). A reply to a card whose prompt
 starts with the question-card prefix and whose `asked` is set parses one answer per
 question — from the drawer's wire line `For "<question>": <answer>` (shared helper
-`askAnswerLine`), or, on a single-question card, from the whole reply text (that
-drawer sends the raw answer without the wire line) — applies it to the question's
-lead card, records free text no question consumed on the unanswered open leads, and
-lands the question card Done (`stage: "done"`, `state: "idle"`, `asked: null`,
-`doneAt` set by the store's Done stamp):
+`askAnswerLine`), from a plain form `Q<n>: <answer>` or `<n>. <answer>` whose n is
+the question's 1-based position in the card's current `asked` order, or, on a
+single-question card, from the whole reply text (the drawer sends the raw answer
+without the wire line). A plain line whose number names no question on the card
+refuses the whole reply with 400, so a stale number left by a partial reply can
+not silently drop or misapply an answer (OTTR-1130). An
+answer matches an option label case-insensitively, with one trailing period
+ignored. A multi-question reply that matches no question is refused with 400 and
+an error that shows the expected line format; the card and the leads stay
+unchanged (OTTR-1130). When some questions match and others do not, the matched
+answers apply, and the card stays at `needs_you` with `asked` holding only the
+unanswered questions and a `needsReason` naming each one with its current answer
+number (`Q1 "..."`, `Q2 "..."`), so the next reply answers the rest with the
+numbering the card shows. A reply that answers every question applies it to each
+question's lead card, records free text no question consumed on the unanswered
+open leads, and lands the question card Done (`stage: "done"`, `state: "idle"`,
+`asked: null`, `doneAt` set by the store's Done stamp):
 
 - `Yes, the risk applies`: an idle backlog lead moves to `stage: "todo"`,
   `state: "queued"`, `queuedAt` set, and the answer appends to its prompt. A lead
@@ -129,8 +141,10 @@ lands the question card Done (`stage: "done"`, `state: "idle"`, `asked: null`,
   question consumed appends to the details of every open lead that got no
   per-question answer.
 - Answers only touch lead cards of the same review (`followUpOf` match) that are
-  still open (not cancelled, not done). The question card lands Done inside the
-  same reply, so a second reply is refused (409, not needs_you).
+  still open (not cancelled, not done). A complete reply lands the card Done
+  inside the same reply, so a second reply is refused (409, not needs_you). A
+  partial reply keeps the card at `needs_you`, so the operator replies again with
+  the remaining questions (OTTR-1130).
 
 No schema change: the question card reuses the existing `asked` column and its
 `AskQuestion` normalization.
@@ -139,8 +153,8 @@ No schema change: the question card reuses the existing `asked` column and its
 
 A lead that sits in the backlog when its review finishes is optional work: the
 review's Done ignored it (`findingsOpen` skips `backlog` children, OTTR-889), and
-the review settled. When the user later promotes that lead (the answer above, or a
-manual queue), `findingsOpen` counts it again, and the findings hold would park
+the review settled. When the user later promoted that lead (the answer above, or a
+manual queue), `findingsOpen` counted it again, and the findings hold parked
 every non-finding merge of the project behind optional work. Incident 2026-11-15:
 seven alate and two velvarr merges waited up to 8 hours behind leads of releases
 that had shipped days earlier.
@@ -161,7 +175,9 @@ stage `backlog` when its review finished:
   `stage: "done"`, an open finding holds other merges only when it carries no
   stamp. A stamped finding never holds, also after it leaves the backlog. A
   finding without the stamp was a commitment when the review finished and keeps
-  holding, even when a reply re-opens it.
+  holding, even when a reply re-opens it. Since OTTR-1128, the shared
+  `findingOpen` rule skips every lead first, so the stamp decides only for
+  untagged findings.
 - The migration (`ProjectStore.open`) adds the column additively and backfills
   reviews that finished before it existed, from the stage history (`events`,
   kind `stage`): a finding whose last stage change at or before the review's
@@ -176,11 +192,11 @@ stage `backlog` when its review finished:
   (`fileKeptFindings`), and a deeper closure card that misses the stamp keeps
   today's hold.
 
-The review's own Done guard is unchanged: a lead promoted while the review still
-runs parks the review at `merging` until the lead reaches done or cancelled, as
-today. `reviewBlocked` is unchanged too: a promoted lead still delays the
-project's next review until it finishes. All other holds stay: an open release
-hold, a running review hold, and the findings hold of a review that is not done.
+The review's own Done guard skips leads since OTTR-1128: a lead promoted while
+the review still runs does not park the review at `merging`. `reviewBlocked`
+skips leads too: a promoted lead does not delay the project's next review. All
+other holds stay: an open release hold, a running review hold, and the findings
+hold of a review that is not done.
 
 #### Lead fingerprint dedupe
 
@@ -220,8 +236,17 @@ OTTR-980). A lead without the line falls back to the title dedupe below.
 A lead with no fingerprint match must not file a second card for a topic that an
 open lead card already holds (OTTR-929).
 
-- Title key: the first line of the prompt, lower case, each run of whitespace
-  changed to one space, trimmed.
+- Title (OTTR-1164): a lead whose line 1 is the bare tag `Needs validation`
+  takes `Needs validation: <subject>` as its card title. The subject is the
+  first content line of the `## Claim` section, else the first line that is not
+  the tag, a `Fingerprint:` line, a heading, or blank. shortTitle cuts the
+  prefixed title at 80 characters, like every other prompt-derived title. Any
+  other prompt keeps its first line as the title. On open, both store backends
+  retitle open cards (not done, not cancelled) whose title is exactly the bare
+  tag; a card the user renamed keeps its title.
+- Title key: that subject title for a bare-tag lead, else the first line of the
+  prompt, lower case, each run of whitespace changed to one space, trimmed. Two
+  fingerprint-less leads with different claims never share a key.
 - The index holds only open cards (not done, not cancelled) whose title key
   starts with `needs validation`. Done and cancelled cards never block a lead
   by title.
@@ -243,8 +268,10 @@ channel as every other recorded finding, and arrival persistence stores it
 before the run settles. The review prompt tells the reviewer to put the audit
 record's fingerprint on the prompt's second line, in the exact form
 `Fingerprint: <fingerprint>`, before any other text (the value comes from the
-audit run's `findings.json`). Line 1 is the lead tag, `Needs validation:
-<title>`, and line 2 is the board's fingerprint line: the strict reader takes
+audit run's `findings.json`). Line 1 is the lead tag — `Needs validation:
+<title>` on the older cards, the bare tag `Needs validation` alone under the
+current prompt wording (OTTR-1164) — and line 2 is the board's fingerprint
+line: the strict reader takes
 the first line that carries the exact prefix (an empty value reads as no
 fingerprint), so a forged line in the record body never wins.
 The board files the leads from the turn's recorded set, and the fingerprint
@@ -262,8 +289,9 @@ records carry whatever the audit run held.
 
 #### Batch validation of leads (OTTR-1047)
 
-A done review's sandbox-run leads wait for one batch run, not one turn per
-lead and not never. After a review lands done and filed leads, the board files
+The sandbox-run leads of a done review, or of a review held at `merging` for its
+findings (OTTR-1128), wait for one batch run, not one turn per lead and not
+never. After a review lands done and filed leads, the board files
 one validation card for that review. The card's run carries the review toolset
 (`OTTR_REVIEW=1`: `propose_task` and `sandbox_run`) and the board's cheap
 model role (the selector stored under `modelRoles().plan`, the role the prompt
@@ -295,18 +323,21 @@ continue."), and routes its `done` landing through the result settle below.
 per call, in one store transaction. It returns `{ id }` for the new card, or
 `{ error, status }` when no card files. Inside one transaction it:
 
-- Finds candidate reviews: `isReview`, `stage: "done"`, not cancelled, with at
-  least one batchable lead. A batchable lead is a direct child (`followUpOf` =
-  the review) in `stage: "backlog"`, not cancelled, with `validatedAt ===
-  null` and a `leadBlocker(prompt)` of kind `sandbox`. Deployment-fact leads
-  never enter a batch.
+- Finds candidate reviews: `isReview`, not cancelled, at `stage: "done"` or
+  held at `stage: "merging"` with `state: "idle"` (`validatableReview`,
+  OTTR-1128), with at least one batchable lead. A batchable lead is a direct
+  child (`followUpOf` = the review) in `stage: "backlog"`, not cancelled, with
+  `validatedAt === null` and a `leadBlocker(prompt)` of kind `sandbox`.
+  Deployment-fact leads never enter a batch.
 - Skips a review when an open validation card of that review exists (same
   `followUpOf`, kind `validation`, not cancelled, stage not `done`), or when
   the review's newest validation card is cancelled (the user declined; the
   manual start overrides).
 - Keeps at most one open validation card per project: the call files one card
   only. Priority: an explicit `reviewId` argument first (the chain of the run
-  that just finished), then candidate reviews by `doneAt` ascending. A
+  that just finished), then candidate reviews by `doneAt` ascending. A review
+  held at `merging` has no `doneAt`, so it sorts as 0, in front of the done
+  reviews (ties by card id). A
   `strictReview` call files for that review only: when the named review has no
   batchable leads it refuses (409, `no batchable leads for review <reviewId>`)
   instead of falling back to another candidate. The chain trigger keeps the
@@ -317,18 +348,21 @@ per call, in one store transaction. It returns `{ id }` for the new card, or
   `Batch validation of <n> lead(s) of review <review id>.` `planModel` is the
   selector stored under `modelRoles().plan`; null when the role is absent, so
   the default role runs. The card sets no `base`, so `reviewCard` stays false.
-- The card is created after the review's `doneAt`, so the `reviewFindings`
-  created-at cutoff excludes it: it never holds merges, never blocks the
-  project's next review, and never holds its review's Done. Tests pin this.
+- A validation card never holds merges, never blocks the project's next
+  review, and never holds its review's Done. The `reviewFindings` created-at
+  cutoff excludes a card created after the review's `doneAt`. Since OTTR-1128,
+  `findingOpen` also skips every card of kind `validation`, so a run for a
+  review held at `merging` (no `doneAt`) holds nothing too. Tests pin this.
 
 The batch is the review's batchable leads in severity order: ascending `rank`
 from the review's stored findings (`listReviewFindings(reviewId)`, matched by
 exact prompt; a lead with no stored rank sorts last), ties by card id
 ascending, capped at `validationBatchSize` (a stored value below 1 behaves as
-1).
+1). The leads that the routing tick (OTTR-1128) returned from a work stage
+sort first, in front of this order: the tick passes their ids in the `first`
+argument of `filePendingValidationRun`.
 
-Triggers, and only these (older done reviews drain through the chain and the
-manual start, not through a periodic sweep):
+Triggers:
 
 1. After a review's Done write: the live settle path after `writePostCheckState`
    lands `done` for a review card, and the scheduled `settleReviewCard` and
@@ -338,6 +372,19 @@ manual start, not through a periodic sweep):
    lands `needs_you` triggers nothing, so a run that records no results, or
    none that apply, stops its chain.
 3. The manual start below.
+4. The periodic catch-up sweep (OTTR-1139): the server's 60 s background tick
+   calls `filePendingValidationRun(e)` for every project (`validationSweep` on
+   the turn loop, `src/turn.ts`, wired in `src/server.ts` next to the
+   supervisor tick). It files nothing new on its own: the same filing rules
+   above decide, so a review whose leads are all deployment-fact, a declined
+   review, and a project with an open validation run stay untouched, and a
+   409 or "nothing to file" result logs nothing. A thrown error logs one
+   line, like the settle triggers' catch.
+
+The sweep is the safety net for a done review that missed its event: a deploy
+gap, a crash between the done write and the filing, or a 409 from the
+one-open-run rule at settle time. Older done reviews drain through the sweep,
+the chain, and the manual start.
 
 The batch prompt is a new builder in `src/prompts.ts`,
 `validationRunPrompt({ reviewId, leads })`, where `leads` is
@@ -423,8 +470,11 @@ the chain trigger runs the filing again.
 ##### Manual start
 
 `POST /api/projects/:project/tasks/:id/validate` (the `:id` is the review
-card): the route resolves the task, refuses a non-review, a review that is
-not `done`, or a cancelled card (404/409 with a short reason), then calls the
+card): the route resolves the task and refuses a non-review or a cancelled card
+(404/409 with a short reason). It also refuses a review that is neither `done`
+nor held at `merging` with `state: "idle"` (OTTR-1128), with the 409 text
+`only a done review or a review waiting at merging for its findings can start a validation run`.
+Then it calls the
 loop's `filePendingValidationRun` for that review through a new `AppDeps`
 entry wired next to `cancel` in `src/server.ts`. The route passes the strict
 flag, so the start files for that review only and refuses (409, `no batchable
@@ -433,6 +483,46 @@ validation card anywhere in the project answers 409. The route calls
 `deps.schedule()` and returns the new card. The manual start overrides the
 cancelled-decline skip, so the user can restart a declined review's
 validation.
+
+##### Validate blocked leads again (OTTR-1129)
+
+The same route takes an optional JSON body. Absent bytes, a JSON `null`, or
+`{}` keep the plain start above byte for byte. The body
+`{ again: "blocked", before: "<ISO timestamp>" }` asks for a re-run over the
+leads whose earlier result came from the broken sandbox: `before` is the
+cutoff instant, and only leads validated before it re-enter a batch. The
+exported parser `parseValidateAgainBody` (src/app.ts) judges the body: any
+other `again` value than the exact string `"blocked"`, or a missing,
+non-string, or unparseable `before`, answers `400 {"error": <reason>}` and
+never reaches the filing seam. Unknown extra keys are ignored.
+
+The reset shares `filePendingValidationRun`'s store transaction and runs
+right after its open-run 409, before any other return: past it every failure
+throws, so a failed filing rolls the reset back and the lead keeps its old
+validated state. With no matching lead the reset is a no-op and the plain
+409s still apply. The reset's candidates are direct backlog lead children
+of the review (prompt `Needs validation`, not cancelled, a sandbox blocker)
+whose `validatedAt` is set and older than `before`. Of those, only leads
+whose newest recorded outcome is `blocked` reset: the scan reads the
+review's validation cards newest first (createdAt desc, ties by id) and
+takes the first parsed result per lead from each card's stored findings; a
+lead whose newest outcome is `confirmed`, `refuted`, or `deployment` keeps
+its validation. Each reset lead loses the settle's newest marker segment
+from its details — from the last
+`\nValidated by validation run #<run id>` through the next
+`\nValidated by ` occurrence or the end of the string, trimmed, `null` when
+nothing remains; no marker leaves the details unchanged — and logs exactly
+one line naming the old result:
+`- validation result cleared for re-validation: was "still blocked"
+(validation run #<run id>)`. The re-listed tasks then feed the batchable
+gate, so a reset lead enters the batch like a never-validated lead.
+
+The response wraps the new validation card's task view with `reset`: the
+ids of the cleared leads in reset order, `[]` without the again flag.
+
+Operator note: after deploy, run OTTR-969 once with
+`before: 2026-11-17T00:00Z` so the leads the broken sandbox marked blocked
+re-validate.
 
 ##### Settings
 
@@ -450,6 +540,72 @@ ALTER TABLE tasks ADD COLUMN validated_at INTEGER
 `Task` gains `validatedAt: number | null` (mapped like the other camelCase
 fields). Unlike `leadAtDone`, the field joins `TaskPatch` and `TASK_COLUMNS`:
 the validation settle writes it, and nothing else does.
+
+#### A lead never runs as a work turn and never holds its review (OTTR-1128)
+
+Incident VELV-179: a release review waited at `merging` for its findings.
+Three promoted leads (VELV-189, VELV-193, VELV-195) ran as work turns. A work
+turn has no `sandbox_run`, so each lead parked at `needs_you` and held the
+review. The validate route refused the review because it was not `done`. The
+release could not ship.
+
+A pending sandbox lead is a lead with `validatedAt === null` and a
+`leadBlocker(prompt)` of kind `sandbox` (`pendingSandboxLead`,
+`src/scheduler.ts`). A lead is a card whose prompt starts with the tag
+`Needs validation`. The question card (prefix
+`Needs-validation lead questions from review #`) is not a lead. A
+deployment-fact lead that the user answered `Yes, the risk applies` and a
+validated lead (for example a confirmed lead) stay normal work.
+
+- Scheduler: `workSlotReady` never picks a pending sandbox lead for a work
+  turn, in stage `todo` or `in_progress`. The grill slot (a backlog card that
+  the user starts) does not change.
+- Hold: the shared `findingOpen` rule (`findingsOpen`, `reviewHoldFor`,
+  `mergeHold`) skips every lead, in every stage, validated or not. It also
+  skips every card of kind `validation`. So no lead and no validation run
+  holds the review's Done, the release publish, other merges, or the project's
+  next review. `leadAtDone` (OTTR-963) still decides for untagged backlog
+  findings.
+- Routing tick (`src/turn.ts` `routeStartedLeads`): on each schedule tick,
+  for each project, the tick finds each pending sandbox lead in stage `todo`
+  or `in_progress` with state `queued`, `idle`, or `needs_you` (not
+  `running`, not `preparing`). For each such lead, the tick applies the
+  first rule that matches:
+  1. The lead has no `followUpOf`, or its review is missing, cancelled, or
+     not a review. The lead parks at `needs_you` with
+     `LEAD_NO_REVIEW_REASON`. The reason tells the user to cancel the card or
+     to remove the tag from its prompt.
+  2. A validation run is open in the project, or the review is not done and
+     not held at `merging`/`idle`. The lead keeps its stage and state, so the
+     start is not lost. A later tick routes it.
+  3. The lead has commits beyond its base, or git cannot count them (see
+     "Commits park" below).
+  4. Else the tick moves the lead to stage `backlog` and state `idle`. It
+     clears `queuedAt`, `needsReason`, and `asked`, and appends one line to
+     the details. In the same transaction, it calls
+     `filePendingValidationRun` with the review id, strict, and the moved
+     lead ids in `first`. When the call refuses, the transaction rolls the
+     move back, and a later tick routes the lead again.
+
+  The commit count is `revListCount(main checkout, base, branch)`, or 0 when
+  the card has no branch or no base. Each write rereads the live card. When
+  a cancel, a claim, or a validation result (a set `validatedAt`) lands during
+  the git read, the tick does not write the card.
+- Commits park: the tick never moves a pending sandbox lead with commits
+  beyond its base, or with a count that git cannot read. The lead parks at
+  `needs_you` with `LEAD_COMMITS_REASON`. The reason says that the lead holds
+  commits from an earlier work turn, and that the user must move it to the
+  backlog or cancel it. The scheduler never starts it. The tick deletes no card.
+- Convergence: the tick covers each path that starts a lead. These paths are
+  the Accept of a proposal, a drag to `todo`, a reply, and the leads that ran
+  as work turns before this change.
+- Held review: `filePendingValidationRun` and the validate route accept a
+  review at stage `done`, or a review held at stage `merging` with state
+  `idle` that is not cancelled (`validatableReview`, `src/scheduler.ts`). So a
+  release review validates its leads before it ships.
+
+Non-goals: no change to `sandbox_run`, the microVM runner, the self-check, or
+the `src/prompts.ts` wording.
 
 ### 5. research-report.md survives the worktree
 
@@ -617,8 +773,9 @@ before the run resolves.
 20. app (red, OTTR-1047): the sandbox endpoint accepts a validation-kind card
     and still refuses a work card; the manual validate route files, queues
     and schedules for a done review, calls the filing with the strict flag
-    (`(entry, review id, true)`), refuses a not-done or cancelled review,
-    and answers 409 while a validation card is open.
+    (`(entry, review id, true)`), refuses a cancelled review or a review that
+    is neither done nor held at `merging`/`idle`, and answers 409 while a
+    validation card is open.
 21. settings (OTTR-1047): `validationBatchSize` round-trips, and a stored
     value below 1 behaves as 1.
 22. turn (red, OTTR-1047): a review that lands `done` through the live settle
@@ -641,6 +798,21 @@ before the run resolves.
     only — a review with no batchable leads answers 409
     `no batchable leads for review <id>` and no card files — while the
     non-strict chain call still falls back to the next candidate review.
+27. sequence (red, OTTR-1128): a release review files leads, and a lead
+    moves to `todo`. The release still publishes and lands `done`. The lead
+    never runs as a work turn: it runs in a validation run.
+28. app (red, OTTR-1128): `POST /api/projects/:project/tasks/:id/validate`
+    on a review at `merging`/`idle` with backlog leads files exactly one
+    validation run.
+29. scheduler (red, OTTR-1128): `reviewHoldFor` returns null when the only
+    open findings are leads in `todo` or `in_progress`. `workSlotReady` never
+    picks a pending sandbox lead, and still picks an answered deployment-fact
+    lead and a confirmed lead.
+30. turn (red, OTTR-1128): the routing tick returns a started pending sandbox
+    lead with no commits to `backlog`/`idle` with `queuedAt`, `needsReason`,
+    and `asked` cleared, and files one validation run for its review. A lead
+    with commits beyond its base stays in its stage and parks at `needs_you`
+    with the commits reason. The tick deletes no card.
 
 ## Non-goals
 
@@ -660,7 +832,8 @@ before the run resolves.
 - No change to how the review writes leads, and no auto-start of single lead
   cards: only the per-review batch card starts by itself (OTTR-1047).
 - No change to leads that already exist (OTTR-929 adds the title dedupe of new
-  leads against open lead cards).
+  leads against open lead cards). The one exception is the OTTR-1128 routing
+  tick: it returns a started pending sandbox lead to the backlog.
 - No recovery of findings lost before this change; no parsing of omp session
   files.
 - No unverified marker column or UI badge; the mark is the card's details text.

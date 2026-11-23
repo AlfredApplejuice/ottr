@@ -8,7 +8,6 @@ import {
 	mkdirSync,
 	openSync,
 	readdirSync,
-	readFileSync,
 	readlinkSync,
 	readSync,
 	renameSync,
@@ -19,6 +18,7 @@ import {
 	writeFileSync,
 	writeSync,
 } from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import {
 	basename,
 	delimiter,
@@ -59,7 +59,8 @@ const { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND } =
 export type WriteMode = "truncate" | "exclusive" | "append";
 const FLAGS: Record<WriteMode, number> = {
 	truncate: O_WRONLY | O_CREAT | O_TRUNC,
-	exclusive: O_WRONLY | O_CREAT | O_EXCL,
+	// "exclusive" is read-write so a caller can read the fresh copy back through the held fd.
+	exclusive: O_RDWR | O_CREAT | O_EXCL,
 	append: O_WRONLY | O_CREAT | O_APPEND,
 };
 
@@ -237,13 +238,133 @@ export function openRegular(path: string): number {
 	return regularOrClose(openSync(path, O_RDONLY | O_NONBLOCK), path);
 }
 
-/** readFileSync for a path on a worker-writable volume: openRegular's refusals apply. */
-export function readRegular(path: string): Buffer {
+/** A task log can be large; the board never reads a worker-written log whole without bound. */
+export const TASK_LOG_MAX_BYTES = 64 * 1024 * 1024;
+
+/** Marks the "larger than N bytes" refusals, so callers can match them without message parsing. */
+interface SizeRefusal extends Error {
+	sizeRefusal: true;
+}
+
+function sizeRefusal(label: string, maxBytes: number): SizeRefusal {
+	const err = new Error(
+		`refusing ${label}: larger than ${maxBytes} bytes`,
+	) as SizeRefusal;
+	err.sizeRefusal = true;
+	return err;
+}
+
+/** True only for the "larger than N bytes" refusals of the bounded readers. */
+export function isSizeRefusal(err: unknown): boolean {
+	return (
+		err instanceof Error && (err as Partial<SizeRefusal>).sizeRefusal === true
+	);
+}
+
+/** The bounded sync read on an open descriptor: refuses non-regular and over-cap files, and
+ * a file that grows while read; never reads unbounded. */
+function readBoundedSync(fd: number, label: string, maxBytes: number): Buffer {
+	const st = fstatSync(fd);
+	if (!st.isFile()) throw new Error(`refusing ${label}: not a regular file`);
+	if (st.size > maxBytes) throw sizeRefusal(label, maxBytes);
+	// One spare byte catches a file that grew after fstat.
+	const buf = Buffer.allocUnsafe(st.size + 1);
+	let n = 0;
+	while (n < buf.length) {
+		const r = readSync(fd, buf, n, buf.length - n, null);
+		if (r === 0) break;
+		n += r;
+	}
+	if (n > st.size) throw new Error(`refusing ${label}: it grew while read`);
+	return buf.subarray(0, n);
+}
+
+/** readFileSync for a path on a worker-writable volume: openRegular's refusals apply, and
+ * `maxBytes` refuses an oversized file before any read (worker-writable volumes must not
+ * be read whole). */
+export function readRegular(path: string, maxBytes: number): Buffer {
 	const fd = openRegular(path);
 	try {
-		return readFileSync(fd);
+		return readBoundedSync(fd, path, maxBytes);
 	} finally {
 		closeSync(fd);
+	}
+}
+
+/**
+ * Bounded async read for a path on a worker-writable volume: opens once with O_NOFOLLOW,
+ * refuses a symlink ("refusing <path>: a symlink"), a non-regular file, a file over
+ * `maxBytes`, and a file that grew while read. Never reads unbounded.
+ */
+export async function readBoundedFile(
+	path: string,
+	maxBytes: number,
+): Promise<Buffer> {
+	let handle: fsPromises.FileHandle;
+	try {
+		handle = await fsPromises.open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+	} catch (err) {
+		if (errCode(err) === "ELOOP")
+			throw new Error(`refusing ${path}: a symlink`);
+		throw err;
+	}
+	try {
+		const st = await handle.stat();
+		if (!st.isFile()) throw new Error(`refusing ${path}: not a regular file`);
+		if (st.size > maxBytes) throw sizeRefusal(path, maxBytes);
+		// One spare byte catches a file that grew after stat.
+		const buf = Buffer.allocUnsafe(st.size + 1);
+		let n = 0;
+		while (n < buf.length) {
+			const { bytesRead } = await handle.read(buf, n, buf.length - n, null);
+			if (bytesRead === 0) break;
+			n += bytesRead;
+		}
+		if (n > st.size) throw new Error(`refusing ${path}: it grew while read`);
+		return buf.subarray(0, n);
+	} finally {
+		await handle.close();
+	}
+}
+
+/**
+ * Bounded async read of the tail [from, size) of a path on a worker-writable volume:
+ * opens once with O_NOFOLLOW, refuses a symlink ("refusing <path>: a symlink"), a
+ * non-regular file, and a tail over `maxBytes`. A file that ends at or before `from`
+ * answers an empty buffer (nothing new to read); a file that grows while read fails
+ * with "grew while read". Never reads unbounded.
+ */
+export async function readTailBounded(
+	path: string,
+	from: number,
+	maxBytes: number,
+): Promise<Buffer> {
+	let handle: fsPromises.FileHandle;
+	try {
+		handle = await fsPromises.open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+	} catch (err) {
+		if (errCode(err) === "ELOOP")
+			throw new Error(`refusing ${path}: a symlink`);
+		throw err;
+	}
+	try {
+		const st = await handle.stat();
+		if (!st.isFile()) throw new Error(`refusing ${path}: not a regular file`);
+		if (st.size <= from) return Buffer.alloc(0);
+		const len = st.size - from;
+		if (len > maxBytes) throw sizeRefusal(path, maxBytes);
+		// One spare byte catches a file that grew after stat.
+		const buf = Buffer.allocUnsafe(len + 1);
+		let n = 0;
+		while (n < buf.length) {
+			const { bytesRead } = await handle.read(buf, n, buf.length - n, from + n);
+			if (bytesRead === 0) break;
+			n += bytesRead;
+		}
+		if (n > len) throw new Error(`refusing ${path}: it grew while read`);
+		return buf.subarray(0, n);
+	} finally {
+		await handle.close();
 	}
 }
 
@@ -299,6 +420,52 @@ export function renameBelow(anchor: string, from: string, to: string): void {
 			renameSync(src.at(basename(from)), dst.at(basename(to))),
 		),
 	);
+}
+
+/**
+ * Opens `name` in the held dir `d` for writing, created exclusively: an entry already there
+ * fails with EEXIST and a symlink there is never followed. Callers hold the fd across the
+ * steps that follow (an integrity check, an install rename), so a worker cannot swap the
+ * entry in between, and the fd is readable, so the caller can read its own copy back.
+ * Close the result.
+ */
+export function openExclusive(d: Dir, name: string, perm = 0o666): number {
+	return openEntry(
+		d.at(entryName(name)),
+		`${d.path}/${entryName(name)}`,
+		"exclusive",
+		perm,
+	);
+}
+
+/**
+ * Renames entry `from` to `to` inside the held dir `d` and proves the installed entry is
+ * the file `fd` holds. The rename runs through the held dir (d.at), so it resolves no
+ * parent again: a parent dir that a worker swapped for a symlink after the walk receives
+ * nothing. The ino checks catch a swap of the entry names (the held fd pins our inode,
+ * so it cannot be recycled), and an entry that is not ours is removed, never followed.
+ */
+export function renameProven(
+	d: Dir,
+	from: string,
+	to: string,
+	fd: number,
+): void {
+	const label = `${d.path}/${to}`;
+	const mine = fstatSync(fd).ino;
+	const pre = lstatSync(d.at(from), { throwIfNoEntry: false });
+	if (pre === undefined || pre.ino !== mine)
+		throw new Error(`refusing ${label}: the entry changed before the rename`);
+	renameSync(d.at(from), d.at(to));
+	const post = lstatSync(d.at(to), { throwIfNoEntry: false });
+	if (post === undefined || post.ino !== mine) {
+		try {
+			unlinkSync(d.at(to));
+		} catch {
+			// the proof failed: report it, and leave no entry of theirs behind when it unlinks
+		}
+		throw new Error(`refusing ${label}: the entry changed during the rename`);
+	}
 }
 
 /** Where a copy goes: the lexical paths of source and destination, and the tree holding the source. */
@@ -489,23 +656,29 @@ function readRegularFile(d: Dir, file: string, maxBytes: number): Buffer {
 		throw err;
 	}
 	try {
-		const st = fstatSync(fd);
-		if (!st.isFile()) throw new Error(`refusing ${file}: not a regular file`);
-		if (st.size > maxBytes)
-			throw new Error(`refusing ${file}: larger than ${maxBytes} bytes`);
-		// One spare byte catches a file that grew after fstat.
-		const buf = Buffer.allocUnsafe(st.size + 1);
-		let n = 0;
-		while (n < buf.length) {
-			const r = readSync(fd, buf, n, buf.length - n, null);
-			if (r === 0) break;
-			n += r;
-		}
-		if (n > st.size) throw new Error(`refusing ${file}: it grew while read`);
-		return buf.subarray(0, n);
+		return readBoundedSync(fd, file, maxBytes);
 	} finally {
 		closeSync(fd);
 	}
+}
+
+/**
+ * Opens `file` below `anchor` for reading without following a symlink at any component
+ * below the anchor (the file included); O_NONBLOCK keeps a planted FIFO from blocking
+ * the board's thread. Anything but a regular file fails with "refusing". Close the result.
+ */
+export function openRegularBelow(anchor: string, file: string): number {
+	return withDir(anchor, dirname(file), {}, (d) => {
+		let fd: number;
+		try {
+			fd = openSync(d.at(basename(file)), O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+		} catch (err) {
+			if (errCode(err) === "ELOOP")
+				throw new Error(`refusing ${file}: a symlink`);
+			throw err;
+		}
+		return regularOrClose(fd, file);
+	});
 }
 
 /**

@@ -4,11 +4,13 @@ import {
 	readdirSync,
 	readFileSync,
 	readlinkSync,
+	realpathSync,
 	statSync,
 } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { ensurePackages as ensureAptPackages, parseAptTxt } from "./apt.ts";
+import { acquireLayerUse } from "./layers.ts";
 import { type SignIn, signIns } from "./login.ts";
 import { platform } from "./platform/index.ts";
 import { redirectProxyHint } from "./proxyHint.ts";
@@ -28,6 +30,19 @@ import {
 	parseToolsJson,
 	type ToolEntry,
 } from "./tools.ts";
+import {
+	applyTurnGitEnv,
+	applyTurnHomeEnv,
+	closeProjectDir,
+	ensureProjectIdentity,
+	type ProvisionPaths,
+	prepareRunWorkspace,
+	prepareTurnHome,
+	projectTurnUid,
+	type TurnHome,
+	type TurnIdentity,
+	uidCollisionNote,
+} from "./turnUid.ts";
 import type { RunResult } from "./types.ts";
 import { stripGitAuthEnv, stripProxyCredentials } from "./worktree.ts";
 
@@ -53,6 +68,10 @@ export interface WorkerRequest {
 	cwd: string;
 	stdin: string;
 	env: Record<string, string>;
+	/** The run's project, set by the board on every dispatch (OTTR-994): the turn
+	 * identity key. Present even when the turn env strips OTTR_PROJECT (retro and
+	 * proposal runs), so a project-less run can only be a direct API caller. */
+	project?: string;
 	/** The board's confirmed read-only GitHub token env (docs/specs/turn-read-token.md),
 	 * applied after the strips — the only GitHub token names a turn may hold. */
 	githubReadEnv?: Record<string, string>;
@@ -200,6 +219,20 @@ export function serveWorker(opts: {
 	sweepKill?: typeof process.kill;
 	/** Only for tests: the expiry of /detached entries instead of 24 h. */
 	detachedTtlMs?: number;
+	/** Per-project turn identity (OTTR-994, docs/specs/worker-turn-uid-isolation.md): when set
+	 * (src/worker.ts, root daemons only), every turn with a project drops to its project's
+	 * uid, provisions into its turn home, and runs with a per-project HOME. Tests and
+	 * non-root daemons omit it (or pass null) and keep the legacy identity. */
+	turnUid?: {
+		homesRoot: string;
+		workerHome: string;
+		/** Shared roots whose per-project dir is closed for other projects per run. */
+		dataRoots: readonly string[];
+		/** The workspace mount root: run cwds must live under it (fail closed). */
+		workspaceRoot: string;
+		/** Provisioning paths the boot/test can point at temp files (OTTR-1184). */
+		provisionPaths?: ProvisionPaths;
+	} | null;
 	/** Only for tests: the sign-ins GET /signins reports instead of reading the worker's own store. */
 	readSignIns?: () => SignIn[];
 	/** Only for tests: the cgroup v2 directory GET /stats and the runs' OOM snapshots
@@ -354,13 +387,16 @@ export function serveWorker(opts: {
 			return handleDetachKill(request);
 		return new Response("not found", { status: 404 });
 	};
-	// The daemon provisions into its own home (the test's when opts.home is set). The
-	// request lists are texts, so no read path can reach for the shared home.
+	// The daemon provisions into the run's turn home (the test's when opts.home is set,
+	// the per-project turn home when turn identity is on). The request lists are texts,
+	// so no read path can reach for the shared home.
 	const workerHome = opts.home ?? homedir();
+	const turnUid = opts.turnUid ?? null;
 	// A failed install or a broken request list ends the run with the error as its stderr
 	// tail (the sentinel), so the client sees the provisioner's failure and no run spawns.
 	const provisionResponse = async (
 		body: WorkerRequest,
+		home: string,
 	): Promise<{ notes: string; pathDir: string } | Response> => {
 		try {
 			return await provisionRun(
@@ -369,7 +405,7 @@ export function serveWorker(opts: {
 				opts.ensurePython ?? buildPythonVenv,
 				opts.buildPath ?? buildToolsPath,
 				parseTurnLists(body.lists),
-				workerHome,
+				home,
 			);
 		} catch (err) {
 			const stderrTail = `${err instanceof Error ? err.message : String(err)}\n`;
@@ -399,11 +435,26 @@ export function serveWorker(opts: {
 		request: Request,
 		body: WorkerRequest,
 	): Promise<{ notes: string; pathDir: string } | Response> => {
-		const project = body.env?.OTTR_PROJECT;
+		const project = body.project ?? body.env?.OTTR_PROJECT;
 		if (typeof project !== "string" || project === "")
 			// No project: no provisioning, and the lists stay ignored (nothing to provision for).
 			return { notes: "", pathDir: "" };
-		const provided = await provisionResponse(body);
+		let turnHome: TurnHome | null = null;
+		if (turnUid) {
+			try {
+				turnHome = prepareTurnHome(
+					turnUid.homesRoot,
+					project,
+					projectTurnUid(project),
+				);
+			} catch (err) {
+				return new Response(`turn-uid: ${String(err)}`, { status: 500 });
+			}
+		}
+		const provided = await provisionResponse(
+			body,
+			turnHome === null ? workerHome : turnHome.provision,
+		);
 		if (provided instanceof Response) return provided;
 		// The client gave up during the install: spawning now would orphan the run.
 		if (request.signal.aborted) return new Response("aborted", { status: 499 });
@@ -427,6 +478,36 @@ export function serveWorker(opts: {
 		pathDir: string,
 	): Promise<Response> => {
 		const env = runChildEnv(body.env, body.githubReadEnv, pathDir);
+		// Per-project turn identity (OTTR-994): the run drops to its project's uid, its
+		// HOME moves to the per-project turn home or layer copy, its project dirs under
+		// the shared roots close for other projects, and its cwd plus git common dir
+		// become writable by the uid. Any failure here fails the run: never a silent
+		// fall-back to a root turn.
+		let ids: TurnIdentity | null = null;
+		let runNotes = notes;
+		if (turnUid) {
+			const project = body.project ?? body.env?.OTTR_PROJECT;
+			if (typeof project === "string" && project !== "") {
+				try {
+					ids = projectTurnUid(project);
+					const collision = uidCollisionNote(project, ids);
+					if (collision !== null) runNotes += `${collision}\n`;
+					const turnHome = prepareTurnHome(turnUid.homesRoot, project, ids);
+					applyTurnHomeEnv(env, {
+						workerHome: turnUid.workerHome,
+						turnHome,
+						ids,
+					});
+					ensureProjectIdentity(project, ids, turnHome, turnUid.provisionPaths);
+					applyTurnGitEnv(env, project, turnHome);
+					for (const root of turnUid.dataRoots)
+						closeProjectDir(join(root, project), ids);
+					prepareRunWorkspace(body.cwd, ids, turnUid.workspaceRoot, project);
+				} catch (err) {
+					return new Response(`turn-uid: ${String(err)}`, { status: 500 });
+				}
+			}
+		}
 		// The provision guard's untracked scan compares against the rules dir as it
 		// stood before omp started (docs/specs/turn-provision-guard.md).
 		const rulesAtStart = opts.rulesAtStart ? opts.rulesAtStart() : undefined;
@@ -434,6 +515,17 @@ export function serveWorker(opts: {
 		// so a kernel kill that lands during this run is distinguishable from one
 		// the container already carried (docs/specs/worker-oom-continue.md).
 		const oomBefore = oomSnapshot(opts.cgroupRoot);
+		// The worker's own lease on the child's pinned layer (OTTR-1132): it lives until the
+		// child closes, so no stream loss, detach, or board settlement can drop it. The
+		// release stays in this closure, off the entry that /detached serializes.
+		let release: () => void;
+		try {
+			release = workerLayerLease(workerHome, env.HOME);
+		} catch (err) {
+			return new Response(`layer lease failed: ${String(err)}`, {
+				status: 500,
+			});
+		}
 		let child: ChildProcess;
 		try {
 			child = spawn(opts.ompPath ?? "omp", body.argv, {
@@ -441,10 +533,18 @@ export function serveWorker(opts: {
 				env,
 				stdio: ["pipe", "pipe", "pipe"],
 				windowsHide: true,
+				...(ids ? { uid: ids.uid, gid: ids.gid } : {}),
 			});
 		} catch (err) {
+			release();
 			return new Response(`spawn failed: ${String(err)}`, { status: 500 });
 		}
+		// A live child can emit "error" after spawn. Only a no-child spawn error releases
+		// before "close"; a live child's lease must remain held.
+		child.on("error", () => {
+			if (child.pid === undefined) release();
+		});
+		child.on("close", release);
 		const forgetChild = (): void => {
 			if (child.pid !== undefined) runChildren.delete(child.pid);
 		};
@@ -493,7 +593,7 @@ export function serveWorker(opts: {
 		const stream = openRunStream({
 			child,
 			entry,
-			notes,
+			notes: runNotes,
 			stdin: body.stdin,
 			state,
 			killTree,
@@ -563,10 +663,22 @@ function validLists(lists: WorkerRequest["lists"]): boolean {
 	);
 }
 
+/** Serialized strings and arrays are not environment records. */
+export function validWorkerEnv(env: unknown): env is Record<string, string> {
+	return (
+		typeof env === "object" &&
+		env !== null &&
+		!Array.isArray(env) &&
+		Object.values(env).every((value) => typeof value === "string")
+	);
+}
+
 /** A /run request is well-formed when argv is all strings, cwd is an existing absolute
  * directory, and the lists are texts. */
 function validRunBody(body: WorkerRequest): boolean {
 	return (
+		typeof body === "object" &&
+		body !== null &&
 		Array.isArray(body.argv) &&
 		body.argv.every((a) => typeof a === "string") &&
 		typeof body.cwd === "string" &&
@@ -574,6 +686,8 @@ function validRunBody(body: WorkerRequest): boolean {
 		isAbsolute(body.cwd) &&
 		existsSync(body.cwd) &&
 		statSync(body.cwd).isDirectory() &&
+		validWorkerEnv(body.env) &&
+		(body.githubReadEnv === undefined || validWorkerEnv(body.githubReadEnv)) &&
 		validLists(body.lists)
 	);
 }
@@ -654,6 +768,35 @@ async function provisionRun(
 	return { notes, pathDir };
 }
 
+/**
+ * The worker's lease on the layer the child's HOME pins (OTTR-1132), as acquireLayerUse's
+ * idempotent release (it never throws: a failed release warns and keeps the protection). Only a
+ * real directory straight below the worker home's `.alate/layers` takes a lease, in the
+ * worker home's own registry: the request never picks the root. Any other HOME (the flat
+ * home, a symlinked or nested path, a foreign home) gets a no-op release. A failed
+ * acquisition throws, so no child reads an unprotected layer.
+ */
+function workerLayerLease(
+	workerHome: string,
+	home: string | undefined,
+): () => void {
+	const none = (): void => {};
+	if (home === undefined || !isAbsolute(home)) return none;
+	let real: string;
+	let layersRoot: string;
+	try {
+		real = realpathSync(home);
+		layersRoot = join(realpathSync(workerHome), ".alate", "layers");
+	} catch {
+		return none;
+	}
+	// Any symlink on the way (a planted layers/<id> link, a linked .alate) changes the
+	// realpath: equality proves HOME is the real layer dir itself.
+	if (real !== home || dirname(real) !== layersRoot) return none;
+	if (!statSync(real).isDirectory()) return none;
+	return acquireLayerUse(workerHome, basename(real));
+}
+
 /** The child's env: request env over the container env, minus every push credential and the
  * alate key; the tools link dir prepended to PATH. */
 function runChildEnv(
@@ -683,8 +826,12 @@ function runChildEnv(
 	// The delivered read-only GitHub token lands last (docs/specs/turn-read-token.md):
 	// it survives every strip above and overrides any ambient name.
 	Object.assign(env, githubReadEnv);
-	// Apply this after every source, including the secondary request environment.
+	// Apply these after every source, including the secondary request environment.
 	delete env.OTTR_DATABASE_URL;
+	// Same strip as childEnv on the server: the SecretBox master key unseals the
+	// sealed credential store; a turn inherits it from neither the container env
+	// nor a request env.
+	delete env.OTTR_SECRET_KEY;
 	// The tools link dir is per tool set: project pins, then _all pins, then the container
 	// PATH. The daemon's own PATH never changes, and two projects never see each
 	// other's pins because the dir is keyed by the project's own tool set.
@@ -962,13 +1109,23 @@ async function dispatchRun(
 	target: WorkerTarget,
 	controller: AbortController,
 ): Promise<Response> {
+	if (
+		!validWorkerEnv(req.env) ||
+		(req.githubReadEnv !== undefined && !validWorkerEnv(req.githubReadEnv))
+	)
+		throw new WorkerConnectError("bad request environment");
+	const env = { ...req.env };
+	delete env.OTTR_DATABASE_URL;
+	const githubReadEnv =
+		req.githubReadEnv === undefined ? undefined : { ...req.githubReadEnv };
+	if (githubReadEnv !== undefined) delete githubReadEnv.OTTR_DATABASE_URL;
 	const res = await fetch(`${url}/run`, {
 		method: "POST",
 		headers: {
 			"content-type": "application/json",
 			...(target.token ? { "x-otwr-token": target.token } : {}),
 		},
-		body: JSON.stringify(req),
+		body: JSON.stringify({ ...req, env, githubReadEnv }),
 		signal: controller.signal,
 		// redirect: "manual": the worker token must never follow a redirect
 		// off-host; a 3xx answer fails the dispatch like any non-200.

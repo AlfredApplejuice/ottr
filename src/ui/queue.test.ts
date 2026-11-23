@@ -362,7 +362,15 @@ test("laneCounts shows a retro that needs the user even in Done", () => {
 	const tasks = [
 		card("r", "done", "needs_you", {
 			kind: "retro",
-			asked: [{ question: "q", options: [], multi: false, recommended: null }],
+			asked: [
+				{
+					question: "q",
+					options: [],
+					multi: false,
+					recommended: null,
+					text: true,
+				},
+			],
 		}),
 	];
 	const { shown, counts } = laneCounts(tasks, "", new Set());
@@ -491,7 +499,15 @@ test("laneCounts keeps waiting and alarm search-unfiltered", () => {
 	const tasks = [
 		card("t1", "todo", "needs_you", { asked: null }), // plain needs: alarm "needs"
 		card("t2", "todo", "needs_you", {
-			asked: [{ question: "q", options: [], multi: false, recommended: null }],
+			asked: [
+				{
+					question: "q",
+					options: [],
+					multi: false,
+					recommended: null,
+					text: true,
+				},
+			],
 		}),
 		card("t3", "merging", "needs_you", { asked: null }),
 	];
@@ -505,7 +521,15 @@ test("laneCounts keeps waiting and alarm search-unfiltered", () => {
 	// Every waiting card holding its question out upgrades the alarm to "asked".
 	const allAsked = [
 		card("t4", "in_progress", "needs_you", {
-			asked: [{ question: "q", options: [], multi: false, recommended: null }],
+			asked: [
+				{
+					question: "q",
+					options: [],
+					multi: false,
+					recommended: null,
+					text: true,
+				},
+			],
 		}),
 	];
 	expect(laneCounts(allAsked, "", new Set()).counts.in_progress.alarm).toBe(

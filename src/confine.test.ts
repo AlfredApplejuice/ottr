@@ -5,6 +5,7 @@ import {
 	closeSync,
 	constants,
 	existsSync,
+	ftruncateSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
@@ -13,9 +14,11 @@ import {
 	readFileSync,
 	readlinkSync,
 	realpathSync,
+	renameSync,
 	rmSync,
 	statSync,
 	symlinkSync,
+	unlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,13 +26,17 @@ import { delimiter, join, relative, sep } from "node:path";
 import {
 	appendLineBelow,
 	copyBelow,
+	isSizeRefusal,
 	mkdirBelow,
 	moveBelow,
 	openDir,
 	readBelow,
+	readBoundedFile,
 	readRegular,
+	readTailBounded,
 	removeBelow,
 	renameBelow,
+	renameProven,
 	touchBelow,
 	trustedAnchor,
 	unlinkBelow,
@@ -182,6 +189,60 @@ describe("renameBelow", () => {
 		);
 		expect(readFileSync(from, "utf8")).toBe("data");
 		expect(readdirSync(outside)).toEqual([]);
+	});
+});
+
+describe("renameProven", () => {
+	test("renames inside the held dir; a parent swapped for a symlink after the walk receives nothing", () => {
+		const { root, anchor } = fixture();
+		const held = join(anchor, "held");
+		mkdirSync(held);
+		const from = join(held, "from");
+		writeFileSync(from, "data");
+		const server = join(root, "server");
+		mkdirSync(server);
+		writeFileSync(join(server, "tasks.db"), "keep");
+		const fd = openSync(from, constants.O_RDONLY);
+		const d = openDir(anchor, held, {});
+		try {
+			// A worker renames the walked dir away and plants a symlink at its name.
+			renameSync(held, join(anchor, "held.moved"));
+			symlinkSync(server, join(anchor, "held"));
+			renameProven(d, "from", "to", fd);
+			// The rename landed in the held dir (now "held.moved"), never through the link.
+			expect(readFileSync(join(anchor, "held.moved", "to"), "utf8")).toBe(
+				"data",
+			);
+			expect(existsSync(join(server, "to"))).toBe(false);
+			expect(readFileSync(join(server, "tasks.db"), "utf8")).toBe("keep");
+		} finally {
+			closeSync(fd);
+			d.close();
+		}
+	});
+
+	test("an entry swapped for a symlink fails the proof and is never followed", () => {
+		const { anchor, outside } = fixture();
+		writeFileSync(join(outside, "keep"), "keep");
+		const held = join(anchor, "held");
+		mkdirSync(held);
+		const fd = openSync(
+			join(held, "from"),
+			constants.O_CREAT | constants.O_WRONLY,
+		);
+		const d = openDir(anchor, held, {});
+		try {
+			// A worker unlinks the entry and plants a symlink to a sentinel under its name.
+			unlinkSync(join(held, "from"));
+			symlinkSync(join(outside, "keep"), join(held, "from"));
+			expect(() => renameProven(d, "from", "to", fd)).toThrow(/refusing/);
+			expect(readFileSync(join(outside, "keep"), "utf8")).toBe("keep");
+			expect(lstatSync(join(held, "from")).isSymbolicLink()).toBe(true);
+			expect(existsSync(join(held, "to"))).toBe(false);
+		} finally {
+			closeSync(fd);
+			d.close();
+		}
 	});
 });
 
@@ -501,14 +562,140 @@ describe("a FIFO in place of the task log", () => {
 
 	test.skipIf(!fifoOk)("readRegular refuses it without hanging", () => {
 		const { log } = fifoLog();
-		expect(() => readRegular(log)).toThrow(/not a regular file/);
+		expect(() => readRegular(log, 1024 * 1024)).toThrow(/not a regular file/);
 	});
 
 	test("readRegular reads a regular file", () => {
 		const { anchor } = fixture();
 		const f = join(anchor, "f");
 		writeFileSync(f, "bytes");
-		expect(readRegular(f).toString()).toBe("bytes");
+		expect(readRegular(f, 1024 * 1024).toString()).toBe("bytes");
+	});
+
+	test("readRegular enforces the cap before reading", () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "f");
+		writeFileSync(f, "1234");
+		expect(() => readRegular(f, 3)).toThrow(/larger than 3 bytes/);
+		expect(readRegular(f, 4).toString()).toBe("1234");
+	});
+
+	test.skipIf(!linux)("readRegular refuses a sparse oversized file", () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "sparse");
+		const fd = openSync(f, "w");
+		ftruncateSync(fd, 64 * 1024 * 1024);
+		closeSync(fd);
+		// fstat before read: the refusal never allocates the 64 MiB.
+		expect(() => readRegular(f, 1024 * 1024)).toThrow(
+			/larger than 1048576 bytes/,
+		);
+		try {
+			readRegular(f, 1024 * 1024);
+			expect.unreachable();
+		} catch (err) {
+			expect(isSizeRefusal(err)).toBe(true);
+		}
+	});
+
+	test.skipIf(!linux)(
+		"readRegular property: a cap at or above the size reads exactly",
+		() => {
+			const { anchor } = fixture();
+			const f = join(anchor, "f");
+			fc.assert(
+				fc.property(
+					fc.uint8Array({ minLength: 0, maxLength: 64 }),
+					fc.integer({ min: -2, max: 2 }),
+					(bytes, slack) => {
+						const cap = bytes.length + slack;
+						writeFileSync(f, bytes);
+						if (cap < bytes.length) {
+							expect(() => readRegular(f, cap)).toThrow(/larger than/);
+						} else {
+							expect(readRegular(f, cap)).toEqual(Buffer.from(bytes));
+						}
+					},
+				),
+			);
+		},
+	);
+});
+
+describe("readBoundedFile", () => {
+	test("reads a regular file back", async () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "f");
+		writeFileSync(f, "bytes");
+		expect((await readBoundedFile(f, 1024 * 1024)).toString()).toBe("bytes");
+	});
+
+	test("refuses an over-cap file with a size refusal; a missing file is not one", async () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "f");
+		writeFileSync(f, "1234");
+		try {
+			await readBoundedFile(f, 3);
+			expect.unreachable();
+		} catch (err) {
+			expect(String(err)).toMatch(/larger than 3 bytes/);
+			expect(isSizeRefusal(err)).toBe(true);
+		}
+		try {
+			await readBoundedFile(join(anchor, "absent"), 1024);
+			expect.unreachable();
+		} catch (err) {
+			expect(err).toMatchObject({ code: "ENOENT" });
+			expect(isSizeRefusal(err)).toBe(false);
+		}
+	});
+
+	test.skipIf(!linux)("refuses a symlink", async () => {
+		const { anchor } = fixture();
+		const real = join(anchor, "real");
+		writeFileSync(real, "bytes");
+		const link = join(anchor, "link");
+		symlinkSync(real, link);
+		await expect(readBoundedFile(link, 1024)).rejects.toThrow(/a symlink/);
+	});
+});
+
+describe("readTailBounded", () => {
+	test("reads [from, size) back", async () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "f");
+		writeFileSync(f, "abcdefgh");
+		expect((await readTailBounded(f, 3, 1024)).toString()).toBe("defgh");
+	});
+
+	test("answers empty when the file ends at or before from", async () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "f");
+		writeFileSync(f, "abc");
+		expect((await readTailBounded(f, 3, 1024)).length).toBe(0);
+		expect((await readTailBounded(f, 10, 1024)).length).toBe(0);
+	});
+
+	test("refuses an over-cap tail with a size refusal", async () => {
+		const { anchor } = fixture();
+		const f = join(anchor, "f");
+		writeFileSync(f, "abcdefgh");
+		try {
+			await readTailBounded(f, 2, 3);
+			expect.unreachable();
+		} catch (err) {
+			expect(String(err)).toMatch(/larger than 3 bytes/);
+			expect(isSizeRefusal(err)).toBe(true);
+		}
+	});
+
+	test.skipIf(!linux)("refuses a symlink", async () => {
+		const { anchor } = fixture();
+		const real = join(anchor, "real");
+		writeFileSync(real, "bytes");
+		const link = join(anchor, "link");
+		symlinkSync(real, link);
+		await expect(readTailBounded(link, 0, 1024)).rejects.toThrow(/a symlink/);
 	});
 });
 

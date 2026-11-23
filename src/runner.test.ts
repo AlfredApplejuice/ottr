@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from "bun:test";
-import type { ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
@@ -34,6 +34,7 @@ import {
 	findHttp400Rejection,
 	hitUsageLimit,
 	NO_DISCOVERY_CONFIG,
+	NO_FETCH_CONFIG,
 	newEventState,
 	OOM_KILL,
 	QUOTA_LIMIT,
@@ -47,10 +48,12 @@ import {
 	vmProviders,
 	vmRunnerFromEnv,
 	WORKER_LOST,
+	withoutGitAuth,
 	workerFromEnv,
 	workerTurnLists,
 } from "./runner.ts";
 import fc from "./test/properties.ts";
+import { CARD_ENV_NOTE } from "./tokens.ts";
 import type {
 	GitFacts,
 	Next,
@@ -123,7 +126,9 @@ const compiledFakeOmp = (
 	const jsTmp = `${js}.${process.pid}.tmp`;
 	writeFileSync(jsTmp, source);
 	renameSync(jsTmp, js);
-	const exeTmp = `${exe}.${process.pid}.tmp`;
+	// Ends in .exe: on Windows `bun build --compile` appends .exe to any other outfile, and
+	// the rename below then finds no file.
+	const exeTmp = `${exe}.${process.pid}.tmp.exe`;
 	Bun.spawnSync([
 		process.execPath,
 		"build",
@@ -807,6 +812,24 @@ describe("renderEvent", () => {
 				},
 			}),
 		).toBe("\n▸ ask\n  ? Which way?\n    • A\n    • B — safer\n");
+	});
+
+	test("ask start renders a text question as a type-your-answer line", () => {
+		expect(
+			renderEvent({
+				type: "tool_execution_start",
+				toolCallId: "t9",
+				toolName: "ask",
+				args: {
+					questions: [
+						{ question: "What name?" },
+						{ question: "Which way?", options: [{ label: "A" }] },
+					],
+				},
+			}),
+		).toBe(
+			"\n▸ ask\n  ? What name?\n    • <type your answer>\n  ? Which way?\n    • A\n",
+		);
 	});
 
 	test("task tool is not mistaken for ask", () => {
@@ -1652,6 +1675,7 @@ describe("classify", () => {
 			options: [{ label: "A" }, { label: "B" }],
 			multi: false,
 			recommended: null,
+			text: false,
 		},
 	];
 
@@ -1670,6 +1694,22 @@ describe("classify", () => {
 			),
 		).toMatchObject({
 			needsReason: `Wants your answer: ${"x".repeat(160)}…`,
+		});
+		// A text question carries through needs_you unchanged too.
+		const textAsk = [
+			{
+				question: "Which way?",
+				options: [],
+				multi: false,
+				recommended: null,
+				text: true,
+			},
+		];
+		expect(run("work", result({ asked: textAsk }))).toEqual({
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: "Wants your answer: Which way?",
+			asked: textAsk,
 		});
 	});
 
@@ -1952,6 +1992,56 @@ describe("classify", () => {
 		});
 	});
 
+	test("9a. merge superseded closes done with a follow-up id, parks without one", () => {
+		expect(
+			run(
+				"merge",
+				result({
+					outcome: outcome({
+						status: "superseded",
+						summary: "main's flow covers it",
+						followUp: "OTTR-1181",
+					}),
+				}),
+			),
+		).toEqual({ stage: "done", state: "idle", needsReason: null });
+		const without = run(
+			"merge",
+			result({ outcome: outcome({ status: "superseded", summary: "gone" }) }),
+		);
+		expect(without).toEqual({
+			stage: "merging",
+			state: "needs_you",
+			needsReason:
+				"Reported superseded, but the report carries no follow-up card id. File the gap card with create_task, then reply and pass its id in followUp.",
+		});
+		expect(
+			run(
+				"merge",
+				result({
+					outcome: outcome({
+						status: "superseded",
+						summary: "gone",
+						followUp: "   ",
+					}),
+				}),
+			),
+		).toEqual(without);
+	});
+
+	test("9b. a work turn's superseded report is rejected once", () => {
+		expect(
+			run(
+				"work",
+				result({ outcome: outcome({ status: "superseded", summary: "gone" }) }),
+			),
+		).toEqual({
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: "Work turns do not close as superseded; report ready.",
+		});
+	});
+
 	test("10. needs_you outcome prefers trimmed question, falls back to summary", () => {
 		expect(
 			run(
@@ -2024,6 +2114,7 @@ describe("classify grill", () => {
 					options: [],
 					multi: false,
 					recommended: null,
+					text: true,
 				},
 			],
 		});
@@ -2295,6 +2386,36 @@ describe("applyEvent", () => {
 			risk: "none found",
 			check: "bun test",
 		});
+	});
+
+	test("a decision rides in the summary and on the proposal, and survives a missing summary field", () => {
+		const full = newEventState();
+		const fields = { prompt: "P", whatChanges: "w", why: "y", gain: "g" };
+		feed(
+			full,
+			proposeStart("p1", { ...fields, check: "c", decision: " pick A or B " }),
+			proposeEnd("p1"),
+		);
+		expect(full.proposed?.decision).toBe("pick A or B");
+		expect(full.proposed?.summary?.decision).toBe("pick A or B");
+		// check missing: no summary, but the decision still holds the card.
+		const partial = newEventState();
+		feed(
+			partial,
+			proposeStart("p1", { ...fields, decision: "pick A or B" }),
+			proposeEnd("p1"),
+		);
+		expect(partial.proposed?.summary).toBeNull();
+		expect(partial.proposed?.decision).toBe("pick A or B");
+		// A blank decision is none.
+		const blank = newEventState();
+		feed(
+			blank,
+			proposeStart("p1", { ...fields, check: "c", decision: "  " }),
+			proposeEnd("p1"),
+		);
+		expect(blank.proposed?.decision).toBeUndefined();
+		expect(blank.proposed?.summary?.decision).toBeUndefined();
 	});
 
 	test("an absent or non-string risk defaults to none found", () => {
@@ -2891,6 +3012,7 @@ describe("applyEvent", () => {
 				options: [{ label: "a" }],
 				multi: false,
 				recommended: null,
+				text: false,
 			},
 		]);
 	});
@@ -2933,6 +3055,26 @@ describe("applyEvent", () => {
 				options: [{ label: "y" }],
 				multi: false,
 				recommended: null,
+				text: false,
+			},
+		]);
+	});
+
+	test("m. a text question takes the ask slot normalized with text set", () => {
+		const s = newEventState();
+		feed(s, {
+			type: "tool_execution_start",
+			toolName: "ask",
+			toolCallId: "a1",
+			args: { questions: [{ question: "Name the branch?" }] },
+		});
+		expect(s.asked).toEqual([
+			{
+				question: "Name the branch?",
+				options: [],
+				multi: false,
+				recommended: null,
+				text: true,
 			},
 		]);
 	});
@@ -2979,6 +3121,152 @@ function fakeStart(o: {
 		launcher,
 	}).then((handle) => ({ handle, fake }));
 }
+
+/** OTTR-990: a local run must park the worktree's custom-tool dirs out of omp's
+ * discovery for the run and restore them at settle. The launcher sees the cwd exactly
+ * when omp would import the planted modules, so the parked state is asserted there.
+ * This list is the test's own spec, deliberately not read from the code's
+ * CUSTOM_TOOL_DIRS: a change that drops one of the five dirs from the code's list must
+ * fail here (the planted dir would still sit at its discovery path at spawn), not pass
+ * because the expectation shrank with the bug. */
+const PARKED_RELS = [
+	".omp/tools",
+	".omp/plugins",
+	".claude/tools",
+	".claude/plugins",
+	".codex/tools",
+] as const;
+
+describe("startRun custom-tool park", () => {
+	/** Plants every parked dir and runs one local startRun whose launcher records the
+	 * cwd's park shape at spawn, then closes the child cleanly. */
+	async function plantedRun(cwd: string) {
+		const atSpawn: Record<string, boolean> = {};
+		const fake = new FakeOmp(4242);
+		const launcher: RunLauncher = (_c, _a, options) => {
+			for (const rel of PARKED_RELS)
+				atSpawn[rel] = existsSync(join(String(options.cwd), rel));
+			queueMicrotask(() => fake.emit("close", 0));
+			return fake as unknown as ChildProcess;
+		};
+		const handle = await startRun({
+			cwd,
+			prompt: "check the work",
+			sessionDir: cwd,
+			extensionPath: "/unused.ts",
+			resumeId: null,
+			logPath: join(dirname(cwd), `${basename(cwd)}-park.log`),
+			dataRoot: dirname(cwd),
+			launcher,
+		});
+		return { handle, atSpawn };
+	}
+
+	/** Every parked dir must be out of omp's sight at spawn: an entry still present is a
+	 * planted module omp would import into the server process. */
+	function expectAllParked(atSpawn: Record<string, boolean>): void {
+		expect(atSpawn).toEqual(
+			Object.fromEntries(PARKED_RELS.map((rel) => [rel, false])),
+		);
+	}
+
+	test("parks planted custom-tool dirs at spawn and restores their content after", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-park-"));
+		try {
+			const planted =
+				'.omp/tools/planted.ts\nexport default () => ({ name: "planted" });\n';
+			for (const rel of PARKED_RELS) {
+				mkdirSync(join(dir, rel), { recursive: true });
+				writeFileSync(join(dir, rel, "planted.ts"), planted);
+			}
+			const { handle, atSpawn } = await plantedRun(dir);
+			const result = await handle.done;
+			// omp would import the planted modules from these exact paths at spawn: none
+			// of the five discovery targets may exist while the run owns the cwd.
+			expectAllParked(atSpawn);
+			expect(result.exitCode).toBe(0);
+			// Every planted dir is back, byte for byte, and no park sibling remains.
+			for (const rel of PARKED_RELS) {
+				expect(readFileSync(join(dir, rel, "planted.ts"), "utf8")).toBe(
+					planted,
+				);
+				expect(existsSync(join(dir, `${rel}.ottr-boardrun`))).toBe(false);
+			}
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("heals a crash leftover parked at the stable sibling", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-park-heal-"));
+		try {
+			mkdirSync(join(dir, ".omp", "tools.ottr-boardrun"), { recursive: true });
+			writeFileSync(
+				join(dir, ".omp", "tools.ottr-boardrun", "planted.ts"),
+				"committed\n",
+			);
+			const { handle, atSpawn } = await plantedRun(dir);
+			await handle.done;
+			// The heal runs before the spawn, so the leftover content sits at the park
+			// target again while the run owns the cwd.
+			expectAllParked(atSpawn);
+			expect(
+				readFileSync(join(dir, ".omp", "tools", "planted.ts"), "utf8"),
+			).toBe("committed\n");
+			expect(existsSync(join(dir, ".omp", "tools.ottr-boardrun"))).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("fails closed before the spawn when a park target cannot be freed", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-park-full-"));
+		try {
+			mkdirSync(join(dir, ".omp", "tools"), { recursive: true });
+			writeFileSync(join(dir, ".omp", "tools", "planted.ts"), "committed\n");
+			// Exhaust `.omp/plugins`' park targets: the dir exists and the stable sibling
+			// plus every numbered one, so its park fails after `.omp/tools` parked.
+			mkdirSync(join(dir, ".omp", "plugins"), { recursive: true });
+			mkdirSync(join(dir, ".omp", "plugins.ottr-boardrun"), {
+				recursive: true,
+			});
+			for (let n = 2; n < 64; n++)
+				mkdirSync(join(dir, `.omp`, `plugins.ottr-boardrun-${n}`), {
+					recursive: true,
+				});
+			let spawned = false;
+			const fake = new FakeOmp();
+			const launcher: RunLauncher = () => {
+				spawned = true;
+				return fake as unknown as ChildProcess;
+			};
+			let failure: unknown = null;
+			try {
+				await startRun({
+					cwd: dir,
+					prompt: "check the work",
+					sessionDir: dir,
+					extensionPath: "/unused.ts",
+					resumeId: null,
+					logPath: join(dirname(dir), "park-full.log"),
+					dataRoot: dirname(dir),
+					launcher,
+				});
+			} catch (err) {
+				failure = err;
+			}
+			expect(spawned).toBe(false);
+			expect(String(failure)).toContain("custom-tool park failed");
+			// The partial park unwound: the planted content sits at its own path again.
+			expect(
+				readFileSync(join(dir, ".omp", "tools", "planted.ts"), "utf8"),
+			).toBe("committed\n");
+			expect(existsSync(join(dir, ".omp", "tools.ottr-boardrun"))).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
 
 describe("startRun", () => {
 	test("session and findings persist in arrival order before local completion", async () => {
@@ -3206,6 +3494,9 @@ describe("startRun", () => {
 			expect(seen[0]).toContain("--no-extensions");
 			expect(seen[0]).toContain("--no-lsp");
 			expect(seen[0]).toContain(NO_DISCOVERY_CONFIG);
+			// OTTR-982: a board-side run reads worker-written content next to the server's
+			// zero-auth loopback API, so the read tool must not fetch URLs.
+			expect(seen[0]).toContain(NO_FETCH_CONFIG);
 			expect(r.ranOn).toBe(`board (${hostname()})`);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
@@ -3293,11 +3584,13 @@ describe("startRun", () => {
 				"--config",
 				"--config",
 				"--config",
+				"--config",
 			]);
 			expect(seen[0]!.filter((a) => a.endsWith(".yml"))).toEqual([
 				NO_DISCOVERY_CONFIG,
 				pluginSkillsOverlayPath({ OTTR_DATA_DIR: dataDir }, empty),
 				join(dataDir, "omp-memory.yml"),
+				NO_FETCH_CONFIG,
 			]);
 		} finally {
 			if (ambientDataDir === undefined) delete process.env.OTTR_DATA_DIR;
@@ -3944,6 +4237,35 @@ describe("startRun worker dispatch", () => {
 		}
 	});
 
+	test("a worker run carries no board-side no-fetch overlay", async () => {
+		// OTTR-982: the no-fetch overlay hardens only the server's own runs (they sit
+		// next to the zero-auth loopback API); a worker run keeps its URL reads.
+		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-nofetch-"));
+		let argv: string[] | null = null;
+		const server = Bun.serve({
+			port: 0,
+			fetch: async (req) => {
+				const body = (await req.json()) as { argv?: string[] };
+				argv = body.argv ?? null;
+				return new Response("spawn failed: recorded", { status: 500 });
+			},
+		});
+		try {
+			const handle = await startRun({
+				...baseOpts(dir, join(dir, "run.log")),
+				worker: { urls: [`http://127.0.0.1:${server.port}`] },
+			});
+			await handle.done;
+			const sent: string[] = argv ?? [];
+			expect(sent.length).toBeGreaterThan(0);
+			expect(sent).not.toContain(NO_FETCH_CONFIG);
+			expect(sent).toContain(NO_DISCOVERY_CONFIG);
+		} finally {
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("a worker never receives the board's GitHub token or data dir (D6)", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-"));
 		let forwarded: object | null = null;
@@ -4545,6 +4867,7 @@ describe("arch-review changed-line coverage", () => {
 						options: [{ label: "y" }],
 						multi: false,
 						recommended: null,
+						text: false,
 					},
 				],
 				proposed: null,
@@ -4646,11 +4969,14 @@ mock.module("node:os", () => ({
 
 // A compiled worker omp stand-in that reports its env and holds the run open until a
 // release file appears, so the test can switch the layer under a live run.
-const layerOmpSource = `import { writeFileSync, existsSync } from "node:fs";
+const layerOmpSource = `import { writeFileSync, existsSync, readFileSync } from "node:fs";
 writeFileSync(process.env.LAYER_ENV_OUT, JSON.stringify(process.env));
 const release = process.env.LAYER_RELEASE;
 const t0 = Date.now();
 while (!existsSync(release) && Date.now() - t0 < 20000) {}
+// OTTR-1132: after the release, read the listed files below HOME (the pinned layer).
+const readOut = process.env.LAYER_READ_OUT;
+if (readOut) writeFileSync(readOut, JSON.stringify(Object.fromEntries((process.env.LAYER_READ ?? "").split(",").map((p) => [p, readFileSync(process.env.HOME + "/" + p, "utf8")]))));
 process.stdout.write(JSON.stringify({ type: "session", id: "sess-layer" }) + "\\n");
 process.stdout.write(JSON.stringify({ type: "agent_end", isTerminal: true }) + "\\n");
 `;
@@ -4685,6 +5011,21 @@ async function until(pred: () => boolean): Promise<void> {
 	for (let i = 0; i < 200 && !pred(); i++)
 		await new Promise((r) => setTimeout(r, 25));
 	if (!pred()) throw new Error("timed out waiting for the fake omp child");
+}
+
+/** Poll for the fake omp child's env file until it parses: writeFileSync is not
+ * atomic, so existsSync can fire while the write is still landing (the suite
+ * read truncated JSON under load). */
+async function untilEnv(out: string): Promise<Record<string, string>> {
+	await until(() => {
+		try {
+			JSON.parse(readFileSync(out, "utf8"));
+			return true;
+		} catch {
+			return false;
+		}
+	});
+	return JSON.parse(readFileSync(out, "utf8")) as Record<string, string>;
 }
 
 describe("startRun agent layer pinning", () => {
@@ -4738,10 +5079,7 @@ describe("startRun agent layer pinning", () => {
 			const h1 = await startRun(workerOpts(out1, rel1));
 			expect(h1.pid).toBeNull();
 			expect(h1.layerId).toBe("A");
-			await until(() => existsSync(out1));
-			const env1: Record<string, string> = JSON.parse(
-				readFileSync(out1, "utf8"),
-			);
+			const env1 = await untilEnv(out1);
 			expect(env1.HOME).toBe(realpathSync(aDir));
 			expect(env1.PI_CODING_AGENT_DIR).toBe(
 				join(realpathSync(aDir), ".omp", "agent"),
@@ -4761,10 +5099,7 @@ describe("startRun agent layer pinning", () => {
 			switchCurrentTo(shared, "B");
 			const h2 = await startRun(workerOpts(out2, rel2));
 			expect(h2.layerId).toBe("B");
-			await until(() => existsSync(out2));
-			const env2: Record<string, string> = JSON.parse(
-				readFileSync(out2, "utf8"),
-			);
+			const env2 = await untilEnv(out2);
 			expect(env1.HOME).toBe(realpathSync(aDir)); // run 1 never moved
 			expect(env2.HOME).toBe(realpathSync(bDir));
 			expect(env2.PI_CODING_AGENT_DIR).toBe(
@@ -5029,6 +5364,569 @@ describe("startRun agent layer pinning", () => {
 	});
 });
 
+// --- Layer leases (OTTR-1132) ------------------------------------------------
+
+describe("startRun layer leases (OTTR-1132)", () => {
+	type Opts = Parameters<typeof startRun>[0];
+	const KEYS = [
+		"OTTR_BOARD_OMP_HOME",
+		"PI_CODING_AGENT_DIR",
+		"OTTR_DATA_DIR",
+		"OTTR_WORKERS_HOME",
+	];
+
+	/** One temp home that is both the board home and the shared home, so local, worker
+	 * and VM runs lease from one registry. Every held run registers its release in
+	 * `cleanups`; the finally releases and awaits each natural exit, also after a failed
+	 * assertion. Nothing here deletes a file or kills a process. */
+	async function inLeaseHome(
+		fn: (
+			home: string,
+			run: string,
+			cleanups: (() => Promise<unknown>)[],
+		) => Promise<void>,
+	): Promise<void> {
+		const saved = Object.fromEntries(KEYS.map((k) => [k, process.env[k]]));
+		const home = mkdtempSync(join(tmpdir(), "ottr-lease-home-"));
+		const run = mkdtempSync(join(tmpdir(), "ottr-lease-run-"));
+		const cleanups: (() => Promise<unknown>)[] = [];
+		try {
+			for (const k of KEYS) delete process.env[k];
+			testHome = home;
+			await fn(home, run, cleanups);
+		} finally {
+			await Promise.allSettled(cleanups.map((c) => c()));
+			testHome = null;
+			for (const k of KEYS) {
+				if (saved[k] === undefined) delete process.env[k];
+				else process.env[k] = saved[k];
+			}
+		}
+	}
+
+	/** Distinct leased ids through the public reader. */
+	const leased = (home: string): string[] =>
+		[...new Set(readLayerUse(home).map((e) => e.id))].sort();
+
+	/** The ids Alate reads: in-use.json keeps exactly {layers:[{id,since}]}. */
+	function publicIds(home: string): string[] {
+		const file = join(home, ".alate", "in-use.json");
+		if (!existsSync(file)) return [];
+		const raw = JSON.parse(readFileSync(file, "utf8")) as {
+			layers: { id: string; since: number }[];
+		};
+		expect(Object.keys(raw)).toEqual(["layers"]);
+		for (const e of raw.layers) {
+			expect(Object.keys(e).sort()).toEqual(["id", "since"]);
+			expect(typeof e.since).toBe("number");
+		}
+		return [...new Set(raw.layers.map((e) => e.id))].sort();
+	}
+
+	/** Alate's clean-up rule (docs/specs/agent-layer-switch.md): a layer may go only when it
+	 * is not current, not the previous layer, and absent from in-use.json. */
+	function deletable(home: string, previous: string): string[] {
+		const current = basename(realpathSync(join(home, ".alate", "current")));
+		const inUse = new Set(publicIds(home));
+		return readdirSync(join(home, ".alate", "layers"))
+			.filter((id) => id !== current && id !== previous && !inUse.has(id))
+			.sort();
+	}
+
+	function localOpts(
+		run: string,
+		name: string,
+		over: Partial<Opts> = {},
+	): Opts {
+		return {
+			cwd: run,
+			prompt: "do it",
+			sessionDir: join(run, "sessions"),
+			extensionPath: null,
+			resumeId: null,
+			logPath: join(run, `${name}.log`),
+			dataRoot: run,
+			memoryConfigPath: null,
+			...over,
+		};
+	}
+
+	const realLaunch: RunLauncher = (_c, a, options) =>
+		spawn(layerOmp, a, options);
+
+	/** A real layer-omp child (local, or on `worker`) that runs until its release file
+	 * appears; `settle` writes the file and awaits the natural exit. */
+	async function heldReal(
+		run: string,
+		name: string,
+		cleanups: (() => Promise<unknown>)[],
+		o: { worker?: string; env?: Record<string, string> } = {},
+	) {
+		const out = join(run, `${name}.env.json`);
+		const release = join(run, `${name}.release`);
+		const handle = await startRun(
+			localOpts(run, name, {
+				env: { LAYER_ENV_OUT: out, LAYER_RELEASE: release, ...o.env },
+				...(o.worker === undefined
+					? { launcher: realLaunch }
+					: {
+							worker: { urls: [o.worker] },
+							extensionPath: join(run, "ext.ts"),
+						}),
+			}),
+		);
+		const settle = async () => {
+			writeFileSync(release, "go\n");
+			return handle.done;
+		};
+		cleanups.push(settle);
+		const env = await untilEnv(out);
+		return { handle, env, settle };
+	}
+
+	/** A FakeOmp-held local run; `settle` emits close and awaits the result. */
+	async function heldFake(
+		run: string,
+		name: string,
+		cleanups: (() => Promise<unknown>)[],
+	) {
+		const fake = new FakeOmp();
+		const handle = await startRun(
+			localOpts(run, name, {
+				launcher: () => fake as unknown as ChildProcess,
+			}),
+		);
+		const settle = async () => {
+			fake.emit("close", 0);
+			return handle.done;
+		};
+		cleanups.push(settle);
+		return { handle, settle };
+	}
+
+	test("overlapping local runs on one layer: the first settle keeps the lease, the last clears it, layer B stays independent", async () => {
+		await inLeaseHome(async (home, run, cleanups) => {
+			const aDir = makeLayerDir(home, "A");
+			switchCurrentTo(home, "A");
+			const a1 = await heldReal(run, "a1", cleanups);
+			const a2 = await heldReal(run, "a2", cleanups);
+			expect(a1.handle.layerId).toBe("A");
+			expect(a2.handle.layerId).toBe("A");
+			expect(a1.env.HOME).toBe(realpathSync(aDir));
+			expect(a2.env.HOME).toBe(realpathSync(aDir));
+			expect(leased(home)).toEqual(["A"]);
+			const bDir = makeLayerDir(home, "B");
+			switchCurrentTo(home, "B");
+			const b = await heldReal(run, "b", cleanups);
+			expect(b.env.HOME).toBe(realpathSync(bDir));
+			expect(leased(home)).toEqual(["A", "B"]);
+
+			expect((await a1.settle()).exitCode).toBe(0);
+			// a2 still reads A: a1's release drops only a1's holder.
+			expect(leased(home)).toEqual(["A", "B"]);
+			expect(publicIds(home)).toEqual(["A", "B"]);
+			expect((await a2.settle()).exitCode).toBe(0);
+			expect(leased(home)).toEqual(["B"]);
+			expect((await b.settle()).exitCode).toBe(0);
+			expect(leased(home)).toEqual([]);
+		});
+	}, 30_000);
+
+	test("a local spawn error settles once and releases only its own lease, even when close follows", async () => {
+		await inLeaseHome(async (home, run, cleanups) => {
+			makeLayerDir(home, "A");
+			switchCurrentTo(home, "A");
+			const holder = await heldFake(run, "holder", cleanups);
+			const fake = new FakeOmp();
+			const failed = await startRun(
+				localOpts(run, "enoent", {
+					launcher: () => fake as unknown as ChildProcess,
+				}),
+			);
+			expect(failed.layerId).toBe("A");
+			fake.emit("error", new Error("spawn omp ENOENT"));
+			fake.emit("close", null); // a second settle call must not release again
+			expect((await failed.done).exitCode).toBeNull();
+			expect(leased(home)).toEqual(["A"]);
+			await holder.settle();
+			expect(leased(home)).toEqual([]);
+		});
+	});
+
+	test("overlapping worker runs on one layer: the first settle and a lost dispatch keep the lease, the last clears it", async () => {
+		await inLeaseHome(async (home, run, cleanups) => {
+			const aDir = makeLayerDir(home, "A");
+			switchCurrentTo(home, "A");
+			const server = serveWorker({ port: 0, ompPath: layerOmp });
+			const url = `http://127.0.0.1:${server.port}`;
+			// A server that was stopped: the port refuses connections immediately.
+			const dead = Bun.serve({ port: 0, fetch: () => new Response("x") });
+			const deadUrl = `http://127.0.0.1:${dead.port}`;
+			dead.stop(true);
+			cleanups.push(async () => server.stop());
+			const w1 = await heldReal(run, "w1", cleanups, { worker: url });
+			const w2 = await heldReal(run, "w2", cleanups, { worker: url });
+			expect(w1.handle.layerId).toBe("A");
+			expect(w1.env.HOME).toBe(realpathSync(aDir));
+			expect(w2.env.HOME).toBe(realpathSync(aDir));
+			expect(leased(home)).toEqual(["A"]);
+
+			const lost = await (
+				await startRun(
+					localOpts(run, "lost", {
+						worker: { urls: [deadUrl] },
+						extensionPath: join(run, "ext.ts"),
+					}),
+				)
+			).done;
+			expect(lost.workerLost).toBe(true);
+			expect(leased(home)).toEqual(["A"]);
+
+			const bDir = makeLayerDir(home, "B");
+			switchCurrentTo(home, "B");
+			const wb = await heldReal(run, "wb", cleanups, { worker: url });
+			expect(wb.env.HOME).toBe(realpathSync(bDir));
+
+			expect((await w1.settle()).exitCode).toBe(0);
+			expect(leased(home)).toEqual(["A", "B"]);
+			expect((await w2.settle()).exitCode).toBe(0);
+			// The worker side may release its own child lease a moment after the result.
+			await until(() => leased(home).join() === "B");
+			expect((await wb.settle()).exitCode).toBe(0);
+			await until(() => leased(home).length === 0);
+		});
+	}, 30_000);
+
+	test("isolated retention: a live holder keeps A through three switches and reads its own bytes; the last settle frees A", async () => {
+		await inLeaseHome(async (home, run, cleanups) => {
+			const aDir = makeLayerDir(home, "A");
+			const skill = join(aDir, ".agents", "skills", "keep", "SKILL.md");
+			mkdirSync(dirname(skill), { recursive: true });
+			writeFileSync(skill, "---\nname: keep\n---\nA skill bytes\n");
+			const installed = {
+				".omp/agent/config.yml": readFileSync(
+					join(aDir, ".omp", "agent", "config.yml"),
+					"utf8",
+				),
+				".agents/skills/keep/SKILL.md": readFileSync(skill, "utf8"),
+			};
+			switchCurrentTo(home, "A");
+			const readOut = join(run, "a2.read.json");
+			const a1 = await heldReal(run, "a1", cleanups);
+			const a2 = await heldReal(run, "a2", cleanups, {
+				env: {
+					LAYER_READ: Object.keys(installed).join(","),
+					LAYER_READ_OUT: readOut,
+				},
+			});
+			expect((await a1.settle()).exitCode).toBe(0);
+			for (const id of ["B", "C", "D"]) {
+				makeLayerDir(home, id);
+				switchCurrentTo(home, id);
+			}
+			// current D, previous C: the public registry keeps A out of the candidates.
+			expect(publicIds(home)).toEqual(["A"]);
+			expect(deletable(home, "C")).toEqual(["B"]);
+
+			expect((await a2.settle()).exitCode).toBe(0);
+			expect(a2.env.HOME).toBe(realpathSync(aDir));
+			// The holder read its skill and config bytes after the rotation, as installed.
+			expect(JSON.parse(readFileSync(readOut, "utf8"))).toEqual(installed);
+			expect(publicIds(home)).toEqual([]);
+			expect(deletable(home, "C")).toEqual(["A", "B"]);
+			expect(existsSync(skill)).toBe(true); // this test deletes no layer
+		});
+	}, 30_000);
+
+	test("microVM settlements (done, busy, lost) release only their own lease and still revoke the token", async () => {
+		await inLeaseHome(async (home, run, cleanups) => {
+			makeLayerDir(home, "A");
+			switchCurrentTo(home, "A");
+			const holder = await heldFake(run, "holder", cleanups);
+			const tokens = new VmTokens({ file: null });
+			for (const answer of ["run", "busy", "lost"] as const) {
+				const seen: string[] = [];
+				const server = Bun.serve({
+					port: 0,
+					fetch: async (req) => {
+						const body = (await req.json()) as WorkerRequest;
+						seen.push(body.vm?.token ?? "");
+						if (answer === "busy")
+							return new Response("busy", {
+								status: 503,
+								headers: { "x-ottr-busy": "1" },
+							});
+						if (answer === "lost") return new Response("down", { status: 503 });
+						return new Response(
+							[
+								JSON.stringify({
+									[WORKER_DONE]: {
+										exitCode: 0,
+										stderrTail: "",
+										host: "vm",
+										vm: { head: "a".repeat(40), pushError: null, dirty: [] },
+									},
+								}),
+								"",
+							].join("\n"),
+						);
+					},
+				});
+				try {
+					const handle = await startRun(
+						vmLeaseOpts(run, answer, tokens, `http://127.0.0.1:${server.port}`),
+					);
+					expect(handle.layerId).toBe("A");
+					const r = await handle.done;
+					if (answer === "busy") expect(r.workerBusy).toBe(true);
+					if (answer === "lost") expect(r.workerLost).toBe(true);
+					if (answer === "run") expect(r.exitCode).toBe(0);
+					expect(seen).toHaveLength(1);
+					expect(tokens.check(seen[0])).toBeNull();
+					expect(leased(home)).toEqual(["A"]);
+				} finally {
+					server.stop();
+				}
+			}
+			await holder.settle();
+			expect(leased(home)).toEqual([]);
+		});
+	});
+
+	function vmLeaseOpts(
+		run: string,
+		name: string,
+		tokens: VmTokens,
+		url: string,
+		over: Partial<Opts> = {},
+	): Opts {
+		mkdirSync(join(run, "sessions"), { recursive: true });
+		return localOpts(run, name, {
+			extensionPath: join(tmpdir(), "ext.ts"),
+			model: "anthropic/claude-x",
+			board: {
+				url: "http://127.0.0.1:4747",
+				token: "boot-token",
+				project: "p",
+				taskId: "P-1",
+			},
+			launcher: (() => {
+				throw new Error("a microVM turn must never spawn locally");
+			}) as RunLauncher,
+			vm: {
+				target: { urls: [url], token: "wtok" },
+				tokens,
+				grant: {
+					project: "p",
+					taskId: "P-1",
+					branch: "ott/p-1-x",
+					repoPath: "/workspace/p",
+					worktree: "/workspace/p/.worktrees/P-1",
+				},
+				base: "sha-base",
+				boardUrl: "http://ottr:8080",
+				providers: ["anthropic"],
+				hindsight: false,
+			},
+			...over,
+		});
+	}
+
+	/** VmTokens that record each raw token startRun issues, so a test can check its revoke. */
+	function spiedTokens(): { tokens: VmTokens; issued: string[] } {
+		const tokens = new VmTokens({ file: null });
+		const issued: string[] = [];
+		const issue = tokens.issue.bind(tokens);
+		tokens.issue = (grant) => {
+			const raw = issue(grant);
+			issued.push(raw);
+			return raw;
+		};
+		return { tokens, issued };
+	}
+
+	test("a lease acquisition failure stops a microVM dispatch before the request and revokes its token", async () => {
+		await inLeaseHome(async (home, run) => {
+			makeLayerDir(home, "A");
+			switchCurrentTo(home, "A");
+			// The lease lock dir is a regular file: the lease cannot be recorded.
+			writeFileSync(join(home, ".alate", "leases"), "not a dir\n");
+			const requests: string[] = [];
+			const server = Bun.serve({
+				port: 0,
+				fetch: (req) => {
+					requests.push(req.url);
+					return new Response("down", { status: 503 });
+				},
+			});
+			try {
+				const { tokens, issued } = spiedTokens();
+				await expect(
+					startRun(
+						vmLeaseOpts(
+							run,
+							"vm-acquire",
+							tokens,
+							`http://127.0.0.1:${server.port}`,
+						),
+					),
+				).rejects.toThrow();
+				expect(requests).toEqual([]);
+				expect(issued).toHaveLength(1);
+				expect(tokens.check(issued[0])).toBeNull();
+				expect(leased(home)).toEqual([]);
+			} finally {
+				server.stop();
+			}
+		});
+	});
+
+	test("a microVM setup failure releases its lease and revokes its issued token", async () => {
+		await inLeaseHome(async (home, run) => {
+			makeLayerDir(home, "A");
+			switchCurrentTo(home, "A");
+			const { tokens, issued } = spiedTokens();
+			await expect(
+				startRun(
+					vmLeaseOpts(run, "vm-invalid", tokens, "http://127.0.0.1:9", {
+						config: join(run, "extra.yml"),
+					}),
+				),
+			).rejects.toThrow(/config overlays not copied into the VM/);
+			expect(issued).toHaveLength(1);
+			expect(tokens.check(issued[0])).toBeNull();
+			expect(leased(home)).toEqual([]);
+		});
+	});
+
+	const UNEXPECTED_SPAWN = "unexpected spawn";
+	const noSpawn: RunLauncher = () => {
+		throw new Error(UNEXPECTED_SPAWN);
+	};
+	/** A regular file where a directory belongs: every confined overlay write under it fails. */
+	const plantedDataFile = (run: string): string => {
+		const file = join(run, "data-is-a-file");
+		writeFileSync(file, "not a dir\n");
+		return file;
+	};
+	const setupFailures: {
+		name: string;
+		arrange: (run: string) => {
+			env?: Record<string, string>;
+			over: Partial<Opts>;
+		};
+		error?: RegExp;
+	}[] = [
+		{
+			name: "memory overlay write",
+			arrange: (run) => ({
+				env: { OTTR_DATA_DIR: plantedDataFile(run) },
+				over: { memoryConfigPath: undefined, launcher: noSpawn },
+			}),
+		},
+		{
+			name: "plugin-skills overlay write",
+			arrange: (run) => ({
+				env: { OTTR_DATA_DIR: plantedDataFile(run) },
+				over: { memoryConfigPath: null, launcher: noSpawn },
+			}),
+		},
+		{
+			name: "identity probe",
+			arrange: () => ({
+				over: {
+					launcher: noSpawn,
+					gitProbe: async () => {
+						throw new Error("git probe failed");
+					},
+				},
+			}),
+			error: /git probe failed/,
+		},
+		{
+			name: "synchronous local launch",
+			arrange: () => ({
+				over: {
+					launcher: () => {
+						throw new Error("spawn omp EACCES");
+					},
+				},
+			}),
+			error: /spawn omp EACCES/,
+		},
+		{
+			name: "microVM overlay validation",
+			arrange: (run) => ({
+				over: vmLeaseOpts(
+					run,
+					"vm-invalid",
+					new VmTokens({ file: null }),
+					"http://127.0.0.1:9",
+					{ config: join(run, "extra.yml") },
+				),
+			}),
+			error: /config overlays not copied into the VM/,
+		},
+		{
+			name: "worker list preparation",
+			arrange: (run) => {
+				const lists = join(run, "lists");
+				// tools.json is a directory: the list read fails before the dispatch.
+				mkdirSync(join(lists, ".ottr", "workers", "p", "tools.json"), {
+					recursive: true,
+				});
+				return {
+					env: { OTTR_WORKERS_HOME: lists },
+					over: {
+						launcher: noSpawn,
+						worker: { urls: ["http://127.0.0.1:9"] },
+						extensionPath: join(run, "ext.ts"),
+						board: {
+							url: "http://127.0.0.1:4747",
+							token: "boot-token",
+							project: "p",
+							taskId: "P-1",
+						},
+					},
+				};
+			},
+		},
+	];
+
+	for (const c of setupFailures)
+		test(`a ${c.name} failure releases only the failed run's lease`, async () => {
+			await inLeaseHome(async (home, run, cleanups) => {
+				makeLayerDir(home, "A");
+				switchCurrentTo(home, "A");
+				const attempt = async (name: string): Promise<void> => {
+					const { env = {}, over } = c.arrange(run);
+					Object.assign(process.env, env);
+					let err: unknown = null;
+					try {
+						await startRun(localOpts(run, name, over));
+					} catch (e) {
+						err = e;
+					} finally {
+						for (const k of Object.keys(env)) delete process.env[k];
+					}
+					expect(err).toBeInstanceOf(Error);
+					expect((err as Error).message).not.toBe(UNEXPECTED_SPAWN);
+					if (c.error) expect((err as Error).message).toMatch(c.error);
+				};
+				// Alone: the failed setup leaves no lease behind.
+				await attempt("solo");
+				expect(leased(home)).toEqual([]);
+				// Beside a live holder of the same layer: the holder's lease survives.
+				const holder = await heldFake(run, "holder", cleanups);
+				expect(leased(home)).toEqual(["A"]);
+				await attempt("beside");
+				expect(leased(home)).toEqual(["A"]);
+				await holder.settle();
+				expect(leased(home)).toEqual([]);
+			});
+		});
+});
+
 describe("vmRunnerFromEnv", () => {
 	test("unset or blank is null", () => {
 		expect(vmRunnerFromEnv({})).toBeNull();
@@ -5084,6 +5982,7 @@ describe("vmEnv", () => {
 			env: {
 				FOO: "bar",
 				OTTR_REVIEW: "1",
+				OTTR_CARD_ENV_NOTE: CARD_ENV_NOTE,
 				ANTHROPIC_API_KEY: "sk-ant",
 				ANTHROPIC_OAUTH_TOKEN: "lent-oauth",
 				ZAI_API_KEY: "zai-lent",
@@ -5108,6 +6007,7 @@ describe("vmEnv", () => {
 		expect(env).toEqual({
 			FOO: "bar",
 			OTTR_REVIEW: "1",
+			OTTR_CARD_ENV_NOTE: CARD_ENV_NOTE,
 			OTTR_SESSION_NAME: "Fix it",
 			OTTR_BOARD_URL: "http://ottr:8080",
 			OTTR_BOARD_TOKEN: "vm-token",
@@ -5130,6 +6030,23 @@ describe("vmEnv", () => {
 		});
 		expect(env).toEqual({
 			KEEP_ME: "1",
+			OTTR_BOARD_URL: "http://ottr:8080",
+			OTTR_BOARD_TOKEN: "vm-token",
+			OTTR_PROJECT: "p",
+			OTTR_TASK_ID: "P-1",
+		});
+	});
+
+	test("the card-env note rides to the guest; any other OTTR_ name stays out", () => {
+		const env = vmEnv({
+			env: { OTTR_CARD_ENV_NOTE: CARD_ENV_NOTE, OTTR_UNLISTED: "x" },
+			board,
+			boardUrl: "http://ottr:8080",
+			token: "vm-token",
+			layerEnv: null,
+		});
+		expect(env).toEqual({
+			OTTR_CARD_ENV_NOTE: CARD_ENV_NOTE,
 			OTTR_BOARD_URL: "http://ottr:8080",
 			OTTR_BOARD_TOKEN: "vm-token",
 			OTTR_PROJECT: "p",
@@ -5336,6 +6253,9 @@ describe("startRun microVM dispatch", () => {
 			for (let i = 0; i < body.argv.length; i++)
 				if (body.argv[i] === "--config" && dirname(body.argv[i + 1]!) === dir)
 					expect(copyIn).toContain(body.argv[i + 1]!);
+			// OTTR-982: the no-fetch overlay is the board's own runs only; a VM run
+			// keeps URL reads.
+			expect(body.argv).not.toContain(NO_FETCH_CONFIG);
 			// The raw VM token never reaches the task log.
 			expect(readFileSync(join(dir, "run.log"), "utf8")).not.toContain(token);
 		} finally {
@@ -5562,6 +6482,11 @@ describe("startRun commit identity env", () => {
 
 	test("a fully configured git identity injects nothing", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-ident-set-"));
+		// A turn env may carry ident vars of its own (the board's default identity rides
+		// the resumed turn's env); "injects nothing" must decide on startRun's own effect,
+		// so the ambient names sit out for the run.
+		const saved = IDENT_VARS.map((k) => [k, process.env[k]] as const);
+		for (const k of IDENT_VARS) delete process.env[k];
 		try {
 			const seen: Parameters<RunLauncher>[2][] = [];
 			const handle = await startRun({
@@ -5578,6 +6503,10 @@ describe("startRun commit identity env", () => {
 			await handle.done;
 			for (const k of IDENT_VARS) expect(seen[0]!.env).not.toHaveProperty(k);
 		} finally {
+			for (const [k, v] of saved) {
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
@@ -5713,4 +6642,18 @@ describe("startRun commit identity env", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	}, 30_000);
+});
+
+test("withoutGitAuth strips the repo-relocating vars and keeps git auth (OTTR-1162)", () => {
+	const env = withoutGitAuth({
+		GIT_DIR: "/workspace/ottr/.git",
+		GIT_WORK_TREE: "/workspace/ottr",
+		GIT_COMMON_DIR: "/workspace/ottr/.git",
+		GH_TOKEN: "ghp_aaaaaaaaaaaaaaaaaaaa",
+	});
+	expect(env.GIT_DIR).toBeUndefined();
+	expect(env.GIT_WORK_TREE).toBeUndefined();
+	expect(env.GIT_COMMON_DIR).toBeUndefined();
+	// GH_TOKEN is not in the stripped set: a merge turn keeps it for its push.
+	expect(env.GH_TOKEN).toBe("ghp_aaaaaaaaaaaaaaaaaaaa");
 });

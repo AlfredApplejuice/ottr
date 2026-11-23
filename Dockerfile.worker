@@ -1,29 +1,29 @@
 # syntax=docker/dockerfile:1
 # D1 pins are deliberate; a bump is a new image build.
-# oven/bun:1.4.4-debian pinned 2026-10-29 — must stay >= the bun the omp pin needs
-# (omp 18.6.0's dist fails to parse on bun 1.3.3; the host runs 1.4.3).
+# oven/bun:1.4.5-debian pinned 2026-11-21 — must stay >= the bun the omp pin needs
+# (omp 18.6.0's dist fails to parse on bun 1.3.3; the host runs 1.4.4).
 # Digest-pinned 2026-10-22: a moved tag would silently change the worker image on the
 # next build. To upgrade bun, read the new tag's digest with
 # `docker buildx imagetools inspect oven/bun:<tag>` and move tag and digest together.
-FROM oven/bun:1.4.4-debian@sha256:93d5032fe06d163427822dc1598f420363759bb18155c9cc90eb1be05a64a19e AS worker
+FROM oven/bun:1.4.5-debian@sha256:3dddea58e1f8f2240eca906b023fedb944f9a8352515a35309fd0c879fe00aaa AS worker
 # scripts/update-image.ts prunes superseded builds of this image by this label.
 LABEL ottr.image=worker
 
-# Debian trixie git version (the 1.4.4-debian base is trixie); a wrong pin fails the build loudly (D1).
+# Debian trixie git version (the 1.4.5-debian base is trixie); a wrong pin fails the build loudly (D1).
 ARG GIT_VERSION=1:2.47.3-0+deb13u1
 # rtk (Rust Token Killer) — pix-optimizer rewrites known bash commands through it only
-# when the binary is on PATH; without it every command runs raw. Host /usr/local/bin runs 1.0.1.
+# when the binary is on PATH; without it every command runs raw. Host /usr/local/bin runs 1.1.0.
 # amd64 uses static musl; arm64 uses glibc. A wrong pin fails the build loudly.
-ARG RTK_VERSION=1.1.0
+ARG RTK_VERSION=1.2.0
 # Release checksums.txt, one archive per target architecture.
-ARG RTK_SHA256_AMD64=9454ad1b9489daa57ab0a9f4ebe2faaf4dc82b8a0f26c9e5135151abd7c9378d
-ARG RTK_SHA256_ARM64=a5c00c3ab0129884bcb757d348afc1a650efa0f4f0769da97c341f28f89719ed
+ARG RTK_SHA256_AMD64=70fee7b4a548c43dde94c77e2335550981b0bc2fb013691d8c8109b5bd0eda37
+ARG RTK_SHA256_ARM64=93c1dcd37fd5fcae8fa772a5b5c34a30af142ace4f4081c8f98319146b7a10a4
 # ripwire (redhat-et) — call-graph CLI for structure questions before shared-code edits
 # (map, --impact, --affected). A wrong pin 404s the download (fails the build loudly).
-ARG RIPWIRE_VERSION=0.6.8
+ARG RIPWIRE_VERSION=0.6.10
 # Release archive digests, one per target architecture.
-ARG RIPWIRE_SHA256_AMD64=aa09e8c43acd2104db91a80f2824a36c314ea4a72fd565cd2e579e043e09b03b
-ARG RIPWIRE_SHA256_ARM64=9015c41ac80af640cda54d98f69b68973e18f5b1c7c3c1116d80f81989513276
+ARG RIPWIRE_SHA256_AMD64=84346e9d487d94c1021810ecb3169ae125bc15529d1662a3463070e851f3be87
+ARG RIPWIRE_SHA256_ARM64=c30c28df31357b648d58d2796d64a5c63e5f1e71d0940bafd007b2dd7c8d15f2
 # gitleaks secret scanner: review gates that name it (e.g. ottr-cloud's AGENTS.md) run
 # `gitleaks git .` on workers. Keep the version and amd64 checksum equal to the CI pin in
 # .github/workflows/ci.yml ("Install gitleaks 8.30.1"). A bump changes both places.
@@ -34,10 +34,10 @@ ARG GITLEAKS_SHA256_AMD64=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca
 ARG GITLEAKS_SHA256_ARM64=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
 # GitHub CLI: the board publishes releases and creates repos with it, server-side, with its
 # GitHub token (D6). Host runs 2.103.3. A wrong pin 404s the download (fails the build loudly).
-ARG GH_VERSION=2.103.3
+ARG GH_VERSION=2.104.0
 # Release checksums.txt, one archive per target architecture.
-ARG GH_SHA256_AMD64=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
-ARG GH_SHA256_ARM64=ee32df2323c8847f5fac6cb6b4b69ca75828e9329a8f22f677021f7b3306ce63
+ARG GH_SHA256_AMD64=98cb101ad87dbbd3f6b2f2bfcbd43197ccd07643140121d8a9cfaa91eadbc24e
+ARG GH_SHA256_ARM64=cb34cefc6f4e77b90731374a2b737516bb8f3033c6ca46aa949e5344f68069e3
 # Node.js: npx starts the agent layer's MCP servers (chrome-devtools), and projects run
 # their Node tooling with it (some need >= 24.21.0). Without it, `node` is bun's fallback and
 # npx is missing. A wrong pin 404s the download (fails the build loudly).
@@ -237,7 +237,7 @@ RUN bun install -g --ignore-scripts --minimum-release-age 604800 "agent-browser@
 # TypeScript 7's tsc serves TS/JS (`tsc --lsp`), typescript-language-server serves projects whose
 # own TypeScript is older, pyright serves Python. A wrong pin fails the build loudly.
 ARG TYPESCRIPT_VERSION=7.0.2
-ARG TS_LANGUAGE_SERVER_VERSION=6.0.2
+ARG TS_LANGUAGE_SERVER_VERSION=6.1.0
 ARG PYRIGHT_VERSION=1.1.414
 RUN bun install -g "typescript@${TYPESCRIPT_VERSION}" \
       "typescript-language-server@${TS_LANGUAGE_SERVER_VERSION}" \
@@ -249,7 +249,7 @@ RUN bun install -g "typescript@${TYPESCRIPT_VERSION}" \
 # omp is the main tool and follows its npm releases: .github/workflows/omp-bump.yml moves this
 # pin (docs/WORKERS.md, "Updates"). It is declared here, not with the other pins: a changed ARG
 # invalidates every later RUN, so a bump rebuilds only the layers below.
-ARG OMP_VERSION=18.15.0
+ARG OMP_VERSION=18.19.0
 # toon CLI (npm @toon-format/cli) for the bundled toon-json skill — must match
 # the host's toon so workers and host produce identical output.
 ARG TOON_VERSION=4.4.0

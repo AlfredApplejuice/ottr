@@ -15,6 +15,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { childDatabaseEnv } from "./childEnv.ts";
 import {
 	appendLineBelow,
 	copyBelow,
@@ -27,6 +28,7 @@ import {
 } from "./confine.ts";
 import { githubHost, hostMatcher } from "./githubHost.ts";
 import { type CommitIdentity, identityArgs } from "./gitIdentity.ts";
+import { stripRepoRelocatingEnv } from "./gitRepoEnv.ts";
 import { HOSTED_SECRET_ENV } from "./hosted.ts";
 import { platform } from "./platform/index.ts";
 import type { DiffFileStat, KeptChoice } from "./types.ts";
@@ -87,7 +89,7 @@ export async function spawnPiped(
 		cwd,
 		// Explicit: the caller picks the env; Bun's default would be this process's boot env
 		// (git scopes GH_TOKEN to network subcommands via gitEnv; gh keeps it for its API).
-		env,
+		env: childDatabaseEnv(env),
 		stdin: input === undefined ? "ignore" : "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -233,6 +235,24 @@ export function gitEnv(
 	auth: Record<string, string> = {},
 ): Record<string, string | undefined> {
 	const env = { ...process.env };
+	// The board's git always names its repo through the cwd argument and path arguments, never
+	// through ambient env: a server or test process that inherited GIT_DIR (a git hook launch)
+	// would otherwise redirect every `git -C <project>` call to that gitdir (OTTR-1162). Calls
+	// that need them pass them as the explicit env below, which merges after this strip.
+	stripRepoRelocatingEnv(env);
+	// Ambient ident vars (a turn env carries the worker's GIT_AUTHOR_*/GIT_COMMITTER_* pair)
+	// outrank every config scope, so an inherited pair would silently override the identity
+	// this call pins with -c (observed 2026-11-21: the worker session's GIT_COMMITTER_NAME=Ottr
+	// beat rebaseTargetBranch's Settings pin). The board's identity comes from identityArgs or
+	// config, never from inherited env; a caller that needs one passes it in the explicit env
+	// below, which merges after this strip.
+	for (const k of [
+		"GIT_AUTHOR_NAME",
+		"GIT_AUTHOR_EMAIL",
+		"GIT_COMMITTER_NAME",
+		"GIT_COMMITTER_EMAIL",
+	])
+		delete env[k];
 	let sub = "";
 	let isNetwork = false;
 	for (let i = 0; i < args.length; i++) {
@@ -252,7 +272,7 @@ export function gitEnv(
 	} else {
 		stripGitAuthEnv(env);
 	}
-	return env;
+	return childDatabaseEnv(env);
 }
 
 /**
@@ -281,6 +301,34 @@ export async function git(
 	}
 	const sub = at < 0 ? "" : (args[at] as string);
 	const isNetwork = NETWORK_GIT[sub] === true;
+	// A planted http.<url>.cookieFile/saveCookies beats the generic pair below: git's URL
+	// match keeps the longest match across sources, and specificity outranks scope. Every
+	// http(s) URL the call names outright therefore gets its own clear — the exact URL is
+	// the most specific pattern possible, and command-line config wins the equal-specificity
+	// tie. A call that names a remote instead reads its URL from repo config, which no -c
+	// can enumerate (docs/WORKERS.md residual).
+	const urlClears: string[] = [];
+	if (isNetwork) {
+		for (let i = 0; i < args.length; i++) {
+			if (args[i] === "-c") {
+				i++;
+				continue;
+			}
+			const a = args[i];
+			if (
+				a !== undefined &&
+				/^https?:\/\//.test(a) &&
+				!urlClears.includes(`http.${a}.cookieFile=`)
+			) {
+				urlClears.push(
+					"-c",
+					`http.${a}.cookieFile=`,
+					"-c",
+					`http.${a}.saveCookies=false`,
+				);
+			}
+		}
+	}
 	const hosted =
 		isNetwork && authEnv === undefined && hostedAuth !== null
 			? await hostedAuth.network(cwd, args)
@@ -325,6 +373,23 @@ export async function git(
 			"gc.auto=0",
 			"-c",
 			"maintenance.auto=false",
+			// OTTR-1176: main checkouts are turn-uid-owned (OTTR-994 chowns them for a
+			// run) and an image roll recreated the server while the ownership was mid
+			// change, so a branch read died with "detected dubious ownership" before the
+			// new boot seeded the board gitconfig. Command-line config is protected
+			// config for safe.directory, so the trust rides every spawn and survives a
+			// missing, empty or stale GIT_CONFIG_GLOBAL file.
+			"-c",
+			"safe.directory=*",
+			// libcurl rewrites http.cookieFile as a Netscape cookie jar after a successful
+			// network fetch: a planted cookieFile + saveCookies would replace any file the
+			// board git can write (the server-only databases included) with a cookie jar.
+			// The empty path reads no cookie file and writes no jar.
+			"-c",
+			"http.cookieFile=",
+			"-c",
+			"http.saveCookies=false",
+			...urlClears,
 			...args.slice(0, at + 1),
 			...(PINNED_ARGS[sub] ?? []),
 			...args.slice(at + 1),
@@ -441,9 +506,10 @@ export async function sealedGit(
 			`[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = ${format}\n`,
 		);
 		try {
+			// A git exclude file is small; the cap refuses a planted oversized one.
 			writeFileSync(
 				path.join(stub, "info", "exclude"),
-				readRegular(path.join(common, "info", "exclude")),
+				readRegular(path.join(common, "info", "exclude"), 1024 * 1024),
 			);
 		} catch (e) {
 			if (!(e instanceof Error && "code" in e && e.code === "ENOENT"))
@@ -1255,7 +1321,11 @@ async function logSkippedTracked(
 ): Promise<void> {
 	await o.log(`skipped ${relFwd}: ${o.base} tracks it`);
 	if (relFwd !== "AGENTS.md") return;
-	const local = readRegular(path.join(o.mainPath, relFwd)).toString("utf8");
+	// AGENTS.md is small; the cap refuses a planted oversized one.
+	const local = readRegular(
+		path.join(o.mainPath, relFwd),
+		1024 * 1024,
+	).toString("utf8");
 	const atBase = await git(["show", `${o.base}:AGENTS.md`], o.mainPath);
 	if (atBase.code !== 0)
 		throw new Error(`git show failed: ${atBase.stderr.trim()}`);
@@ -1629,11 +1699,14 @@ function cappedPushOutput(text: string): string | undefined {
 }
 
 /**
- * The server's merge push (no agent holds git host credentials; the merge prompt tells the
- * agent not to push). Pushes the local target branch to the pinned origin when origin lacks
- * its tip and the main repo proves the local merge. The proof is the worktree's HEAD, else the task branch,
- * in the local branch. A merge agent may remove both before it reports (a project's AGENTS.md
- * can say so). Then the local branch ahead of origin is the proof: only merge turns move it.
+ * The server's merge push (no agent holds git host credentials; the merge prompt tells
+ * the agent not to push and not to run git in the main checkout). Fast-forwards the
+ * local target branch to the integration head first (serverFastForward, OTTR-987), then
+ * pushes the local target branch to the pinned origin when origin lacks its tip and the
+ * main repo proves the local merge. The proof is the worktree's HEAD, else the task branch,
+ * in the local branch. A merge agent may remove both before it reports (a project's
+ * AGENTS.md can say so). Then the local branch ahead of origin is the proof: only the
+ * board moves it (the server's fast-forward, then this push).
  * git() adds the host auth: per-host tokens or the ssh key, and GH_TOKEN for GitHub. The local
  * tip is refs/heads/<branch>: `origin/<branch>` names the remote-tracking ref, which only this
  * push moves. A hold-approved merge passes `leaseTip` (OTTR-274): the audited origin tip the
@@ -1650,20 +1723,22 @@ function cappedPushOutput(text: string): string | undefined {
  * "error:") and `output` with git's complete output (OTTR-465), so the card log shows the
  * cause a permission failure points at.
  */
-/** The merge-hold gate: the audited origin tip must be contained in the local branch. Null when it holds. */
+/** The merge-hold gate: the audited origin tip must be contained in what the push will
+ * land. `ref` is the proposed integration head before the fast-forward runs (the ff
+ * precondition), and the landed branch after it. Null when it holds. */
 async function holdGate(
 	mainPath: string,
 	leaseTip: string,
-	branch: string,
+	ref: string,
 ): Promise<{ status: "failed"; error: string } | null> {
 	const pinned = await git(
-		["merge-base", "--is-ancestor", leaseTip, `refs/heads/${branch}`],
+		["merge-base", "--is-ancestor", leaseTip, ref],
 		mainPath,
 	);
 	if (pinned.code === 0) return null;
 	return {
 		status: "failed",
-		error: `merge-hold gate: the audited origin tip ${leaseTip} is not contained in refs/heads/${branch}`,
+		error: `merge-hold gate: the audited origin tip ${leaseTip} is not contained in ${ref}`,
 	};
 }
 
@@ -1675,6 +1750,119 @@ async function integrationHead(
 ): Promise<string | null> {
 	if (await worktreeLinked(worktreePath)) return sha("HEAD", worktreePath);
 	return taskBranch === "" ? null : sha(`refs/heads/${taskBranch}`);
+}
+
+/** integrationHead with the board's own git: the head the server's fast-forward would
+ * land, so the merge hold can judge the proposed push set before the fast-forward runs. */
+export async function integrationSha(
+	worktreePath: string,
+	taskBranch: string,
+): Promise<string | null> {
+	return integrationHead(worktreePath, taskBranch, async (ref, cwd) => {
+		const r = await git(
+			["rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
+			cwd ?? worktreePath,
+		);
+		return r.code === 0 ? r.stdout.trim() : null;
+	});
+}
+
+/**
+ * The server's fast-forward of the local target branch (OTTR-987). mergePrompt no longer
+ * tells the agent to run `git merge --ff-only` in the main checkout: the agent's shell
+ * git reads the worker-writable common gitdir, and a planted post-merge or
+ * reference-transaction hook would run as root in the server container. The board runs
+ * the fast-forward through git() instead, whose argv pins outrank the planted config,
+ * from the same integration head the push's proof reads. The branch is the target name
+ * itself when the target carries no `origin/` prefix (resolveTarget supports local-only
+ * targets — the prompt forbids the agent's merge, so the board is the only integrator
+ * left). A missing local branch is created at the head: a newly selected remote branch
+ * has nothing to lose, so no fast-forward check applies. The checked-out branch moves
+ * through `git merge --ff-only` (its worktree follows); any other branch moves by
+ * `git branch -f`, which refuses a branch checked out in some other worktree and fails
+ * closed. `done` covers the ran and the no-op case (the target already holds the head —
+ * an agent that still merges per its project's AGENTS.md, or a re-merge); `output`
+ * carries the merge output for the card log, or "" for a no-op. A fast-forward git
+ * refuses (the branch is not ahead of the target, an unconcluded merge in the main
+ * checkout) returns `failed` with git's reason and full output — the same parking shape
+ * as a failed push.
+ */
+async function serverFastForward(
+	mainPath: string,
+	worktreePath: string,
+	target: string,
+	taskBranch: string,
+): Promise<
+	| { status: "done"; output: string }
+	| { status: "failed"; error: string; output?: string }
+> {
+	const branch = target.startsWith("origin/")
+		? target.slice("origin/".length)
+		: target;
+	const sha = async (ref: string, cwd = mainPath) => {
+		const r = await git(
+			["rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
+			cwd,
+		);
+		return r.code === 0 ? r.stdout.trim() : null;
+	};
+	const head = await integrationHead(worktreePath, taskBranch, sha);
+	if (head === null) return { status: "done", output: "" };
+	const local = await sha(`refs/heads/${branch}`);
+	if (local === null) {
+		// The target branch does not exist locally yet: create it at the head.
+		const r = await git(["branch", branch, head], mainPath);
+		if (r.code !== 0)
+			return {
+				status: "failed",
+				error: redactUrlCredentials(
+					r.stderr.trim().split("\n").filter(Boolean).pop() ??
+						`git branch exited ${r.code}`,
+				),
+				output: cappedPushOutput(
+					redactUrlCredentials(`${r.stdout}${r.stderr}`).trim(),
+				),
+			};
+		return { status: "done", output: `${r.stdout}${r.stderr}`.trim() };
+	}
+	if (local === head) return { status: "done", output: "" };
+	const holds = await git(
+		["merge-base", "--is-ancestor", head, local],
+		mainPath,
+	);
+	if (holds.code === 0) return { status: "done", output: "" };
+	// branch -f never refuses divergence, and silently discarding local-only commits
+	// would lose what the old merge --ff-only refused: the move must be a fast-forward
+	// (OTTR-987 review).
+	const ffable = await git(
+		["merge-base", "--is-ancestor", local, head],
+		mainPath,
+	);
+	if (ffable.code !== 0)
+		return {
+			status: "failed",
+			error: redactUrlCredentials(
+				`the target branch ${branch} cannot fast-forward to the integration head ${head}`,
+			),
+		};
+	const checkedOut = await checkedOutBranch(mainPath);
+	const r =
+		checkedOut === branch
+			? await git(["merge", "--ff-only", head], mainPath)
+			: await git(["branch", "-f", branch, head], mainPath);
+	if (r.code !== 0) {
+		return {
+			status: "failed",
+			error: redactUrlCredentials(
+				r.stderr.trim().split("\n").filter(Boolean).pop() ??
+					`git exited ${r.code}`,
+			),
+			output: cappedPushOutput(
+				redactUrlCredentials(`${r.stdout}${r.stderr}`).trim(),
+			),
+		};
+	}
+	return { status: "done", output: `${r.stdout}${r.stderr}`.trim() };
 }
 
 /** Result of serverMergePush and its helpers. */
@@ -1762,7 +1950,7 @@ async function mergePushPreflight(
 	const local = await sha(`refs/heads/${branch}`);
 	if (local === null || local === base) return { status: "skipped" };
 	if (leaseTip !== null) {
-		const gate = await holdGate(mainPath, leaseTip, branch);
+		const gate = await holdGate(mainPath, leaseTip, `refs/heads/${branch}`);
 		if (gate !== null) return gate;
 	}
 	const head = await integrationHead(worktreePath, taskBranch, sha);
@@ -1791,12 +1979,43 @@ export async function serverMergePush(
 	taskBranch: string,
 	leaseTip: string | null = null,
 	originUrl: string | null = null,
+	/** The board integrates only on the agent's integrated report: a needs_you or
+	 * ask-paused turn must not publish its branch. False keeps the old contract, where
+	 * only proof of a merge the agent already made reaches the push. */
+	fastForward = false,
 ): Promise<
 	| { status: "skipped" }
 	| { status: "pushed"; output: string }
 	| { status: "failed"; error: string; output?: string }
 	| { status: "rejected"; error: string; output?: string }
 > {
+	// The board fast-forwards the local target itself (OTTR-987): the merge prompt no
+	// longer drives the agent's `git merge --ff-only` in the main checkout, whose shell
+	// git would run planted hooks from the worker-writable common gitdir as root.
+	// The hold gate runs first: a held merge must not carry commits beyond the audited
+	// tip into the local target before the gate reads it (OTTR-274).
+	let ffOutput = "";
+	if (fastForward) {
+		// The gate reads the head the fast-forward will land, never the stale local
+		// target: when origin moved past the checkout, or the target branch does not
+		// exist locally yet, `leaseTip ⊆ refs/heads/<branch>` fails a valid held merge
+		// before the branch creation can run (OTTR-274, OTTR-987).
+		if (leaseTip !== null && target.startsWith("origin/")) {
+			const proposed = await integrationSha(worktreePath, taskBranch);
+			if (proposed !== null) {
+				const gate = await holdGate(mainPath, leaseTip, proposed);
+				if (gate !== null) return gate;
+			}
+		}
+		const ff = await serverFastForward(
+			mainPath,
+			worktreePath,
+			target,
+			taskBranch,
+		);
+		if (ff.status === "failed") return ff;
+		ffOutput = ff.output;
+	}
 	const pre = await mergePushPreflight(
 		mainPath,
 		worktreePath,
@@ -1839,7 +2058,11 @@ export async function serverMergePush(
 		// derivation came from origin/HEAD loses nothing), so origin/<branch> stays the
 		// resolved target after "Push to origin".
 		await recordLandedPush(mainPath, branch, local);
-		return { status: "pushed", output: `${r.stdout}${r.stderr}`.trim() };
+		const pushOut = `${r.stdout}${r.stderr}`.trim();
+		return {
+			status: "pushed",
+			output: ffOutput === "" ? pushOut : `${ffOutput}\n${pushOut}`.trim(),
+		};
 	}
 	// OTTR-465: the card log gets git's complete output (URL credentials redacted), and
 	// needsReason keeps every reason line — "! [rejected]", "remote:", "fatal:" and the
@@ -1939,7 +2162,7 @@ export async function lfsPointerOids(
 		undefined,
 		undefined,
 		{},
-		shas.join("\n") + "\n",
+		`${shas.join("\n")}\n`,
 	);
 	if (check.code !== 0) return [];
 	const small: string[] = [];
@@ -1986,20 +2209,24 @@ export async function lfsPointerOids(
  * candidates x LFS_POINTER_MAX_BYTES no matter how big the range's other blobs are. A
  * plain --batch names no config-driven program — filters run only behind
  * --filters/--textconv, and cat-file runs no hook and no fsmonitor — so the
- * planted-config pins git() carries do not apply here.
+ * planted-config pins git() carries do not apply here. The safe.directory pin
+ * (OTTR-1176) still rides this spawn: the main checkout can be turn-uid-owned.
  */
 async function catFileBatch(
 	mainPath: string,
 	shas: readonly string[],
 ): Promise<Buffer> {
-	const proc = Bun.spawn([gitExe(), "cat-file", "--batch"], {
-		cwd: mainPath,
-		env: gitEnv(["cat-file", "--batch"]),
-		stdin: "pipe",
-		stdout: "pipe",
-		stderr: "pipe",
-		windowsHide: true,
-	});
+	const proc = Bun.spawn(
+		[gitExe(), "-c", "safe.directory=*", "cat-file", "--batch"],
+		{
+			cwd: mainPath,
+			env: gitEnv(["cat-file", "--batch"]),
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+			windowsHide: true,
+		},
+	);
 	// Chunked writes keep the pipe moving while git streams the answer back.
 	for (let i = 0; i < shas.length; i += 256) {
 		proc.stdin.write(`${shas.slice(i, i + 256).join("\n")}\n`);
@@ -2015,12 +2242,35 @@ async function catFileBatch(
 	return err.trim() !== "" ? Buffer.alloc(0) : Buffer.from(bytes);
 }
 
-/** The LFS endpoint git-lfs derives for an http(s) origin URL, pinned on the command
- * line so a planted `lfs.url` cannot move the upload (verified against git-lfs 3.6.1:
- * an empty `-c lfs.url=` fails the push, the derived value overrides the plant). */
+/**
+ * The LFS endpoint git-lfs derives for an http(s) origin URL, plus the lock-check
+ * opt-out, both pinned on the command line so a planted `lfs.url` cannot move the
+ * upload (verified against git-lfs 3.6.1: an empty `-c lfs.url=` fails the push, the
+ * derived value overrides the plant).
+ *
+ * The endpoint mirrors git-lfs's own derivation (lfsapi/endpoint_finder.go
+ * NewEndpointFromCloneURL): `<url>.git/info/lfs` when the URL lacks the `.git`
+ * suffix, `<url>/info/lfs` when it carries it. OTTR-1109: the bare
+ * `<url>/info/lfs` form this pin used before lands on a different server route —
+ * GitHub answers 422 to the locks/verify call and to the batch alike there
+ * (MYST-34) — where git-lfs's own derivation appends `.git`. git-lfs reads the lock
+ * opt-out as `lfs.<endpoint>.locksverify` (commands/lockverifier.go
+ * getVerifyStateFor), so the second pin scopes that same endpoint: the board never
+ * uses LFS locks, and on github hosts git-lfs verifies locks by default, so a 422
+ * from a locking endpoint must not fail an upload whose batch works.
+ */
 function lfsEndpointPin(originUrl: string): readonly string[] {
 	if (!/^https?:\/\//i.test(originUrl)) return [];
-	return ["-c", `lfs.url=${originUrl.replace(/\/+$/, "")}/info/lfs`];
+	const base = originUrl.replace(/\/+$/, "");
+	const endpoint = base.endsWith(".git")
+		? `${base}/info/lfs`
+		: `${base}.git/info/lfs`;
+	return [
+		"-c",
+		`lfs.url=${endpoint}`,
+		"-c",
+		`lfs.${endpoint}.locksverify=false`,
+	];
 }
 
 /**
@@ -2354,7 +2604,7 @@ export async function runMergeGates(
 	mainPath: string,
 ): Promise<{ ok: boolean; output: string }> {
 	// The gates run repo code: never hand it the hosted identity-signing key.
-	const env = { ...process.env };
+	const env = childDatabaseEnv();
 	delete env[HOSTED_SECRET_ENV];
 	const check = Bun.spawn([process.execPath, "run", "check"], {
 		cwd: mainPath,
@@ -2414,6 +2664,14 @@ export async function mergeHoldMismatch(
 	base: string,
 	approvedHead: string,
 	originUrl: string | null = null,
+	/** The head the server's fast-forward would land (worktree HEAD, else the task
+	 * branch tip). The board integrates itself now, so at audit time the local target
+	 * still sits stale at the old tip: judging `refs/heads/<branch>` would compare an
+	 * empty push set against the approval and park every valid held merge, and an
+	 * exactly-approved local target would skip the audit while a resumed session's
+	 * worktree head carries unapproved patches. When set, the gate judges the proposed
+	 * push set `auditedTip..<proposedHead>` instead of the local branch. */
+	proposedHead: string | null = null,
 ): Promise<{
 	mismatch: boolean;
 	pushDiff: string | null;
@@ -2471,6 +2729,7 @@ export async function mergeHoldMismatch(
 	// as it judges the push set. An unreadable approved-side diff falls through: the return
 	// below then mismatches, and the hold still fails closed.
 	if (
+		proposedHead === null &&
 		approved !== null &&
 		(await targetContains(
 			mainPath,
@@ -2485,7 +2744,7 @@ export async function mergeHoldMismatch(
 			auditedTip,
 		};
 	}
-	const push = await effect(auditedTip, `refs/heads/${branch}`);
+	const push = await effect(auditedTip, proposedHead ?? `refs/heads/${branch}`);
 	if (push === null) return failClosed();
 	return {
 		mismatch: approved === null || push !== approved,
@@ -2761,6 +3020,7 @@ export async function treesEqual(
 export async function unsavedWork(
 	worktreePath: string,
 	target: string,
+	opts: { ignoreCommits?: boolean } = {},
 ): Promise<string | null> {
 	// An unlinked husk holds no checkout: nothing to lose, so the delete check must pass and
 	// the tracker can remove the empty folder. Only an unlinked dir WITH files stays suspect.
@@ -2770,8 +3030,12 @@ export async function unsavedWork(
 	try {
 		const lost: string[] = [];
 		if (!(await isClean(worktreePath))) lost.push("uncommitted changes");
-		const n = await commitsAhead(worktreePath, target);
-		if (n > 0) lost.push(`${n} commit${n === 1 ? "" : "s"} not on ${target}`);
+		// ignoreCommits: a superseded close's branch commits are the work the outcome
+		// discards, so they must not keep the tree; only uncommitted changes still do.
+		if (!opts.ignoreCommits) {
+			const n = await commitsAhead(worktreePath, target);
+			if (n > 0) lost.push(`${n} commit${n === 1 ? "" : "s"} not on ${target}`);
+		}
 		return lost.length > 0 ? lost.join(" and ") : null;
 	} catch (err) {
 		return `cannot check it: ${err instanceof Error ? err.message : String(err)}`;

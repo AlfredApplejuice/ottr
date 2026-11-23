@@ -2,10 +2,12 @@ import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import {
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
@@ -22,12 +24,14 @@ import {
 	formatStamp,
 	listSnapshots,
 	type Manifest,
+	moveAsideIn,
 	parseStamp,
 	readManifest,
 	resolveBackup,
 	restoreSnapshot,
 	runBackup,
 } from "./backup.ts";
+import { openDir } from "./confine.ts";
 import { closeLocked, openLocked, StoreLockedError } from "./dblock.ts";
 import { GlobalStore } from "./globalStore.ts";
 import { ProjectStore } from "./store.ts";
@@ -1231,11 +1235,49 @@ describe("restoreSnapshot", () => {
 				now: RESTORE_AT,
 				trackerDb,
 				projectDbFor: (name) => join(base, "server", name, "tasks.db"),
+				projectAnchor: join(base, "server"),
 				adoptedMarker: marker,
 				...change,
 			});
 		return { base, dir, snap, trackerDb, projDb, marker, restore };
 	};
+
+	test("the aside move runs in the held dir: a parent swapped for a symlink after the walk receives nothing", () => {
+		const base = tmp("aside-swap");
+		const data = join(base, "data");
+		const proj = join(data, "proj");
+		sqliteFile(join(proj, "tasks.db"), "held-proj");
+		writeFileSync(join(proj, "tasks.db-wal"), "wal");
+		writeFileSync(join(proj, "tasks.db-shm"), "shm");
+		const server = join(base, "server-swap");
+		sqliteFile(join(server, "tasks.db"), "server-keep");
+		const d = openDir(base, proj, {});
+		try {
+			// A worker renames the walked dir away and plants a symlink at its name.
+			renameSync(proj, join(data, "proj.moved"));
+			symlinkSync(server, proj);
+			const aside: string[] = [];
+			moveAsideIn(d, "tasks.db", RESTORE_AT, aside);
+			// The move landed in the held dir (now "proj.moved"), never through the link.
+			expect(aside).toEqual([
+				`${proj}/tasks.db${ASIDE}`,
+				`${proj}/tasks.db-wal${ASIDE}`,
+				`${proj}/tasks.db-shm${ASIDE}`,
+			]);
+			expect(existsSync(join(data, "proj.moved", `tasks.db${ASIDE}`))).toBe(
+				true,
+			);
+			expect(existsSync(join(data, "proj.moved", "tasks.db"))).toBe(false);
+			// The swapped parent keeps its databases, under their names and the aside name.
+			expect(rowIn(join(server, "tasks.db"))).toBe("server-keep");
+			expect(existsSync(join(server, `tasks.db${ASIDE}`))).toBe(false);
+			expect(existsSync(join(server, "tasks.db-wal"))).toBe(false);
+			expect(existsSync(join(server, "tasks.db-shm"))).toBe(false);
+			expect(lstatSync(proj).isSymbolicLink()).toBe(true);
+		} finally {
+			d.close();
+		}
+	});
 
 	test("each snapshot file goes to its target, and the marker is written", async () => {
 		const f = fixture();

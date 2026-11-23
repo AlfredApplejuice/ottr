@@ -286,16 +286,16 @@ button > kbd,
 button > .spinner {
 	margin-top: 2px;
 }
-/* The B shortcut badge: the New task kbd's shape in the quiet button's neutral ink. */
-.lane-add kbd {
+/* The B shortcut badge: the New task kbd's shape in the quiet menu's neutral ink. */
+.project-menu kbd {
 	font-family: inherit;
 	font-size: 11px;
 	line-height: 1;
 	padding: 3px 5px;
-	margin: 0 0 0 2px; /* .lane-add has no 2px bottom padding to offset, unlike button > kbd */
 	color: inherit;
 	border: 1px solid var(--line-hover);
 	border-radius: 3px;
+	margin-inline-start: auto; /* at the row's end, like a native menu's accelerator */
 }
 .compose-keys kbd {
 	font-family: var(--mono);
@@ -944,6 +944,52 @@ textarea {
 		gap: 6px;
 	}
 }
+/* Hosted credits chip in the bar: the tenant's balance, a link to the control plane's
+   account page; at zero it names the hard stop (docs/specs/hosted-mode.md section 7).
+   Contrast holds AA 4.5:1 in both themes: --text on the bar's --chrome gives 9.5:1
+   (dark) and 9.6:1 (light); the empty pair reuses the .state-chip.warn tones at 6.7:1
+   and 4.7:1. The word change, not hue alone, carries the empty state. The global
+   :focus-visible steel ring stays; no rule here touches outlines. */
+.credits-chip {
+	display: inline-flex;
+	align-items: center;
+	flex: none;
+	max-width: 220px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 12px;
+	font-weight: 600;
+	padding: 3px 10px;
+	border-radius: 999px;
+	border: 1px solid var(--line-soft);
+	color: var(--text);
+	text-decoration: none;
+}
+.credits-chip:hover {
+	border-color: var(--line);
+}
+.credits-chip[data-empty] {
+	color: var(--alarm);
+	background: var(--alarm-bg);
+	border-color: var(--alarm-line);
+}
+.credits-chip .credits-short {
+	display: none;
+}
+/* The shortest phones swap the full sentence for the short label, so a 375px bar
+   never overflows. The title attribute always carries the full sentence. */
+@media (max-width: 380px) {
+	.credits-chip {
+		max-width: 40vw;
+	}
+	.credits-chip .credits-full {
+		display: none;
+	}
+	.credits-chip .credits-short {
+		display: inline;
+	}
+}
 .sb-twin .t {
 	position: relative;
 	height: 2px;
@@ -1100,6 +1146,11 @@ textarea {
 	/* Four sections outgrow short windows; the panel scrolls instead of leaving the viewport. */
 	max-height: calc(100dvh - var(--bar-h) - 18px);
 	overflow: auto;
+}
+/* The System popover's quota table carries five columns (label, bars, used, pace, resets):
+   the wider box keeps window labels readable. */
+#system-detail {
+	width: 480px;
 }
 @supports (position-anchor: --a) {
 	.meters {
@@ -1294,10 +1345,45 @@ textarea {
    (.quota h3). The list gap holds 2px to the group's first row; the margin lifts the
    heading off the row above, so a group reads as one labelled chunk. */
 .model-heading {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: 8px;
 	margin: 7px 0 0;
 	font-size: 12px;
 	font-weight: 600;
 	color: var(--text);
+}
+/* The quota pace beside a role row or provider heading: the System popover's pace colors. */
+.model-option-end {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	flex: none;
+}
+.model-pace {
+	font-size: 11.5px;
+	font-weight: 400;
+	white-space: nowrap;
+}
+/* The model field's pace pill: the menu row's note, tinted by pace so the tiny bars need no
+   squinting. "on pace" keeps no tint (Grey-Is-Normal). */
+.pace-pill {
+	padding: 1px 7px;
+	border: 1px solid transparent;
+	border-radius: 999px;
+}
+.pace-pill[data-pace="ahead"] {
+	background: var(--alarm-bg);
+	border-color: var(--alarm-line);
+}
+.pace-pill[data-pace="behind"] {
+	background: var(--accent-bg);
+	border-color: var(--accent-line);
+}
+.pace-pill[data-pace="full"] {
+	background: var(--crit-bg);
+	border-color: var(--crit-line);
 }
 /* Trigger: "model level" (Gemini's "Argon Mittel"): the model in the bright tone, the level
    after a space in the dim tone, so the model name reads first. */
@@ -1434,6 +1520,10 @@ textarea {
 	font-weight: 600;
 	color: var(--text-strong);
 }
+/* In the quota table the headline sits in the head row's label cell. */
+.qt-head > h2 {
+	margin: 0;
+}
 .caption {
 	margin: 6px 0 0;
 	font-size: 12px;
@@ -1537,7 +1627,7 @@ textarea {
    differ in shape and weight (a thin bright line with an end dot, a boxed grey bar), not only tone. */
 .qt {
 	display: grid;
-	grid-template-columns: minmax(0, 1fr) 96px 3.2em 4.6em;
+	grid-template-columns: minmax(0, 1fr) 96px 3.2em 7.6em 4.6em;
 	align-items: center;
 	gap: 5px 10px;
 	font-size: 12.5px;
@@ -1553,6 +1643,7 @@ textarea {
 }
 .qt-num,
 .qt-val,
+.qt-pace,
 .qt-reset {
 	text-align: right;
 }
@@ -1571,6 +1662,22 @@ textarea {
 	font-size: 12px;
 	font-weight: 600;
 	color: var(--text);
+}
+/* Provider head: the name, then its banked resets, and the usage page link at the right. */
+.qt-provider {
+	display: flex;
+	align-items: baseline;
+	gap: 10px;
+}
+.qt-credits {
+	font-weight: 400;
+	color: var(--accent);
+}
+.qt-provider > a {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	color: inherit;
 }
 .qt-label {
 	min-width: 0;
@@ -1612,8 +1719,21 @@ textarea {
 .qt-row[data-level="crit"] .qt-val {
 	color: var(--crit-text);
 }
-.qt-reset {
+.qt-reset,
+.qt-pace {
 	color: var(--dim);
+}
+/* Pace reads at a glance: amber when the quota runs ahead of the clock (slow down), steel
+   accent when it lags behind (room to spend). DESIGN.md keeps green for diff text only. */
+.qt-pace[data-pace="ahead"] {
+	color: var(--alarm);
+}
+.qt-pace[data-pace="behind"] {
+	color: var(--accent);
+}
+/* A used-up window (the model picker's "limit · back in …") reads critical. */
+.qt-pace[data-pace="full"] {
+	color: var(--crit-text);
 }
 .qt-key .qt-time,
 .qt-key .qt-used {
@@ -1633,6 +1753,66 @@ textarea {
 	font-size: 12px;
 	font-weight: 600;
 	color: var(--text);
+}
+/* Services keep account identities and raw balances separate from model quota meters. */
+.service-source + .service-source {
+	margin-top: 14px;
+	padding-top: 12px;
+	border-top: 1px solid var(--line-soft);
+}
+.service-source {
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+.service-source h3 {
+	margin: 0;
+	font-size: 12.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.service-status {
+	display: flex;
+	align-items: baseline;
+	gap: 4px;
+}
+.service-status .mark {
+	align-self: center;
+}
+.service-status[data-level="needs"] {
+	color: var(--alarm);
+}
+.service-status[data-level="crit"] {
+	color: var(--crit-text);
+}
+.service-metrics {
+	margin: 8px 0 0;
+	font-size: 12.5px;
+}
+.service-metric {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+	gap: 8px;
+}
+.service-metric + .service-metric {
+	margin-top: 8px;
+}
+.service-metric dt {
+	color: var(--dim);
+}
+.service-metric dd {
+	margin: 0;
+	text-align: right;
+	font-variant-numeric: tabular-nums;
+	color: var(--text-strong);
+}
+.service-metric .caption {
+	margin-top: 4px;
+}
+@media (max-width: 480px) {
+	.service-metric {
+		grid-template-columns: minmax(0, 1fr);
+		gap: 4px;
+	}
 }
 .project-id h1,
 .overview h1,
@@ -1774,6 +1954,33 @@ textarea {
 	letter-spacing: 0.06em;
 	text-transform: uppercase;
 	color: var(--dim);
+}
+/* OTTR-1136: the drawer shell while the card row loads, or after a not-found or a
+   failed fetch. The near-empty body centers its short column, so the state reads as
+   designed; the actions sit on one line. */
+.drawer-body.drawer-body-pending {
+	display: flex;
+}
+.drawer-pending {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	justify-content: center;
+	gap: 10px;
+	margin: auto;
+	padding: 0 4px;
+	color: var(--dim);
+}
+.drawer-pending p {
+	margin: 0;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+.drawer-pending-actions {
+	display: flex;
+	align-items: center;
+	gap: 8px;
 }
 /* A section head with a trailing action: caps label left, one quiet ghost button right. */
 .section-head {
@@ -2741,6 +2948,8 @@ a[data-card-link] {
 /* Release and image links read as links: accent like every other anchor, no rest
    underline (the icon already marks them), underline on hover. */
 .project-meta a {
+	min-width: 24px;
+	min-height: 24px;
 	color: var(--accent);
 	text-decoration: none;
 }
@@ -2753,24 +2962,6 @@ a[data-card-link] {
 	width: fit-content;
 	max-width: 100%;
 	overflow-wrap: anywhere;
-}
-.fu-list a {
-	display: flex;
-	align-items: baseline;
-	justify-content: space-between;
-	gap: 12px;
-	width: 100%;
-	min-height: 32px;
-	padding: 5px 10px;
-	border: 1px solid transparent;
-	border-radius: 4px;
-	background: none;
-	font: inherit;
-	font-size: 13px;
-	color: var(--text);
-	text-align: left;
-	text-decoration: none;
-	cursor: pointer;
 }
 /* The source card id inside a proposal reason: a real link, underlined so it reads
    as one; the accent carries the hover and focus states. */
@@ -2829,11 +3020,14 @@ a[data-card-link] {
 	color: var(--dim);
 	font-weight: 600;
 }
-/* Header actions: one square "more" button opens a menu of the project's actions, so
-   the bar holds only the search, the menu and New task. Project settings lives in the
-   menu too. An overdue review stays out as the one nudge; the status span next to the
-   name carries the words. The button keeps grey stock: a review due is a nudge, not an
-   alarm (Grey-Is-Normal). */
+/* The running chip links to its review card in the drawer; the chevron marks in-app navigation. */
+.project-meta a.arch-live {
+	gap: 3px;
+}
+/* Header actions: New task and a chevron form one split button; the chevron opens the
+   menu of the project's actions (review, release, diagrams, settings, Add draft). A
+   gitless project keeps a square grey trigger instead. An overdue review stays out as
+   the one nudge; the status span next to the name carries the words. */
 .project-more {
 	anchor-name: --project-more;
 	aspect-ratio: 1;
@@ -2844,6 +3038,39 @@ a[data-card-link] {
 .project-more:has(+ :popover-open) {
 	background: var(--card-hover);
 	border-color: var(--line-hover);
+}
+.new-split {
+	display: inline-flex;
+	align-items: stretch;
+}
+.new-split > .primary:first-child {
+	border-start-end-radius: 0;
+	border-end-end-radius: 0;
+}
+.new-split > .project-more {
+	position: relative;
+	aspect-ratio: auto;
+	padding: 0 8px;
+	border-start-start-radius: 0;
+	border-end-start-radius: 0;
+}
+/* The seam between the halves: a short ink line, so the two targets read apart. */
+.new-split > .project-more::before {
+	content: "";
+	position: absolute;
+	inset-block: 6px;
+	inset-inline-start: -1px;
+	border-inline-start: 1px solid var(--accent-ink);
+	opacity: 0.3;
+}
+.new-split:has(+ :popover-open) > .project-more {
+	background: var(--accent-hover);
+	border-color: var(--accent-hover);
+}
+.project-menu hr {
+	margin: 2px 4px;
+	border: 0;
+	border-top: 1px solid var(--line-soft);
 }
 .project-menu {
 	position-anchor: --project-more;
@@ -3692,8 +3919,7 @@ a.pr-link:hover {
 	color: var(--dim);
 }
 /* Todo lane's backlog row: the column head's grammar one step down (bright 13px title,
-   quiet count at the right), and Add draft as a full-width dashed slot underneath,
-   where the new draft lands. */
+   quiet count at the right). Add draft lives in the New task menu (B). */
 .backlog-head {
 	display: flex;
 	flex-wrap: wrap;
@@ -3712,30 +3938,6 @@ a.pr-link:hover {
 	font-variant-numeric: tabular-nums;
 	color: var(--dim);
 }
-.lane-add {
-	display: flex;
-	flex-basis: 100%;
-	align-items: center;
-	justify-content: center;
-	gap: 4px;
-	min-height: 32px;
-	padding: 0;
-	font-size: 12px;
-	font-weight: 500;
-	letter-spacing: 0;
-	text-transform: none;
-	color: var(--dim);
-	background: transparent;
-	border: 1px dashed var(--line);
-	border-radius: 4px;
-	cursor: pointer;
-}
-.lane-add:hover {
-	color: var(--text-strong);
-	background: var(--card-hover);
-	border-style: solid;
-	border-color: var(--line-hover);
-}
 /* Done lane "Show more": a quiet full-width button under the last page of cards. */
 .lane-more {
 	display: flex;
@@ -3753,6 +3955,27 @@ a.pr-link:hover {
 	cursor: pointer;
 }
 .lane-more:hover {
+	border-style: solid;
+	color: var(--text);
+}
+/* Done lane search status: the server-side search's "Searching…" line and the
+   failed-page retry; both sit where "Show more" renders. */
+.lane-status {
+	margin: 2px 0 0;
+	font-size: 11px;
+	color: var(--dim);
+}
+.lane-retry {
+	margin-left: 6px;
+	padding: 2px 8px;
+	font-size: 11px;
+	color: var(--dim);
+	background: transparent;
+	border: 1px dashed var(--line-soft);
+	border-radius: 4px;
+	cursor: pointer;
+}
+.lane-retry:hover {
 	border-style: solid;
 	color: var(--text);
 }
@@ -3986,10 +4209,6 @@ a.pr-link:hover {
    the hue never carries the warning alone. */
 .sys tr[data-warn] > * {
 	background: var(--alarm-bg);
-}
-.fu-list a:hover {
-	background: var(--card);
-	color: var(--text-strong);
 }
 .needs-reason a:hover,
 .needs-reason a:focus-visible,
@@ -4984,6 +5203,18 @@ dialog.diff-view {
 .gate-start .needs-reason {
 	margin: 0;
 }
+/* A parked gate's section context lines above the ask questions. */
+.gate-context {
+	margin: 0 0 8px;
+	color: var(--dim);
+	font-size: 12.5px;
+}
+.gate-context p {
+	margin: 0 0 4px;
+}
+.gate-context p:last-child {
+	margin-bottom: 0;
+}
 .diff-empty {
 	padding: 18px 14px;
 }
@@ -5246,6 +5477,29 @@ dialog.confirm-dialog {
 }
 .attach-error .icon {
 	flex: none;
+}
+/* A refused resume (the model route's 409 for a provider still out of quota): crit
+   text on the composer surface beside the Resume button, like a refused image pick;
+   the bell's copy alone hides inside the closed notifications popover. */
+.resume-problem {
+	display: flex;
+	align-items: baseline;
+	gap: 6px;
+	margin: 0;
+	font-size: 12px;
+	color: var(--crit-text);
+	overflow-wrap: anywhere;
+	/* Its own full line of the button bar, under the Resume button. */
+	flex-basis: 100%;
+}
+.resume-problem .icon {
+	flex: none;
+}
+/* Steer grid: an implicit full-width row under the named stop row, only when shown. */
+.drawer-body > .steer-form .composer-bar > .resume-problem {
+	grid-row: auto;
+	grid-column: 1 / -1;
+	margin-top: 8px;
 }
 /* The footer is its own group: it sits farther from the fields above it (their gap
    plus this margin) than the fields sit from each other. */
@@ -5620,6 +5874,38 @@ dialog.confirm-dialog {
 }
 .settings-content > h1 {
 	margin: 0;
+}
+.settings-search {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	min-width: 0;
+}
+.settings-search > label {
+	color: var(--text-strong);
+	font-size: 13px;
+	font-weight: 600;
+}
+.settings-search-controls {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: flex-end;
+	gap: 8px;
+}
+.settings-search-controls > input {
+	flex: 1 1 180px;
+	min-width: 0;
+	width: 100%;
+}
+.settings-search-controls > button {
+	flex: none;
+}
+.settings-search-status {
+	margin: 0;
+	color: var(--dim);
+}
+.settings-search-status:empty {
+	margin-top: -8px;
 }
 /* A project page stacks its sections inside one form; give the form the same column gap. */
 .settings-content > form {
@@ -6475,6 +6761,151 @@ dialog.confirm-dialog {
 	}
 }
 
+/* Local Add project drafts share the existing setup sections without fieldset chrome. */
+.add-wizard,
+.setup-fields {
+	display: grid;
+	gap: 12px;
+	min-width: 0;
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+.setup-source {
+	min-width: 0;
+	margin: 0;
+}
+/* A fixed frame keeps the title, step indicator, and actions at the same position.
+   Only the draft fields scroll. The existing Open setup layout stays unchanged. */
+.dialog.add-project-dialog {
+	height: min(720px, calc(100dvh - 24px));
+	max-height: calc(100dvh - 24px);
+	overflow: hidden;
+}
+.add-project-dialog[open] {
+	display: flex;
+	flex-direction: column;
+}
+.add-project-dialog > .dialog-body,
+.add-project-dialog .add-wizard {
+	flex: 1;
+	min-height: 0;
+	min-width: 0;
+}
+.add-project-dialog > .dialog-body {
+	overflow: hidden;
+}
+.add-project-dialog .dialog-head,
+.add-project-dialog .setup-steps,
+.add-project-dialog .dialog-actions {
+	flex: none;
+}
+.add-project-dialog .add-wizard {
+	display: flex;
+	flex-direction: column;
+}
+.add-project-dialog .setup-fields {
+	flex: 1;
+	grid-template-columns: minmax(0, 1fr);
+	align-content: start;
+	min-height: 0;
+	overflow-y: auto;
+	overflow-wrap: anywhere;
+	scrollbar-gutter: stable;
+	padding: 4px;
+	margin: -4px;
+}
+.add-project-dialog .setup-source {
+	grid-template-columns: minmax(0, 1fr);
+}
+.add-project-dialog .setup-source > [role="tabpanel"][hidden] {
+	display: none;
+}
+.add-project-dialog :is(input, textarea, select, label) {
+	min-width: 0;
+	max-width: 100%;
+}
+.add-project-dialog .settings-field {
+	max-width: none;
+}
+.add-project-dialog textarea {
+	width: 100%;
+}
+.add-project-dialog .setup-sec > h3 {
+	margin: 0;
+}
+.add-project-dialog input:is([type="checkbox"], [type="radio"]) {
+	flex: none;
+	width: 15px;
+	height: 15px;
+	accent-color: var(--accent);
+}
+.add-project-dialog .setup-steps {
+	min-width: 0;
+}
+.add-project-dialog .setup-steps li {
+	flex: 1 1 0;
+	flex-wrap: wrap;
+	justify-content: center;
+	gap: 2px 4px;
+	min-width: 0;
+	min-height: 48px;
+	padding: 6px 4px;
+	font-size: 12.5px;
+}
+.add-project-dialog .setup-steps .step-n {
+	flex-basis: 100%;
+	text-align: center;
+}
+.add-project-dialog .dialog-actions {
+	margin-top: 0;
+	padding-top: 12px;
+	border-top: 1px solid var(--line-soft);
+}
+.add-project-dialog .add-wizard > :is(.auth-error, [role="status"]) {
+	flex: none;
+	max-height: 20dvh;
+	overflow-y: auto;
+	overflow-wrap: anywhere;
+}
+@media (max-width: 600px) {
+	/* The current step and its count replace the strip, not a clipped label run. */
+	.add-project-dialog .setup-steps {
+		overflow: visible;
+	}
+	.add-project-dialog .setup-steps li:not([aria-current="step"]) {
+		display: none;
+	}
+	.add-project-dialog .setup-steps li[aria-current="step"] {
+		justify-content: space-between;
+		min-height: 40px;
+		padding: 0 8px;
+	}
+	.add-project-dialog .setup-steps .step-n {
+		display: inline;
+		flex-basis: auto;
+	}
+	body:has(.add-project-dialog[open]) .fab {
+		visibility: hidden;
+	}
+}
+@media (max-width: 440px) {
+	.add-project-dialog .dialog-actions > .primary {
+		flex: 1 0 100%;
+	}
+}
+@media (pointer: coarse) {
+	.add-project-dialog label.add-check {
+		min-height: 44px;
+	}
+	.add-project-dialog .check-row .alate-def-name label {
+		display: flex;
+		align-items: center;
+		min-height: 44px;
+		margin: -10px 0;
+	}
+}
+
 /* ---- Project setup wizard (Add project steps 2-4, Open setup) ---- */
 .setup-steps {
 	display: flex;
@@ -6531,6 +6962,50 @@ dialog.confirm-dialog {
 }
 .setup-sec .settings-field {
 	width: 100%;
+}
+/* The wizard's typed fields (Runner cap, Extra paths) use the settings page's rows: the name
+   and its hint stack in the left column, the field fills the right one, a soft rule between. */
+.setup-sec .alate-def-rows {
+	display: grid;
+	align-self: stretch;
+}
+.setup-sec .alate-def-row:not(.check-row) {
+	display: grid;
+	grid-template-columns: 150px minmax(0, 1fr);
+	gap: 14px;
+	align-items: center;
+	padding: 8px 0;
+}
+.setup-sec .alate-def-row:not(.check-row) + .alate-def-row:not(.check-row) {
+	border-top: 1px solid var(--line-soft);
+}
+.setup-sec .alate-def-row:not(.check-row) > label {
+	display: flex;
+}
+.setup-sec .alate-def-row:not(.check-row) textarea {
+	flex: 1;
+	min-width: 0;
+}
+/* A number keeps its short field on the column's right edge, as on the Runners card. */
+.setup-sec .alate-def-row:not(.check-row) > label:has(input[type="number"]) {
+	justify-self: end;
+}
+.setup-sec .alate-def-row:not(.check-row) .alate-def-name {
+	display: grid;
+	gap: 2px;
+	font-size: 13px;
+}
+.setup-sec .alate-def-row:not(.check-row) .alate-def-name b {
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.setup-sec .alate-def-row:not(.check-row) .alate-def-name code {
+	font-family: var(--mono);
+	font-size: 11px;
+	color: var(--dim);
+}
+.setup-sec .alate-def-row:not(.check-row) input[type="number"] {
+	width: 64px;
 }
 /* Checkbox in column 1; the title and the hint share column 2, so a long title wraps beside the box. */
 .setup-sec label.add-check,
@@ -6983,6 +7458,10 @@ dialog.drawer[open]::backdrop {
 	border-radius: 50%;
 	background: var(--well);
 }
+/* Waiting for: the blocking cards as bare nodes, no thread; a dependency is no lineage. */
+.lineage-deps li::before {
+	display: none;
+}
 /* This card is always the rail's last item: its node and thread end at its own row (15px, half a
    30px row), not at the middle of the item, which also holds the follow-up branch. */
 .lineage-rail .lineage-self::after {
@@ -7132,42 +7611,6 @@ a.lineage-row:hover .lineage-title {
 .st-running {
 	color: var(--text-strong);
 }
-/* Related-task rows (dependencies, follow-ups): one quiet list, a full-row click target per task;
-   the status word reuses the meta line's coding (dim, amber only for needs-you, steel for an asked
-   round). Kept below the .st rules so specificity never descends. */
-.fu-list {
-	list-style: none;
-	margin: 0;
-	padding: 0;
-	display: grid;
-	gap: 2px;
-	/* The track shrinks to the drawer, so a long title ellipsizes instead of pushing the status
-	   off a phone screen (the auto track grew to the title's full width). */
-	grid-template-columns: minmax(0, 1fr);
-}
-.fu-title {
-	min-width: 0;
-	overflow: hidden;
-	white-space: nowrap;
-	text-overflow: ellipsis;
-	/* Links are steel, same as the parent chip above. */
-	color: var(--accent);
-}
-/* Related-row key: the card's speaking id (e.g. OTTR-6), same quiet mono metadata as the card head. */
-.fu-list .fu-key {
-	flex: none;
-	font-family: var(--mono);
-	font-size: 11.5px;
-	color: var(--dim); /* at least 4.5:1 on --card */
-	font-variant-numeric: tabular-nums;
-}
-.fu-list a:hover .fu-title {
-	color: var(--accent-hover);
-}
-.fu-list .st {
-	flex: none;
-	font-size: 12px;
-}
 .fu-head button:hover {
 	color: var(--text-strong);
 }
@@ -7301,6 +7744,18 @@ a.lineage-row:hover .lineage-title {
 	flex: 1;
 	min-width: 0;
 }
+/* A text question's row: the field takes the free width, the Answer button rides beside it.
+   The global input styles own the border, the accent focus ring and the locked look. */
+.ask-text-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-top: 8px;
+}
+.ask-text-row input {
+	flex: 1;
+	min-width: 0;
+}
 .kept-panel {
 	margin: 8px 0;
 	padding: 10px 12px;
@@ -7427,6 +7882,10 @@ button.diff-path {
 	/* Git errors carry the GitHub-API hint on a following line ("GitHub: …"); keep it under. */
 	white-space: pre-line;
 }
+/* The usage-hold hint reads as the reason's next step: tucked under the box. */
+.hint.hold-next {
+	margin: -2px 0 8px;
+}
 .needs-reason::before {
 	content: "";
 	flex: none;
@@ -7436,22 +7895,39 @@ button.diff-path {
 	background: var(--alarm);
 	clip-path: polygon(50% 0, 100% 100%, 0 100%);
 }
-/* The proposal's decision is one recessed card: a dim byline (the reason, led by the
-   lineage arrow, never the amber triangle), the summary and the full prompt, then a
-   footer bar with Accept and Edit at the right, like a dialog's actions. */
+/* The proposal's decision takes the ask panel's box and the board card's proposal border
+   (dashed, --line-hover): no fill and no inner rules. The summary leads in bold behind the
+   grey waiting mark like a question, the dim byline (the reason, led by the lineage arrow,
+   never the amber triangle) and the full prompt follow, then the model and the buttons. */
 .decide-card {
-	margin: 8px 0 0;
-	background: var(--well);
-	border: 1px solid var(--line);
+	margin: 8px 0;
+	padding: 14px;
+	border: 1px dashed var(--line-hover);
 	border-radius: 6px;
 }
 .decide-body {
-	padding: 4px 14px 12px;
+	display: flex;
+	flex-direction: column;
+}
+.decide-ask {
+	display: flex;
+	align-items: flex-start;
+	gap: 7px;
+	margin: 0 0 6px;
+	color: var(--text-strong);
+}
+.decide-ask > .mark {
+	flex: none;
+	margin-top: 3px;
+}
+.decide-ask > :not(.mark) {
+	flex: 1;
+	min-width: 0;
 }
 .decide-reason {
 	display: flex;
 	gap: 8px;
-	margin: 8px 0 0;
+	margin: 2px 0 0;
 	font-size: 12.5px;
 	color: var(--dim);
 	overflow-wrap: anywhere;
@@ -7467,7 +7943,7 @@ button.diff-path {
 	display: grid;
 	grid-template-columns: max-content minmax(0, 1fr);
 	gap: 2px 14px;
-	margin: 10px 0 0;
+	margin: 0;
 }
 .decide-facts > div {
 	display: contents;
@@ -7476,8 +7952,7 @@ button.diff-path {
 	color: var(--dim);
 }
 .decide-fallback {
-	margin: 10px 0 0;
-	color: var(--text-strong);
+	font-weight: 600;
 	overflow-wrap: anywhere;
 }
 .meta div {
@@ -7491,8 +7966,11 @@ button.diff-path {
 	display: flex;
 	justify-content: flex-end;
 	gap: 8px;
-	padding: 10px 14px;
-	border-top: 1px solid var(--line);
+	padding: 14px 0 0;
+}
+/* The model the first turn runs with sits over the decision buttons. */
+.decide-model {
+	padding: 14px 0 0;
 }
 .decide-actions .primary {
 	min-width: 96px;
@@ -8127,10 +8605,9 @@ button.log-mode[aria-pressed="true"] {
 	margin-top: 8px;
 	font-size: 0;
 }
-/* New task / Follow up: the caption's name group joins the picker's own row — the visible
-   "(optional)" sits in the elastic gap column, flush against the model trigger. Left loose,
-   the head drops to an implicit full-width row below the box, where the mark reads as a
-   stray label of the actions row under the card. The quota chip keeps its implicit row. */
+/* New task / Follow up: the caption's name group (hidden at font-size 0, kept for the label's
+   accessible name) joins the picker's own row. Left loose, the head drops to an implicit
+   full-width row below the box. The quota chip keeps its implicit row. */
 .prompt-card > .model-fields .field-head {
 	display: contents;
 }
@@ -8526,8 +9003,7 @@ button.log-mode[aria-pressed="true"] {
 		padding-bottom: 72px; /* FAB 56px + 16px bottom offset */
 	}
 	/* No hardware keyboard on touch: the shortcut badge is noise and costs width. */
-	.project-actions kbd,
-	.lane-add kbd {
+	.project-actions kbd {
 		display: none;
 	}
 	/* The FAB replaces the header New task button: the board's only primary action stays
@@ -8848,9 +9324,9 @@ button.log-mode[aria-pressed="true"] {
 	.stage-tabs button,
 	.perf-range button,
 	.meters,
-	.lane-add,
 	.help-badge,
-	.notif-line button.icon {
+	.notif-line button.icon,
+	.project-meta a {
 		min-height: 44px;
 		min-width: 44px;
 	}
@@ -8973,12 +9449,20 @@ button.log-mode[aria-pressed="true"] {
 .check-row > input:disabled + .alate-def-name label {
 	cursor: default;
 }
+.check-row .alate-def-name > b > .save-tick:empty {
+	min-width: 0;
+	margin-left: 0;
+}
 /* A muted pill after a row's name, e.g. "Not needed: private repo". */
 .check-row .alate-def-name b .state-chip {
 	margin-left: 8px;
 	font-weight: 400;
 	font-size: 11.5px;
 	vertical-align: 1px;
+}
+/* The amber pill (e.g. "Legacy"): outranks `.settings-sec .alate-def-name span`'s dim color. */
+.check-row .alate-def-name b .state-chip.warn {
+	color: var(--alarm);
 }
 /* A dependent option hangs under its parent: one indent in, no rule between them. */
 .settings-sec .alate-def-row.check-row:has(+ .check-sub) {
@@ -9454,6 +9938,32 @@ button.log-mode[aria-pressed="true"] {
 	font-size: 12.5px;
 	line-height: 1.5;
 }
+/* The microVM switch's warning: the role-warn box, below the switch's description. */
+.vm-warn {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr);
+	gap: 2px 8px;
+	margin-top: 8px;
+	padding: 8px 10px;
+	background: var(--alarm-bg);
+	border: 1px solid var(--alarm-line);
+	border-radius: 6px;
+	color: var(--text);
+}
+.vm-warn > .mark {
+	grid-row: 1 / span 2;
+	margin-top: 3px;
+}
+.vm-warn > b {
+	color: var(--text-strong);
+	font-weight: 600;
+}
+.vm-warn a {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	color: var(--accent);
+}
 .role-warn-actions {
 	grid-column: 3;
 	grid-row: 1 / span 2;
@@ -9466,6 +9976,28 @@ button.log-mode[aria-pressed="true"] {
 .role-warn-actions button {
 	color: var(--text-strong);
 	border-color: var(--alarm-line);
+}
+/* Check routing: the same table voice as the System page (left-aligned th, dim header). */
+.check-routing table {
+	width: 100%;
+	max-width: 480px;
+	border-collapse: collapse;
+	font-size: 13px;
+}
+.check-routing th,
+.check-routing td {
+	padding: 6px 12px 6px 0;
+	text-align: left;
+}
+.check-routing thead th {
+	font-size: 12.5px;
+	font-weight: 600;
+	color: var(--dim);
+}
+.check-routing tbody th {
+	font-weight: 600;
+	color: var(--text-strong);
+	white-space: nowrap;
 }
 @container (max-width: 640px) {
 	.role-warn {
@@ -9858,4 +10390,9 @@ dialog.updates {
 }
 .notify-hint {
 	color: var(--dim);
+}
+
+/* Keep native and filter-owned hidden elements outside the settings layout. */
+.settings-page .settings-content [hidden] {
+	display: none;
 }

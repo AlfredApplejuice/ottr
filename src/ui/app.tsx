@@ -34,12 +34,13 @@ import {
 	IMPLEMENT_RECOMMENDATIONS,
 	isProposalReason,
 } from "../prompts.ts";
-import { forModel, tightest, tightestFor } from "../quota.ts";
+import { forModel, providerOf, tightest, tightestFor } from "../quota.ts";
 import { missingByUse, type SkillUse } from "../requiredSkills.ts";
 import {
 	type DepIndex,
 	type DepProject,
 	findDep,
+	isReview,
 	liveCardOf,
 	queueOrder,
 	waitingOn,
@@ -48,9 +49,11 @@ import {
 	type AddProjectResponse,
 	APPROVE_REPLY,
 	type AskQuestion,
+	answeredCard,
 	askAnswerLine,
 	doneReadKey,
 	type GhStatus,
+	type HostedCreditsView,
 	type KeptChoice,
 	MERGE_HOLD_MISMATCH_REASON,
 	newestLanded,
@@ -64,6 +67,7 @@ import {
 	type ProjectView,
 	type ProvisioningResponse,
 	type PrReviewView,
+	type QuotaResetCredits,
 	type QuotaState,
 	REVIEW_BODY_MAX,
 	type ReleasePlan,
@@ -75,6 +79,7 @@ import {
 	type SystemCard,
 	type SystemPoint,
 	type SystemSnapshot,
+	type SystemVm,
 	type TaskCard,
 	type TaskView,
 	type TurnUsage,
@@ -129,6 +134,8 @@ import {
 	Mark,
 	Meter,
 	Modal,
+	type ModelPace,
+	modelPace,
 	ProjectLogo,
 	ProjectTag,
 	post,
@@ -144,6 +151,7 @@ import {
 	useOptimisticValue,
 	useQuota,
 	windowGone,
+	windowPace,
 	ZoomableImage,
 } from "./kit.tsx";
 import { Markdown } from "./markdown.tsx";
@@ -162,6 +170,7 @@ import {
 	reviewModel,
 	useModels,
 } from "./models.ts";
+import { shortNoticeText } from "./notice.ts";
 import {
 	type AskDraft,
 	alatePendingEntry,
@@ -214,10 +223,12 @@ import {
 	taskPath,
 	viewPath,
 } from "./route.ts";
+import { ServiceQuotas } from "./serviceQuotas.tsx";
 import {
 	alateHint,
 	asError,
 	asTrust,
+	capValue,
 	type GitHostsView,
 	gitReq,
 	HostedContext,
@@ -225,9 +236,11 @@ import {
 	openSettingsSection,
 	type PendingKeyInfo,
 	PendingKeyRow,
-	ProjectSetupSteps,
 	SETTINGS_TOC,
 	SettingsPage,
+	type SetupFields,
+	SetupSettingsFields,
+	SetupStepsNav,
 	SetupWizardModal,
 	SshTestRow,
 	type TestAnswer,
@@ -244,9 +257,11 @@ import {
 } from "./socket.ts";
 import {
 	alarmLabel,
+	bellAlarms,
 	cardMark,
 	holdFor,
 	holdLeft,
+	isProposal,
 	reReleaseOf,
 	splitAlarms,
 	statusLine,
@@ -698,24 +713,11 @@ function cardDerived(task: TaskCard): {
 	return { sp, spLeft, silent, commits, held };
 }
 
-/** A retro proposal waiting for the operator's decision: not started, never an error. */
-function isProposalCard(
-	task: Pick<TaskCard, "state" | "cancelledAt" | "needsReason">,
-): boolean {
-	return (
-		task.state === "needs_you" &&
-		task.cancelledAt === null &&
-		isProposalReason(task.needsReason)
-	);
-}
-
-/** The card's top line: mark, id, unread/research/cancelled flags, main-loop model. A
- *  proposal takes the grey queued ring: it waits like a card not started yet. */
+/** The card's top line: mark, id, unread/research/cancelled flags, main-loop model. */
 function cardHead(
 	task: TaskCard,
 	unread: boolean,
 	catalog: ModelCatalog | null,
-	proposal: boolean,
 ): ReactNode {
 	return (
 		<span className="card-head">
@@ -724,7 +726,7 @@ function cardHead(
 				// icon button toggles it, the card carries only the state.
 				<Mark kind="star" />
 			) : (
-				<Mark kind={proposal ? "queued" : cardMark(task)} />
+				<Mark kind={cardMark(task)} />
 			)}
 			<span className="card-key" title={`Task ${task.id}`}>
 				{task.id}
@@ -1038,7 +1040,7 @@ const Card = memo(function Card({
 	task: TaskCard;
 	github: string | null;
 	/** Opens this card's drawer; stable across frames, so memoized cards keep it. */
-	onOpen: (id: string) => void;
+	onOpen: (id: string, project?: string) => void;
 	unread: boolean;
 	delta?: number;
 	fuOf?: string | null;
@@ -1069,7 +1071,7 @@ const Card = memo(function Card({
 	const catalog = useModels();
 	const release = releaseOf(task);
 	const { sp, spLeft, silent, commits, held } = cardDerived(task);
-	const proposal = isProposalCard(task);
+	const proposal = isProposal(task);
 	return (
 		// A stretched link opens the card; the release link sits beside it, never nested in it.
 		// biome-ignore lint/a11y/noStaticElementInteractions: HTML5 drag-and-drop on the card shell; keyboard users act through the stretched link inside
@@ -1099,9 +1101,9 @@ const Card = memo(function Card({
 						? (task.needsReason ?? "Action required")
 						: undefined
 				}
-				onClick={(e) => navClick(e, () => onOpen(task.id))}
+				onClick={(e) => navClick(e, () => onOpen(task.id, task.project))}
 			>
-				{cardHead(task, unread, catalog, proposal)}
+				{cardHead(task, unread, catalog)}
 				<span className="card-title">{task.sessionTitle ?? task.title}</span>
 				{/* A proposal is a suggestion, not a fault: its reason stays in the tooltip and the
 				    drawer's decision panel, never as the amber error line. */}
@@ -1187,7 +1189,9 @@ function systemQuotaGrp(
 	);
 }
 
-/** The Agents section of the System popover: running, merging, waiting and the slot cap. */
+/** The Agents section of the System popover: running, merging, waiting and the slot cap.
+ *  Running is the scheduler's own count (OTTR-1143): it includes preparing claims and merge
+ *  turns. Merging stays the frame's stage split. */
 function systemAgents(
 	slots: SlotCounts,
 	maxTotal: number | null,
@@ -1198,12 +1202,12 @@ function systemAgents(
 		<section>
 			<h2>Agents</h2>
 			<dl className="ag-nums">
-				<div data-zero={slots.in_progress + slots.todo === 0 || undefined}>
+				<div data-zero={used === 0 || undefined}>
 					<dt>
 						<Mark kind="running" />
 						Running
 					</dt>
-					<dd>{slots.in_progress + slots.todo}</dd>
+					<dd>{used}</dd>
 				</div>
 				<div data-zero={slots.merging === 0 || undefined}>
 					<dt>
@@ -1263,6 +1267,7 @@ function quotaRow(l: QuotaState["limits"][number]): ReactNode {
 				</span>
 			</span>
 			<span className="qt-val">{Math.round(l.usedPct)} %</span>
+			{quotaPaceCell(l)}
 			<span
 				className="qt-reset"
 				title={l.resetsAt === null ? undefined : `Resets ${stamp(l.resetsAt)}`}
@@ -1273,13 +1278,73 @@ function quotaRow(l: QuotaState["limits"][number]): ReactNode {
 	);
 }
 
+/** The pace cell: amber "ahead" says slow down, steel "behind" says there is room to spend,
+ *  dim "on pace" says neither. */
+function quotaPaceCell(l: QuotaState["limits"][number]): ReactNode {
+	const p = windowPace(l, Date.now());
+	return (
+		<span className="qt-pace" data-pace={p?.pace}>
+			{p?.label ?? "–"}
+		</span>
+	);
+}
+
+/** Each provider's own usage page, where the account's windows and banked resets live. */
+const PROVIDER_USAGE_PAGES: Record<string, string> = {
+	anthropic: "https://claude.ai/settings/usage",
+	"openai-codex": "https://chatgpt.com/settings/usage?tab=overview",
+	zai: "https://z.ai/manage-apikey/coding-plan/personal/usage",
+};
+
+/** A provider's head row in the quota table: its name, linked to its usage page when the
+ *  provider has one, then the banked resets it can redeem now (only when there are any). */
+function quotaProviderHead(
+	provider: string,
+	credits: QuotaResetCredits | undefined,
+): ReactNode {
+	const page = PROVIDER_USAGE_PAGES[provider];
+	return (
+		<h3 className="qt-provider">
+			{page === undefined ? (
+				<span>{provider}</span>
+			) : (
+				<a
+					href={page}
+					target="_blank"
+					rel="noopener noreferrer"
+					title={`Open the ${provider} usage page`}
+				>
+					{provider}
+					<Icon name="external-link" size={12} />
+				</a>
+			)}
+			{credits !== undefined && credits.available > 0 && (
+				<span
+					className="qt-credits"
+					title={
+						credits.nextExpiry === null
+							? undefined
+							: `The next one expires ${stamp(credits.nextExpiry)}`
+					}
+				>
+					{credits.available === 1
+						? "1 reset available"
+						: `${fmtNum(credits.available)} resets available`}
+				</span>
+			)}
+		</h3>
+	);
+}
+
 /** The Provider quota section of the System popover; one row per window per provider.
  *  One row per window: a thin time line over the quota bar, so a quota bar longer than
  *  its time line means the window burns faster than it runs. */
 function systemQuotaSection(quota: QuotaState | null): ReactNode {
 	return (
 		<section>
-			<h2>Provider quota</h2>
+			{(quota === null ||
+				quota.error !== null ||
+				quota.limits.length === 0) && <h2>Provider quota</h2>}
 			{quota === null ? (
 				<p className="caption">Checking omp usage…</p>
 			) : quota.error !== null ? (
@@ -1291,9 +1356,11 @@ function systemQuotaSection(quota: QuotaState | null): ReactNode {
 			) : (
 				<>
 					<div className="qt">
-						<div className="qt-head" aria-hidden="true">
-							<span />
-							<span className="qt-key">
+						{/* The headline takes the head row's empty label cell; the column keys
+						    beside it are visual only. */}
+						<div className="qt-head">
+							<h2>Provider quota</h2>
+							<span className="qt-key" aria-hidden="true">
 								<span>
 									<span className="qt-time">
 										<i />
@@ -1307,13 +1374,23 @@ function systemQuotaSection(quota: QuotaState | null): ReactNode {
 									quota
 								</span>
 							</span>
-							<span className="qt-num">used</span>
-							<span className="qt-num">resets</span>
+							<span className="qt-num" aria-hidden="true">
+								used
+							</span>
+							<span className="qt-num" aria-hidden="true">
+								pace
+							</span>
+							<span className="qt-num" aria-hidden="true">
+								resets
+							</span>
 						</div>
 						{[...Map.groupBy(quota.limits, (l) => l.provider)].map(
 							([provider, limits]) => (
 								<Fragment key={provider}>
-									<h3>{provider}</h3>
+									{quotaProviderHead(
+										provider,
+										quota.resetCredits?.find((c) => c.provider === provider),
+									)}
 									{limits.map((l) => quotaRow(l))}
 								</Fragment>
 							),
@@ -1330,16 +1407,21 @@ function systemQuotaSection(quota: QuotaState | null): ReactNode {
 
 /** Overview indicators in the app bar; the button opens the detail popover (agents and quota).
  *  While any container warns, a warning link to the System view sits beside the button. */
-function SystemBar({
+export function SystemBar({
 	tasks,
 	maxTotal,
+	slotsUsed,
 	quota,
+	serviceQuotas,
 	navigate,
 	hosted,
 }: {
 	tasks: TaskCard[];
 	maxTotal: number | null;
+	/** OTTR-1143: the scheduler's own slot count; absent on frames from an older server. */
+	slotsUsed?: number;
 	quota: QuotaState | null;
+	serviceQuotas?: StateResponse["serviceQuotas"];
 	/** Plain-click navigation to a view path (see navClick). */
 	navigate: (path: string) => void;
 	/** Hosted mode has no System view, so no warning link. */
@@ -1348,7 +1430,10 @@ function SystemBar({
 	const system = useSystem();
 	const catalog = useModels();
 	const slots = slotUse(tasks);
-	const used = SLOT_STAGES.reduce((n, s) => n + slots[s], 0);
+	// OTTR-1143: the scheduler's own count wins; the frame's cards are not a snapshot
+	// across projects, so their sum can exceed the cap. Without the field (older
+	// server) the board keeps today's card count.
+	const used = slotsUsed ?? SLOT_STAGES.reduce((n, s) => n + slots[s], 0);
 	const waiting = queueOrder(tasks).length;
 	// The bar tracks the default model's provider: that is the quota that stops agents first.
 	const tightest = tightestFor(
@@ -1389,9 +1474,11 @@ function SystemBar({
 			</button>
 			<div id="system-detail" popover="auto" className="popover">
 				{/* Order by urgency: agents first (big figures, no table to read), quota second.
-				    Running counts preparing todo slots too. */}
+				    Running is the scheduler's own count; it includes preparing claims and merge
+				    turns. */}
 				{systemAgents(slots, maxTotal, used, waiting)}
 				{!hosted && systemQuotaSection(quota)}
+				{!hosted && <ServiceQuotas sources={serviceQuotas} now={Date.now()} />}
 			</div>
 			{/* Outside the meters button: a link cannot nest in a button. Rendered only while a
 			    container warns, so the bar stays grey at rest. */}
@@ -1562,8 +1649,9 @@ function eventCount(total: number | null, hour: number | null): ReactNode {
 
 /** The System view at /system: one row per container (the server, then each worker), the
  *  Docker VM, and the board-wide holds. Containers and VM come from the 30 s System snapshot;
- *  the holds read the live board state with the top bar's own slotUse and queueOrder, so the
- *  two always show the same numbers. */
+ *  the holds read the live board state with the top bar's own slotUse and queueOrder. The
+ *  Agent cap line prefers the server's slotsUsed (OTTR-1143) like the top bar, so the two
+ *  always show the same numbers. */
 /** One container row of the System table: warn head, metrics or gap, turns, mutation lock. */
 function containerRow(
 	c: SystemSnapshot["containers"][number],
@@ -1585,16 +1673,18 @@ function containerRow(
 						: `not reachable since ${clockTime(c.unreachableSince)}`}
 				</td>
 			)}
-			{containerTurns(c, tasks, openTask)}
+			{containerTurns(c, tasks, openTask, links)}
 			{containerLock(c, links)}
 		</tr>
 	);
 }
 
-/** A container row's first cell: name, warning mark, and the warning reasons in text —
- *  amber alone never carries a warning. */
+/** A container row's first cell: name, warning mark, the warning reasons, and on the
+ *  vm-runner row the runner health, VM fleet, and vm-state disk facts as plain text —
+ *  amber alone never carries a warning, and no fact rides on color only. */
 function containerWarnHead(c: SystemSnapshot["containers"][number]): ReactNode {
 	const warn = c.warnings.length > 0;
+	const vm = c.vm;
 	return (
 		<th scope="row">
 			<span className="sys-name">
@@ -1606,6 +1696,29 @@ function containerWarnHead(c: SystemSnapshot["containers"][number]): ReactNode {
 					{c.warnings.map((w) => (
 						<li key={w}>{w}</li>
 					))}
+				</ul>
+			)}
+			{vm && (
+				<ul className="sys-warns">
+					<li className="sys-sub">
+						{vm.health.ok
+							? "vm-runner ok"
+							: (vm.health.reason ?? "runner not reachable")}
+					</li>
+					{c.reachable && (
+						<>
+							<li className="sys-sub">
+								{vm.max === null
+									? `${vm.vms.length} VMs`
+									: `${vm.vms.length} / ${vm.max} VMs`}
+							</li>
+							{vm.disk !== null && (
+								<li className="sys-sub">
+									{`vm-state ${gib(vm.disk.base + vm.disk.layers + vm.disk.runs)} GiB allocated (base ${gib(vm.disk.base)} · layers ${gib(vm.disk.layers)} · runs ${gib(vm.disk.runs)})`}
+								</li>
+							)}
+						</>
+					)}
 				</ul>
 			)}
 		</th>
@@ -1667,16 +1780,60 @@ function containerMetrics(
 	);
 }
 
-/** A container's live-turns cell: none, or the turn list with each turn's usage figures. */
+/** One vm-runner turn's VM facts: mode, vCPUs, guest memory, scratch allocated, start
+ *  time — the scratch part drops while the runner has not created the disk yet. */
+function vmTurnFacts(v: SystemVm): ReactNode {
+	return (
+		<span className="sys-sub">
+			{[
+				v.mode,
+				`${v.vcpus} vCPU`,
+				`${v.memMiB} MiB guest`,
+				v.scratchBytes === null
+					? null
+					: `scratch ${gib(v.scratchBytes)} GiB allocated`,
+				`since ${clockTime(v.startedAt)}`,
+			]
+				.filter((part): part is string => part !== null)
+				.map((part, i) => (
+					<Fragment key={part}>
+						{i > 0 && " · "}
+						<span>{part}</span>
+					</Fragment>
+				))}
+		</span>
+	);
+}
+
+/** The vm-runner's refused-as-busy cards under the turns, mirrored on the lock cell's
+ *  waiter style: a text lead, then the card links. */
+function vmBusyWaiters(
+	busy: SystemCard[],
+	links: (cards: SystemCard[]) => ReactNode,
+): ReactNode {
+	if (busy.length === 0) return null;
+	return (
+		<span className="sys-cards">
+			<span className="sys-sub">waiting for a free VM:</span>
+			{links(busy)}
+		</span>
+	);
+}
+
+/** A container's live-turns cell: none, or the turn list with each turn's usage figures;
+ *  on the vm-runner row each turn also gains its VM facts and the busy cards follow. */
 function containerTurns(
 	c: SystemSnapshot["containers"][number],
 	tasks: TaskCard[],
 	openTask: (id: string) => void,
+	links: (cards: SystemCard[]) => ReactNode,
 ): ReactNode {
+	const busy = c.vm?.busy ?? [];
 	if (c.cards.length === 0) {
 		return (
 			<td data-label="Turns">
 				<span className="sys-sub">none</span>
+				{vmBusyWaiters(busy, links)}
 			</td>
 		);
 	}
@@ -1685,22 +1842,29 @@ function containerTurns(
 			{/* Largest memory first (the server's order): the turn to look at
 			    when the container runs full leads the list. */}
 			<ul className="sys-turns">
-				{c.cards.map((t) => (
-					<li key={`${t.project}/${t.id}`}>
-						<SystemCardLink card={t} tasks={tasks} openTask={openTask} />
-						{t.usage !== null && (
-							<span className="sys-sub">
-								{turnUsageParts(t.usage).map((part, i) => (
-									<Fragment key={part}>
-										{i > 0 && " · "}
-										<span>{part}</span>
-									</Fragment>
-								))}
-							</span>
-						)}
-					</li>
-				))}
+				{c.cards.map((t) => {
+					const v = c.vm?.vms.find(
+						(x) => x.project === t.project && x.cardId === t.id,
+					);
+					return (
+						<li key={`${t.project}/${t.id}`}>
+							<SystemCardLink card={t} tasks={tasks} openTask={openTask} />
+							{t.usage !== null && (
+								<span className="sys-sub">
+									{turnUsageParts(t.usage).map((part, i) => (
+										<Fragment key={part}>
+											{i > 0 && " · "}
+											<span>{part}</span>
+										</Fragment>
+									))}
+								</span>
+							)}
+							{v && vmTurnFacts(v)}
+						</li>
+					);
+				})}
 			</ul>
+			{vmBusyWaiters(busy, links)}
 		</td>
 	);
 }
@@ -1743,8 +1907,10 @@ function SystemView({
 }) {
 	const system = useSystem();
 	const tasks = state.tasks;
-	const slots = slotUse(tasks);
-	const running = SLOT_STAGES.reduce((n, s) => n + slots[s], 0);
+	// OTTR-1143: the Agent cap line shows the scheduler's own count; the frame's own
+	// cards are only the fallback (older server).
+	const running =
+		state.slotsUsed ?? SLOT_STAGES.reduce((n, s) => n + slotUse(tasks)[s], 0);
 	const queue = queueOrder(tasks);
 	const oldest = queue[0];
 	const links = (cards: SystemCard[]): ReactNode =>
@@ -1784,7 +1950,7 @@ function SystemView({
 								<caption className="sr">
 									Containers: CPU and memory now and over the last hour, memory
 									limit hits, OOM kills, live turns with each turn's memory and
-									CPU, and the mutation lock
+									CPU, cards waiting for a free VM, and the mutation lock
 								</caption>
 								<thead>
 									<tr>
@@ -2285,11 +2451,14 @@ function QuotaTwin({ limit }: { limit: QuotaState["limits"][number] }) {
 	);
 }
 
-/** The model field's quota chip: every window as a twin bar with its used percent; only a
- *  window past the band turns amber, a critical one red. */
+/** The model field's quota chip: every window as a twin bar with its used percent (only a
+ *  window past the band turns amber, a critical one red), then the model's pace pill: the
+ *  model menu's own note ("1d 13h ahead", "limit · back in 28m") for the window that stops
+ *  agents first, so a glance says whether the pick is good to go. */
 function modelQuotaChip(
 	limits: QuotaState["limits"],
 	worst: QuotaState["limits"][number] | null,
+	pace: ModelPace | null,
 ): ReactNode {
 	if (worst === null) return null;
 	return (
@@ -2303,6 +2472,11 @@ function modelQuotaChip(
 					</span>
 				</span>
 			))}
+			{pace !== null && (
+				<span className="model-pace qt-pace pace-pill" data-pace={pace.pace}>
+					{pace.label}
+				</span>
+			)}
 		</span>
 	);
 }
@@ -2434,12 +2608,15 @@ function ModelField({
 			: `Model: ${model}`;
 	const quota = useQuota();
 	// The budget of the model that would actually run: the pick, else the catalog default.
-	const limits = forModel(
-		quota?.limits ?? [],
-		base || catalog?.defaultModel || null,
-	);
+	const runSelector = base || catalog?.defaultModel || null;
+	const limits = forModel(quota?.limits ?? [], runSelector);
 	// The chip's color tracks the window that runs out first.
 	const worst = tightest(limits);
+	// The pace pill reads every limit: usageReset finds the binding reset across them.
+	const pace =
+		runSelector === null
+			? null
+			: modelPace(quota?.limits ?? [], runSelector, Date.now());
 	const pickModel = (selector: string): void => {
 		setModel(selector);
 		menu.close();
@@ -2460,15 +2637,12 @@ function ModelField({
 				{/* biome-ignore lint/a11y/noLabelWithoutControl: the label wraps the picker's trigger button, which sits inside ModelMenuTrigger */}
 				<label className="field">
 					<span className="field-head">
-						{/* Name and mark share one flex child: the head is space-between, so a loose
-						    third child would float mid-row between label and quota chip. */}
-						<span className="field-head-name">
-							Model
-							<span className="opt-mark">(optional)</span>
-						</span>
+						{/* The name stays one flex child: the head is space-between, so the quota
+						    chip sits at the right edge. */}
+						<span className="field-head-name">Model</span>
 						{/* Every window as the top bar's twin bar (time gone over quota used) plus its used
 						    percent; only a window past the band turns amber, a critical one red. */}
-						{modelQuotaChip(limits, worst)}
+						{modelQuotaChip(limits, worst, pace)}
 					</span>
 					<ModelMenuTrigger menu={menu} label={fullLabel}>
 						<span className="model-name">
@@ -2500,6 +2674,7 @@ function ModelField({
 				shown={models.length}
 				total={allModels.length}
 				loading={catalog === null}
+				defaultModel={catalog?.defaultModel ?? undefined}
 				onPick={pickModel}
 				after={modelLevelAfter(
 					menu,
@@ -3894,11 +4069,15 @@ function laneColumnData(
 	return { col };
 }
 
-/** The project head's overflow menu: review, release, diagrams and settings, plus the popover trigger. */
+/** The project head's New task split button: New task, plus a chevron that opens the menu of
+ * review, release, diagrams, settings and Add draft. A gitless project cannot file tasks, so it
+ * keeps only a square trigger for the menu. */
 function ProjectMenu(p: {
 	project: ProjectView;
 	/** The provisioned user layer; null before the first provisioning answer. */
 	userLayer: ProvisioningResponse["userLayer"] | null;
+	compose: () => void;
+	composeDraft: () => void;
 	startReview: () => void;
 	showRelease: () => void;
 	showDiagrams: () => void;
@@ -3907,15 +4086,39 @@ function ProjectMenu(p: {
 	const reviewNote = skillGapNote(p.userLayer, "review");
 	return (
 		<>
-			<button
-				type="button"
-				className="project-more"
-				popoverTarget="project-more"
-				aria-label="More project actions"
-				title="More project actions"
-			>
-				<Icon name="more" />
-			</button>
+			{project.gitless ? (
+				<button
+					type="button"
+					className="project-more"
+					popoverTarget="project-more"
+					aria-label="More project actions"
+					title="More project actions"
+				>
+					<Icon name="more" />
+				</button>
+			) : (
+				<span className="new-split">
+					<button
+						type="button"
+						className="primary"
+						onClick={p.compose}
+						title="New task (N)"
+					>
+						<Icon name="plus" />
+						New task
+						<kbd>N</kbd>
+					</button>
+					<button
+						type="button"
+						className="primary project-more"
+						popoverTarget="project-more"
+						aria-label="More project actions"
+						title="More project actions"
+					>
+						<Icon name="chevron-down" size={14} />
+					</button>
+				</span>
+			)}
 			{/* biome-ignore lint/a11y/useKeyWithClickEvents lint/a11y/noStaticElementInteractions: the items are buttons; a click on one runs it, then this closes the menu */}
 			<div
 				id="project-more"
@@ -3989,16 +4192,46 @@ function ProjectMenu(p: {
 					<Icon name="gear" />
 					Project settings
 				</a>
+				{!project.gitless && (
+					<>
+						<hr />
+						<button
+							type="button"
+							className="ghost"
+							onClick={p.composeDraft}
+							title="Park an idea in the backlog (B)"
+						>
+							<Icon name="edit" />
+							Add draft
+							<kbd>B</kbd>
+						</button>
+					</>
+				)}
 			</div>
 		</>
 	);
 }
 
-/** The review state chip in the project meta line. */
+/** The review state chip in the project meta line; a running review links to its card. */
 function ReviewStateChip(p: {
 	review: ProjectView["archReview"];
 	target: string | null;
+	project: string;
+	open: (id: string) => void;
 }) {
+	const cardId = p.review?.runningCardId ?? null;
+	if (cardId !== null)
+		return (
+			<a
+				className="arch-live"
+				href={taskPath(p.project, cardId)}
+				title={`Open review card ${cardId}: a review is queued or running, or its findings are still open`}
+				onClick={(e) => navClick(e, () => p.open(cardId))}
+			>
+				Review in progress
+				<Icon name="chevron-right" size={13} />
+			</a>
+		);
 	return (
 		<span
 			className={p.review?.running ? "arch-live" : "arch-due"}
@@ -4020,7 +4253,7 @@ function ReviewStateChip(p: {
 }
 
 /** The project head's meta line: latest release, latest image, review state, open PRs, repo link. */
-function ProjectMeta(p: { project: ProjectView }) {
+function ProjectMeta(p: { project: ProjectView; open: (id: string) => void }) {
 	const project = p.project;
 	return (
 		<p className="project-meta">
@@ -4063,7 +4296,12 @@ function ProjectMeta(p: { project: ProjectView }) {
 				</a>
 			)}
 			{(project.archReview?.due || project.archReview?.running) && (
-				<ReviewStateChip review={project.archReview} target={project.target} />
+				<ReviewStateChip
+					review={project.archReview}
+					target={project.target}
+					project={project.name}
+					open={p.open}
+				/>
 			)}
 			{/* More than three open PRs collapse to one count link, mirroring prs.ts's PR_CHIP_MAX. */}
 			{project.openPrs != null &&
@@ -4100,6 +4338,17 @@ function ProjectMeta(p: { project: ProjectView }) {
 				>
 					<GhMark />
 					{repoSlug(project.github)}
+				</a>
+			)}
+			{project.homepage != null && (
+				<a
+					href={project.homepage.url}
+					target="_blank"
+					rel="noopener noreferrer"
+					title="Project homepage"
+				>
+					<Icon name="external-link" size={13} />
+					{project.homepage.domain}
 				</a>
 			)}
 		</p>
@@ -4282,7 +4531,7 @@ export function ProjectBoard({
 	project: ProjectView;
 	tasks: TaskCard[];
 	deltas: Map<string, number>;
-	open: (id: string) => void;
+	open: (id: string, project?: string) => void;
 	seenAnswers: Set<string>;
 	/** The server's done baseline; the unread rule reads it (OTTR-827). */
 	seenDoneSince: number;
@@ -4374,6 +4623,22 @@ export function ProjectBoard({
 	// cards the state already carries, so counting the held cards stalls the number
 	// and "Show more" repeats one page forever. Each successful fetch advances it.
 	const [nextDonePage, setNextDonePage] = useState(2);
+	// The server-side Done search (OTTR-1135): the state holds only a slice, so a
+	// query reads the server's matching pages instead of filtering the loaded
+	// window. null = no active search; the query-change effect fills it.
+	const [searched, setSearched] = useState<{
+		q: string;
+		tasks: TaskCard[];
+		total: number;
+		page: number;
+	} | null>(null);
+	const [searchBusy, setSearchBusy] = useState(false);
+	const [searchFailed, setSearchFailed] = useState(false);
+	// The search's generation: every query change, project switch and Done-lane
+	// data change bumps it, so an answer applies only when its own generation is
+	// still the current one — a late answer for a text-equal older query cannot
+	// replace the newest result.
+	const searchGenRef = useRef(0);
 	// The flat view's pinned Starred section: one collapse toggle, default expanded.
 	const [starredCollapsed, setStarredCollapsed] = useState(false);
 	// The setup wizard, opened from the checklist's Open setup button.
@@ -4426,20 +4691,46 @@ export function ProjectBoard({
 		seenAnswers,
 		seenDoneSince,
 	);
-	// The done-lane cards the state holds (the window and the pinned ones) and the
-	// fetched older pages, so the hidden count stays true when a page lands.
-	const heldDoneCount = tasks.filter((t) => laneStage(t) === "done").length;
-	const heldIds = new Set(tasks.map((t) => t.id));
-	const olderCount = older.filter((t) => !heldIds.has(t.id)).length;
-	const doneHidden = Math.max(
-		0,
-		project.doneTotal - heldDoneCount - olderCount,
-	);
-	// The search count matches the lanes: a retro off the board is no task to count,
-	// and the done cards behind the state window still belong to the project's size.
+	// With a query applied the done lane reads the server search, not the state
+	// window: the shown done cards and the fetched ones the state lacks drive the
+	// search count against the server's matching total.
+	const shownDoneCount = shown.filter((t) => laneStage(t) === "done").length;
+	// The lane's merged done list, computed once: the held matched cards plus the
+	// fetched ones the state lacks, sorted for landing. The head count and the
+	// hidden count read these real IDs, so a card the lane renders can never sit
+	// behind "Show more" at the same time.
+	const doneCol = laneColumnData(
+		"done",
+		shown,
+		q,
+		q === "" ? older : (searched?.tasks ?? []),
+	).col;
+	// Retro cards hide in Done (onBoard) unless they need the user, but the
+	// settled total and the fetched pages still carry them. The hidden count
+	// excludes retro matches the lane has not rendered and can never render — a
+	// retro a fetched page delivered renders like any card, so only the ones
+	// missing from the rendered IDs leave "Show more" honest.
+	const renderedDoneIds = new Set(doneCol.map((t) => t.id));
+	const heldHiddenDone = tasks.filter(
+		(t) =>
+			laneStage(t) === "done" &&
+			t.kind === "retro" &&
+			t.state !== "needs_you" &&
+			(q === "" || matchesQuery(t, q)) &&
+			!renderedDoneIds.has(t.id),
+	).length;
+	const doneHidden =
+		q === ""
+			? Math.max(0, project.doneTotal - doneCol.length - heldHiddenDone)
+			: searched === null
+				? 0
+				: Math.max(0, searched.total - doneCol.length - heldHiddenDone);
+	// The search count's two values share one card set: every task of the project
+	// (open tasks plus the full settled total the server pages count, hidden
+	// retro matches included). Filtering either side would let the numerator
+	// exceed the denominator when every Done card matches.
 	const boardTotal =
-		tasks.filter(onBoard).length +
-		Math.max(0, project.doneTotal - heldDoneCount);
+		tasks.filter((t) => laneStage(t) !== "done").length + project.doneTotal;
 	/** One older-Done-page fetch: page 1 is the state window, so the first click reads
 	 * page 2, and a success advances the counter even when the page adds no new card.
 	 * A failure keeps the previous list and re-arms the button, with no notice. */
@@ -4463,6 +4754,82 @@ export function ProjectBoard({
 			.catch(() => undefined)
 			.finally(() => setOlderBusy(false));
 	};
+	/** One server-side Done-search page fetch (OTTR-1135): page 1 replaces the
+	 * result, a later page appends to the previous one (the render dedupes against
+	 * the held cards, so pages store their raw tasks). Every success advances the
+	 * page counter, even when the page adds no new card (OTTR-975). An answer whose
+	 * generation is no longer current does nothing, so a newer query — or the same
+	 * query re-entered later — discards the earlier request's pages and answers. A
+	 * non-ok page keeps the loaded cards and flags the retry line, with no notice. */
+	const runSearchFetch = useCallback(
+		(qAt: string, page: number, gen: number): void => {
+			setSearchBusy(true);
+			setSearchFailed(false);
+			fetch(
+				`/api/projects/${encodeURIComponent(project.name)}/done?page=${page}&q=${encodeURIComponent(qAt)}`,
+			)
+				.then(async (res) =>
+					res.ok ? ((await res.json()) as DonePageResponse) : null,
+				)
+				.then((next) => {
+					// First drop a stale answer: only the answer of the current search
+					// generation may touch the lane. A query that left and came back
+					// gets a new generation, so the first response cannot replace the
+					// newest result.
+					if (searchGenRef.current !== gen) return;
+					if (next === null) {
+						setSearchFailed(true);
+						return;
+					}
+					if (page === 1) {
+						setSearched({
+							q: qAt,
+							tasks: next.tasks,
+							total: next.total,
+							page: 1,
+						});
+						return;
+					}
+					setSearched((prev) =>
+						prev !== null && prev.q === qAt
+							? {
+									q: qAt,
+									tasks: [...prev.tasks, ...next.tasks],
+									total: next.total,
+									page,
+								}
+							: prev,
+					);
+				})
+				.catch(() => {
+					// A rejected fetch (server down, blocked request) fails the lane the
+					// same way a non-ok answer does; the loaded cards stay.
+					if (searchGenRef.current === gen) setSearchFailed(true);
+				})
+				.finally(() => {
+					if (searchGenRef.current === gen) setSearchBusy(false);
+				});
+		},
+		[project.name],
+	);
+	// A query swap moves the done lane to the server search: drop the previous
+	// result, then fetch the matching page 1. An empty query clears the search and
+	// returns to the normal view with no fetch. The SEARCH_APPLY_MS debounce on
+	// applied is the delay, so no timer here. A changed doneTotal means the lane's
+	// own data moved (a card settled or left): the cached matching total and the
+	// page cursor no longer describe the lane, so the search restarts at page 1
+	// under a fresh generation.
+	useEffect(() => {
+		const gen = ++searchGenRef.current;
+		if (q === "") {
+			setSearched(null);
+			setSearchBusy(false);
+			setSearchFailed(false);
+			return;
+		}
+		setSearched(null);
+		runSearchFetch(q, 1, gen);
+	}, [q, project.name, project.doneTotal, runSearchFetch]);
 	return (
 		<section className="project" aria-labelledby="project-title">
 			<header className="project-head">
@@ -4470,7 +4837,7 @@ export function ProjectBoard({
 					<ProjectLogo project={project} />
 					<div className="project-id-text">
 						<h1 id="project-title">{projectLabel(project)}</h1>
-						<ProjectMeta project={project} />
+						<ProjectMeta project={project} open={open} />
 					</div>
 				</div>
 				<div className="project-actions">
@@ -4491,7 +4858,23 @@ export function ProjectBoard({
 								q === "" ? "Tasks in this project" : "Matching of total tasks"
 							}
 						>
-							{q === "" ? boardTotal : `${shown.length}/${boardTotal}`}
+							{q === ""
+								? boardTotal
+								: searched !== null
+									? // Once the server answers, the numerator counts every matching
+										// done card, not only the ones the loaded window holds.
+										`${
+											shown.filter((t) => laneStage(t) !== "done").length +
+											searched.total
+										}/${boardTotal}`
+									: searchBusy || searchFailed
+										? // No server answer yet: the done matches are unknown, and the
+											// state window's matches must not pose as the whole count.
+											`—/${boardTotal}`
+										: `${
+												shown.filter((t) => laneStage(t) !== "done").length +
+												shownDoneCount
+											}/${boardTotal}`}
 						</span>
 					</span>
 					{/* Only an overdue review stays out, as the grey nudge; every other action waits in the menu. */}
@@ -4511,27 +4894,17 @@ export function ProjectBoard({
 						project={project}
 						onOpen={() => setShowJira(true)}
 					/>
-					{/* Project settings now lives in the menu, so every project gets the menu;
-					    review, release and diagrams stay conditional inside it. */}
+					{/* New task and the project menu form one split button; a gitless project
+					    keeps only the square menu trigger. */}
 					<ProjectMenu
 						project={project}
 						userLayer={userLayer ?? null}
+						compose={compose}
+						composeDraft={composeDraft}
 						startReview={() => setShowReview(true)}
 						showRelease={() => setShowRelease(true)}
 						showDiagrams={() => setShowDiagrams(true)}
 					/>
-					{!project.gitless && (
-						<button
-							type="button"
-							className="primary"
-							onClick={compose}
-							title="New task (N)"
-						>
-							<Icon name="plus" />
-							New task
-							<kbd>N</kbd>
-						</button>
-					)}
 				</div>
 			</header>
 			<ReleaseDialog
@@ -4675,22 +5048,25 @@ export function ProjectBoard({
 				}}
 			>
 				{COLUMNS.map((c) => {
-					const { col } = laneColumnData(c.key, shown, q, older);
+					// The done column is the merged list computed above; the other lanes
+					// order per column.
+					const col =
+						c.key === "done"
+							? doneCol
+							: laneColumnData(c.key, shown, q, []).col;
 					const count = counts[c.key];
 					const unread = (t: TaskCard): boolean =>
 						isUnread(t, seenAnswers, seenDoneSince);
 					const onReorder = (
 						dragId: string,
 						beforeId: string | null,
-					): Promise<boolean> => {
-						const order = reorderIds(tasks, c.key, dragId, beforeId);
-						if (order === null) return Promise.resolve(true);
-						return act(() =>
+					): Promise<boolean> =>
+						act(() =>
 							post(`/api/projects/${encodeURIComponent(project.name)}/queue`, {
-								order,
+								id: dragId,
+								before: beforeId,
 							}).then(() => undefined),
 						);
-					};
 					return (
 						<section
 							key={c.key}
@@ -4711,11 +5087,18 @@ export function ProjectBoard({
 								)}
 								<span className={q === "" ? "count" : "count filtered"}>
 									{c.key === "done"
-										? // The state holds only the Done window (OTTR-965): the head and
-											// the search variant read the project's true done+cancelled total.
+										? // The state holds only the Done window (OTTR-965): the head reads
+											// the project's true done+cancelled total, and the search variant
+											// reads the server's matching total once its answer landed.
 											q === ""
 											? fmtNum(project.doneTotal)
-											: `${fmtNum(col.length)}/${fmtNum(project.doneTotal)}`
+											: searched !== null
+												? `${fmtNum(col.length)}/${fmtNum(searched.total)}`
+												: searchBusy
+													? "Searching…"
+													: // The server answer never landed: the count names the state
+														// window's matches and marks the total unknown.
+														`${fmtNum(shownDoneCount)}/—`
 										: q === ""
 											? fmtNum(col.length)
 											: `${fmtNum(col.length)}/${fmtNum(count.total)}`}
@@ -4725,8 +5108,42 @@ export function ProjectBoard({
 								stage={c.key}
 								tasks={col}
 								more={c.key === "done" ? doneHidden : 0}
-								onMore={fetchOlderDone}
-								moreBusy={olderBusy}
+								// With a query applied "Show more" pages the server search instead
+								// of the older-pages fetch.
+								onMore={
+									q === ""
+										? fetchOlderDone
+										: () => {
+												if (searched !== null)
+													runSearchFetch(
+														q,
+														searched.page + 1,
+														searchGenRef.current,
+													);
+											}
+								}
+								moreBusy={q === "" ? olderBusy : searchBusy}
+								searching={
+									c.key === "done" &&
+									q !== "" &&
+									searchBusy &&
+									searched === null
+								}
+								searchFailed={c.key === "done" && q !== "" && searchFailed}
+								onSearchRetry={
+									c.key === "done" && q !== ""
+										? () => {
+												if (searched === null)
+													runSearchFetch(q, 1, ++searchGenRef.current);
+												else
+													runSearchFetch(
+														q,
+														searched.page + 1,
+														searchGenRef.current,
+													);
+											}
+										: undefined
+								}
 								starredCollapsed={starredCollapsed}
 								onStarredToggle={() => setStarredCollapsed((c) => !c)}
 								// Idle backlog cards park under the todo lane, below a divider; started ones
@@ -4739,7 +5156,6 @@ export function ProjectBoard({
 								parkedTotal={
 									c.key === "todo" ? counts.backlog.total : undefined
 								}
-								onAddDraft={c.key === "todo" ? composeDraft : undefined}
 								projectTasks={tasks}
 								foreignDeps={foreignDeps}
 								onRerelease={rerelease}
@@ -5910,6 +6326,32 @@ function queueTarget(
 }
 
 /** A lane's card content: the empty state, the pinned Inbox and Starred groups, the flat list, then the "Show more" button. */
+/** The done lane's server-search status lines: the "Searching…" note while the first
+ * page fetches, and the failed-page line with its retry. Both render at the lane's
+ * tail, where "Show more" sits, and in the empty lane's early return (LaneCol), so a
+ * failed first page still offers the retry on a lane with no cards (OTTR-1135). */
+function LaneSearchStatus(p: {
+	searching: boolean;
+	searchFailed: boolean;
+	onSearchRetry: (() => void) | undefined;
+}) {
+	if (!p.searching && !p.searchFailed) return null;
+	if (p.searching)
+		return (
+			<p className="lane-status" role="status">
+				Searching…
+			</p>
+		);
+	return (
+		<p className="lane-status">
+			Search failed
+			<button type="button" className="lane-retry" onClick={p.onSearchRetry}>
+				Retry
+			</button>
+		</p>
+	);
+}
+
 function LaneCards(p: {
 	stage: Stage;
 	filtering: boolean;
@@ -5923,6 +6365,12 @@ function LaneCards(p: {
 	onMore: (() => void) | undefined;
 	/** True while the older-pages fetch runs; the button disables until it settles. */
 	moreBusy?: boolean;
+	/** Done lane only: the server search is fetching its first page and the lane holds no result yet. */
+	searching?: boolean;
+	/** Done lane only: a search page fetch failed; the loaded cards stay and the line offers a retry. */
+	searchFailed?: boolean;
+	/** Done lane only: refetches the failed page — page 1 with no result yet, the next page with one. */
+	onSearchRetry?: () => void;
 	/** LaneCol's useId value: names the Starred body for aria-controls. */
 	uid: string;
 	starredCollapsed: boolean;
@@ -5940,6 +6388,9 @@ function LaneCards(p: {
 		more,
 		onMore,
 		moreBusy = false,
+		searching = false,
+		searchFailed = false,
+		onSearchRetry,
 		showMore,
 		card,
 	} = p;
@@ -5996,6 +6447,11 @@ function LaneCards(p: {
 					)
 					.map(card)
 			}
+			<LaneSearchStatus
+				searching={searching}
+				searchFailed={searchFailed}
+				onSearchRetry={onSearchRetry}
+			/>
 			{more > 0 && onMore && (
 				<button
 					type="button"
@@ -6111,10 +6567,12 @@ export function LaneCol({
 	draining,
 	parked,
 	parkedTotal,
-	onAddDraft,
 	more = 0,
 	onMore,
 	moreBusy = false,
+	searching = false,
+	searchFailed = false,
+	onSearchRetry,
 	starredCollapsed = false,
 	onStarredToggle,
 	onRerelease,
@@ -6126,13 +6584,17 @@ export function LaneCol({
 	parked?: TaskCard[];
 	/** All parked (idle) backlog cards, ignoring the filter: the label count next to the Backlog label. */
 	parkedTotal?: number;
-	/** Todo lane only: opens the draft mask from the backlog row's Add draft button. */
-	onAddDraft?: () => void;
 	/** Done lane only: cards hidden behind the "Show more" button; 0 renders no button. */
 	more?: number;
 	onMore?: () => void;
 	/** Done lane only: an older-pages fetch is in flight; the button disables until it settles. */
 	moreBusy?: boolean;
+	/** Done lane only: the server search is fetching its first page and the lane holds no result yet. */
+	searching?: boolean;
+	/** Done lane only: a search page fetch failed; the loaded cards stay and the line offers a retry. */
+	searchFailed?: boolean;
+	/** Done lane only: refetches the failed page — page 1 with no result yet, the next page with one. */
+	onSearchRetry?: () => void;
 	/** Done lane only: the pinned Starred section starts collapsed when true. */
 	starredCollapsed?: boolean;
 	/** Done lane only: flips the Starred section's collapse state. */
@@ -6148,7 +6610,7 @@ export function LaneCol({
 	hasRules: boolean;
 	github: string | null;
 	deltas: Map<string, number>;
-	open: (id: string) => void;
+	open: (id: string, project?: string) => void;
 	unread: (t: TaskCard) => boolean;
 	onReorder: (dragId: string, beforeId: string | null) => Promise<boolean>;
 	filtering: boolean;
@@ -6303,9 +6765,18 @@ export function LaneCol({
 
 	if (!hasTasks && !showBacklogRow)
 		return (
-			<p className="stage-empty">
-				{filtering ? "No matches." : EMPTY_STAGE[stage]}
-			</p>
+			<>
+				<p className="stage-empty">
+					{filtering ? "No matches." : EMPTY_STAGE[stage]}
+				</p>
+				{/* A failed search page never reads as complete: the empty lane still
+				    names the gap and offers the retry (OTTR-1135). */}
+				<LaneSearchStatus
+					searching={searching}
+					searchFailed={searchFailed}
+					onSearchRetry={onSearchRetry}
+				/>
+			</>
 		);
 
 	// --- Queue drag & drop (native HTML5) -------------------------------------
@@ -6318,10 +6789,13 @@ export function LaneCol({
 	// overwrite the first on the server (last write wins). Every reorder path routes through here.
 	const sendReorder = (id: string, before: string | null): void => {
 		// `tasks` is this column's laneOrder-ed list; reorderIds over it yields the column's
-		// queued-id order, which the server's queuedAt rewrite reproduces exactly.
+		// queued-id order after the drop. A drop that changes nothing sends no request —
+		// the server moves only the named card, so a no-op body would still rewrite queuedAt.
 		const next = reorderIds(tasks, stage, id, before);
+		const current = queued.map((t) => t.id);
+		if (next === null || next.join(" ") === current.join(" ")) return;
 		setPending({ id, before });
-		if (next !== null) setLocalOrder(next);
+		setLocalOrder(next);
 		void onReorder(id, before)
 			.then((ok) => {
 				if (!ok) setLocalOrder(null);
@@ -6423,6 +6897,9 @@ export function LaneCol({
 				more={more}
 				onMore={onMore}
 				moreBusy={moreBusy}
+				searching={searching}
+				searchFailed={searchFailed}
+				onSearchRetry={onSearchRetry}
 				uid={uid}
 				starredCollapsed={starredCollapsed}
 				onStarredToggle={onStarredToggle}
@@ -6437,19 +6914,9 @@ export function LaneCol({
 						{parkedTotal !== undefined && (
 							<span className="backlog-count">{parkedTotal}</span>
 						)}
-						{onAddDraft && (
-							<button
-								type="button"
-								className="lane-add"
-								onClick={onAddDraft}
-								title="Park an idea in the backlog (B)"
-							>
-								<Icon name="plus" size={12} />
-								Add draft
-								<kbd>B</kbd>
-							</button>
-						)}
 					</p>
+					{/* Backlog empty (not just filtered away). */}
+					{parkedTotal === 0 && <p className="stage-empty">No drafts yet.</p>}
 				</>
 			)}
 			{parked?.map(card)}
@@ -7092,8 +7559,7 @@ export function UpdateRowLine({
 		<div className="updates-row">{body}</div>
 	);
 }
-/** The "Git URL" tab of the Add-project dialog: URL and name fields, the SSH key choice,
- * and the token fieldset the server demands on a 400 needsToken. */
+/** The Git URL source fields and independent SSH access controls. */
 function AddUrlPanel({
 	mode,
 	url,
@@ -7109,14 +7575,6 @@ function AddUrlPanel({
 	onPending,
 	runSshTest,
 	onSshTestOk,
-	needsTokenHost,
-	tokUser,
-	onTokUser,
-	tokToken,
-	onTokToken,
-	saveToken,
-	boardTokenUsable,
-	useBoardToken,
 }: {
 	mode: "url" | "new";
 	url: string;
@@ -7132,14 +7590,6 @@ function AddUrlPanel({
 	onPending: (p: PendingKeyInfo | null) => void;
 	runSshTest: (trust?: string[]) => Promise<TestAnswer>;
 	onSshTestOk: () => void;
-	needsTokenHost: string | null;
-	tokUser: string;
-	onTokUser: (u: string) => void;
-	tokToken: string;
-	onTokToken: (t: string) => void;
-	saveToken: () => void;
-	boardTokenUsable: boolean;
-	useBoardToken: () => void;
 }) {
 	return (
 		<div
@@ -7213,45 +7663,8 @@ function AddUrlPanel({
 					)}
 					<SshTestRow send={runSshTest} onOk={onSshTestOk} />
 					<p className="hint">
-						Add stays disabled until the test passed for this URL and key.
+						Next waits until the test passes for this URL and key.
 					</p>
-				</fieldset>
-			)}
-			{needsTokenHost !== null && (
-				<fieldset>
-					<legend>
-						Token for <code>{needsTokenHost}</code>
-					</legend>
-					<label>
-						Username
-						<span className="opt-mark">(optional)</span>
-						<input
-							value={tokUser}
-							onChange={(e) => onTokUser(e.target.value)}
-							placeholder={defaultGitUsername(
-								needsTokenHost ?? "",
-								hosts?.githubHost ?? null,
-							)}
-						/>
-					</label>
-					<label>
-						Token
-						<input
-							type="password"
-							value={tokToken}
-							onChange={(e) => onTokToken(e.target.value)}
-							autoComplete="off"
-							required
-						/>
-					</label>
-					<button type="button" disabled={tokToken === ""} onClick={saveToken}>
-						Save token and retry
-					</button>
-					{boardTokenUsable && (
-						<button type="button" onClick={useBoardToken}>
-							Use the board GitHub token
-						</button>
-					)}
 				</fieldset>
 			)}
 		</div>
@@ -7307,89 +7720,28 @@ function GhRepoHint({
 	);
 }
 
-/** The Add-project POST body shared by both submit paths. */
-function addGitProjectRequest(req: {
-	url: string;
-	name: string;
-	taskIdPrefix: string;
-	sshKey: string | undefined;
-	trust: string[] | undefined;
-}): ReturnType<typeof gitReq> {
-	return gitReq("POST", "/api/projects", {
-		url: req.url,
-		name: req.name === "" ? undefined : req.name,
-		taskIdPrefix: req.taskIdPrefix,
-		sshKey: req.sshKey,
-		trust: req.trust,
-	});
-}
-
-function reportAddedProject(
-	data: unknown,
-	hooks: {
-		setAdded: (v: { project: ProjectView }) => void;
-	},
-): void {
-	const r = data as unknown as AddProjectResponse; // unchecked cast: the server's documented answer shape
-	hooks.setAdded({ project: r.project });
-}
-
-/** The Add submit from the form: success reports the project, otherwise it raises
- * the trust step, the token step or the server's error into the dialog. */
-async function addGitProject(
-	req: {
-		url: string;
-		name: string;
-		taskIdPrefix: string;
-		sshKey: string | undefined;
-		trust: string[] | undefined;
-	},
-	hooks: {
-		setAdded: (v: { project: ProjectView }) => void;
-		setAddTrust: (t: TrustNeeded) => void;
-		setNeedsTokenHost: (h: string) => void;
-	},
-): Promise<void> {
-	const { status, data } = await addGitProjectRequest(req);
-	const t = asTrust(data);
-	if (status < 300) {
-		reportAddedProject(data, hooks);
-		return;
+/** Draft capability uses a validated remote authority, never a hostname substring. */
+export function draftGithubSource(
+	url: string,
+	configuredHost: string | null,
+): boolean {
+	if (
+		configuredHost === null ||
+		url.trim() === "" ||
+		gitUrlProblem(url) !== null
+	)
+		return false;
+	const source = url.trim();
+	const scp = /^[^/@\s]+@([^/:]+):/.exec(source);
+	if (scp !== null)
+		return scp[1]?.toLowerCase() === configuredHost.toLowerCase();
+	try {
+		return (
+			new URL(source).hostname.toLowerCase() === configuredHost.toLowerCase()
+		);
+	} catch {
+		return false;
 	}
-	if (t !== null) {
-		hooks.setAddTrust(t);
-		throw new Error(t.error);
-	}
-	if (typeof data.needsToken === "string") {
-		hooks.setNeedsTokenHost(data.needsToken);
-		throw new Error(asError(data, status, "adding the project"));
-	}
-	throw new Error(asError(data, status, "adding the project"));
-}
-
-/** The Add retry after the user confirmed the trust prompt: success clears the prompt. */
-async function addGitProjectTrusted(
-	req: {
-		url: string;
-		name: string;
-		taskIdPrefix: string;
-		sshKey: string | undefined;
-		trust: string[] | undefined;
-	},
-	hooks: {
-		setAdded: (v: { project: ProjectView }) => void;
-		setAddTrust: (t: TrustNeeded | null) => void;
-	},
-): Promise<TestAnswer> {
-	const { status, data } = await addGitProjectRequest(req);
-	const t = asTrust(data);
-	if (status < 300) {
-		reportAddedProject(data, hooks);
-		hooks.setAddTrust(null);
-		return { ok: true } as const;
-	}
-	if (t !== null) return t;
-	return { error: asError(data, status, "adding the project") };
 }
 
 /** Empty keeps the server's derived default; otherwise 1 to 8 letters and digits. */
@@ -7435,7 +7787,9 @@ function AddPrefixField({
 	);
 }
 
-/** The tab strip of the Add-project dialog. */
+/** The tab strip of the Add-project dialog. A click (or Enter/Space) opens the tab and puts
+ *  the caret in its field; arrow keys only move between the tabs, as the ARIA tabs pattern
+ *  expects. */
 function AddTabs({
 	mode,
 	setMode,
@@ -7443,6 +7797,15 @@ function AddTabs({
 	mode: "url" | "new";
 	setMode: (m: "url" | "new") => void;
 }) {
+	const open = (m: "url" | "new"): void => {
+		setMode(m);
+		// The panel unhides on the next render; focus its field after that.
+		requestAnimationFrame(() =>
+			document
+				.querySelector<HTMLInputElement>(`#add-panel-${m} input`)
+				?.focus(),
+		);
+	};
 	return (
 		<div className="add-tabs" role="tablist" aria-label="Project source">
 			<button
@@ -7453,7 +7816,7 @@ function AddTabs({
 				aria-selected={mode === "url"}
 				aria-controls="add-panel-url"
 				tabIndex={mode === "url" ? 0 : -1}
-				onClick={() => setMode("url")}
+				onClick={() => open("url")}
 				onKeyDown={(e) => switchTab(e, ["url", "new"], setMode)}
 			>
 				<Icon name="branch" />
@@ -7467,51 +7830,11 @@ function AddTabs({
 				aria-selected={mode === "new"}
 				aria-controls="add-panel-new"
 				tabIndex={mode === "new" ? 0 : -1}
-				onClick={() => setMode("new")}
+				onClick={() => open("new")}
 				onKeyDown={(e) => switchTab(e, ["url", "new"], setMode)}
 			>
 				<Icon name="plus" />
 				New
-			</button>
-		</div>
-	);
-}
-
-/** The dialog's submit row: Add stays disabled until the SSH test passed or the host sign-in blocks it. */
-function AddSubmitButton({
-	busy,
-	failed,
-	mode,
-	ssh,
-	sshTested,
-	noGitHost,
-}: {
-	busy: boolean;
-	failed: boolean;
-	mode: "url" | "new";
-	ssh: boolean;
-	sshTested: boolean;
-	noGitHost: boolean;
-}) {
-	const untested = mode === "url" && ssh && !sshTested;
-	return (
-		<div className="dialog-actions">
-			<button
-				type="submit"
-				disabled={busy || untested || noGitHost}
-				className={`primary${failed ? " failed" : ""}`}
-				aria-busy={busy || undefined}
-				title={
-					untested
-						? "Run the SSH test first"
-						: noGitHost
-							? "Sign in to a Git host in Settings, or uncheck the repo box"
-							: undefined
-				}
-			>
-				{busy && <span className="spinner" aria-hidden="true" />}
-				<Icon name="plus" />
-				Add project
 			</button>
 		</div>
 	);
@@ -7579,66 +7902,162 @@ function AddNewPanel({
 	);
 }
 
+/** Credentials belong to the Git host, not the local project draft. */
+function AddTokenFields({
+	needsTokenHost,
+	hosts,
+	tokUser,
+	onTokUser,
+	tokToken,
+	onTokToken,
+	saveToken,
+	boardTokenUsable,
+	useBoardToken,
+}: {
+	needsTokenHost: string | null;
+	hosts: GitHostsView | null;
+	tokUser: string;
+	onTokUser: (value: string) => void;
+	tokToken: string;
+	onTokToken: (value: string) => void;
+	saveToken: () => void;
+	boardTokenUsable: boolean;
+	useBoardToken: () => void;
+}) {
+	return (
+		<>
+			{needsTokenHost !== null && (
+				<fieldset>
+					<legend>
+						Token for <code>{needsTokenHost}</code>
+					</legend>
+					<label>
+						Username
+						<span className="opt-mark">(optional)</span>
+						<input
+							value={tokUser}
+							onChange={(e) => onTokUser(e.target.value)}
+							placeholder={defaultGitUsername(
+								needsTokenHost ?? "",
+								hosts?.githubHost ?? null,
+							)}
+						/>
+					</label>
+					<label>
+						Token
+						<input
+							type="password"
+							value={tokToken}
+							onChange={(e) => onTokToken(e.target.value)}
+							autoComplete="off"
+						/>
+					</label>
+					<button type="button" disabled={tokToken === ""} onClick={saveToken}>
+						Save token and retry
+					</button>
+					{boardTokenUsable && (
+						<button type="button" onClick={useBoardToken}>
+							Use the board GitHub token
+						</button>
+					)}
+				</fieldset>
+			)}
+		</>
+	);
+}
+
 export function AddProjectModal({
 	act,
 	onClose,
 	openTask,
 	projects,
+	onNotice,
 }: {
 	act: Act;
 	onClose: () => void;
-	/** Opens the rules interview card in the board drawer: the wizard's "Open rules task". */
 	openTask: (id: string) => void;
 	projects: ProjectView[];
+	onNotice?: (message: string) => void;
 }) {
 	const [mode, setMode] = useState<"url" | "new">("url");
 	const [url, setUrl] = useState("");
 	const [name, setName] = useState("");
 	const [ghRepo, setGhRepo] = useState(false);
 	const [err, setErr] = useState<string | null>(null);
-	const add = useBusy();
-	// Git-URL flow: a client-side name mirror, the hosts view, the SSH key choice and
-	// the token step the server demands on a 400 needsToken.
+	const [step, setStep] = useState(1);
+	// Retro and its auto-start start on as explicit changes, so Finish saves them even over
+	// a clone's own settings (docs/specs/add-project-wizard.md "Drafts and clone settings").
+	const [changes, setChanges] = useState<Partial<SetupFields>>({
+		retro: true,
+		retroAutoStart: true,
+	});
+	const values: SetupFields = {
+		retro: false,
+		retroFilter: true,
+		retroAutoStart: false,
+		forkResearch: false,
+		holdUpdateMerges: false,
+		forkMergeHold: true,
+		maxParallel: "0",
+		copyExtra: "",
+		microVm: false,
+		prMode: false,
+		targetBranch: "",
+		// The stored defaults (DEFAULT_SETTINGS in src/store.ts): Finish sends only changes.
+		trendingScout: false,
+		issueWatch: false,
+		prReviews: false,
+		prReviewNotify: true,
+		prReviewApprove: false,
+		prReviewRequestChanges: false,
+		ompWatch: false,
+		dependabotWarn: true,
+		...changes,
+	};
+	const change = (next: Partial<SetupFields>): void =>
+		setChanges((previous) => ({ ...previous, ...next }));
+	const [busy, setBusy] = useState(false);
+	const finishing = useRef(false);
+	const created = useRef<ProjectView | null>(null);
+	const [project, setProject] = useState<ProjectView | null>(null);
+	const [progress, setProgress] = useState("");
 	const [nameTouched, setNameTouched] = useState(false);
-	// The task ID prefix: follows the derived value from the name until the user edits it.
 	const [prefix, setPrefix] = useState("");
 	const [prefixTouched, setPrefixTouched] = useState(false);
 	const [hosts, setHosts] = useState<GitHostsView | null>(null);
 	const [sshMode, setSshMode] = useState<"global" | "new">("global");
 	const [pendingKey, setPendingKey] = useState<PendingKeyInfo | null>(null);
 	const [trusted, setTrusted] = useState<string[] | undefined>(undefined);
-	const [tested, setTested] = useState<string | null>(null); // "url\0key" that passed
+	const [tested, setTested] = useState<string | null>(null);
 	const [addTrust, setAddTrust] = useState<TrustNeeded | null>(null);
 	const [needsTokenHost, setNeedsTokenHost] = useState<string | null>(null);
 	const [tokUser, setTokUser] = useState("oauth2");
-	// When the hosts view lands and names the configured GitHub host, prefill the
-	// host's token convention ("x-access-token") instead of the generic "oauth2".
-	useEffect(() => {
-		if (needsTokenHost !== null && hosts !== null) {
-			setTokUser(defaultGitUsername(needsTokenHost, hosts.githubHost));
-		}
-	}, [needsTokenHost, hosts]);
 	const [tokToken, setTokToken] = useState("");
-	const repoName = name.trim();
-	// The effective handle: uppercase, and empty keeps the server's derived default.
-	const prefixOut = prefix.trim().toUpperCase();
-	const trimmedUrl = url.trim();
-	// The URL field's own error (The Error-Says-Fix Rule): shown while the URL tab
-	// holds a value that cannot parse, under the field it names.
-	const urlProblem = gitUrlProblem(trimmedUrl);
-	const ssh = isSshUrl(trimmedUrl);
-	const sshKey = ssh
-		? sshMode === "global"
-			? "global"
-			: `pending:${pendingKey?.id ?? ""}`
-		: undefined;
-	// gh facts for the New tab's hints: auth state, login, projects root, name check.
 	const [gh, setGh] = useState<GhStatus | null>(null);
 	const [free, setFree] = useState<boolean | null>(null);
-	// A checked repo box needs a signed-in Git host; Add waits until one is (or the box clears).
-	// A failed probe (gh null) blocks nothing: the server still answers at submit.
+	const repoName = name.trim();
+	const prefixOut = prefix.trim().toUpperCase();
+	const trimmedUrl = url.trim();
+	const urlProblem = gitUrlProblem(trimmedUrl);
+	const ssh = isSshUrl(trimmedUrl);
+	const selectedSshKey =
+		sshMode === "global" ? "global" : `pending:${pendingKey?.id ?? ""}`;
+	const sshKey = ssh ? selectedSshKey : undefined;
 	const noGitHost = mode === "new" && ghRepo && gh?.authed === false;
-	// One probe per dialog open; a failed probe leaves the hints out, the form still works.
+	const sshTested =
+		ssh &&
+		(sshKey === "global"
+			? (hosts?.globalKey ?? null) !== null
+			: pendingKey !== null) &&
+		tested === `${trimmedUrl}\0${sshKey ?? ""}`;
+	let github = draftGithubSource(trimmedUrl, hosts?.githubHost ?? null);
+	if (mode === "new")
+		github = ghRepo && gh?.authed === true && gh.host !== null;
+	if (project !== null) github = project.github !== null;
+	useEffect(() => {
+		if (needsTokenHost !== null && hosts !== null)
+			setTokUser(defaultGitUsername(needsTokenHost, hosts.githubHost));
+	}, [needsTokenHost, hosts]);
 	useEffect(() => {
 		let alive = true;
 		fetch("/api/gh-status")
@@ -7652,7 +8071,6 @@ export function AddProjectModal({
 			.then((s) => {
 				if (!alive) return;
 				setHosts(s);
-				// The server rejects "global" when no global key exists: start on a new key.
 				if (s.globalKey === null) setSshMode("new");
 			})
 			.catch(() => {});
@@ -7660,56 +8078,191 @@ export function AddProjectModal({
 			alive = false;
 		};
 	}, []);
-	// The name mirror: propose the URL's last path segment until the user edits it.
 	const onName = (n: string): void => {
 		setName(n);
 		if (!prefixTouched) setPrefix(derivedTaskPrefix(n));
 	};
 	const onUrl = (u: string): void => {
 		setUrl(u);
-		if (!nameTouched) {
-			const seg = (
-				u.trim().replace(/\/+$/, "").split(/[:/]/).pop() ?? ""
-			).replace(/\.git$/, "");
-			onName(seg);
-		}
+		setTrusted(undefined);
+		setAddTrust(null);
+		if (!nameTouched)
+			onName(
+				(u.trim().replace(/\/+$/, "").split(/[:/]/).pop() ?? "").replace(
+					/\.git$/,
+					"",
+				),
+			);
 	};
-	// The prefix must stay a short handle of letters and digits; the server
-	// normalizes case itself, but the client rejects other characters early.
-	const prefixValid = prefixUsable(prefixOut);
-	// The Add call: ssh URLs carry the key choice; the server answers with trust or token steps.
-	const addProject = (trust?: string[]): void => {
-		if (!prefixValid) {
-			setErr("The task ID prefix must be 1 to 8 letters and digits.");
+	useEffect(() => {
+		if (
+			mode !== "new" ||
+			!ghRepo ||
+			gh?.authed !== true ||
+			!/^[A-Za-z0-9_.-]+$/.test(repoName)
+		) {
+			setFree(null);
 			return;
 		}
-		add.start(() =>
-			act(
-				async () =>
-					await addGitProject(
-						{
-							url: trimmedUrl,
-							name: repoName,
-							taskIdPrefix: prefixOut,
-							sshKey,
-							trust,
-						},
-						{
-							setAdded,
-							setAddTrust: (t) => setAddTrust(t),
-							setNeedsTokenHost: (h) => setNeedsTokenHost(h),
-						},
-					),
-				setErr,
-			),
-		);
+		let alive = true;
+		const timer = setTimeout(() => {
+			fetch(`/api/gh-status?name=${encodeURIComponent(repoName)}`)
+				.then((res) => unwrap<GhStatus>(res))
+				.then((s) => {
+					if (alive) setFree(s.free);
+				})
+				.catch(() => {});
+		}, 500);
+		return () => {
+			alive = false;
+			clearTimeout(timer);
+		};
+	}, [mode, ghRepo, gh?.authed, repoName]);
+	const validate = (validateProject = step >= 4): boolean => {
+		if (
+			created.current === null &&
+			(repoName === "" ||
+				!prefixUsable(prefixOut) ||
+				(mode === "url" &&
+					(trimmedUrl === "" || urlProblem !== null || (ssh && !sshTested))) ||
+				noGitHost)
+		) {
+			setStep(1);
+			setErr(
+				!prefixUsable(prefixOut)
+					? "The task ID prefix must be 1 to 8 letters and digits."
+					: "Check the source fields and Git host access before you continue.",
+			);
+			return false;
+		}
+		const parallel = capValue(values.maxParallel);
+		if (parallel !== null && parallel > 8) {
+			setStep(3);
+			setErr(
+				"Runner cap must be a whole number from 1 to 8, or empty or 0 for no cap.",
+			);
+			return false;
+		}
+		if (validateProject && values.prMode && !github) {
+			setStep(4);
+			setErr(
+				"PR mode requires a GitHub repository. Turn off PR mode here, or return to Source and select GitHub.",
+			);
+			return false;
+		}
+		return true;
 	};
-	// The created project: once set, the dialog shows the setup wizard instead of the form.
-	// The rules interview waits for the wizard's last step (docs/specs/add-project-wizard.md).
-	const [added, setAdded] = useState<{ project: ProjectView } | null>(null);
-	// A token save for the host the server named, then the retry of Add.
+	// The ref guards the whole pipeline, including access recovery. Retain identity before any later request.
+	const finish = async (
+		trust = trusted,
+		access?: () => Promise<void>,
+	): Promise<boolean> => {
+		if (finishing.current || !validate(true)) return false;
+		finishing.current = true;
+		setBusy(true);
+		setErr(null);
+		try {
+			return await act(async () => {
+				if (access !== undefined) {
+					setProgress("Save Git host access");
+					await access();
+				}
+				let current = created.current;
+				if (current === null) {
+					setProgress(
+						mode === "url"
+							? "1 of 5: Clone repository"
+							: "1 of 5: Create project",
+					);
+					const { status, data } = await gitReq(
+						"POST",
+						"/api/projects",
+						mode === "url"
+							? {
+									url: trimmedUrl,
+									name: repoName || undefined,
+									taskIdPrefix: prefixOut,
+									sshKey,
+									trust,
+								}
+							: { name: repoName, taskIdPrefix: prefixOut, github: ghRepo },
+					);
+					if (status >= 300) {
+						setAddTrust(asTrust(data));
+						if (typeof data.needsToken === "string")
+							setNeedsTokenHost(data.needsToken);
+						throw new Error(asError(data, status, "adding the project"));
+					}
+					current = (data as unknown as AddProjectResponse).project;
+					created.current = current;
+					setProject(current);
+					setAddTrust(null);
+					setNeedsTokenHost(null);
+				}
+				const base = `/api/projects/${encodeURIComponent(current.name)}`;
+				if (current.gitless) {
+					setProgress("2 of 5: Create git repository");
+					const result = await post<AddProjectResponse>(`${base}/init`, {});
+					current = result.project;
+					created.current = current;
+					setProject(current);
+				}
+				setProgress("3 of 5: Save project settings");
+				const {
+					maxParallel,
+					copyExtra,
+					targetBranch,
+					forkResearch,
+					...switches
+				} = changes;
+				const body: Record<string, unknown> = { ...switches };
+				if (forkResearch !== undefined && current.github !== null)
+					body.forkResearch = forkResearch;
+				// The Automation step hides the GitHub-only watches for a non-GitHub source; a
+				// draft left from a GitHub source picked before Back is dropped like fork research.
+				if (current.github === null)
+					for (const key of [
+						"issueWatch",
+						"prReviews",
+						"prReviewNotify",
+						"prReviewApprove",
+						"prReviewRequestChanges",
+						"dependabotWarn",
+					])
+						delete body[key];
+				if (maxParallel !== undefined) body.maxParallel = capValue(maxParallel);
+				if (copyExtra !== undefined)
+					body.copyExtra = copyExtra
+						.split("\n")
+						.map((s) => s.trim())
+						.filter((s) => s.length > 0);
+				if (targetBranch !== undefined)
+					body.targetBranch = targetBranch.trim() || null;
+				if (Object.keys(body).length > 0) {
+					current = await post<ProjectView>(`${base}/settings`, body);
+					created.current = current;
+					setProject(current);
+				}
+				setProgress("4 of 5: Check project rules");
+				const result = await post<{ interview: string; id: string | null }>(
+					`${base}/interview`,
+					{},
+				);
+				onNotice?.(interviewMsg(result.interview));
+				setProgress("5 of 5: Complete setup");
+				await post(`${base}/settings`, { setupChecklist: false });
+				refreshState();
+				onClose();
+				if (result.id !== null) openTask(result.id);
+			}, setErr);
+		} finally {
+			finishing.current = false;
+			setBusy(false);
+			setProgress("");
+		}
+	};
 	const saveToken = (): void => {
-		void act(async () => {
+		void finish(trusted, async () => {
 			const { status, data } = await gitReq("POST", "/api/git-hosts/tokens", {
 				host: needsTokenHost ?? "",
 				username:
@@ -7724,35 +8277,26 @@ export function AddProjectModal({
 				);
 			setNeedsTokenHost(null);
 			setTokToken("");
-			addProject(trusted);
-		}, setErr);
+		});
 	};
-	// One click opts the board GitHub token in for this host: the server stores it as the
-	// host's entry (username x-access-token) and the Add retries.
 	const useBoardToken = (): void => {
-		void act(async () => {
+		void finish(trusted, async () => {
 			const { status, data } = await gitReq(
 				"POST",
 				"/api/git-hosts/github-token",
-				{
-					testUrl: trimmedUrl,
-				},
+				{ testUrl: trimmedUrl },
 			);
 			if (status !== 200)
 				throw new Error(asError(data, status, "saving the board GitHub token"));
 			setNeedsTokenHost(null);
 			setTokToken("");
-			addProject(trusted);
-		}, setErr);
+		});
 	};
-	// The board token can stand in only when the dialog's host IS the configured
-	// GitHub host and the board actually has one.
 	const boardTokenUsable =
 		needsTokenHost !== null &&
 		hosts?.githubTokenSet === true &&
 		hosts.githubHost !== null &&
 		needsTokenHost.toLowerCase() === hosts.githubHost;
-	// The SSH pre-test: Add stays disabled until the current url+key pair passed it.
 	const runSshTest = (trust?: string[]): Promise<TestAnswer> => {
 		if (trust !== undefined) setTrusted(trust);
 		return gitReq("POST", "/api/git-hosts/ssh/test", {
@@ -7760,179 +8304,235 @@ export function AddProjectModal({
 			key: sshKey,
 			trust,
 		}).then(({ status, data }) => {
-			const t = asTrust(data);
 			if (status === 200) return { ok: true } as const;
-			if (t !== null) return t;
-			return { error: asError(data, status, "the SSH key test") };
+			return (
+				asTrust(data) ?? { error: asError(data, status, "the SSH key test") }
+			);
 		});
 	};
-	const sshTested =
-		ssh &&
-		(sshKey === "global"
-			? (hosts?.globalKey ?? null) !== null
-			: pendingKey !== null) &&
-		tested === `${trimmedUrl}\0${sshKey ?? ""}`;
-	// Availability while typing: check 500ms after the last keystroke; a stale
-	// in-flight answer is dropped, so the hint always names the current input.
-	useEffect(() => {
-		if (
-			mode !== "new" ||
-			!ghRepo ||
-			gh?.authed !== true ||
-			!/^[A-Za-z0-9_.-]+$/.test(repoName)
-		) {
-			setFree(null);
-			return;
-		}
-		let alive = false;
-		const t = setTimeout(() => {
-			alive = true;
-			fetch(`/api/gh-status?name=${encodeURIComponent(repoName)}`)
-				.then((res) => unwrap<GhStatus>(res))
-				.then((s) => {
-					if (alive) setFree(s.free);
-				})
-				.catch(() => {});
-		}, 500);
-		return () => {
-			alive = false;
-			clearTimeout(t);
-		};
-	}, [mode, ghRepo, gh?.authed, repoName]);
-
+	const close = (): void => {
+		if (!finishing.current) onClose();
+	};
 	return (
-		<Modal onClose={onClose} label="Add project" className="dialog">
+		<Modal
+			onClose={close}
+			dismissible={!busy}
+			label="Add project"
+			className="dialog add-project-dialog"
+		>
 			<div className="dialog-body">
 				<div className="dialog-head">
-					<h2>
-						{added === null
-							? "Add project"
-							: `Set up ${projectLabel(added.project)}`}
-					</h2>
-					<CloseButton />
+					<h2>Add project</h2>
+					<CloseButton disabled={busy} />
 				</div>
-				{added === null ? (
-					<form
-						className="add-form"
-						onSubmit={(e) => {
-							e.preventDefault();
-							if (mode === "url") {
-								// The field error already says why; a known-bad URL never posts.
-								if (urlProblem !== null) return;
-								addProject(trusted);
-								return;
-							}
-							if (!prefixValid) {
-								setErr("The task ID prefix must be 1 to 8 letters and digits.");
-								return;
-							}
-							add.start(() =>
-								act(async () => {
-									const r = await post<AddProjectResponse>("/api/projects", {
-										name: name.trim(),
-										taskIdPrefix: prefixOut,
-										github: ghRepo,
-									});
-									setAdded({ project: r.project });
-								}, setErr),
-							);
-						}}
-					>
-						<AddTabs mode={mode} setMode={setMode} />
-						<AddUrlPanel
-							mode={mode}
-							url={url}
-							onUrl={onUrl}
-							urlProblem={urlProblem}
-							name={name}
-							onName={(n) => {
-								setNameTouched(true);
-								setName(n);
-								if (!prefixTouched) setPrefix(derivedTaskPrefix(n));
-							}}
-							ssh={ssh}
-							sshMode={sshMode}
-							setSshMode={setSshMode}
-							hosts={hosts}
-							pendingKey={pendingKey}
-							onPending={(p) => {
-								setPendingKey(p);
-								setTested(null);
-							}}
-							runSshTest={runSshTest}
-							onSshTestOk={() => setTested(`${trimmedUrl}\0${sshKey ?? ""}`)}
-							needsTokenHost={needsTokenHost}
-							tokUser={tokUser}
-							onTokUser={setTokUser}
-							tokToken={tokToken}
-							onTokToken={setTokToken}
-							saveToken={saveToken}
-							boardTokenUsable={boardTokenUsable}
-							useBoardToken={useBoardToken}
-						/>
-						<AddNewPanel
-							mode={mode}
-							name={name}
-							setName={(n) => onName(n)}
-							ghRepo={ghRepo}
-							setGhRepo={setGhRepo}
-							gh={gh}
-							free={free}
-							repoName={repoName}
-							onClose={onClose}
-						/>
-						<AddPrefixField
-							prefix={prefix}
-							setPrefix={(v) => {
-								setPrefixTouched(true);
-								setPrefix(v);
-							}}
-							prefixOut={prefixOut}
-							projects={projects}
-						/>
-						{err !== null && (
-							<p className="auth-error" role="alert">
-								{err}
+				<SetupStepsNav step={step} seenUpTo={step} />
+				<form
+					className="add-wizard"
+					onSubmit={(e) => {
+						e.preventDefault();
+						if (finishing.current || !validate()) return;
+						setErr(null);
+						if (step === 5) void finish();
+						else setStep(step + 1);
+					}}
+				>
+					<fieldset className="setup-fields" disabled={busy}>
+						{step === 1 && (
+							<fieldset
+								className="add-form setup-source"
+								disabled={project !== null}
+							>
+								<legend className="sr">Source</legend>
+								<AddTabs mode={mode} setMode={setMode} />
+								<AddUrlPanel
+									mode={mode}
+									url={url}
+									onUrl={onUrl}
+									urlProblem={urlProblem}
+									name={name}
+									onName={(n) => {
+										setNameTouched(true);
+										onName(n);
+									}}
+									ssh={ssh}
+									sshMode={sshMode}
+									setSshMode={setSshMode}
+									hosts={hosts}
+									pendingKey={pendingKey}
+									onPending={(p) => {
+										setPendingKey(p);
+										setTested(null);
+									}}
+									runSshTest={runSshTest}
+									onSshTestOk={() =>
+										setTested(`${trimmedUrl}\0${sshKey ?? ""}`)
+									}
+								/>
+								<AddNewPanel
+									mode={mode}
+									name={name}
+									setName={onName}
+									ghRepo={ghRepo}
+									setGhRepo={setGhRepo}
+									gh={gh}
+									free={free}
+									repoName={repoName}
+									onClose={close}
+								/>
+								<AddPrefixField
+									prefix={prefix}
+									setPrefix={(v) => {
+										setPrefixTouched(true);
+										setPrefix(v);
+									}}
+									prefixOut={prefixOut}
+									projects={projects}
+								/>
+								{project === null && (
+									<p className="hint">
+										Next keeps the source local. Finish creates the project.
+									</p>
+								)}
+								{ssh && (
+									<p className="hint">
+										Host access tests, keys, tokens, and trust can remain after
+										Cancel. They do not create a project.
+									</p>
+								)}
+							</fieldset>
+						)}
+						{mode === "url" && step > 1 && step < 5 && (
+							<p className="hint">
+								These are proposed settings. Unchanged fields keep the clone's
+								values after Finish.
 							</p>
 						)}
-						{addTrust !== null && (
-							<SshTestRow
-								label="Add project"
-								success="Project added"
-								send={(trust) =>
-									addGitProjectTrusted(
-										{
-											url: trimmedUrl,
-											name: repoName,
-											taskIdPrefix: prefixOut,
-											sshKey,
-											trust,
-										},
-										{
-											setAdded,
-											setAddTrust: (t) => setAddTrust(t),
-										},
-									)
-								}
-							/>
-						)}
-						<AddSubmitButton
-							busy={add.busy}
-							failed={add.failed}
-							mode={mode}
-							ssh={ssh}
-							sshTested={sshTested}
-							noGitHost={noGitHost}
+						<SetupSettingsFields
+							step={step}
+							values={values}
+							github={github}
+							vmRunner={projects[0]?.vmRunner ?? null}
+							onForkDraft={(v) => change({ forkResearch: v })}
+							onChange={change}
+							savePrMode={async (v) => {
+								change({ prMode: v });
+								return true;
+							}}
+							act={act}
+							draft
 						/>
-					</form>
-				) : (
-					<ProjectSetupSteps
-						project={added.project}
-						openTask={openTask}
-						act={act}
-						onClose={onClose}
-					/>
-				)}
+						{step === 5 && (
+							<section className="setup-sec">
+								<h3>Rules</h3>
+								<p className="hint">
+									{project === null
+										? "Finish creates the project, saves your selected settings, then checks its actual rules."
+										: "Finish saves your selected settings, then checks this project's actual rules."}
+								</p>
+								<p className="hint">
+									If rules are absent, the rules interview starts as a card.
+									Existing rules and live rules tasks keep their current
+									behavior.
+								</p>
+							</section>
+						)}
+						{project !== null && (
+							<p className="hint" role="status">
+								The project {projectLabel(project)} exists. Retry uses this
+								project. Close does not undo its creation.
+							</p>
+						)}
+						{needsTokenHost !== null && (
+							<div className="add-form">
+								<p className="hint">
+									Host credentials remain after Cancel. The token save retries
+									the same Finish operation.
+								</p>
+								<AddTokenFields
+									needsTokenHost={needsTokenHost}
+									hosts={hosts}
+									tokUser={tokUser}
+									onTokUser={setTokUser}
+									tokToken={tokToken}
+									onTokToken={setTokToken}
+									saveToken={saveToken}
+									boardTokenUsable={boardTokenUsable}
+									useBoardToken={useBoardToken}
+								/>
+							</div>
+						)}
+						{addTrust !== null && (
+							<div className={addTrust.changed ? "trust-warn" : undefined}>
+								<p>
+									{addTrust.changed ? "Warning: the host key changed. " : ""}
+									Check these fingerprints with your host admin for{" "}
+									<code>{addTrust.host}</code>:
+								</p>
+								<ul>
+									{addTrust.fingerprints.map((fingerprint) => (
+										<li key={fingerprint}>
+											<code>{fingerprint}</code>
+										</li>
+									))}
+								</ul>
+								<button
+									type="button"
+									onClick={() => {
+										setTrusted(addTrust.fingerprints);
+										void finish(addTrust.fingerprints);
+									}}
+								>
+									Trust and finish
+								</button>
+							</div>
+						)}
+					</fieldset>
+					{err !== null && (
+						<p className="auth-error" role="alert">
+							{err}
+						</p>
+					)}
+					{busy && (
+						<p className="hint" role="status">
+							{progress}. Keep this dialog open until the operation ends.
+						</p>
+					)}
+					<div className="dialog-actions setup-actions">
+						<button
+							type="button"
+							className="ghost"
+							disabled={busy}
+							onClick={close}
+						>
+							{project === null ? "Cancel" : "Close"}
+						</button>
+						{step > 1 && (
+							<button
+								type="button"
+								disabled={busy}
+								onClick={() => {
+									setErr(null);
+									setStep(step - 1);
+								}}
+							>
+								Back
+							</button>
+						)}
+						<button
+							type="submit"
+							className="primary"
+							disabled={
+								busy ||
+								(step === 1 &&
+									((mode === "url" && ssh && !sshTested) || noGitHost))
+							}
+							aria-busy={busy || undefined}
+						>
+							{busy && <span className="spinner" aria-hidden="true" />}
+							{step === 5 ? "Finish" : "Next"}
+						</button>
+					</div>
+				</form>
 			</div>
 		</Modal>
 	);
@@ -8231,7 +8831,7 @@ function AskCustom({
 						setCustom(e.target.value);
 						if (multi) onDraft(askMultiText(picked, customOn, e.target.value));
 					}}
-					placeholder="Deploy only the API"
+					placeholder="Your answer"
 					disabled={busy}
 				/>
 			</label>
@@ -8251,8 +8851,56 @@ function AskCustom({
 	);
 }
 
+/** A text question's answer row: one single-line field, labeled with the question text.
+ * Enter or the button answers with the trimmed text; a text answer is one wire line,
+ * so nothing but the trim joins the field's value. */
+function AskTextRow({
+	q,
+	busy,
+	selected,
+	onDraft,
+	onAnswer,
+}: {
+	q: AskQuestion;
+	busy: boolean;
+	selected: string | null;
+	onDraft: (text: string | null) => void;
+	onAnswer: (text: string) => void;
+}) {
+	// The saved answer seeds the field once: a loaded draft remounts the block through its key.
+	const [draft, setDraft] = useState(selected ?? "");
+	const value = draft.trim();
+	return (
+		<form
+			className="ask-text-row"
+			onSubmit={(e) => {
+				e.preventDefault();
+				if (value !== "") onAnswer(value);
+			}}
+		>
+			{/* The question paragraph above is the visible label; aria-label ties it to the field. */}
+			<input
+				type="text"
+				value={draft}
+				aria-label={q.question}
+				disabled={busy}
+				onChange={(e) => {
+					setDraft(e.target.value);
+					const v = e.target.value.trim();
+					onDraft(v === "" ? null : v);
+				}}
+			/>
+			<button type="submit" disabled={busy || value === ""}>
+				{busy && <span className="spinner" aria-hidden="true" />}
+				{selected === null ? "Answer" : "Replace answer"}
+			</button>
+		</form>
+	);
+}
+
 /** One ask question: single-choice presets answer in one click; multi questions collect
- * checkbox picks plus an "Other" pick or typed text and answer with one comma list. */
+ * checkbox picks plus an "Other" pick or typed text and answer with one comma list; a
+ * text question answers from one labeled free-text field. */
 export function AskBlock({
 	q,
 	name,
@@ -8312,6 +8960,26 @@ export function AskBlock({
 	const multiTotal = picked.length + (customJoined ? 1 : 0);
 	// A multi question counts as answered as soon as anything is checked.
 	const done = answered || (multi && multiTotal > 0);
+	// A text question has no picks: its row is one labeled field and its Answer button;
+	// the recorded answer sits back in the field and ticks the question like a check does.
+	if (q.text)
+		return (
+			<div className={`ask-q${answered ? " answered" : ""}`}>
+				<AskText
+					q={q}
+					changed={changed}
+					done={answered}
+					onOpenDiff={onOpenDiff}
+				/>
+				<AskTextRow
+					q={q}
+					busy={busy}
+					selected={selected}
+					onDraft={onDraft}
+					onAnswer={onAnswer}
+				/>
+			</div>
+		);
 	return (
 		<div className={`ask-q${done ? " answered" : ""}`}>
 			<AskText q={q} changed={changed} done={done} onOpenDiff={onOpenDiff} />
@@ -8735,17 +9403,20 @@ export async function implementSteps(o: {
 /** moved to ../types.ts (the server resolves stored steps too, OTTR-488) */
 export { recommendsSteps };
 
-/** Related cards in the drawer (dependencies, follow-ups): one quiet row per card with the same
- * status words and alarm coding as the meta line; a click opens the card. The href uses each
- * linked card's own project, so a cross-project row opens that project's URL. */
+/** The drawer's "Waiting for" cards in the lineage rail's node grammar: one unthreaded node
+ * per blocking card (a blocker is no parent; this card's own row stays in Lineage), its live
+ * status where the lineage puts its tag, with the meta line's alarm coding. LineageCardLink
+ * keeps every card link's href and click rules. */
 function RelatedTasks({
 	items,
+	selfProject,
 	project,
 	tasks,
 	onOpenTask,
 	draining,
 }: {
 	items: TaskCard[];
+	selfProject: string;
 	project: ProjectView;
 	tasks: TaskCard[];
 	onOpenTask: (id: string) => void;
@@ -8753,31 +9424,31 @@ function RelatedTasks({
 	draining: boolean;
 }) {
 	return (
-		<ul className="fu-list">
+		<ol className="lineage-rail lineage-deps">
 			{items.map((k) => (
 				<li key={k.id}>
-					<a
-						href={taskPath(k.project, k.id)}
-						title={k.sessionTitle ?? k.title}
-						onClick={(e) => navClick(e, () => onOpenTask(k.id))}
-					>
-						<span className="fu-key">{k.id}</span>
-						<span className="fu-title">{k.sessionTitle ?? k.title}</span>
-						<span
-							className={
-								k.state === "needs_you"
-									? `st st-needs_you${k.asked !== null ? " st-asked" : ""}`
-									: "st"
-							}
-						>
-							{/* Same alarm marks as the meta line: markup, not ::before. */}
-							{k.state === "needs_you" && <Mark kind={cardMark(k)} />}
-							{statusLine(k, project.hasRules, holdFor(k, tasks), draining)}
-						</span>
-					</a>
+					<LineageCardLink
+						card={k}
+						selfProject={selfProject}
+						tag=""
+						onOpenTask={onOpenTask}
+						state={
+							<span
+								className={
+									k.state === "needs_you"
+										? `st st-needs_you${k.asked !== null ? " st-asked" : ""}`
+										: "st"
+								}
+							>
+								{/* Same alarm marks as the meta line: markup, not ::before. */}
+								{k.state === "needs_you" && <Mark kind={cardMark(k)} />}
+								{statusLine(k, project.hasRules, holdFor(k, tasks), draining)}
+							</span>
+						}
+					/>
 				</li>
 			))}
-		</ul>
+		</ol>
 	);
 }
 
@@ -9424,10 +10095,10 @@ function PromptEditForm({
 }
 
 /** The decision panel of a proposal card: the reason line, the stored five-line summary
- * (or the prompt's first paragraph for older and fork proposals), the two decision
- * buttons and the collapsed full prompt. The decline lives in the drawer-actions row's
- * Cancel task. The panel replaces the needs-reason box and the
- * Prompt section, which stay hidden on proposal cards. */
+ * (or the prompt's first paragraph for older and fork proposals), the model the first turn
+ * runs with, the decision buttons and the collapsed full prompt. The panel replaces the
+ * needs-reason box, the Prompt section and the Reply composer, which stay hidden on
+ * proposal cards until Accept starts the task. */
 function ProposalPanel({
 	task,
 	loading,
@@ -9446,6 +10117,7 @@ function ProposalPanel({
 	onSaveEdit,
 	editConflict,
 	onCancel,
+	modelField,
 }: {
 	task: TaskView;
 	/** True while the detail fetch runs: the prompt slots hold a loading line. */
@@ -9466,6 +10138,8 @@ function ProposalPanel({
 	editConflict: TaskView | null;
 	/** Declines the proposal (the drawer's Cancel task, with its confirm). */
 	onCancel: () => Promise<boolean>;
+	/** The drawer's model picker; a pick lands before Accept starts the first turn. */
+	modelField: ReactNode;
 }) {
 	// Older proposals and partial fixtures carry no summary: undefined reads as the fallback.
 	const s = task.proposalSummary ?? null;
@@ -9485,6 +10159,13 @@ function ProposalPanel({
 	const facts =
 		s !== null ? (
 			<dl className="decide-facts">
+				{/* The question this proposal waits on (docs/specs/retro-auto-start.md). */}
+				{s.decision !== undefined && (
+					<div>
+						<dt>Decision</dt>
+						<dd>{s.decision}</dd>
+					</div>
+				)}
 				<div>
 					<dt>What changes</dt>
 					<dd>{s.whatChanges}</dd>
@@ -9575,15 +10256,20 @@ function ProposalPanel({
 				</div>
 			</details>
 		);
-	// One recessed card holds the whole decision: reason, summary and full prompt, then
-	// a footer bar with Accept and Edit at the right, like a dialog's actions.
+	// One framed card in the ask panel's grammar holds the whole decision: the summary as
+	// the question behind the waiting mark, the reason byline and full prompt, then the model
+	// and the decision buttons.
 	return (
 		<div className="decide-card">
 			<div className="decide-body">
+				<div className="decide-ask">
+					<Mark kind="queued" />
+					{facts}
+				</div>
 				{reason}
-				{facts}
 				{prompt}
 			</div>
+			<div className="decide-model">{modelField}</div>
 			{actions}
 		</div>
 	);
@@ -9760,7 +10446,7 @@ function DrawerHead(p: {
 				)}
 				{/* The stage label already says done; the status word only earns its place when it adds state.
 				    A proposal is a suggestion, not a fault: it reads "not started" in grey, like its card. */}
-				{isProposalCard(task) ? (
+				{isProposal(task) ? (
 					<span className="st">not started</span>
 				) : (
 					task.state !== "idle" && (
@@ -9830,14 +10516,98 @@ function DrawerMut(p: { mut: ReturnType<typeof strykerProgress> | null }) {
 function DrawerLineage(p: {
 	row: TaskCard;
 	parent: TaskCard | null;
-	retroSource: { id: string; card: TaskCard | null } | null;
+	retroSource: (LineageRef & { card: TaskCard | null }) | null;
 	kids: TaskCard[];
 	proposals: Map<string, TaskCard[]>;
 	branchRow: (k: TaskCard, tag: string) => ReactNode;
 	onOpenTask: (id: string) => void;
+	/** OTTR-1158: fetch state of a parent or retro source the state's Done window
+	 * dropped; null when the card sits in the state and nothing fetches. */
+	parentFetch: LineageFetch | null;
+	retroFetch: LineageFetch | null;
+	/** Refetches one lineage card after a failed fetch (the row's Retry button). */
+	onLineageRetry: (c: LineageRef) => void;
+	/** The live state span for a fetched card, built by the drawer. */
+	stateRow: (k: TaskCard) => ReactNode;
 }) {
-	const { row, parent, retroSource, kids, proposals, branchRow, onOpenTask } =
-		p;
+	const {
+		row,
+		parent,
+		retroSource,
+		kids,
+		proposals,
+		branchRow,
+		onOpenTask,
+		parentFetch,
+		retroFetch,
+		onLineageRetry,
+		stateRow,
+	} = p;
+	/** An inert rail row for a linked card the rail cannot link (yet): the same
+	 * three-column structure as a card row, so the loading, not-found and error rows
+	 * never shift the layout next to a real card row (OTTR-1158). */
+	const goneRow = (
+		id: string,
+		tag: string,
+		text: string,
+		title: string,
+		retry?: LineageRef,
+	): ReactNode => (
+		<li className="lineage-gone">
+			<span className="lineage-row" title={title}>
+				<span className="lineage-key">{id}</span>
+				<span className="lineage-title">{text}</span>
+				<span className="lineage-end">
+					<span className="lineage-tag">{tag}</span>
+					{retry !== undefined && (
+						<button
+							type="button"
+							className="notif-link"
+							onClick={() => onLineageRetry(retry)}
+						>
+							Retry
+						</button>
+					)}
+				</span>
+			</span>
+		</li>
+	);
+	/** The rail row for a linked card the state list dropped (OTTR-1158): a real link
+	 * once its fetch lands, loading / 404 / error rows before that. Only a 404 earns
+	 * "Card not found" — an older done card exists, it just left the window. */
+	const fetchRow = (
+		c: LineageRef,
+		fetch: LineageFetch | null,
+		tag: string,
+	): ReactNode => {
+		// No entry yet (first render before the fetch state lands) reads as loading.
+		if (fetch === null || fetch.status === "loading")
+			return goneRow(c.id, tag, "Loading…", `Loading ${c.id}`);
+		switch (fetch.status) {
+			case "card":
+				return (
+					<li>
+						<LineageCardLink
+							card={fetch.card}
+							selfProject={row.project}
+							tag={tag}
+							onOpenTask={onOpenTask}
+							state={stateRow(fetch.card)}
+						/>
+					</li>
+				);
+			case "missing":
+				return goneRow(c.id, tag, "Card not found", `${c.id} does not exist`);
+			case "error":
+				return goneRow(
+					c.id,
+					tag,
+					"Could not load card",
+					`${c.id}: ${fetch.message}`,
+					c,
+				);
+		}
+	};
 	return (
 		<>
 			{" "}
@@ -9847,18 +10617,7 @@ function DrawerLineage(p: {
 				<DrawerSec id="drawer-lineage" label="Lineage" className="lineage">
 					<ol className="lineage-rail">
 						{retroSource !== null &&
-							(retroSource.card === null ? (
-								<li className="lineage-gone">
-									<span
-										className="lineage-row"
-										title={`${retroSource.id} is not on the board`}
-									>
-										<span className="lineage-key">{retroSource.id}</span>
-										<span className="lineage-title">Not on the board</span>
-										<span className="lineage-tag">retro source</span>
-									</span>
-								</li>
-							) : (
+							(retroSource.card !== null ? (
 								<li>
 									<LineageCardLink
 										card={retroSource.card}
@@ -9867,30 +10626,37 @@ function DrawerLineage(p: {
 										onOpenTask={onOpenTask}
 									/>
 								</li>
+							) : (
+								fetchRow(
+									{ project: retroSource.project, id: retroSource.id },
+									retroFetch,
+									"retro source",
+								)
 							))}
 						{row.followUpOf !== null &&
-							(parent === null ? (
-								// The state no longer carries the parent (a cancelled card): the
-								// row keeps the lineage on the bare id, inert like the card's.
-								<li className="lineage-gone">
-									<span
-										className="lineage-row"
-										title={`${row.followUpOf} is not on the board`}
-									>
-										<span className="lineage-key">{row.followUpOf}</span>
-										<span className="lineage-title">Not on the board</span>
-										<span className="lineage-tag">parent</span>
-									</span>
-								</li>
-							) : (
+							(parent !== null ? (
 								<li>
 									<LineageCardLink
 										card={parent}
 										selfProject={row.project}
 										tag={retroSource !== null ? "retro" : "parent"}
 										onOpenTask={onOpenTask}
+										state={
+											parentFetch?.status === "card"
+												? stateRow(parent)
+												: undefined
+										}
 									/>
 								</li>
+							) : (
+								fetchRow(
+									{
+										project: row.followUpOfProject ?? row.project,
+										id: row.followUpOf,
+									},
+									parentFetch,
+									retroSource !== null ? "retro" : "parent",
+								)
 							))}
 						<li className="lineage-self" aria-current="true">
 							<span className="lineage-row">
@@ -9980,6 +10746,18 @@ function DrawerAskPanel(p: {
 	return (
 		<>
 			{" "}
+			{/* A parked gate's section context rides once above the questions;
+			    it is never a question. */}
+			{task.state === "needs_you" &&
+				task.gate?.parked === true &&
+				task.gate.context !== undefined &&
+				task.gate.context.length > 0 && (
+					<div className="gate-context">
+						{task.gate.context.map((line, i) => (
+							<p key={i}>{line}</p>
+						))}
+					</div>
+				)}
 			{/* The ask leads the body: an outstanding question is the card's one
 					    action item, so it sits right below the lineage, before the file lists. */}
 			{task.asked !== null && task.state === "needs_you" && (
@@ -10055,6 +10833,7 @@ function DrawerWaiting(p: {
 				<DrawerSec id="drawer-waiting" label="Waiting for">
 					<RelatedTasks
 						items={waiting}
+						selfProject={row.project}
 						project={project}
 						tasks={tasks}
 						onOpenTask={onOpenTask}
@@ -10077,6 +10856,17 @@ function DrawerWaiting(p: {
 							onOpenTask={onOpenTask}
 						/>
 					</div>
+				)}
+			{/* A usage-limit hold's way out lives in the steer composer: name it here. An
+			    expired hold waits for a merge/dispatch slot, not for the picker. */}
+			{task.state === "queued" &&
+				task.holdUntil !== null &&
+				task.holdUntil > Date.now() &&
+				task.holdProvider !== null && (
+					<p className="hint hold-next">
+						To start now, pick a model from another provider in the composer
+						below, then press Resume.
+					</p>
 				)}
 			{/* A parked merge hold approves by reply; the hold-actions bar at the end of the
 					    body pins the message's actions while the report scrolls. The server still
@@ -10413,16 +11203,29 @@ function DrawerPrompts(p: {
 				</DrawerSec>
 			)}
 			{!proposal && editable && edit === null && (
-				<DrawerSec id="drawer-prompt" label="Prompt">
+				<DrawerSec
+					id="drawer-prompt"
+					label="Prompt"
+					head={
+						// Release notes' grammar: the section's one quiet action sits in its head.
+						!p.loading && (
+							<button
+								type="button"
+								className="ghost"
+								title="Edit the task text"
+								onClick={openEdit}
+							>
+								<Icon name="edit" />
+								Edit task
+							</button>
+						)
+					}
+				>
 					{p.loading ? (
 						<DrawerLoading label="Loading the prompt" />
 					) : (
 						<div className="task-prompt">
 							<Markdown text={task.prompt} />
-							<button type="button" onClick={openEdit}>
-								<Icon name="edit" />
-								Edit task
-							</button>
 						</div>
 					)}
 				</DrawerSec>
@@ -10537,7 +11340,10 @@ function DrawerWorkCheck(p: {
 											? "Blocked"
 											: "Error"}
 									{" · "}
-									{run.role === "critic" || run.role === "adversary" ? (
+									{/* The routed check role, any name the routing picked; "default"
+									    keeps its own wording, and records from before the field
+									    existed render without a role. */}
+									{run.role !== undefined && run.role !== "default" ? (
 										<>
 											{run.role}
 											{" · "}
@@ -12033,7 +12839,7 @@ function SteerComposer(p: {
 				onModelMenuOpen={onModelMenuOpen}
 				modelConflict={modelConflict}
 				secondary={
-					task.state === "running" && (
+					task.state === "running" ? (
 						<BusyButton
 							title="Interrupt this turn like Esc: the worktree, branch and session stay; the card waits for your reply"
 							run={async () =>
@@ -12057,6 +12863,21 @@ function SteerComposer(p: {
 							<Icon name="stop" />
 							Stop turn
 						</BusyButton>
+					) : (
+						// A usage-limit hold names its provider; an open prompt edit holds
+						// without one. An expired hold (holdUntil in the past) waits for a
+						// slot alone: no picker way out for a hold that no longer stands.
+						task.state === "queued" &&
+						task.holdUntil !== null &&
+						task.holdUntil > Date.now() &&
+						task.holdProvider !== null && (
+							<HoldResumeButton
+								task={task}
+								catalog={catalog}
+								model={model.value}
+								act={act}
+							/>
+						)
 					)
 				}
 				primary={
@@ -12085,6 +12906,78 @@ function SteerComposer(p: {
 				browse. A model pick lands with the next turn.
 			</p>
 		</form>
+	);
+}
+
+/** The steer composer's way out of a usage-limit hold: start the card now on the model its
+ *  picker holds. On a model of the held provider the button stays off: that model waits for
+ *  the same reset. The server ends the hold with the switch (`resume: true`); a refusal —
+ *  the 409 for a provider that is still out of quota (OTTR-1181) — shows beside the button:
+ *  the bell's copy alone hides inside the closed notifications popover. */
+export function HoldResumeButton({
+	task,
+	catalog,
+	model,
+	act,
+}: {
+	task: Pick<TaskView, "project" | "id" | "holdProvider">;
+	catalog: ModelCatalog | null;
+	model: string;
+	act: Act;
+}) {
+	const runs = model === "" ? (catalog?.defaultModel ?? "") : model;
+	const held = providerOf(runs) === task.holdProvider;
+	// The refusal names the model it was asked for: a response that lands after a new
+	// pick describes the old pick, so the render guard keeps it off the surface.
+	const [problem, setProblem] = useState<{
+		model: string;
+		message: string;
+	} | null>(null);
+	// A different pick invalidates the shown refusal: drop it so the line names only
+	// the model the user chose last.
+	useEffect(() => {
+		setProblem(null);
+	}, [model]);
+	return (
+		<>
+			<BusyButton
+				disabled={held}
+				title={
+					held
+						? `This model waits for the same ${task.holdProvider} reset: pick one from another provider`
+						: "End the usage-limit hold and start the task now with this model"
+				}
+				run={() =>
+					act(
+						async () => {
+							await post(
+								`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/model`,
+								{ model, resume: true },
+							);
+							setProblem(null);
+						},
+						(message) => setProblem({ model, message }),
+					)
+				}
+			>
+				<Icon name="play" />
+				Resume
+			</BusyButton>
+			{problem !== null && problem.model === model && (
+				<p className="resume-problem" role="alert">
+					<Mark kind="crit" />
+					<span>{problem.message}</span>
+					<button
+						type="button"
+						className="icon"
+						aria-label="Dismiss error"
+						onClick={() => setProblem(null)}
+					>
+						<Icon name="x" />
+					</button>
+				</p>
+			)}
+		</>
 	);
 }
 
@@ -12170,7 +13063,9 @@ function DrawerComposer(p: {
 				/>
 			) : (
 				task.state === "needs_you" &&
-				!prReviewOpen && (
+				!prReviewOpen &&
+				// An open proposal decides in the Decide panel: nothing to reply to before Accept.
+				!(proposal && !cancelled) && (
 					<ReplyComposer
 						task={task}
 						proposal={proposal}
@@ -12240,6 +13135,12 @@ function DrawerActions(p: {
 	runRefile: () => Promise<boolean>;
 	refileError: string | null;
 	rerunDone: boolean;
+	/** OTTR-1129: the done-review re-validation group (datetime + button) and its inline lines. */
+	validateAgainBefore: string;
+	setValidateAgainBefore: (v: string) => void;
+	runValidateAgain: () => Promise<boolean>;
+	validateAgainError: string | null;
+	validateAgainDone: boolean;
 	runCancel: () => Promise<boolean>;
 	/** A proposal's decision card carries Cancel task in its footer; the row drops it. */
 	cancelInPanel: boolean;
@@ -12264,6 +13165,11 @@ function DrawerActions(p: {
 		runRefile,
 		refileError,
 		rerunDone,
+		validateAgainBefore,
+		setValidateAgainBefore,
+		runValidateAgain,
+		validateAgainError,
+		validateAgainDone,
 		runCancel,
 		cancelInPanel,
 	} = p;
@@ -12351,10 +13257,16 @@ function DrawerActions(p: {
 							Merge anyway
 						</button>
 					)}
-				{/* OTTR-604: cards whose text links a GitHub Actions run offer a
-						    re-run of that run's failed jobs; errors surface inline. */}
+				{/* OTTR-604: cards whose text links a GitHub Actions run of the
+					    project's own repository offer a re-run of that run's failed
+					    jobs; the title names the run, errors surface inline. */}
 				{rerunUrl !== null && !cancelled && (
-					<BusyButton run={rerunFailedJobs}>Re-run failed jobs</BusyButton>
+					<BusyButton
+						title={`Re-runs the failed jobs of ${rerunUrl}`}
+						run={rerunFailedJobs}
+					>
+						Re-run failed jobs
+					</BusyButton>
 				)}
 				{/* A cancelled card is final: its drawer is read-only, so the delete
 						    action goes too (an uncancel does not exist). */}
@@ -12376,6 +13288,54 @@ function DrawerActions(p: {
 					</BusyButton>
 				)}
 			</div>
+			{/* OTTR-1129: a done review card can clear the blocked results its leads
+			    got before a chosen time and file a fresh validation run. The datetime
+			    starts empty and stays required: the board tracks no sandbox-fix time
+			    to preset it with (a future preset would fill the input from a known
+			    sandbox-fix time). Like the re-run lines below, the group and its
+			    inline lines render full width under the actions row. OTTR-1166: a
+			    done release card offers the same control — isReview is the same
+			    review-or-release rule the validate route itself gates on. */}
+			{isReview(task) && task.stage === "done" && !cancelled && (
+				<div className="reply-form">
+					<label htmlFor="validate-again-before">
+						Validate blocked leads again
+					</label>
+					<input
+						id="validate-again-before"
+						type="datetime-local"
+						required
+						value={validateAgainBefore}
+						onChange={(e) => setValidateAgainBefore(e.target.value)}
+					/>
+					<div className="reply-actions">
+						<BusyButton
+							title="Clears the blocked results this review's leads got before the chosen time and files a fresh validation run for them"
+							disabled={validateAgainBefore.trim().length === 0}
+							run={runValidateAgain}
+						>
+							Validate blocked leads again
+						</BusyButton>
+					</div>
+				</div>
+			)}
+			{isReview(task) &&
+				task.stage === "done" &&
+				!cancelled &&
+				validateAgainError !== null && (
+					<p className="auth-error" role="alert">
+						{validateAgainError}
+					</p>
+				)}
+			{isReview(task) &&
+				task.stage === "done" &&
+				!cancelled &&
+				validateAgainDone &&
+				validateAgainError === null && (
+					<p className="hint" role="status">
+						Validation run filed.
+					</p>
+				)}
 			{/* OTTR-604: the re-run error and confirmation render as full-width
 					    lines below the actions row, not as flex items inside it, so they
 					    align with the drawer's content margin and keep their spacing. */}
@@ -12726,6 +13686,17 @@ const releaseWaits = (v: TaskView): boolean =>
 	v.state === "needs_you" &&
 	v.cancelledAt === null;
 
+/** A linked card named only by id and project: the state's Done window may not carry
+ * it, and the drawer fetches it from that project's tasks route (OTTR-1158). */
+type LineageRef = { project: string; id: string };
+
+/** Fetch state of one lineage card the state's Done window dropped (OTTR-1158). */
+type LineageFetch =
+	| ({ status: "loading" } & LineageRef)
+	| ({ status: "card"; card: TaskCard } & LineageRef)
+	| ({ status: "missing" } & LineageRef)
+	| ({ status: "error"; message: string } & LineageRef);
+
 /** The follow-up lineage of a drawer card: its parent row and, for a retro, the source
  * card above it. Null when the card is a root, or the parent is no retro. */
 function followUpParent(
@@ -12733,7 +13704,7 @@ function followUpParent(
 	tasks: TaskCard[],
 ): {
 	parent: TaskCard | null;
-	retroSource: { id: string; card: TaskCard | null } | null;
+	retroSource: (LineageRef & { card: TaskCard | null }) | null;
 } {
 	const parent =
 		row.followUpOf === null
@@ -12744,12 +13715,14 @@ function followUpParent(
 						t.project === (row.followUpOfProject ?? row.project),
 				) ?? null);
 	// A retro's proposal card reads its lineage from the retro's source: the parent row is the
-	// retro and the source card sits above it. Null when the parent is no retro.
+	// retro and the source card sits above it. Null when the parent is no retro. `project` is
+	// the route the drawer fetches an out-of-window source from.
 	const retroSource =
 		parent === null || parent.kind !== "retro" || parent.followUpOf === null
 			? null
 			: {
 					id: parent.followUpOf,
+					project: parent.followUpOfProject ?? parent.project,
 					card:
 						tasks.find(
 							(t) =>
@@ -13057,6 +14030,80 @@ export function Drawer({
 	maxTotal: number | null;
 }) {
 	const { parent, retroSource } = followUpParent(row, tasks);
+	// OTTR-1158: the state carries only the Done window (the newest done and cancelled
+	// cards plus the pinned ones), so a parent or retro source older than that window is
+	// absent here even while its card exists. Fetch each missing card once from its own
+	// tasks route so the rail keeps a real link; only a 404 earns the not-found row.
+	// Keyed by "<project>/<id>", so a same-id card on another board cannot stand in.
+	const parentRef: LineageRef | null =
+		row.followUpOf === null || parent !== null
+			? null
+			: {
+					project: row.followUpOfProject ?? row.project,
+					id: row.followUpOf,
+				};
+	const retroRef: LineageRef | null =
+		retroSource === null || retroSource.card !== null
+			? null
+			: { project: retroSource.project, id: retroSource.id };
+	const lineageKey = (c: LineageRef): string => `${c.project}/${c.id}`;
+	const [lineage, setLineage] = useState<Record<string, LineageFetch>>({});
+	const loadLineage = (refs: LineageRef[]): void => {
+		for (const c of refs) {
+			setLineage((m) => ({
+				...m,
+				[lineageKey(c)]: { status: "loading", ...c },
+			}));
+			void readDetail(
+				`/api/projects/${encodeURIComponent(c.project)}/tasks/${encodeURIComponent(c.id)}`,
+			)
+				.then((v) => {
+					// Only a loading entry takes the answer: a response that lands after the
+					// drawer moved to another card (entries reset) or after a retry armed a
+					// fresh request must not write stale state.
+					setLineage((m) =>
+						m[lineageKey(c)]?.status === "loading"
+							? {
+									...m,
+									[lineageKey(c)]: {
+										status: "card",
+										...c,
+										card: taskCardFromDetail(v),
+									},
+								}
+							: m,
+					);
+				})
+				.catch((e: unknown) => {
+					const msg = e instanceof Error ? e.message : String(e);
+					setLineage((m) =>
+						m[lineageKey(c)]?.status === "loading"
+							? {
+									...m,
+									[lineageKey(c)]:
+										msg === "404"
+											? { status: "missing", ...c }
+											: { status: "error", ...c, message: msg },
+								}
+							: m,
+					);
+				});
+		}
+	};
+	// lineageWant encodes exactly parentRef and retroRef: the fetch restarts when the
+	// drawer's card changes or its fetched lineage lands.
+	const lineageWant = `${parentRef === null ? "" : lineageKey(parentRef)} ${retroRef === null ? "" : lineageKey(retroRef)}`;
+	useEffect(() => {
+		const refs: LineageRef[] = [];
+		if (parentRef !== null) refs.push(parentRef);
+		if (retroRef !== null) refs.push(retroRef);
+		// Empty want: this card has both lineage cards in state — drop the old fetch state.
+		if (refs.length === 0) {
+			setLineage({});
+			return;
+		}
+		loadLineage(refs);
+	}, [lineageWant]);
 	// Oldest first: the rail reads top to bottom in the order the follow-ups were filed.
 	// Retros are follow-up rows too; each retro's proposals hang one more level in under it.
 	const kids = tasks
@@ -13067,6 +14114,21 @@ export function Drawer({
 		)
 		.sort((a, b) => a.createdAt - b.createdAt);
 	const proposals = retroProposals(kids, tasks, row.project);
+	/** The live state span a lineage row shows after its tags, as the meta line shows
+	 * it. Follow-up rows and fetched parent rows share it. */
+	const lineageState = (k: TaskCard): ReactNode => (
+		<span
+			className={
+				k.state === "needs_you"
+					? `st st-needs_you${k.asked !== null ? " st-asked" : ""}`
+					: "st"
+			}
+		>
+			{/* Same alarm marks as the meta line: markup, not ::before. */}
+			{k.state === "needs_you" && <Mark kind={cardMark(k)} />}
+			{statusLine(k, project.hasRules, holdFor(k, tasks), draining)}
+		</span>
+	);
 	/** A follow-up or proposal row: the linked card with its live state, as the meta line shows it. */
 	const branchRow = (k: TaskCard, tag: string): ReactNode => (
 		<LineageCardLink
@@ -13074,21 +14136,37 @@ export function Drawer({
 			selfProject={row.project}
 			tag={tag}
 			onOpenTask={onOpenTask}
-			state={
-				<span
-					className={
-						k.state === "needs_you"
-							? `st st-needs_you${k.asked !== null ? " st-asked" : ""}`
-							: "st"
-					}
-				>
-					{/* Same alarm marks as the meta line: markup, not ::before. */}
-					{k.state === "needs_you" && <Mark kind={cardMark(k)} />}
-					{statusLine(k, project.hasRules, holdFor(k, tasks), draining)}
-				</span>
-			}
+			state={lineageState(k)}
 		/>
 	);
+	// The rail rows for cards the Done window dropped: the fetch state fills the row
+	// until the card lands, then the plain link renders with its live state.
+	const parentFetch: LineageFetch | null =
+		parentRef === null
+			? null
+			: (lineage[lineageKey(parentRef)] ?? {
+					status: "loading",
+					...parentRef,
+				});
+	const retroFetch: LineageFetch | null =
+		retroRef === null
+			? null
+			: (lineage[lineageKey(retroRef)] ?? {
+					status: "loading",
+					...retroRef,
+				});
+	const parentCard =
+		parent ?? (parentFetch?.status === "card" ? parentFetch.card : null);
+	const retroCard =
+		retroSource === null
+			? null
+			: {
+					id: retroSource.id,
+					project: retroSource.project,
+					card:
+						retroSource.card ??
+						(retroFetch?.status === "card" ? retroFetch.card : null),
+				};
 	// A held card waits until these are done; a cancelled dependency counts as done.
 	const waiting = row.stage !== "done" ? waitingOn(tasks, row) : [];
 	const [reply, setReply] = useState("");
@@ -13270,10 +14348,13 @@ export function Drawer({
 	const [triageReason, setTriageReason] = useState("");
 	const [triageError, setTriageError] = useState<string | null>(null);
 	const triageSave = useBusy();
-	// OTTR-604 re-run failed jobs: the action exists only while the card's text
-	// links a GitHub Actions run; a cancelled card's drawer is read-only, so no
-	// action there either. The server's error string names the missing scope.
-	const rerunUrl = ciRunUrl(
+	// OTTR-604 re-run failed jobs. OTTR-1005 binds the target: the action exists
+	// only while the card's text links a GitHub Actions run in this project's
+	// repository (owner/repo compared case-insensitively, `.git` ignored, the
+	// same rule the server enforces), and a project with no GitHub remote has no
+	// target at all. The button title names the exact run it re-runs.
+	const projectRepo = project.github === null ? null : repoSlug(project.github);
+	const linkedRun = ciRunUrl(
 		[
 			task.prompt,
 			task.needsReason ?? "",
@@ -13281,6 +14362,16 @@ export function Drawer({
 			detail?.details ?? "",
 		].join("\n"),
 	);
+	const rerunUrl =
+		linkedRun !== null &&
+		projectRepo !== null &&
+		linkedRun
+			.toLowerCase()
+			.startsWith(
+				`https://github.com/${projectRepo.toLowerCase()}/actions/runs/`,
+			)
+			? linkedRun
+			: null;
 	const [rerunError, setRerunError] = useState<string | null>(null);
 	const [rerunDone, setRerunDone] = useState(false);
 	// A new card's drawer starts without the previous card's re-run status or error.
@@ -13330,6 +14421,40 @@ export function Drawer({
 			return true;
 		} catch (e) {
 			setRefileError(e instanceof Error ? e.message : String(e));
+			return false;
+		}
+	};
+	// OTTR-1129: a done review card can clear the blocked results its leads got
+	// before a chosen time and file a fresh validation run for them (OTTR-1166:
+	// a done release card offers the same control through isReview). The datetime
+	// starts empty and stays required: the board tracks no sandbox-fix time to
+	// preset it with (a future preset would fill the input from a known
+	// sandbox-fix time). A new card's drawer starts without the last card's
+	// input, error or confirmation.
+	const [validateAgainBefore, setValidateAgainBefore] = useState("");
+	const [validateAgainError, setValidateAgainError] = useState<string | null>(
+		null,
+	);
+	const [validateAgainDone, setValidateAgainDone] = useState(false);
+	useEffect(() => {
+		setValidateAgainBefore("");
+		setValidateAgainError(null);
+		setValidateAgainDone(false);
+	}, [rerunTaskId]);
+	const runValidateAgain = async (): Promise<boolean> => {
+		setValidateAgainError(null);
+		try {
+			await post(
+				`/api/projects/${encodeURIComponent(task.project)}/tasks/${encodeURIComponent(task.id)}/validate`,
+				{
+					again: "blocked",
+					before: new Date(validateAgainBefore).toISOString(),
+				},
+			);
+			setValidateAgainDone(true);
+			return true;
+		} catch (e) {
+			setValidateAgainError(e instanceof Error ? e.message : String(e));
 			return false;
 		}
 	};
@@ -13795,18 +14920,33 @@ export function Drawer({
 								onSaveEdit={editSubmit}
 								editConflict={editConflict}
 								onCancel={runCancel}
+								modelField={
+									<ModelField
+										catalog={catalog}
+										model={model.value}
+										setModel={switchModel}
+										modelQuery={modelQuery}
+										setModelQuery={setModelQuery}
+										onOpen={captureModelMenu}
+										conflict={modelConflict}
+									/>
+								}
 							/>
 						</section>
 					)}
 					<DrawerMut mut={mut} />
 					<DrawerLineage
 						row={row}
-						parent={parent}
-						retroSource={retroSource}
+						parent={parentCard}
+						retroSource={retroCard}
 						kids={kids}
 						proposals={proposals}
 						branchRow={branchRow}
 						onOpenTask={onOpenTask}
+						parentFetch={parentFetch}
+						retroFetch={retroFetch}
+						onLineageRetry={(c) => loadLineage([c])}
+						stateRow={lineageState}
 					/>
 					<DrawerLateCommits task={task} cancelled={cancelled} />
 					<DrawerAskPanel
@@ -13983,6 +15123,11 @@ export function Drawer({
 						runRefile={runRefile}
 						refileError={refileError}
 						rerunDone={rerunDone}
+						validateAgainBefore={validateAgainBefore}
+						setValidateAgainBefore={setValidateAgainBefore}
+						runValidateAgain={runValidateAgain}
+						validateAgainError={validateAgainError}
+						validateAgainDone={validateAgainDone}
 						runCancel={runCancel}
 						cancelInPanel={proposal && task.state === "needs_you"}
 					/>
@@ -14287,7 +15432,10 @@ function railRow(
 	const running = split.running.length;
 	const needs = split.needs.length;
 	const asks = split.asks.length;
-	const waiting = own.filter((t) => t.state === "queued").length;
+	// A proposal waits for a decision like a queued card; it never takes the needs mark.
+	const waiting = own.filter(
+		(t) => t.state === "queued" || isProposal(t),
+	).length;
 	const unread = own.filter((t) => isUnread(t, seen, since)).length;
 	// The one mark a row shows, by rank: needs action > asked > running > unread. Waiting has no mark.
 	const top = railTop({ needs, asks, running, unread });
@@ -14598,86 +15746,9 @@ export function warningLinks(
 	return out;
 }
 
-/** True for a whitespace-delimited token whose shape is host detail the collapsed
- * line must not carry (OTTR-1084): a path (holds "/", but an http(s) link stays),
- * a CLI flag ("-d", "--no-deps"), or a container-style name ("ottr-worker-1").
- * Card refs ("OTTR-1071", "ottr#OTTR-1071") match no shape. The tests run on the
- * token's bare core: sentence punctuation and brackets ride on the token
- * ("ottr-worker-1.", "(alate-seed-2)") and must not hide the shape from the
- * anchored tests. */
-function isNoticeDetailToken(token: string): boolean {
-	const core = token.replace(/^[^\w/@#-]+/, "").replace(/[^\w/@#-]+$/, "");
-	if (/^https?:\/\//i.test(core)) return false;
-	if (core.includes("/")) return true;
-	if (/^-{1,2}[a-zA-Z0-9]/.test(core)) return true;
-	return /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*-\d+$/.test(core);
-}
-
-/** A notice line's collapsed copy: detail tokens gone, repeated spaces
- * collapsed, and a connector word popped with a removed token so the line does
- * not end on a dangling preposition ("in /opt/x" goes as a unit). A removed
- * token keeps its trailing punctuation so its sentence end survives and the
- * next sentence does not merge into it; that punctuation drops when no kept
- * word precedes it (a line of detail tokens alone strips empty). */
-function stripNoticeTokens(line: string): string {
-	let out = "";
-	for (const token of line.split(/\s+/)) {
-		if (token === "") continue;
-		if (isNoticeDetailToken(token)) {
-			const punct = /[.,;:!?]+$/.exec(token)?.[0] ?? "";
-			const head = out.slice(out.lastIndexOf(" ") + 1);
-			if (
-				out.includes(" ") &&
-				/^(?:in|at|on|from|with|to|for|by|into|under|via)$/.test(head)
-			)
-				out = out.slice(0, out.lastIndexOf(" "));
-			if (out !== "" && punct !== "") out += punct;
-			continue;
-		}
-		out += (out === "" ? "" : " ") + token;
-	}
-	return out;
-}
-
-/** The collapsed form of a bell entry's text: the first line, stripped of host
- * detail first (stripNoticeTokens) so no cut point can still carry a path or
- * flag, then cut at the end of its first sentence when more sentence follows,
- * then capped at maxChars on a word boundary with an ellipsis. The cap is for
- * the update script's flattened records, which hold no line break to cut at
- * (SeedFailedLine passes 160); the default leaves the line uncapped. A line
- * that strips empty returns "". Whatever this drops, the entry's Details
- * disclosure must carry. */
-export function shortNoticeText(
-	text: string,
-	maxChars = Number.POSITIVE_INFINITY,
-): string {
-	const nl = text.indexOf("\n");
-	const line = nl < 0 ? text : text.slice(0, nl);
-	const stripped = stripNoticeTokens(line);
-	let out = stripped;
-	for (let i = 0; i < stripped.length - 1; i++) {
-		const ch = stripped[i];
-		if (
-			ch !== undefined &&
-			".!?;:".includes(ch) &&
-			stripped[i + 1] === " " &&
-			stripped.slice(i + 2).trim() !== ""
-		) {
-			out = stripped.slice(0, i + 1);
-			break;
-		}
-	}
-	if (Number.isFinite(maxChars) && out.length > maxChars) {
-		// Cut at the last whole word that fits; a single word past the cap
-		// hard-cuts mid-word, since there is no boundary to cut at.
-		const space = out.lastIndexOf(" ", maxChars);
-		out =
-			space < 0
-				? `${out.slice(0, maxChars)}…`
-				: `${out.slice(0, space).trimEnd()}…`;
-	}
-	return out;
-}
+/** The notice-text helpers live in ./notice.ts, DOM-free, so server-side tests
+ *  import them without this module's window state (OTTR-1097). */
+export { shortNoticeText } from "./notice.ts";
 
 /** A collapsed bell line shows at most this many card links; the rest hide behind
  * a "+N more" control until it expands. */
@@ -15099,6 +16170,7 @@ function appViewSelection(
 	view: string,
 	projects: ProjectView[],
 	selectedId: string | null,
+	selectedProjectName: string | null,
 	tasks: TaskCard[],
 	bootHosted: boolean,
 ): {
@@ -15125,7 +16197,11 @@ function appViewSelection(
 	const selected =
 		selectedId === null
 			? null
-			: (tasks.find((t) => t.id === selectedId) ?? null);
+			: (tasks.find(
+					(t) =>
+						t.id === selectedId &&
+						(selectedProjectName === null || t.project === selectedProjectName),
+				) ?? null);
 	const selectedProject =
 		selected === null
 			? null
@@ -15140,6 +16216,37 @@ function appViewSelection(
 		selectedProject,
 	};
 }
+
+/** Keep the selected old card small; the drawer reads its wide fields separately. */
+function taskCardFromDetail(detail: TaskView): TaskCard {
+	const {
+		turns,
+		prompt: _prompt,
+		summary: _summary,
+		details: _details,
+		report: _report,
+		diffFiles: _diffFiles,
+		workCheckLog: _workCheckLog,
+		workCheckReport: _workCheckReport,
+		gate: _gate,
+		worktreeFiles: _worktreeFiles,
+		savedFiles: _savedFiles,
+		prReview: _prReview,
+		prRun: _prRun,
+		lateCommits: _lateCommits,
+		retro: _retro,
+		findings: _findings,
+		...card
+	} = detail;
+	return { ...card, answered: answeredCard(turns) };
+}
+
+/** The drawer shell's state while the selection resolves outside the frame (OTTR-1136):
+ * the fetch runs, the server has no such card, or the fetch failed. */
+type PendingDrawerState = {
+	id: string;
+	status: "loading" | "missing" | "error";
+};
 
 /** Server-frame notice fields the board's inbox and banner read; defaults while the
  * first frame is still loading. */
@@ -15200,7 +16307,7 @@ function appUpdateNotices(
 /** Inbox entry keys for the board's notice lines: occurrence keys so a recurrence
  * counts as new. shortKey hashes a long body (an error text, an id list), so no key
  * outgrows the seen route's limit. */
-function appNoticeKeys(
+export function appNoticeKeys(
 	state: StateResponse | null,
 	coveredUpdates: Map<string, TaskCard>,
 	error: string | null,
@@ -15232,10 +16339,23 @@ function appNoticeKeys(
 	alatePendingKey: string | null;
 } {
 	// U6: rows an open (non-done, non-cancelled) update card already carries are not pending for the user.
-	/** Actionable upstream updates (rows with a pin target); drives the inbox entry (U5). */
+	// A hands-off project (approval off) files its own qualified rows, so only rows a person
+	// must file count, plus every removed row (docs/specs/hands-off-updates.md).
+	const handsOff = new Set(
+		state?.projects
+			.filter((p) => !p.settings.holdUpdateMerges)
+			.map((p) => p.name) ?? [],
+	);
+	/** Upstream updates a person must act on; drives the inbox entry (U5). */
 	const updateIds =
 		state?.updates?.rows
-			.filter((r) => r.target !== null && !coveredUpdates.has(r.id))
+			.filter(
+				(r) =>
+					!coveredUpdates.has(r.id) &&
+					(r.removed === true ||
+						(r.target !== null &&
+							(r.project === null || !handsOff.has(r.project)))),
+			)
 			.map((r) => r.id) ?? [];
 	const updateCount = updateIds.length;
 	const critKey = error !== null ? shortKey("crit", error) : null;
@@ -15306,6 +16426,7 @@ export function appInboxMeta(
 	needTasks: TaskCard[],
 	askCards: TaskCard[],
 	prActivity: TaskCard[],
+	prPosted: TaskCard[],
 	infoKeys: (string | null)[],
 	warnings: string[],
 	alarmCount: number,
@@ -15331,6 +16452,10 @@ export function appInboxMeta(
 		})),
 		...prActivity.map((t) => ({
 			key: `pr:${t.id}:${t.prOccurrence?.comments}`,
+			level: "needs" as const,
+		})),
+		...prPosted.map((t) => ({
+			key: `pr:${t.id}:posted:${t.prOccurrence?.posted?.head}`,
 			level: "needs" as const,
 		})),
 		...askCards.map((t) => ({ key: taskEntryKey(t), level: "asked" as const })),
@@ -15427,6 +16552,7 @@ export function AppInboxPanel(p: {
 	needTasks: TaskCard[];
 	askCards: TaskCard[];
 	prActivity: TaskCard[];
+	prPosted: TaskCard[];
 	alarmCount: number;
 	updatesKey: string | null;
 	updateCount: number;
@@ -15471,6 +16597,7 @@ export function AppInboxPanel(p: {
 		needTasks,
 		askCards,
 		prActivity,
+		prPosted,
 		alarmCount,
 		updatesKey,
 		updateCount,
@@ -15554,50 +16681,86 @@ export function AppInboxPanel(p: {
 					{
 						heading: "PR review activity",
 						tasks: prActivity,
+						posted: prPosted,
 						prKey: true,
 					},
 				]
-					.filter((g) => g.tasks.length > 0)
+					.filter((g) => g.tasks.length > 0 || (g.posted?.length ?? 0) > 0)
 					.map((g) => (
 						<section key={g.heading}>
 							<h2>
-								{g.heading} · {g.tasks.length}
+								{g.heading} · {g.tasks.length + (g.posted?.length ?? 0)}
 							</h2>
-							<ul className="alarm-list">
-								{g.tasks.map((t) => {
-									const owner = projects.find((p) => p.name === t.project);
-									const key = g.prKey
-										? `pr:${t.id}:${t.prOccurrence?.comments}`
-										: taskEntryKey(t);
-									return (
-										<li key={t.id} data-inbox-key={key}>
-											<a
-												className="alarm-link"
-												href={taskPath(t.project, t.id)}
-												onClick={(e) => {
-													navClick(e, () => openTask(t.id));
-													// Hides the inbox panel; hiding a closed one is a no-op.
-													document.getElementById("inbox")?.hidePopover();
-												}}
-											>
-												<Mark kind={cardMark(t)} />
-												<span className="alarm-project">
-													{owner === undefined
-														? t.project
-														: projectLabel(owner)}
-												</span>
-												<span className="alarm-key" title={`Task ${t.id}`}>
-													{t.id}
-												</span>
-												<span className="alarm-title">
-													{t.sessionTitle ?? t.title}
-												</span>
-												{isNew(key) && <span className="new-tag">New</span>}
-											</a>
-										</li>
-									);
-								})}
-							</ul>
+							{g.tasks.length > 0 && (
+								<ul className="alarm-list">
+									{g.tasks.map((t) => {
+										const owner = projects.find((p) => p.name === t.project);
+										const key = g.prKey
+											? `pr:${t.id}:${t.prOccurrence?.comments}`
+											: taskEntryKey(t);
+										return (
+											<li key={t.id} data-inbox-key={key}>
+												<a
+													className="alarm-link"
+													href={taskPath(t.project, t.id)}
+													onClick={(e) => {
+														navClick(e, () => openTask(t.id));
+														// Hides the inbox panel; hiding a closed one is a no-op.
+														document.getElementById("inbox")?.hidePopover();
+													}}
+												>
+													<Mark kind={cardMark(t)} />
+													<span className="alarm-project">
+														{owner === undefined
+															? t.project
+															: projectLabel(owner)}
+													</span>
+													<span className="alarm-key" title={`Task ${t.id}`}>
+														{t.id}
+													</span>
+													<span className="alarm-title">
+														{t.sessionTitle ?? t.title}
+													</span>
+													{isNew(key) && <span className="new-tag">New</span>}
+												</a>
+											</li>
+										);
+									})}
+								</ul>
+							)}
+							{(g.posted?.length ?? 0) > 0 && (
+								<ul className="alarm-list">
+									{g.posted?.map((t) => {
+										const owner = projects.find((p) => p.name === t.project);
+										// The filter guarantees the stamp; the optional chain keeps TS honest.
+										const posted = t.prOccurrence?.posted;
+										const key = `pr:${t.id}:posted:${posted?.head}`;
+										return (
+											<li key={t.id} data-inbox-key={key}>
+												<a
+													className="alarm-link"
+													href={posted?.url}
+													target="_blank"
+													rel="noreferrer"
+												>
+													<span className="alarm-project">
+														{owner === undefined
+															? t.project
+															: projectLabel(owner)}
+													</span>
+													<span className="alarm-key" title={`Task ${t.id}`}>
+														{posted != null ? `PR #${posted.number}` : null}
+													</span>
+													<span className="alarm-title">
+														Ottr posted the review on GitHub
+													</span>
+													{isNew(key) && <span className="new-tag">New</span>}
+												</a>
+											</li>
+										);
+									})}
+								</ul>
+							)}
 						</section>
 					))
 			: null;
@@ -16135,6 +17298,38 @@ function AppRailToggle({
 	);
 }
 
+/** Hosted mode's credits chip (docs/specs/hosted-mode.md section 7): the balance,
+ * linking to the control plane's account page; at zero it names the hard stop. */
+export function CreditsChip({ credits }: { credits: HostedCreditsView }) {
+	if (credits.balance === null) return null;
+	const empty = credits.balance <= 0;
+	return (
+		<a
+			className="credits-chip"
+			href={credits.accountUrl}
+			target="_blank"
+			rel="noopener noreferrer"
+			data-empty={empty ? "" : undefined}
+			title={
+				empty
+					? "Out of credit — top up on the account page"
+					: "Credits balance — opens the account page"
+			}
+		>
+			{empty ? (
+				<>
+					{/* The 380px tier hides the full sentence and shows the short form,
+					    so the bar never overflows on a 375px phone. */}
+					<span className="credits-full">Out of credit — work stopped</span>
+					<span className="credits-short">Out of credit</span>
+				</>
+			) : (
+				`${credits.balance.toFixed(1)} credits`
+			)}
+		</a>
+	);
+}
+
 /** The account menu (rail chip on phones, bar button everywhere): identity, settings
  * link, theme radios, sign out. */
 function AppUserMenu({
@@ -16325,6 +17520,10 @@ function AppDrawer(p: {
 	selected: TaskCard | null;
 	selectedProject: ProjectView | null;
 	sheet: { task: TaskCard; project: ProjectView } | null;
+	/** OTTR-1136: the drawer shell state while the selection resolves outside the frame. */
+	pendingDrawer: PendingDrawerState | null;
+	/** Re-arms the pending card fetch (the Retry button). */
+	retryPending: () => void;
 	state: StateResponse | null;
 	projects: ProjectView[];
 	tasks: TaskCard[];
@@ -16345,6 +17544,7 @@ function AppDrawer(p: {
 		selected,
 		selectedProject,
 		sheet,
+		pendingDrawer,
 		state,
 		projects,
 		tasks,
@@ -16359,12 +17559,26 @@ function AppDrawer(p: {
 		markUnread,
 		closeDrawer,
 		seenDoneSince,
+		retryPending,
 	} = p;
 	// While open, the drawer renders the live selection; on a close (X, Esc, backdrop,
 	// Back, mark-unread) it freezes into `sheet` so the dialog can animate out mounted.
 	const drawerTask = selected ?? sheet?.task ?? null;
 	const drawerProject = selectedProject ?? sheet?.project ?? null;
-	if (drawerTask === null || drawerProject === null) return null;
+	if (drawerTask === null) {
+		// OTTR-1136: a selection the frame lacks shows its fetch state, so a click on
+		// a Show-more card or a pasted URL never lands on nothing.
+		if (pendingDrawer !== null)
+			return (
+				<DrawerPending
+					pending={pendingDrawer}
+					onRetry={retryPending}
+					onClose={closeDrawer}
+				/>
+			);
+		return null;
+	}
+	if (drawerProject === null) return null;
 	// The drawer's context: the project's cards plus the cross-project links the
 	// lineage rail resolves (OTTR-787) — the drawer card's foreign parent, that
 	// parent's own source (a retro's source card), the drawer card's foreign
@@ -16442,6 +17656,51 @@ function AppDrawer(p: {
 				closeDrawer(); // close the drawer so the board shows the follow-up fly in
 			}}
 		/>
+	);
+}
+
+/** OTTR-1136: the drawer shell while its row resolves outside the state frame — the
+ * loading skeleton, a not-found line with Close, or a failed fetch with Retry. The
+ * same `dialog.drawer` the row drawer renders, so the shell opens and closes alike. */
+function DrawerPending(p: {
+	pending: PendingDrawerState;
+	onRetry: () => void;
+	onClose: () => void;
+}) {
+	return (
+		<Modal open onClose={p.onClose} label="Card" className="drawer">
+			<div className="drawer-body drawer-body-pending">
+				{p.pending.status === "loading" ? (
+					<Skeleton shape="list" rows={3} label="Loading the card" />
+				) : p.pending.status === "missing" ? (
+					<div className="drawer-pending" role="status">
+						<p>Card not found: {p.pending.id}</p>
+						<button type="button" className="ghost" onClick={p.onClose}>
+							Close
+						</button>
+					</div>
+				) : (
+					<div className="drawer-pending" role="alert">
+						<p>
+							<Mark kind="crit" /> Loading the card failed.
+						</p>
+						<div className="drawer-pending-actions">
+							<BusyButton
+								run={async () => {
+									p.onRetry();
+									return true;
+								}}
+							>
+								Retry
+							</BusyButton>
+							<button type="button" className="ghost" onClick={p.onClose}>
+								Close
+							</button>
+						</div>
+					</div>
+				)}
+			</div>
+		</Modal>
 	);
 }
 
@@ -16527,6 +17786,7 @@ function AppOverlays(p: {
 	tasks: TaskCard[];
 	act: Act;
 	openTask: (id: string) => void;
+	onNotice: (message: string) => void;
 	setShowAdd: (v: boolean) => void;
 	setShowUpdates: (v: boolean) => void;
 }) {
@@ -16541,6 +17801,7 @@ function AppOverlays(p: {
 		tasks,
 		act,
 		openTask,
+		onNotice,
 		setShowAdd,
 		setShowUpdates,
 	} = p;
@@ -16565,6 +17826,7 @@ function AppOverlays(p: {
 					projects={state?.projects ?? []}
 					onClose={() => setShowAdd(false)}
 					openTask={openTask}
+					onNotice={onNotice}
 				/>
 			)}
 
@@ -16600,16 +17862,35 @@ function AppOverlays(p: {
 
 /** The whole board. Exported for the DOM tests; index.html is its only real consumer. */
 export function App() {
-	// One-time client migration: an old hash URL becomes its path URL before the first
-	// readPath(), so the initial view and card come from the pathname.
-	migrateHash();
 	const [state, setState] = useState<StateResponse | null>(null);
-	const [view, setView] = useState(readPath().view);
+	const [view, setView] = useState(() => {
+		// One-time client migration: an old hash URL becomes its path URL before the first
+		// readPath(), so the initial view and card come from the pathname.
+		migrateHash();
+		return readPath().view;
+	});
 	const [showAdd, setShowAdd] = useState(false);
 	const [showUpdates, setShowUpdates] = useState(false);
 	const [selectedId, setSelectedId] = useState<string | null>(
 		() => readPath().task,
 	);
+	const [selectedProjectName, setSelectedProjectName] = useState<string | null>(
+		() => {
+			const path = readPath();
+			return path.task === null ? null : path.view;
+		},
+	);
+	const [fallbackTask, setFallbackTask] = useState<TaskCard | null>(null);
+	const [fallbackTaskSource, setFallbackTaskSource] = useState<
+		"state" | "detail" | null
+	>(null);
+	const [fallbackAttempt, setFallbackAttempt] = useState(0);
+	// OTTR-1136: the drawer shell's state for an off-frame selection while the
+	// fallback fetch runs, after a not-found, or after a failed fetch.
+	const [fallbackStatus, setFallbackStatus] = useState<
+		"idle" | "loading" | "missing" | "error"
+	>("idle");
+	const [error, setError] = useState<string | null>(null);
 	/** Cards with something to read (answers, PR reviews) that the user has opened; the unread badge on done cards reads its absence. Starts empty; the server owns the set. */
 	const [seenAnswers, setSeenAnswers] = useState(() => new Set<string>());
 	/** Done-read keys whose auto-mark POST failed; the read-mark effect must not re-post them in a loop. */
@@ -16620,6 +17901,7 @@ export function App() {
 	const migratedSeen = useRef(false);
 	// Hoisted above markRead/openTask: openTask looks cards up here, and a plain const is not a hook, so order with the useState lines is free.
 	const tasks = state?.tasks ?? [];
+	const projects = state?.projects ?? [];
 	// U6: rows an open (non-done, non-cancelled) update card already carries are not pending for the user.
 	const coveredUpdates = coveredUpdateIds(tasks);
 	/** OTTR-827: marks a card read — the plain id always, and (OTTR-566) the completion key
@@ -16696,24 +17978,31 @@ export function App() {
 		});
 	}, []);
 	const openTask = useCallback(
-		(id: string) => {
-			// Every card open is one history entry, so Back returns to the previous card
-			// (e.g. child → parent → child) before it leaves the page. The URL names the
-			// card: /projects/<project>/tasks/<id>, and the board follows the URL: a card
-			// of another project selects that project first, so header, rail, lanes and
-			// drawer always agree (OTTR-487). Closing the drawer then stays on that
-			// project. The same value is a no-op: a current-project open changes nothing.
-			const card = tasks.find((t) => t.id === id);
-			if (card === undefined) {
-				history.pushState({ ompTask: id }, "", location.pathname);
-			} else {
-				history.pushState({ ompTask: id }, "", taskPath(card.project, id));
-				setView(card.project);
+		(id: string, explicitProject?: string) => {
+			// Each open adds one history entry. The path names the task and its project.
+			const card =
+				explicitProject === undefined
+					? tasks.find((t) => t.id === id)
+					: tasks.find((t) => t.id === id && t.project === explicitProject);
+			const projectName =
+				card?.project ??
+				explicitProject ??
+				projects.find((p) => p.name === view)?.name;
+			if (projectName === undefined) {
+				setError(`Cannot open task ${id}: no project is selected.`);
+				return;
 			}
+			history.pushState({ ompTask: id }, "", taskPath(projectName, id));
+			setView(projectName);
+			setSelectedProjectName(projectName);
 			setSelectedId(id);
 			if (card !== undefined && autoMarkOnOpen(card)) markRead(card);
+			if (card === undefined) {
+				setError(null);
+				setFallbackAttempt((attempt) => attempt + 1);
+			}
 		},
-		[tasks, markRead],
+		[tasks, projects, view, markRead],
 	);
 	/** Plain-click navigation for the view links: pushes the path and swaps the view. The
 	 * drawer selection stays untouched, like the hashchange listener did. */
@@ -16725,11 +18014,11 @@ export function App() {
 	 * URL without a card. replaceState never adds an entry, so Back keeps walking cards. */
 	const closeDrawer = useCallback(() => {
 		setSelectedId(null);
+		setSelectedProjectName(null);
 		history.replaceState(null, "", viewPath(view));
 	}, [view]);
 	const [composeFor, setComposeFor] = useState<string | null>(null);
 	const [draftFor, setDraftFor] = useState<string | null>(null);
-	const [error, setError] = useState<string | null>(null);
 	const [notice, setNotice] = useState<string | null>(null);
 	const [offline, setOffline] = useState(false);
 	/** OTTR-964: why the board cannot reach the server, for the offline banner. */
@@ -16896,16 +18185,15 @@ export function App() {
 	const applied = theme === "system" ? (sysLight ? "light" : "dark") : theme;
 	const themeName = `Theme: ${THEME_META[applied].label}${theme === "system" ? " (match system)" : ""}`;
 
-	// Back/Forward walk the entries pushState()d by openTask and the view links; both the
-	// view and the drawer follow the entry. A vanished card id self-cleans: the drawer only
-	// renders a task the current state still lists. The explicit close (X, Esc, backdrop)
-	// only drops the selection: it must not traverse, or closing the parent of a child →
-	// parent walk would pop to the child's entry and reopen it instead of closing.
+	// Back and Forward select the task named by each path. Older task IDs can stay selected.
+	// Their detail lookup can report a missing task without clearing the URL selection.
 	useEffect(() => {
 		const onPop = (e: PopStateEvent): void => {
 			const path = readPath();
+			const id = historyTask(e.state, path.task);
 			setView(path.view);
-			setSelectedId(historyTask(e.state, path.task));
+			setSelectedId(id);
+			setSelectedProjectName(path.task === null ? null : path.view);
 		};
 		window.addEventListener("popstate", onPop);
 		return () => window.removeEventListener("popstate", onPop);
@@ -16939,11 +18227,6 @@ export function App() {
 				setState((prev) => reuseCards(prev, s));
 				// The frame carries the server's seen list, which now includes (or settled) every ack sent before it.
 				setAckLocal(new Set());
-				// The open card can vanish (cancelled in another tab): drop the selection,
-				// or the drawer would keep rendering a stale row.
-				setSelectedId((id) =>
-					id === null || s.tasks.some((t) => t.id === id) ? id : null,
-				);
 				// Drafts die with their ask: a sent, cancelled or other-device answer drops them.
 				pruneAskDrafts(
 					new Set(s.tasks.filter((t) => t.asked !== null).map((t) => t.id)),
@@ -17086,7 +18369,148 @@ export function App() {
 		[], // stable: setError and refreshState never change between renders
 	);
 
-	const projects = state?.projects ?? [];
+	const selectedStateTask =
+		selectedId === null
+			? undefined
+			: tasks.find(
+					(t) =>
+						t.id === selectedId &&
+						(selectedProjectName === null || t.project === selectedProjectName),
+				);
+	const lookupProject =
+		selectedStateTask?.project ??
+		selectedProjectName ??
+		(selectedId === null
+			? null
+			: (projects.find((p) => p.name === view)?.name ?? null));
+	const latestTaskSelection = useRef<{
+		id: string | null;
+		project: string | null;
+		task: TaskCard | undefined;
+		revision: number;
+	} | null>(null);
+	useLayoutEffect(() => {
+		const previousRevision = latestTaskSelection.current?.revision ?? 0;
+		latestTaskSelection.current = {
+			id: selectedId,
+			project: lookupProject,
+			task: selectedStateTask,
+			revision: previousRevision + 1,
+		};
+		if (selectedId === null) {
+			setFallbackTask(null);
+			setFallbackTaskSource(null);
+			setFallbackStatus("idle");
+		} else if (selectedStateTask !== undefined) {
+			setFallbackTask(selectedStateTask);
+			setFallbackTaskSource("state");
+		}
+	}, [selectedId, lookupProject, selectedStateTask]);
+	const selectedProjectForView =
+		selectedStateTask?.project ?? selectedProjectName;
+	const hasSelectedStateTask = selectedStateTask !== undefined;
+	const stateLoaded = state !== null;
+	const fallbackMatches =
+		fallbackTask !== null &&
+		selectedId !== null &&
+		lookupProject !== null &&
+		fallbackTask.id === selectedId &&
+		fallbackTask.project === lookupProject;
+	const selectionTasks =
+		!hasSelectedStateTask && fallbackMatches && fallbackTask !== null
+			? [...tasks, fallbackTask]
+			: tasks;
+	useEffect(() => {
+		if (
+			selectedId === null ||
+			lookupProject === null ||
+			!stateLoaded ||
+			hasSelectedStateTask ||
+			(fallbackMatches && fallbackTaskSource === "detail")
+		)
+			return;
+		let alive = true;
+		const requestSelection = latestTaskSelection.current;
+		if (requestSelection === null) return;
+		const requestRevision = requestSelection.revision;
+		const url = `/api/projects/${encodeURIComponent(lookupProject)}/tasks/${encodeURIComponent(selectedId)}`;
+		// OTTR-1136: the shell shows the fetch, not nothing.
+		setFallbackStatus("loading");
+		void readDetail(url)
+			.then((detail) => {
+				if (!alive) return;
+				const currentSelection = latestTaskSelection.current;
+				if (
+					currentSelection === null ||
+					currentSelection.id !== selectedId ||
+					currentSelection.project !== lookupProject ||
+					currentSelection.task !== undefined ||
+					currentSelection.revision !== requestRevision
+				)
+					return;
+				setFallbackTask(taskCardFromDetail(detail));
+				setFallbackTaskSource("detail");
+				setFallbackStatus("idle");
+			})
+			.catch((e: unknown) => {
+				if (!alive) return;
+				const reason = e instanceof Error ? e.message : String(e);
+				// A 404 names no such card: the shell shows its not-found line.
+				// Any other answer is a failed fetch: the shell offers Retry.
+				setFallbackStatus(reason === "404" ? "missing" : "error");
+				setError(`Task ${selectedId} could not be loaded: ${reason}`);
+			});
+		return () => {
+			alive = false;
+		};
+	}, [
+		selectedId,
+		lookupProject,
+		hasSelectedStateTask,
+		stateLoaded,
+		fallbackMatches,
+		fallbackTaskSource,
+		fallbackAttempt,
+	]);
+	// OTTR-1136: the frame cannot carry an off-frame card's changes, so each new
+	// frame refetches the row the drawer holds: a reply or a stage change still
+	// reaches the open drawer. A failure keeps the held row and the next frame
+	// tries again; an identical revision swaps nothing.
+	const refreshInFlight = useRef(false);
+	useEffect(() => {
+		if (selectedId === null || state === null) return;
+		if (lookupProject === null || !fallbackMatches) return;
+		if (fallbackTaskSource !== "detail") return; // the fetch above owns the row
+		if (refreshInFlight.current) return;
+		refreshInFlight.current = true;
+		const requestRevision = latestTaskSelection.current?.revision ?? 0;
+		const url = `/api/projects/${encodeURIComponent(lookupProject)}/tasks/${encodeURIComponent(selectedId)}`;
+		void readDetail(url)
+			.then((detail) => {
+				refreshInFlight.current = false;
+				const currentSelection = latestTaskSelection.current;
+				if (
+					currentSelection === null ||
+					currentSelection.id !== selectedId ||
+					currentSelection.project !== lookupProject ||
+					currentSelection.revision !== requestRevision
+				)
+					return;
+				const next = taskCardFromDetail(detail);
+				setFallbackTask((prev) =>
+					prev !== null && prev.revision === next.revision ? prev : next,
+				);
+			})
+			.catch(() => {
+				// A failed refresh keeps the held row; the next frame tries again.
+				refreshInFlight.current = false;
+			});
+	}, [state, selectedId, lookupProject, fallbackMatches, fallbackTaskSource]);
+	/** OTTR-1136: the shell's Retry re-arms the fallback fetch. */
+	const retryPendingDrawer = useCallback(() => {
+		setFallbackAttempt((attempt) => attempt + 1);
+	}, []);
+
 	// ponytail: a dev tool for the board that develops Ottr itself, so it shows only where a
 	// project tracks ottr-ai/ottr (that project holds the check card). Put it behind a release
 	// switch once Ottr ships releases.
@@ -17099,7 +18523,15 @@ export function App() {
 		overviewCurrent,
 		selected,
 		selectedProject,
-	} = appViewSelection(state, view, projects, selectedId, tasks, bootHosted);
+	} = appViewSelection(
+		state,
+		view,
+		projects,
+		selectedId,
+		selectedProjectForView,
+		selectionTasks,
+		bootHosted,
+	);
 	// Hosted mode: Alate, provisioning and the workers are the operator's, so no probe runs
 	// and the user layer stays unknown (the skill-gap markers stay out). The gate waits for
 	// the first state frame: `hosted` is false before it lands, and a mount-time fetch would
@@ -17124,6 +18556,16 @@ export function App() {
 		task: TaskCard;
 		project: ProjectView;
 	} | null>(null);
+	// OTTR-1136: the shell state for a selection the frame lacks: the fallback fetch
+	// runs, the server has no such card, or the fetch failed. The exit sheet wins,
+	// so a closing drawer never flips to a shell mid-animation.
+	const pendingDrawer: PendingDrawerState | null =
+		selectedId !== null &&
+		selected === null &&
+		sheet === null &&
+		fallbackStatus !== "idle"
+			? { id: selectedId, status: fallbackStatus }
+			: null;
 	// While open, the drawer renders the live selection; on a close (X, Esc, backdrop,
 	// Back, mark-unread) it freezes into `sheet` so the dialog can animate out mounted.
 	useEffect(() => {
@@ -17163,29 +18605,36 @@ export function App() {
 		const t = setTimeout(() => setSheet(null), 300);
 		return () => clearTimeout(t);
 	}, [selected, selectedProject]);
+	const sheetTask = selected ?? sheet?.task ?? null;
+	const drawerHasFallback =
+		fallbackTask !== null &&
+		sheetTask !== null &&
+		fallbackTask.id === sheetTask.id &&
+		fallbackTask.project === sheetTask.project &&
+		!tasks.some(
+			(t) => t.id === fallbackTask.id && t.project === fallbackTask.project,
+		);
+	const drawerContextTasks =
+		drawerHasFallback && fallbackTask !== null
+			? [...tasks, fallbackTask]
+			: tasks;
 	const deltas = commitDeltas(tasks);
-	// Live agent counts for the drawer's Workflow modal: slots busy now machine-wide, against
-	// the global cap (SystemBar shows the same count in the app bar).
-	const slotsAll = slotUse(tasks);
-	const usedTotal = SLOT_STAGES.reduce((n, s) => n + slotsAll[s], 0);
+	// Live agent counts for the drawer's Workflow modal: the scheduler's own slot count
+	// (OTTR-1143) against the global cap; SystemBar shows the same number in the app bar.
+	const usedTotal =
+		state?.slotsUsed ?? SLOT_STAGES.reduce((n, s) => n + slotUse(tasks)[s], 0);
 	// One split for the bell, the popover groups and the counts (shared with the rail rows/Overview).
-	const { needs: needTasks, asks: askCards } = splitAlarms(tasks);
-	// Projects with PR review notifications off show no PR rows in the bell.
-	const prQuiet = (t: TaskCard): boolean =>
-		t.kind === "pr_review" &&
-		projects.find((p) => p.name === t.project)?.settings.prReviewNotify ===
-			false;
-	const needsShown = needTasks.filter((t) => !prQuiet(t));
-	const prActivity = tasks.filter(
-		(t) =>
-			t.kind === "pr_review" && t.prOccurrence?.comments != null && !prQuiet(t),
-	);
-	const alarmLine = alarmLabel(
-		needsShown.length,
-		askCards.length,
-		prActivity.length,
-	);
-	const alarmCount = needsShown.length + askCards.length + prActivity.length;
+	const { needs, asks: askCards } = splitAlarms(tasks);
+	// Projects with PR review notifications off show no PR rows in the bell; the
+	// board's own posted reviews show as external PR links (docs/specs/pr-review-auto-post.md).
+	const {
+		needsShown,
+		activity: prActivity,
+		posted: prPosted,
+	} = bellAlarms(tasks, needs, projects);
+	const prAlarms = prActivity.length + prPosted.length;
+	const alarmLine = alarmLabel(needsShown.length, askCards.length, prAlarms);
+	const alarmCount = needsShown.length + askCards.length + prAlarms;
 	const {
 		draining,
 		drainCommits,
@@ -17253,6 +18702,7 @@ export function App() {
 			needsShown,
 			askCards,
 			prActivity,
+			prPosted,
 			infoKeys,
 			warnings,
 			alarmCount,
@@ -17371,7 +18821,9 @@ export function App() {
 					<SystemBar
 						tasks={tasks}
 						maxTotal={state.maxTotal}
+						slotsUsed={state.slotsUsed}
 						quota={state.quota}
+						serviceQuotas={state.serviceQuotas}
 						navigate={navigate}
 						hosted={hosted}
 					/>
@@ -17418,6 +18870,7 @@ export function App() {
 					needTasks={needsShown}
 					askCards={askCards}
 					prActivity={prActivity}
+					prPosted={prPosted}
 					alarmCount={alarmCount}
 					updatesKey={updatesKey}
 					updateCount={updateCount}
@@ -17456,6 +18909,13 @@ export function App() {
 					setError={setError}
 					setNotice={setNotice}
 				/>
+				{/* The payload carries credits only in hosted mode; a self-hosted board's
+				    payload lacks the field, so nothing renders and its DOM stays
+				    byte-identical. The chip fetches nothing: the anchor navigates only
+				    on a click. */}
+				{state?.credits !== undefined && state.credits.balance !== null && (
+					<CreditsChip credits={state.credits} />
+				)}
 				{/* Desktop keeps theme in the bar; phones reach it through the account menu. */}
 				<button
 					type="button"
@@ -17614,9 +19074,11 @@ export function App() {
 				selected={selected}
 				selectedProject={selectedProject}
 				sheet={sheet}
+				pendingDrawer={pendingDrawer}
+				retryPending={retryPendingDrawer}
 				state={state}
 				projects={projects}
-				tasks={tasks}
+				tasks={drawerContextTasks}
 				deltas={deltas}
 				draining={draining}
 				usedTotal={usedTotal}
@@ -17641,6 +19103,7 @@ export function App() {
 				tasks={tasks}
 				act={act}
 				openTask={openTask}
+				onNotice={setNotice}
 				setShowAdd={setShowAdd}
 				setShowUpdates={setShowUpdates}
 			/>

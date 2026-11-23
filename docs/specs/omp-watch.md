@@ -1,6 +1,8 @@
 # omp watch: a changelog review gates each omp bump
 
 Status: accepted (OTTR-672). Supersedes the push half of ADR 0005, see ADR 0010.
+Superseded-pending: `docs/specs/omp-channel.md` (ADR 0016, proposed) replaces this
+spec; this file describes the shipped watch until that spec's build cards land.
 
 ## Goal
 

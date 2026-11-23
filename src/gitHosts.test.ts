@@ -1,4 +1,5 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
 	existsSync,
 	mkdtempSync,
@@ -31,7 +32,13 @@ import {
 	setGitSecrets,
 	sshPaths,
 } from "./gitHosts.ts";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import fc from "./test/properties.ts";
+import {
+	installSshKeygenStub,
+	removeSshKeygenStub,
+	sshKeygenStubDir,
+} from "./test/sshKeygenStub.ts";
 
 const root = mkdtempSync(join(tmpdir(), "ottr-gh-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
@@ -40,13 +47,24 @@ const hasKeygen = Bun.which("ssh-keygen") !== null;
 
 /** One ssh-keygen run for a test fixture; throws its stderr on failure. */
 function runKeygen(args: string[]): void {
-	const r = Bun.spawnSync(["ssh-keygen", ...args], {
+	// An explicit stub path: Bun.spawnSync resolves a bare name from the PATH the
+	// process started with, not the current env, so the PATH prepend alone cannot
+	// switch it to the stub (OTTR-1180).
+	const r = Bun.spawnSync([join(sshKeygenStubDir(), "ssh-keygen"), ...args], {
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
 	});
 	if (r.exitCode !== 0) throw new Error(r.stderr.toString());
 }
+
+// OTTR-1180: the real ssh-keygen dies on hosts whose uid has no passwd entry (it runs
+// getpwuid at startup; this worker container's ephemeral uid has none), which fails the
+// fixtures above and every production spawn (generatePendingKey, keyInfo, importPendingKey).
+// The stub from ./test/sshKeygenStub.ts answers the same command lines; the suite env belt
+// restores the ambient PATH after each test.
+beforeEach(installSshKeygenStub);
+afterAll(removeSshKeygenStub);
 
 describe("parseGitUrl", () => {
 	test("accepts the four remote forms", () => {
@@ -305,19 +323,22 @@ describe("gitAuthEnv credential helper", () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-gh-"));
 		try {
 			const marker = join(dir, "stolen");
-			Bun.spawnSync(["git", "init", "-q", dir]);
-			Bun.spawnSync([
-				"git",
-				"-C",
-				dir,
-				"config",
-				"credential.helper",
-				`!f() { env > '${marker}'; }; f`,
-			]);
+			Bun.spawnSync(["git", "init", "-q", dir], { env: fixtureGitEnv() });
+			Bun.spawnSync(
+				[
+					"git",
+					"-C",
+					dir,
+					"config",
+					"credential.helper",
+					`!f() { env > '${marker}'; }; f`,
+				],
+				{ env: fixtureGitEnv() },
+			);
 			const proc = Bun.spawn(["git", "credential", "fill"], {
 				cwd: dir,
 				env: {
-					...process.env,
+					...fixtureGitEnv(),
 					...env,
 					GIT_CONFIG_SYSTEM: "/dev/null",
 					GIT_CONFIG_GLOBAL: "/dev/null",
@@ -408,6 +429,21 @@ describe("importPendingKey", () => {
 			const r = await importPendingKey(dir, readFileSync(enc, "utf8"));
 			expect("error" in r && r.error).toContain("passphrase");
 			expect(readdirSync(join(dir, "pending"))).toEqual([]);
+			// The -N key is genuinely encrypted: the right passphrase decrypts it, so the
+			// rejection above is a real decryption failure, not header sniffing.
+			const genuine = Bun.spawnSync(
+				[
+					join(sshKeygenStubDir(), "ssh-keygen"),
+					"-y",
+					"-P",
+					"secretpass",
+					"-f",
+					enc,
+				],
+				{ stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+			);
+			expect(genuine.exitCode).toBe(0);
+			expect(genuine.stdout.toString()).toContain("ssh-ed25519 ");
 		},
 	);
 
@@ -428,15 +464,48 @@ describe("importPendingKey", () => {
 			const r = await importPendingKey(dir, readFileSync(plain, "utf8"));
 			expect("id" in r).toBe(true);
 			if (!("id" in r)) return;
-			const ref = Bun.spawnSync([
-				"ssh-keygen",
-				"-l",
-				"-E",
-				"sha256",
-				"-f",
-				`${plain}.pub`,
-			]).stdout.toString();
-			expect(r.fingerprint).toBe(/SHA256:[A-Za-z0-9+/=]+/.exec(ref)?.[0] ?? "");
+			// The expected fingerprint, computed from the key bytes against the OpenSSH
+			// wire spec: an oracle independent of both the stub and the production path,
+			// so the real-tool check survives the stub substitution.
+			const pub = readFileSync(`${plain}.pub`, "utf8").trim();
+			const blob = Buffer.from(pub.split(/\s+/)[1] ?? "", "base64");
+			const expectSha =
+				"SHA256:" +
+				createHash("sha256").update(blob).digest("base64").replace(/=+$/, "");
+			expect(r.fingerprint).toBe(expectSha);
+			// The stub answers -E per algorithm, so production's digest choice stays
+			// observable: a regression from sha256 to md5 cannot hide behind the stub.
+			const sha = Bun.spawnSync(
+				[
+					join(sshKeygenStubDir(), "ssh-keygen"),
+					"-l",
+					"-E",
+					"sha256",
+					"-f",
+					`${plain}.pub`,
+				],
+				{ stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+			);
+			expect(sha.exitCode).toBe(0);
+			expect(sha.stdout.toString()).toContain(expectSha);
+			const md5 = Bun.spawnSync(
+				[
+					join(sshKeygenStubDir(), "ssh-keygen"),
+					"-l",
+					"-E",
+					"md5",
+					"-f",
+					`${plain}.pub`,
+				],
+				{ stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+			);
+			expect(md5.exitCode).toBe(0);
+			expect(md5.stdout.toString()).toContain(
+				`MD5:${createHash("md5")
+					.update(blob)
+					.digest("hex")
+					.replace(/(..)(?=.)/g, "$1:")}`,
+			);
 			const crlf = await importPendingKey(
 				dir,
 				readFileSync(plain, "utf8").replaceAll("\n", "\r\n"),
@@ -773,8 +842,13 @@ describe("defaultSshDir", () => {
 
 	test("a native start keeps keys outside the Ottr checkout and every project root", () => {
 		const home = mkdtempSync(join(tmpdir(), "ottr-home-"));
+		// The projects root as OMP_TRACKER_ROOTS would name it: its own fixture tree,
+		// kept disjoint from the home, so all three roots assert unconditionally in
+		// every layout — a checkout under the OS temp dir included.
+		const projectsTree = mkdtempSync(join(tmpdir(), "ottr-ssh-proj-"));
 		try {
-			const roots = [repo, join(home, "workspace"), resolve(repo, "..")];
+			const projectsRoot = join(projectsTree, "projects");
+			const roots = [repo, projectsRoot, join(home, "workspace")];
 			for (const [env, platform] of [
 				[{}, "linux"],
 				[{ XDG_DATA_HOME: join(home, "data") }, "linux"],
@@ -789,6 +863,7 @@ describe("defaultSshDir", () => {
 			expect(inside(defaultSshDir({}), repo)).toBe(false);
 		} finally {
 			rmSync(home, { recursive: true, force: true });
+			rmSync(projectsTree, { recursive: true, force: true });
 		}
 	});
 

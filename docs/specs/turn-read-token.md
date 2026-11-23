@@ -99,6 +99,26 @@ confirmed === true`.
 The delivered names are the only GitHub token names a turn can hold. Strips cover boot env,
 env.txt values, the worker container's own env, and the vm-runner's own env.
 
+### Scout carve-out (OTTR-1028)
+
+A trending scout (task kind `trending`) reads third-party repository text: the scan's
+candidate bundle, the README pages, and raw file URLs the prompt names. A model that
+follows instructions hidden in that text could otherwise echo the turn's secrets to an
+attacker-chosen destination through the `read` tool's URL fetch. The scout therefore gets
+no served token and no project env values:
+
+- `turnRunStartOptions` never calls `turnReadToken` for a scout, so no `githubReadEnv`
+  rides any dispatch and the token joins no `secrets` list.
+- The turn asks `turnEnv` with `values: false`: the scout's env carries only the lent
+  provider token (a run cannot start without it), the run marks (`OTTR_TRENDING`), and the
+  PATH prefix — never the Settings values. `gateTurnEnv` still parks the card on a
+  credential fault and no longer logs listed-but-valueless names the scout would not read.
+- The local `stripGithubToken` strip stays: it keeps the server's own `GH_TOKEN` and
+  `GITHUB_TOKEN` out of a local scout spawn.
+- The scout's GitHub reads are the unauthenticated public ones; rate limits drop to the
+  egress IP's anonymous budget. The server-side scan (src/trending.ts) keeps its own
+  token — it never meets the third-party text at run time.
+
 ## Checker
 
 New module `src/turnGithubToken.ts`:
@@ -181,6 +201,9 @@ as `GH_HOST` plus `GH_ENTERPRISE_TOKEN`.
 - An scp-style ssh origin (`git@host:owner/repo.git`) on the configured host is checked
   like an https origin: the checker receives its `owner/repo` (test).
 - `bun run check` and `bun test` exit 0.
+- A scout turn with a served token starts with no `githubReadEnv`, holds no read token in
+  `secrets`, and its env carries the lent provider token but no Settings values; a work
+  turn under the same board still gets `githubReadEnv` (tests).
 
 ## Non-goals
 
@@ -191,6 +214,10 @@ as `GH_HOST` plus `GH_ENTERPRISE_TOKEN`.
   credential helper.
 - Hosted-mode turns: the control plane mints per-project tokens there; the setting stays
   self-hosted only (hidden UI).
+- Enforced read destinations for the scout's `read` tool. The tool is omp's implementation;
+  Ottr pins the tool list but cannot scope its URL fetches. The scout prompt restricts
+  fetches to `raw.githubusercontent.com` and marks repository text untrusted; a destination
+  allowlist stays an omp change.
 
 ## Risks
 
@@ -203,6 +230,9 @@ as `GH_HOST` plus `GH_ENTERPRISE_TOKEN`.
 - The VM boundary (ADR 0009) deliberately admits one delivered secret. The delivered names
   ride a dedicated body field applied after the strips, so no ambient name can follow the
   same path.
+- The scout's residual exfiltration surface is the lent provider token and whatever the
+  model itself sends to its provider. The carve-out removes the GitHub read token and the
+  Settings values from that surface; the remaining token is the minimum a model run needs.
 
 ## Alternatives considered
 

@@ -21,6 +21,7 @@ import {
 } from "../src/prompts.ts";
 import { applyEvent, newEventState } from "../src/runner.ts";
 import { ProjectStore } from "../src/store.ts";
+import { CARD_ENV_NOTE } from "../src/tokens.ts";
 import { VM_VALIDATE } from "../src/vmValidateShared.ts";
 import createTracker, { hasAcceptanceSection } from "./tracker.ts";
 
@@ -56,6 +57,8 @@ let runtimeReady = true;
 const stopHandlers: Array<(...args: unknown[]) => unknown> = [];
 // tool_result handlers: the session-file redaction of git host secrets.
 const resultHandlers: Array<(...args: unknown[]) => unknown> = [];
+// before_agent_start handlers: the card-env guidance injected into the system prompt.
+const startHandlers: Array<(...args: unknown[]) => unknown> = [];
 
 function fakePi(
 	tracker: typeof createTracker = createTracker,
@@ -89,6 +92,7 @@ function fakePi(
 		on: (event: string, handler: (...args: unknown[]) => unknown) => {
 			if (event === "session_stop") stopHandlers.push(handler);
 			if (event === "tool_result") resultHandlers.push(handler);
+			if (event === "before_agent_start") startHandlers.push(handler);
 		},
 		getSessionName: async () => {
 			if (!runtimeReady)
@@ -127,6 +131,7 @@ const envKeys = [
 	"OTTR_TRENDING",
 	"OTTR_MODELS",
 	"OTTR_VM_RUNNER_URL",
+	"OTTR_CARD_ENV_NOTE",
 ] as const;
 function setEnv(v: Partial<Record<(typeof envKeys)[number], string>>) {
 	for (const k of envKeys) if (v[k] !== undefined) process.env[k] = v[k];
@@ -143,6 +148,7 @@ afterEach(() => {
 	runtimeReady = true;
 	stopHandlers.length = 0;
 	resultHandlers.length = 0;
+	startHandlers.length = 0;
 });
 
 // The sandbox staging signature: <project>/validate-jobs/<id>. The belt root may
@@ -768,7 +774,7 @@ describe("propose_task tool", () => {
 		expect(tool?.loadMode).toBe("essential");
 	});
 
-	test("declares exactly prompt, model, project and the five summary fields", () => {
+	test("declares exactly prompt, model, project, the five summary fields and decision", () => {
 		process.env.OTTR_RETRO = "1";
 		expect(Object.keys(fakePi().propose_task?.parameters ?? {})).toEqual([
 			"prompt",
@@ -779,6 +785,7 @@ describe("propose_task tool", () => {
 			"gain",
 			"risk",
 			"check",
+			"decision",
 		]);
 	});
 
@@ -848,17 +855,23 @@ describe("propose_task tool", () => {
 			{ prompt: `p${acceptance}`, gain: "" },
 			{ prompt: `p${acceptance}`, risk: {} },
 			{ prompt: `p${acceptance}`, check: "x".repeat(401) },
+			{ prompt: `p${acceptance}`, decision: "  " },
+			{ prompt: `p${acceptance}`, decision: "x".repeat(401) },
 		];
 		for (const params of bad) {
 			const out = await tools.propose_task!.execute("t1", params);
 			expect(text(out)).toMatch(
-				/^Error: (whatChanges|why|gain|risk|check) must be a string of 1-400 characters \(trimmed\) when given\.$/,
+				/^Error: (whatChanges|why|gain|risk|check|decision) must be a string of 1-400 characters \(trimmed\) when given\.$/,
 			);
 		}
 	});
 
 	test("accepts all five summary fields and resolves locally once, then refuses the second call; create_task untouched", async () => {
 		process.env.OTTR_RETRO = "1";
+		// The board's project list this run proposes against; set here, not inherited
+		// from an earlier test's value (OTTR-1180: the suite env belt restores the env
+		// after each test, so a leaked value no longer reaches this call).
+		process.env.OTTR_PROJECTS = "alate\nagent-data\nottr";
 		let fetched = false;
 		globalThis.fetch = (async () => {
 			fetched = true;
@@ -1033,6 +1046,7 @@ describe("arch-review changed-line coverage", () => {
 			"shots",
 			"dependsOn",
 			"prBody",
+			"followUp",
 		]);
 	});
 
@@ -1049,9 +1063,12 @@ describe("arch-review changed-line coverage", () => {
 		}
 	});
 
-	test("ask delivers questions and reports the pause", async () => {
+	test("ask delivers mixed questions with one without options and reports the pause", async () => {
 		const out = await fakePi().ask!.execute("t1", {
-			questions: [{ question: "Go left?", options: [{ label: "yes" }] }],
+			questions: [
+				{ question: "Go left?", options: [{ label: "yes" }] },
+				{ question: "Name it?" },
+			],
 		});
 		expect(text(out)).toBe(
 			"Your question was delivered to the tracker user. The run is paused; the answer arrives as the next user message. End your turn now WITHOUT calling report_outcome (the tracker knows you are waiting).",
@@ -1171,7 +1188,7 @@ describe("arch-review changed-line coverage", () => {
 		]);
 	});
 
-	test("report_outcome status accepts exactly the four tracker statuses", () => {
+	test("report_outcome status accepts exactly the five tracker statuses", () => {
 		// The zod fake records the enum payload on the captured schema node.
 		const status = (fakePi().report_outcome?.parameters?.status ?? {}) as {
 			values?: string[];
@@ -1181,7 +1198,17 @@ describe("arch-review changed-line coverage", () => {
 			"answered",
 			"integrated",
 			"needs_you",
+			"superseded",
 		]);
+	});
+
+	test("followUp describes the superseded close's follow-up card id", () => {
+		const params = fakePi().report_outcome?.parameters ?? {};
+		expect(Object.keys(params)).toContain("followUp");
+		// unchecked cast: the fake schema shape is built in this file's harness, not external input
+		const followUp = params.followUp as { description?: string };
+		expect(followUp.description).toContain("Superseded merge turns only");
+		expect(followUp.description).toContain("parks the card instead of closing");
 	});
 
 	test("ask describes the option description field and the options array", () => {
@@ -1198,7 +1225,7 @@ describe("arch-review changed-line coverage", () => {
 			"Optional explanation of the choice",
 		);
 		expect(questions.element?.options?.description).toBe(
-			"2-5 answer choices; the user can also type a custom answer",
+			"2-5 answer choices; omit for a free-text question the user answers by typing one line",
 		);
 	});
 
@@ -1824,5 +1851,49 @@ describe("sandbox_run tool", () => {
 		});
 		const headers = seen!.init.headers as Record<string, string>;
 		expect(headers["x-board-token"]).toBeUndefined();
+	});
+});
+
+// The card-env guidance must reach the model, not only the process env: turnEnv sets
+// OTTR_CARD_ENV_NOTE and the extension's before_agent_start handler puts the guidance
+// into the session system prompt on its presence (OTTR-1099).
+describe("before_agent_start card-env guidance", () => {
+	const event = (systemPrompt: string[]) => ({
+		type: "before_agent_start",
+		reason: "prompt",
+		prompt: "do the task",
+		systemPrompt,
+	});
+
+	test("a turn env that carries the note injects the guidance into the system prompt", () => {
+		fakePi();
+		expect(startHandlers.length).toBe(1);
+		process.env.OTTR_CARD_ENV_NOTE = CARD_ENV_NOTE;
+		const out = startHandlers[0]?.(event(["base prompt"])) as
+			| { systemPrompt?: string[] }
+			| undefined;
+		expect(out).not.toBeUndefined();
+		expect(out?.systemPrompt).toEqual([
+			"base prompt",
+			expect.stringContaining("eval kernel env"),
+		]);
+		// The guidance names the documented path an eval cell must take.
+		expect(out?.systemPrompt?.[1]).toContain("bash tool");
+	});
+
+	test("no note in the env injects nothing", () => {
+		fakePi();
+		expect(startHandlers[0]?.(event(["base prompt"]))).toBeUndefined();
+	});
+
+	test("the injection appends to omp's chained prompt, it never replaces it", () => {
+		fakePi();
+		process.env.OTTR_CARD_ENV_NOTE = CARD_ENV_NOTE;
+		const base = ["first block", "second block"];
+		const out = startHandlers[0]?.(event(base)) as
+			| { systemPrompt?: string[] }
+			| undefined;
+		expect(out?.systemPrompt?.slice(0, 2)).toEqual(base);
+		expect(out?.systemPrompt).toHaveLength(3);
 	});
 });

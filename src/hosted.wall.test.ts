@@ -7,8 +7,8 @@ import type { Server } from "bun";
 import { type App, createApp, type Entry } from "./app.ts";
 import {
 	type IdentityRole,
-	SESSION_COOKIE,
 	SESSION_MS,
+	sessionCookieName,
 	signIdentity,
 	signSession,
 } from "./auth.ts";
@@ -195,6 +195,7 @@ const hosted: Hosted = {
 		creditOk: async () => true,
 		gitToken: async () => null,
 	},
+	creditBalance: { balance: null },
 };
 
 /** What the proxy forwards: the tenant's public Host and Origin, plus a fresh signed header. */
@@ -298,7 +299,7 @@ describe("hosted mode request wall", () => {
 	});
 
 	test("a session cookie or X-API-Key grants nothing", async () => {
-		const cookie = `${SESSION_COOKIE}=${signSession("wall-secret", "ada", SESSION_MS)}`;
+		const cookie = `${sessionCookieName(0)}=${signSession("wall-secret", "ada", SESSION_MS)}`;
 		for (const headers of [
 			{ ...loopback, cookie },
 			{ ...loopback, "x-api-key": "wall-key" },

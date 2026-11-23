@@ -18,6 +18,7 @@ import {
 } from "./app.ts";
 import { signIdentity } from "./auth.ts";
 import { createHostedGitAuth, HOSTED_TOKEN_MARGIN_MS } from "./gitHosts.ts";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { GlobalStore } from "./globalStore.ts";
 import type { GitToken, Hosted, HostedHooks } from "./hosted.ts";
 import { hostedGh } from "./release.ts";
@@ -439,7 +440,10 @@ async function board(
 		["init", "-q", "-b", "main"],
 		["remote", "add", "origin", "fake-host.example:o/r.git"],
 	]) {
-		const r = Bun.spawnSync(["git", ...args], { cwd: dir });
+		const r = Bun.spawnSync(["git", ...args], {
+			cwd: dir,
+			env: fixtureGitEnv(),
+		});
 		expect(r.exitCode).toBe(0);
 	}
 	const store = await ProjectStore.open(dir);
@@ -517,6 +521,7 @@ describe("createApp network git credential", () => {
 				},
 			},
 			hooks,
+			creditBalance: { balance: null },
 		});
 		await withEnv("GH_TOKEN", GLOBAL, async () => {
 			await b.fetch();
@@ -564,6 +569,7 @@ const hostedCfg = (hooks: HostedHooks): Hosted => ({
 		},
 	},
 	hooks,
+	creditBalance: { balance: null },
 });
 
 /** A fetch stub that records each request's Authorization header and answers 404. */

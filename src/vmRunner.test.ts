@@ -1,8 +1,10 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import {
+	closeSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	openSync,
 	readdirSync,
 	readFileSync,
 	readlinkSync,
@@ -11,9 +13,12 @@ import {
 	statSync,
 	symlinkSync,
 	writeFileSync,
+	writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { CgroupReading, SystemVm, VmStateDisk } from "./types.ts";
+import { probeVmRunner } from "./vmHealth.ts";
 import {
 	type Exec,
 	netStartup,
@@ -23,7 +28,13 @@ import {
 	slotUpCommands,
 	startupCommands,
 } from "./vmNet.ts";
-import { type BakeResult, layerKey, listFiles, VmRootfs } from "./vmRootfs.ts";
+import {
+	type BakeResult,
+	layerKey,
+	listFiles,
+	sparseFile,
+	VmRootfs,
+} from "./vmRootfs.ts";
 import {
 	extractCopyOut,
 	firecrackerConfig,
@@ -34,8 +45,10 @@ import {
 	type VmLauncher,
 	type VmLaunchSpec,
 	type VmRunnerOptions,
+	vmStateDiskUsage,
 } from "./vmRunner.ts";
 import { parseSize, readVmRunnerEnv } from "./vmRunnerMain.ts";
+import { vmState } from "./vmState.ts";
 import {
 	type ValidateJobSpec,
 	type ValidateRequest,
@@ -1440,6 +1453,36 @@ describe("vm-runner /validate", () => {
 		}, "free slot");
 	});
 
+	test("healthz reports the pool usage the board's probe reads (OTTR-1142)", async () => {
+		const held = heldGuest();
+		const r = startRunner({ max: 2, script: { run: held.run } });
+		const free = await fetch(`${r.url}/healthz`);
+		expect(free.status).toBe(200);
+		expect(free.headers.get("x-ottr-vms-max")).toBe("2");
+		expect(free.headers.get("x-ottr-vms-busy")).toBe("0");
+		const first = await post(r.url, "/run", request());
+		const reader = first.body!.getReader();
+		await reader.read(); // the guest's first event: the VM holds the slot
+		const full = await fetch(`${r.url}/healthz`);
+		expect(full.status).toBe(200);
+		expect(full.headers.get("x-ottr-vms-busy")).toBe("1");
+		// The board's probe writes both counts into the pool state its start gate reads.
+		const savedPool = vmState.pool;
+		const savedHealth = vmState.health;
+		try {
+			await probeVmRunner({ urls: [r.url], token: "tok" });
+			expect(vmState.health.ok).toBe(true);
+			expect(vmState.pool).toEqual({ busy: 1, max: 2 });
+		} finally {
+			vmState.pool = savedPool;
+			vmState.health = savedHealth;
+		}
+		held.release();
+		while (!(await reader.read()).done) {
+			// drain to the end of the run
+		}
+	});
+
 	test("builds both disks with mkfs.ext4 -d and stages the job input before the scratch mkfs", async () => {
 		const mkfs: {
 			argv: string[];
@@ -1645,6 +1688,184 @@ describe("vm-runner /validate", () => {
 		expect(bake2.spec.mode).toBe("bake");
 		expect(bake2.puts).toHaveLength(0);
 		expect(bake2.bakeBody).toEqual({ project: "proj" });
+	});
+});
+
+/** GET /stats's body: the worker stats spread plus the vm-runner fields. */
+type StatsBody = CgroupReading & {
+	vms: SystemVm[];
+	max: number;
+	disk: VmStateDisk;
+};
+
+describe("vm-runner /stats", () => {
+	const getStats = (url: string, token?: string): Promise<Response> =>
+		fetch(`${url}/stats`, {
+			headers: token === undefined ? {} : { "x-otwr-token": token },
+		});
+
+	test("needs the worker token and answers the stats spread when idle", async () => {
+		const r = startRunner();
+		const none = await getStats(r.url);
+		expect(none.status).toBe(401);
+		const wrong = await getStats(r.url, "wrong");
+		expect(wrong.status).toBe(401);
+		const ok = await getStats(r.url, "tok");
+		expect(ok.status).toBe(200);
+		const body = (await ok.json()) as StatsBody;
+		expect(body.vms).toEqual([]);
+		expect(body.max).toBe(2);
+		// A fresh state dir holds no disks yet: every part reads zero, no throw.
+		expect(body.disk).toEqual({ base: 0, layers: 0, runs: 0 });
+	});
+
+	test("lists one live turn VM with its allocated scratch size, then none after it ends", async () => {
+		const held = heldGuest();
+		// Real bytes into the sparse scratch at mkfs time, so its allocated size
+		// is deterministic: 4096 allocated while the file's apparent size stays
+		// the configured 1 MiB.
+		const r = startRunner({
+			script: { run: held.run },
+			execHook: (argv) => {
+				if (argv[0] === "mkfs.ext4") {
+					const fd = openSync(argv[argv.length - 1]!, "r+");
+					try {
+						writeSync(fd, Buffer.alloc(4096, 1));
+					} finally {
+						closeSync(fd);
+					}
+				}
+				return { code: 0, stdout: "", stderr: "" };
+			},
+		});
+		const body = request();
+		const first = await post(r.url, "/run", body);
+		const reader = first.body!.getReader();
+		await reader.read(); // the guest's first event: the VM is live
+		const stats = await getStats(r.url, "tok");
+		expect(stats.status).toBe(200);
+		const s = (await stats.json()) as StatsBody;
+		expect(s.vms).toHaveLength(1);
+		const vm = s.vms[0]!;
+		expect(vm.id).toBe(body.id);
+		expect(vm.project).toBe("proj");
+		expect(vm.cardId).toBe("P-1");
+		expect(vm.mode).toBe("turn");
+		expect(vm.vcpus).toBe(2);
+		expect(vm.memMiB).toBe(512);
+		expect(typeof vm.startedAt).toBe("number");
+		// Allocated, not apparent: the scratch holds 4096 real bytes inside its
+		// 1 MiB sparse file.
+		expect(vm.scratchBytes).toBe(4096);
+		const runDir = join(
+			r.stateDir,
+			"runs",
+			readdirSync(join(r.stateDir, "runs"))[0]!,
+		);
+		expect(statSync(join(runDir, "scratch.ext4")).size).toBe(1024 * 1024);
+		// The worker stats spread rides along; runs lists the live pids (this
+		// fake pid exists under no /proc, so the usage list stays empty).
+		expect("at" in s).toBe(true);
+		expect("cpuUsageUsec" in s).toBe(true);
+		expect("memoryCurrent" in s).toBe(true);
+		expect("lock" in s).toBe(true);
+		expect(Array.isArray(s.runs)).toBe(true);
+		expect(s.max).toBe(2);
+		held.release();
+		while (!(await reader.read()).done) {
+			// drain to the end of the run
+		}
+		await until(async () => {
+			const after = (await (await getStats(r.url, "tok")).json()) as StatsBody;
+			return after.vms.length === 0;
+		}, "the ended run to leave /stats");
+	});
+
+	test("lists one live validate VM with the sandbox job's card id and fixed limits", async () => {
+		const held = gate();
+		const r = startRunner({
+			max: 1,
+			script: { validateResult: { ...VALID_RESULT, id: "val-stats" } },
+			// Hold the scratch mkfs: the job is mid-flight with its scratch disk
+			// created. A job gated earlier than that is hard to time, so the
+			// scratchBytes-null case relies on the code path (scratchPath starts null).
+			exec: async (argv) => {
+				if (
+					argv[0] === "mkfs.ext4" &&
+					argv[argv.length - 1]!.endsWith("scratch.ext4")
+				)
+					await held.wait;
+				return { code: 0, stdout: "", stderr: "" };
+			},
+		});
+		const pending = post(
+			r.url,
+			"/validate",
+			validateBody(seedTarget(r, "val-stats"), {
+				id: "val-stats",
+				taskId: "R-9",
+			}),
+		);
+		await until(async () => {
+			const s = (await (await getStats(r.url, "tok")).json()) as StatsBody;
+			return s.vms.length === 1;
+		}, "the validate job to appear in /stats");
+		const s = (await (await getStats(r.url, "tok")).json()) as StatsBody;
+		const vm = s.vms[0]!;
+		expect(vm.id).toBe("val-stats");
+		expect(vm.mode).toBe("validate");
+		expect(vm.project).toBe("proj");
+		expect(vm.cardId).toBe("R-9");
+		expect(vm.vcpus).toBe(VM_VALIDATE.vcpus);
+		expect(vm.memMiB).toBe(VM_VALIDATE.memMiB);
+		held.open();
+		const res = await pending;
+		expect(res.status).toBe(200);
+		await res.text();
+		await until(async () => {
+			const after = (await (await getStats(r.url, "tok")).json()) as StatsBody;
+			return after.vms.length === 0;
+		}, "the finished job to leave /stats");
+	});
+
+	test("vmStateDiskUsage reports allocated bytes per part and never throws on a missing tree", () => {
+		const stateDir = mkdtempSync(join(root, "diskusage-"));
+		mkdirSync(join(stateDir, "base"), { recursive: true });
+		mkdirSync(join(stateDir, "layers", "proj"), { recursive: true });
+		mkdirSync(join(stateDir, "runs", "0-aa"), { recursive: true });
+		const sparse = (path: string, bytes: number): void => {
+			sparseFile(path, bytes);
+			const fd = openSync(path, "r+");
+			try {
+				writeSync(fd, Buffer.alloc(4096, 1));
+			} finally {
+				closeSync(fd);
+			}
+		};
+		const base = join(stateDir, "base", "base.ext4");
+		const layer = join(stateDir, "layers", "proj", "layer.ext4");
+		const scratch = join(stateDir, "runs", "0-aa", "scratch.ext4");
+		sparse(base, 65536);
+		sparse(layer, 1024 * 1024);
+		sparse(scratch, 1024 * 1024);
+		// An extra subdir outside the three parts and a link inside one: neither
+		// may add a byte.
+		mkdirSync(join(stateDir, "extra"), { recursive: true });
+		sparse(join(stateDir, "extra", "big.ext4"), 1024 * 1024);
+		symlinkSync(base, join(stateDir, "layers", "proj", "link.ext4"));
+		const alloc = (p: string): number => statSync(p).blocks * 512;
+		const usage = vmStateDiskUsage(stateDir);
+		expect(usage.base).toBe(alloc(base));
+		expect(usage.base).toBeLessThan(statSync(base).size);
+		expect(usage.layers).toBe(alloc(layer));
+		expect(usage.layers).toBeLessThan(statSync(layer).size);
+		expect(usage.runs).toBe(alloc(scratch));
+		expect(usage.runs).toBeLessThan(statSync(scratch).size);
+		expect(vmStateDiskUsage(join(stateDir, "missing"))).toEqual({
+			base: 0,
+			layers: 0,
+			runs: 0,
+		});
 	});
 });
 

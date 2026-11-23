@@ -51,6 +51,7 @@ interface CreateTaskParams {
 	gain?: unknown;
 	risk?: unknown;
 	check?: unknown;
+	decision?: unknown;
 }
 interface TrendingParams {
 	repo?: unknown;
@@ -270,6 +271,7 @@ function summaryFieldsValidationError(params: CreateTaskParams): string | null {
 		"gain",
 		"risk",
 		"check",
+		"decision",
 	] as const;
 	for (const field of summaryFields) {
 		if (params[field] === undefined) continue;
@@ -572,6 +574,25 @@ export default function (pi: Pi) {
 		return { content, details };
 	});
 
+	// OTTR-1099: omp filters the eval kernel env, so a card env value (Settings, env.txt)
+	// never reaches an eval cell's os.environ while bash children see it. An agent that
+	// hits the KeyError there can report a set value as missing, so the guidance must be
+	// in front of the model from the first prompt, not only in a variable it may never
+	// print. turnEnv sets OTTR_CARD_ENV_NOTE when the project lists values; this handler
+	// surfaces a fixed text on its presence, so no env value flows into the prompt.
+	// omp chains handler results per prompt and resets at the next preparation, so the
+	// note is injected once per request, not cumulatively.
+	pi.on("before_agent_start", (event: unknown) => {
+		if ((process.env.OTTR_CARD_ENV_NOTE ?? "").trim() === "") return undefined;
+		const e = event as { systemPrompt?: string[] }; // omp's BeforeAgentStartEvent
+		return {
+			systemPrompt: [
+				...(Array.isArray(e.systemPrompt) ? e.systemPrompt : []),
+				"Eval cells cannot read the card env values (the names the project lists under Settings, Env): omp filters the eval kernel env, so os.environ misses them and a KeyError there is not a missing value. Read a card env value from a script run through the bash tool instead; a bash child inherits the full turn env.",
+			],
+		};
+	});
+
 	// Proactive naming: name a fresh session before the agent runs; a named session keeps its name.
 	// omp throws "Extension runtime not initialized" when an action method is called during
 	// extension load — and a synchronous throw escapes the .catch below, aborting the whole
@@ -606,12 +627,13 @@ export default function (pi: Pi) {
 			"status: ready = work committed on the task branch and needs integration; " +
 			"answered = question-only task, nothing to merge; " +
 			"integrated = merge turn finished and the branch is on the integration target; " +
+			"superseded = merge turn whose branch main's own flow already covers: merge nothing and push nothing, and put the follow-up card's id in followUp; " +
 			"needs_you = you need the user (put the exact question in question). " +
 			"summary: 1-3 lines for the board card. details: the full report shown on the card (answered: your complete answer; integrated: the integration output verbatim). " +
 			"dependsOn: ids of cards this turn waits for — a needs_you outcome with dependsOn requeues the card in its current stage, and the tracker restarts it when every id is done or cancelled.",
 		parameters: z.object({
 			status: z
-				.enum(["ready", "answered", "integrated", "needs_you"])
+				.enum(["ready", "answered", "integrated", "needs_you", "superseded"])
 				.describe("How the turn ended"),
 			summary: z.string().describe("1-3 lines for the board card"),
 			details: z
@@ -644,6 +666,13 @@ export default function (pi: Pi) {
 				.describe(
 					"PR mode merge turns only: the pull request body for the pull request the server opens after this report. Write it from the repo's pull request template (.github/pull_request_template.md) when one exists; describe the change, never the push. Missing or blank: the pull request body falls back to this report's summary and details.",
 				),
+			// Superseded merge turns only: the id of the gap card the turn filed with create_task.
+			followUp: z
+				.string()
+				.optional()
+				.describe(
+					"Superseded merge turns only: the id of the follow-up card this turn filed with create_task for the gap main's flow left (create_task returns the id). A superseded report without a linked follow-up parks the card instead of closing it.",
+				),
 		}),
 		loadMode: "essential",
 		approval: "read",
@@ -664,9 +693,10 @@ export default function (pi: Pi) {
 		name: "ask",
 		label: "Ask the user",
 		description:
-			"Ask the tracker user one or more questions with clickable choices. Pauses the run until the answer " +
-			"arrives as the next message. Use it instead of guessing a direction. Bundle all questions of one " +
-			"pause into a single call.",
+			"Ask the tracker user one or more questions with clickable choices. A question without " +
+			"options is a free-text question the user answers by typing one line. Pauses the run until " +
+			"the answer arrives as the next message. Use it instead of guessing a direction. Bundle all " +
+			"questions of one pause into a single call.",
 		parameters: z.object({
 			questions: z
 				.array(
@@ -682,8 +712,9 @@ export default function (pi: Pi) {
 										.describe("Optional explanation of the choice"),
 								}),
 							)
+							.optional()
 							.describe(
-								"2-5 answer choices; the user can also type a custom answer",
+								"2-5 answer choices; omit for a free-text question the user answers by typing one line",
 							),
 						multi: z
 							.boolean()
@@ -889,7 +920,7 @@ export default function (pi: Pi) {
 			name: "propose_task",
 			label: "Propose task",
 			description: retroMode
-				? "Propose ONE improvement task from this retro. Ottr files it as a held card when the retro ends: it starts only after the user accepts it. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. End the prompt with a section headed 'Acceptance' that holds at least one observable check (a command to run or a result to see); the tool refuses a prompt without one. model: optional model for the task. summary: five short strings the board shows next to the prompt, each the same fact as its prompt part: whatChanges: the file or setting and the edit, in one sentence; why: the cause and the evidence, with the card ids; gain: the saving in concrete units; risk: what can break, or \"none found\"; check: how the result is verified."
+				? "Propose ONE improvement task from this retro. Ottr files it as a card when the retro ends: it starts after the user accepts it, or at once when the project starts proposals without asking. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. End the prompt with a section headed 'Acceptance' that holds at least one observable check (a command to run or a result to see); the tool refuses a prompt without one. model: optional model for the task. summary: five short strings the board shows next to the prompt, each the same fact as its prompt part: whatChanges: the file or setting and the edit, in one sentence; why: the cause and the evidence, with the card ids; gain: the saving in concrete units; risk: what can break, or \"none found\"; check: how the result is verified. decision: optional; the question the user must answer before this task can start, for example a choice between two designs or a scope call. Leave it out when the task needs no decision. A proposal with a decision always waits for the user."
 				: 'Record ONE finding of this review; call it once per finding, as many times as you need. After the review ends, Ottr ranks the findings, checks the best ones with a second model, and files the ones that pass as cards (at most 10, plus confirmed high or critical security findings). prompt: the self-contained finding text (what is wrong, the evidence, the effect, the fix). rank: the finding\'s importance, 1 = most important. security: "critical" or "high" for a confirmed security finding of that severity, else leave it out. End the prompt with a section headed \'Acceptance\' that holds at least one observable check; the tool refuses a prompt without one.',
 			parameters: z.object(
 				retroMode
@@ -935,6 +966,12 @@ export default function (pi: Pi) {
 								.string()
 								.optional()
 								.describe("How the result is verified (1-400 characters)"),
+							decision: z
+								.string()
+								.optional()
+								.describe(
+									"The question the user must answer before the task can start; omit when none (1-400 characters)",
+								),
 						}
 					: {
 							prompt: z

@@ -23,7 +23,12 @@ export type RunState =
 	| "idle";
 /** Turn 1 (and its replies) is `work`; the integrate turn (and its replies) is `merge`. */
 export type TurnKind = "work" | "merge";
-export type OutcomeStatus = "ready" | "answered" | "integrated" | "needs_you";
+export type OutcomeStatus =
+	| "ready"
+	| "answered"
+	| "integrated"
+	| "needs_you"
+	| "superseded";
 
 /** The fixed reply text that approves a parked merge hold; the drawer's approve button sends it. */
 export const APPROVE_REPLY = "approved";
@@ -33,6 +38,7 @@ export const OUTCOME_STATUSES: readonly OutcomeStatus[] = [
 	"answered",
 	"integrated",
 	"needs_you",
+	"superseded",
 ];
 
 /** One choice of an agent ask question. Used only inside this module. */
@@ -55,15 +61,22 @@ export interface ProposalSummary {
 	risk: string;
 	/** How the result is verified. */
 	check: string;
+	/** The question the user must answer before the task can start; absent when none. A
+	 *  proposal with a decision always waits for Accept (docs/specs/retro-auto-start.md). */
+	decision?: string;
 }
 
-/** One question of the agent's outstanding `ask` call; the UI renders options as click-to-answer buttons. */
+/** One question of the agent's outstanding `ask` call; the UI renders options as click-to-answer
+ * buttons, and a text question (`text`, no options) as a single-line typed answer. */
 export interface AskQuestion {
 	question: string;
 	options: AskOption[];
 	multi: boolean;
 	/** Zero-based recommended option index; null when the agent gave none. */
 	recommended: number | null;
+	/** Free-text question: true exactly when `options` is empty; `multi` is then false and
+	 * `recommended` null. */
+	text: boolean;
 }
 
 /** One gate question the gate itself answered with the default it would build with (OTTR-904). */
@@ -90,6 +103,9 @@ export interface PromptGateState {
 	assumptions?: GateAssumption[];
 	/** The outside check the gate adopted when the prompt text carried none (OTTR-904); absent when the text carried one. */
 	check?: string;
+	/** The parked "Open questions" section's context lines that are not questions and not
+	 * agent instructions (OTTR-1160); absent when none. The drawer renders them once above the ask questions. */
+	context?: string[];
 	/** The duplicate-work gate's stamp (OTTR-941); absent = the gate never ran on this card. */
 	dup?: DupGateStamp;
 }
@@ -121,19 +137,25 @@ export function askAnswerLine(question: string, answer: string): string {
 	return `For "${question}": ${answer}`;
 }
 
-/** One normalized ask question, or null when its question/options are unusable. */
+/** One normalized ask question, or null when its question text is unusable; unusable or
+ * missing options degrade to a text question instead of null. */
 function askQuestionOf(item: unknown): AskQuestion | null {
-	if (
-		typeof item !== "object" ||
-		item === null ||
-		!("question" in item) ||
-		!("options" in item)
-	)
+	if (typeof item !== "object" || item === null || !("question" in item))
 		return null;
-	const { question, options: rawOptions } = item;
+	const { question } = item;
+	if (typeof question !== "string") return null;
+	// No options (absent or not an array): the user answers by typing one line.
+	const rawOptions = "options" in item ? item.options : null;
+	if (!Array.isArray(rawOptions))
+		return {
+			question,
+			options: [],
+			multi: false,
+			recommended: null,
+			text: true,
+		};
 	const multi = "multi" in item ? item.multi : undefined;
 	const recommended = "recommended" in item ? item.recommended : undefined;
-	if (typeof question !== "string" || !Array.isArray(rawOptions)) return null;
 	const options: AskOption[] = [];
 	const keptRaw: number[] = [];
 	for (const [rawIdx, entry] of rawOptions.entries()) {
@@ -142,6 +164,16 @@ function askQuestionOf(item: unknown): AskQuestion | null {
 		options.push(option);
 		keptRaw.push(rawIdx);
 	}
+	// No usable option survived (including an empty options array): the text form
+	// wins over multi/recommended, which have nothing to point at.
+	if (options.length === 0)
+		return {
+			question,
+			options: [],
+			multi: false,
+			recommended: null,
+			text: true,
+		};
 	// recommended is a raw index; map it onto the kept options or null when that
 	// option was dropped. indexOf rejects non-integers/out-of-range for free.
 	const at =
@@ -151,6 +183,7 @@ function askQuestionOf(item: unknown): AskQuestion | null {
 		options,
 		multi: multi === true,
 		recommended: at === -1 ? null : at,
+		text: false,
 	};
 }
 
@@ -176,6 +209,8 @@ export interface Outcome {
 	dependsOn?: string[];
 	/** PR mode only: the pull request body the merge turn wrote for the PR the server opens; missing or blank = the PR body falls back to the report text. */
 	prBody?: string;
+	/** Superseded merge turns only: the id of the follow-up card this turn filed with create_task for the gap main's flow left. A superseded report without a linked follow-up parks instead of closing. */
+	followUp?: string;
 }
 
 /** Repo facts for the onboarding fork panel; built by forkSummary (src/forks.ts). */
@@ -230,6 +265,8 @@ export interface ProjectSettings {
 	retroSince: number | null;
 	/** Skip the retro of a smooth, cheap task (the friction filter); false gives every task a retro. */
 	retroFilter: boolean;
+	/** A retro proposal with no decision starts as a queued card instead of waiting for Accept (docs/specs/retro-auto-start.md). */
+	retroAutoStart: boolean;
 	/** Hourly fork watch: analyze new fork-only commits with a tool-free model call and file held proposals (off by default). */
 	forkResearch: boolean;
 	/** Hourly PR watch: file or requeue a read-only review card for each settled open PR (off by default). */
@@ -240,6 +277,8 @@ export interface ProjectSettings {
 	prReviewApprove: boolean;
 	/** Post requests changes when the run found blocking findings; off by default. */
 	prReviewRequestChanges: boolean;
+	/** Only a Post click posts a review draft; off lets the board post each finished draft by itself (docs/specs/pr-review-auto-post.md). */
+	prReviewManualPost: boolean;
 	/** Per-project PR mode: integration pushes the card branch and opens a GitHub pull request instead of merging into the target branch (off by default). */
 	prMode: boolean;
 	/** Run work turns in a Firecracker microVM via vm-runner instead of a worker container (off by default; docs/adr/0009-microvm-workers.md). */
@@ -248,6 +287,8 @@ export interface ProjectSettings {
 	trendingScout: boolean;
 	/** Hourly issue watch: file each new open GitHub issue as a backlog card and label it ottr-tracked (off by default). */
 	issueWatch: boolean;
+	/** Hourly code scanning watch: file each open CodeQL alert rule as a backlog card, grouped by rule (off by default; docs/specs/code-scanning-watch.md). */
+	codeScanWatch: boolean;
 	/** When issueWatch last turned on (epoch ms); null while never enabled. */
 	issueWatchSince: number | null;
 	/** Hourly omp release watch: a model reviews each new omp release; fail and bump cards (off by default; docs/specs/omp-watch.md). */
@@ -269,12 +310,6 @@ export interface ProjectSettings {
 	 * closed at the next push until the server pins again.
 	 */
 	originUrl: string | null;
-	/**
-	 * Standing approval for the board to push the main checkout's target branch to the pinned
-	 * origin when the tick finds local commits origin lacks (OTTR-531 sync commits); false
-	 * needs the one click on the board's push button instead. Without it nothing pushes.
-	 */
-	pushSyncCommits: boolean;
 	/** Task id handle like OTTR; null = derived from the folder name. Uppercase letters and digits, at most 8. */
 	taskIdPrefix: string | null;
 	/** Name of the board-level Jira connection this project imports from; null = none. */
@@ -348,6 +383,19 @@ export interface PrWatchStatus {
 	nextPollAt: number | null;
 }
 
+/** OTTR-1087: the code scanning watch's poll facts, shipped in the project's view for the
+ * Settings Watches card. Mirrors PrWatchStatus; in-memory only: a restart clears the
+ * times and the next polls refill them. */
+export interface CodeScanWatchStatus {
+	/** Clock value when the project's last poll completed; null before the first. */
+	lastPollAt: number | null;
+	/** The last poll's failure reason; null when it completed clean or never ran. */
+	lastError: string | null;
+	/** Clock value of the next regular hourly poll (the server's interval grid);
+	 * null when the wiring names no grid. */
+	nextPollAt: number | null;
+}
+
 /** U7: an update card parked by holdUpdateMerges; the reply recognizes it by this reason. Shared by the turn loop and the drawer's hold action bar. */
 export const UPDATE_HOLD_REASON =
 	"Update card: read the summary, then reply to approve the merge.";
@@ -409,6 +457,8 @@ export interface PrReviewRow {
 	postedLogin: string | null;
 	/** The event the posted review used (REQUEST_CHANGES); null for COMMENT/APPROVE or no post. */
 	postedEvent: string | null;
+	/** Who posted the current review: "user" for a Post click, "auto" for the board (docs/specs/pr-review-auto-post.md); null for no post or an older post. */
+	postedVia: string | null;
 	state: PrState;
 	draft: boolean;
 	title: string;
@@ -552,6 +602,11 @@ export interface Task {
 	sourcePrDependabot: boolean;
 	/** OTTR-1063: true when the ship proved the card branch holds nothing beyond the target (an integrated merge turn rebased it onto a moved target). The card waits only on its source PR and finishes done once that PR closes — merged or closed unmerged; the watch never parks it. */
 	sourcePrSuperseded: boolean;
+	/** OTTR-996: the outside issue or ticket this card was filed from; null for every
+	 * other card. The GitHub issue number as text for issue-watch cards, the Jira issue
+	 * key for Jira imports. The prompt embeds that author's text, so the duplicate gate
+	 * never uses the card as a duplicate candidate. */
+	sourceIssue: string | null;
 	/** OTTR-809: the follow-up pull request the ship step opened for a Dependabot card's
 	 * fixes beyond the source PR's head (base = the Dependabot branch); null otherwise.
 	 * The card waits for this PR and the source PR to merge before it finishes. */
@@ -651,6 +706,26 @@ export interface WorkCheckBlocker {
 	statusReason?: string;
 }
 
+/** One user-set vendor rule of the check routing: a work model whose vendor is `vendor`
+ *  checks with the model of role `role`. */
+export interface CheckRoutingRule {
+	/** Lowercase vendor key (modelVendor's keys, or "unknown" for a model with no known vendor). */
+	vendor: string;
+	/** The model role the check uses; the role needs no configured model at save time. */
+	role: string;
+}
+
+/** User-set vendor routing for the second-model check (Settings -> Model roles). The first
+ *  rule whose vendor matches the work model's vendor names the check role; when no rule
+ *  matches, a nonempty fallback names it; otherwise the built-in default rule applies
+ *  (checkRoleFor). null = automatic routing, no setting. Board-wide, stored in the
+ *  GlobalStore config row. */
+export type CheckRoutingSetting = {
+	rules: CheckRoutingRule[];
+	/** Role for models no rule matches; "" = straight to the default rule. */
+	fallback: string;
+} | null;
+
 /** One run of the second-model check of a work card. */
 export interface WorkCheckRun {
 	/** Epoch milliseconds when the check run started. */
@@ -659,10 +734,11 @@ export interface WorkCheckRun {
 	 *  board's default role (omp's fallback when a model is unset); null = omp's own default
 	 *  (no role names it, so the card shows "default model"). */
 	model: string | null;
-	/** The role the check's model came from: the picked critic or adversary role, or
+	/** The role the check's model came from: the routed check role (checkRoleFor), or
 	 *  "default" when that role is unset and the model fell back to the default role.
+	 *  Old records carry only "critic", "adversary", or "default".
 	 *  Absent on records written before this field existed and on lost runs (settleLostCheck). */
-	role?: "critic" | "adversary" | "default";
+	role?: string;
 	/** pass = nothing blocks, blockers = real problems found, error = the run itself failed after a retry. */
 	outcome: "pass" | "blockers" | "error";
 	blockers: WorkCheckBlocker[];
@@ -750,6 +826,8 @@ export interface RunResult {
 		prompt: string;
 		model: string | null;
 		summary: ProposalSummary | null;
+		/** The question the user must answer before the card starts; absent or null when none. */
+		decision?: string | null;
 		project: string | null;
 	} | null;
 	/** Every valid `propose_task` call of the run, in order: a retro records at most one (the
@@ -970,6 +1048,8 @@ export interface ArchReview {
 	due: boolean;
 	/** A live architecture-review task exists (queued or running): the due chip says so and Start review disables. */
 	running: boolean;
+	/** The review card that keeps `running` true (queued, running, or with open findings); null when nothing runs. */
+	runningCardId: string | null;
 }
 
 /** The repo's public ghcr.io container image, as shown in the project header chip. */
@@ -995,6 +1075,12 @@ export interface OpenPrSummary {
 export interface OpenPrsView {
 	total: number;
 	prs: OpenPrSummary[];
+}
+
+/** A validated homepage URL and the host shown in the project header. */
+export interface ProjectHomepage {
+	url: string;
+	domain: string;
 }
 
 export interface ProjectView {
@@ -1051,9 +1137,14 @@ export interface ProjectView {
 	/** Open pull requests on the GitHub repo, newest first; null with no GitHub remote,
 	 * before the first probe, or when gh fails. */
 	openPrs: OpenPrsView | null;
+	/** Validated homepage of the GitHub repo, or null when none is available. */
+	homepage: ProjectHomepage | null;
 	/** OTTR-1071: the PR watch's poll facts (last check, its error, next regular check),
 	 * shown by the Settings Watches card's PR reviews row. */
 	prWatch: PrWatchStatus;
+	/** OTTR-1087: the code scanning watch's poll facts (last check, its error, next
+	 * regular check), shown by the Settings Watches card's Code scanning row. */
+	codeScanWatch: CodeScanWatchStatus;
 	settings: ProjectSettings;
 	/** Effective task id handle: the taskIdPrefix override or the folder-derived default. */
 	taskPrefix: string;
@@ -1075,8 +1166,12 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	savedFiles?: { name: string; size: number }[];
 	/** Set only for kind "pr_review". */
 	prReview?: PrReviewView;
-	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and the unseen comment stamp that key the bell occurrences. */
-	prOccurrence?: { draft: number | null; comments: number | null };
+	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and the unseen comment stamp that key the bell occurrences, plus the board-posted stamp (docs/specs/pr-review-auto-post.md). The head keys the posted occurrence. */
+	prOccurrence?: {
+		draft: number | null;
+		comments: number | null;
+		posted?: { url: string; number: number; head: string } | null;
+	};
 	/** OTTR-1073: set only for kind "pr_review". The watcher's last draft run; its start and end change the board row, so an open drawer refetches the detail and the composer's run status moves. */
 	prRun?: PrRunState | null;
 	/** Present on the drawer detail of a release card waiting for approval; commits between the reviewed base and the target head. */
@@ -1158,9 +1253,18 @@ export type TaskCard = Omit<
 	/** Ids of the queued merges mergeHold parks behind this open release ("waiting for release
 	 * <version>"); present on release cards only, and only when the list is non-empty. */
 	heldMerges?: string[];
+	/** OTTR-1128: present (true) on a review lead, a card whose prompt carries the "Needs
+	 * validation" tag. The card ships no prompt, so the hold rules (scheduler.ts isLead)
+	 * read this mark instead. */
+	lead?: true;
 	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and
-	 * the unseen comment stamp that key the bell occurrences (board build and event diff). */
-	prOccurrence?: { draft: number | null; comments: number | null };
+	 * the unseen comment stamp that key the bell occurrences, plus the board-posted stamp
+	 * (docs/specs/pr-review-auto-post.md). The head keys the posted occurrence. */
+	prOccurrence?: {
+		draft: number | null;
+		comments: number | null;
+		posted?: { url: string; number: number; head: string } | null;
+	};
 	/** OTTR-506: stamped on queued merges the push hold parks while local main has commits
 	 * origin lacks (a rejected server push); the board shows the hold reason — the browser
 	 * gets no git, so the server derives the fact (pushHold) and stamps it. */
@@ -1322,6 +1426,14 @@ export interface OrphanProcess {
 	kind: string | null;
 }
 
+/** Hosted mode's credits chip data (docs/specs/hosted-mode.md section 7): present only in hosted mode. */
+export interface HostedCreditsView {
+	/** Last balance the credit gate saw, in credits; null until a /credit answer carried one. */
+	balance: number | null;
+	/** Absolute control-plane account page (the chip's link; at zero it is the top-up path). */
+	accountUrl: string;
+}
+
 export interface StateResponse {
 	projects: ProjectView[];
 	/** Every project's open cards plus its Done window (OTTR-965): the newest DONE_PAGE
@@ -1330,6 +1442,11 @@ export interface StateResponse {
 	tasks: TaskCard[];
 	/** Global cap of concurrently running omp processes; null = no cap. */
 	maxTotal: number | null;
+	/** The scheduler's own live slot count at frame assembly: the distinct running and
+	 *  preparing run keys the claim gate compares against maxTotal (OTTR-1143). The frame's
+	 *  card list is not a snapshot across projects, so its own sum can exceed the cap.
+	 *  Absent on frames from an older server; the UI then counts the frame's own cards. */
+	slotsUsed?: number;
 	/** True when a review's findings are checked by a second model before they become cards. */
 	reviewCheck: boolean;
 	/** True when a finished work card is checked by a second model before it enters the merge queue. */
@@ -1346,8 +1463,11 @@ export interface StateResponse {
 	serverVersion: string;
 	/** Provider usage limits from `omp usage --json`; null until the first check. */
 	quota: QuotaState | null;
+	serviceQuotas?: readonly ServiceQuotaSourceState[];
 	/** Hosted mode (docs/specs/hosted-mode.md): the UI hides host-level panels and identity surfaces. Absent or false on every self-hosted board. */
 	hosted?: boolean;
+	/** Hosted mode's credits chip data: present only in hosted mode. */
+	credits?: HostedCreditsView;
 	/** True until the single admin exists (/api/setup); the UI shows the setup dialog then. */
 	onboarding: boolean;
 	/** Admin name for the top-bar user chip; null until /api/setup. */
@@ -1444,13 +1564,146 @@ export interface QuotaLimit {
 	resetsAt: number | null;
 }
 
+/** One provider's banked rate-limit resets as omp reports them (OpenAI Codex, Anthropic). */
+export interface QuotaResetCredits {
+	provider: string;
+	/** Resets the account can redeem now. */
+	available: number;
+	/** Epoch ms when the soonest available reset expires; null when omp names none. */
+	nextExpiry: number | null;
+}
+
 export interface QuotaState {
 	limits: QuotaLimit[];
+	/** Banked resets per provider that reports them; absent from boards that predate them. */
+	resetCredits?: QuotaResetCredits[];
 	/** Why the last check failed; limits are empty then. */
 	error: string | null;
 	/** Epoch ms of the last check. */
 	at: number;
 }
+
+export type ServiceQuotaUnit =
+	| { kind: "currency"; code: string }
+	| { kind: "count"; name: string };
+
+export type ServiceQuotaMetric = {
+	id: string;
+	label: string;
+	unit: ServiceQuotaUnit;
+} & (
+	| {
+			kind: "window";
+			used: number;
+			limit: number;
+			startsAt: number | null;
+			resetsAt: number | null;
+	  }
+	| {
+			kind: "balance";
+			remaining: number;
+			reportedTotal: number | null;
+			resetsAt: number | null;
+			providerStatus: string | null;
+			plan: string | null;
+	  }
+);
+
+export interface ServiceQuotaConfigurationError {
+	code: "configuration";
+}
+
+export interface ServiceQuotaReadError {
+	code:
+		| "authentication"
+		| "rate_limit"
+		| "timeout"
+		| "network"
+		| "http"
+		| "invalid_response"
+		| "internal";
+	httpStatus: number | null;
+	retryAfterAt: number | null;
+}
+
+export type ServiceQuotaReadResult =
+	| { ok: true; metrics: readonly ServiceQuotaMetric[] }
+	| { ok: false; error: ServiceQuotaReadError };
+
+export interface ServiceQuotaReader {
+	read(context: { signal: AbortSignal }): Promise<ServiceQuotaReadResult>;
+}
+
+export interface ServiceQuotaAdapterDefinition {
+	readonly id: string;
+	createReader(context: { credential: string }): ServiceQuotaReader;
+}
+
+export interface ServiceQuotaSourceConfig {
+	id: string;
+	adapterId: string;
+	label: string;
+	credentialEnv: string;
+}
+
+export interface ServiceQuotaSample {
+	observedAt: number;
+	metrics: readonly ServiceQuotaMetric[];
+}
+
+export interface ServiceQuotaSourceIdentity {
+	id: string;
+	adapterId: string;
+	label: string;
+}
+
+export type ServiceQuotaSourceState = ServiceQuotaSourceIdentity &
+	(
+		| {
+				status: "unconfigured";
+				lastAttemptAt: null;
+				nextAttemptAt: null;
+				sample: null;
+				error: ServiceQuotaConfigurationError;
+		  }
+		| {
+				status: "pending";
+				lastAttemptAt: null;
+				nextAttemptAt: number;
+				sample: null;
+				error: null;
+		  }
+		| {
+				status: "ok";
+				lastAttemptAt: number;
+				nextAttemptAt: number;
+				sample: ServiceQuotaSample;
+				error: null;
+		  }
+		| {
+				status: "stale";
+				staleReason: "refresh_error";
+				lastAttemptAt: number;
+				nextAttemptAt: number | null;
+				sample: ServiceQuotaSample;
+				error: ServiceQuotaReadError;
+		  }
+		| {
+				status: "stale";
+				staleReason: "expired";
+				lastAttemptAt: number;
+				nextAttemptAt: number;
+				sample: ServiceQuotaSample;
+				error: null;
+		  }
+		| {
+				status: "error";
+				lastAttemptAt: number;
+				nextAttemptAt: number | null;
+				sample: null;
+				error: ServiceQuotaReadError;
+		  }
+	);
 
 /** Context-window reading from a task's omp session transcript; null = no session data. */
 export interface SessionContext {
@@ -1576,6 +1829,32 @@ export interface SystemTurn extends SystemCard {
 	usage: TurnUsage | null;
 }
 
+/** One live VM in the vm-runner's GET /stats body (src/vmRunner.ts) and on the System view. */
+export interface SystemVm {
+	/** The turn's run id (WorkerRequest.id) or the validate job id. */
+	id: string;
+	project: string;
+	/** The card the dispatch named (VmSpec.taskId, the sandbox job's taskId); null when it carried none. */
+	cardId: string | null;
+	/** "turn" for a card run, "validate" for a sandbox validation job. */
+	mode: "turn" | "validate";
+	vcpus: number;
+	/** Guest memory in MiB. */
+	memMiB: number;
+	/** Epoch ms the runner accepted the run. */
+	startedAt: number;
+	/** Allocated bytes of the run's scratch disk (st_blocks × 512, du semantics — never the
+	 *  sparse file's apparent size); null while the runner has not created the disk. */
+	scratchBytes: number | null;
+}
+
+/** Allocated bytes (st_blocks × 512, du semantics) of the vm-state volume's parts. */
+export interface VmStateDisk {
+	base: number;
+	layers: number;
+	runs: number;
+}
+
 /** One container in the System view: the server, then each OTTR_WORKER_URLS worker. */
 export interface ContainerRow {
 	/** "server", or the worker url's hostname (e.g. "worker-a"). */
@@ -1613,6 +1892,20 @@ export interface ContainerRow {
 	/** Warning reasons in plain text ("memory 93 %", "OOM kill in the last hour",
 	 *  "CPU at 90 % of its share for 5 min"); empty = ok. */
 	warnings: string[];
+	/** Set only on the vm-runner row (OTTR_VM_RUNNER_URL set): what the container's
+	 *  cgroup numbers cannot say — health, the VM fleet, the vm-state volume's real use. */
+	vm?: {
+		/** The board's last /healthz probe (src/vmState.ts); ok false carries the reason. */
+		health: { ok: boolean; reason: string | null };
+		/** OTTR_VM_MAX, as the runner's /stats reported it; null without a reachable reading. */
+		max: number | null;
+		/** One entry per live VM, the runner's /stats vms list. */
+		vms: SystemVm[];
+		/** The vm-state volume's allocated bytes per part; null without a reachable reading. */
+		disk: VmStateDisk | null;
+		/** Cards whose last dispatch vm-runner refused as busy (src/vmState.ts). */
+		busy: SystemCard[];
+	};
 }
 
 /** The Docker VM as the server's /proc sees it. Never warns. */
